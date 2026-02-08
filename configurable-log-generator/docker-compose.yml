@@ -1,0 +1,13 @@
+services:
+  log-generator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: log_generator
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env.example
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
