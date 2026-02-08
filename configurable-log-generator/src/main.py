@@ -17,6 +17,7 @@ from src.models import LogEntry, generate_short_id, generate_user_id, generate_r
 from src.formatters import get_formatter
 from src.output import LogWriter
 from src.messages import get_random_message
+from src.burst import BurstController
 
 # Internal logging to stderr (separate from generated log output)
 logging.basicConfig(
@@ -65,11 +66,16 @@ def main():
 
     formatter = get_formatter(config.log_format)
     writer = LogWriter(config.output_file, config.console_output, config.log_format)
+    burst = BurstController(
+        config.burst_frequency, config.burst_multiplier,
+        config.burst_duration, config.enable_bursts,
+    )
 
     try:
         while _running:
             second_start = time.time()
-            current_rate = config.log_rate
+            multiplier = burst.get_current_multiplier()
+            current_rate = config.log_rate * multiplier
             sleep_per_log = 1.0 / current_rate if current_rate > 0 else 1.0
 
             logs_generated = 0
