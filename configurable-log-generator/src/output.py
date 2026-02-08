@@ -21,7 +21,15 @@ class LogWriter:
             os.makedirs(dir_path, exist_ok=True)
 
     def _open_file(self):
+        is_new = (
+            not os.path.exists(self._output_file)
+            or os.path.getsize(self._output_file) == 0
+        )
         self._file_handle = open(self._output_file, "a", encoding="utf-8")
+        if is_new and self._log_format == "csv":
+            from src.formatters import CSV_HEADER
+            self._file_handle.write(CSV_HEADER + "\n")
+            self._file_handle.flush()
 
     def write(self, line: str):
         with self._lock:
