@@ -18,6 +18,7 @@ from src.formatters import get_formatter
 from src.output import LogWriter
 from src.messages import get_random_message
 from src.burst import BurstController
+from src.patterns import PatternManager
 
 # Internal logging to stderr (separate from generated log output)
 logging.basicConfig(
@@ -70,6 +71,7 @@ def main():
         config.burst_frequency, config.burst_multiplier,
         config.burst_duration, config.enable_bursts,
     )
+    patterns = PatternManager(config.services, config.enable_patterns)
 
     try:
         while _running:
@@ -80,6 +82,21 @@ def main():
 
             logs_generated = 0
             while _running and (time.time() - second_start) < 1.0:
+                # Emit any ready pattern logs
+                for level, message, service, user_id, request_id in patterns.tick():
+                    entry = LogEntry(
+                        timestamp=datetime.now(),
+                        level=level,
+                        id=generate_short_id(),
+                        service=service,
+                        user_id=user_id,
+                        request_id=request_id,
+                        duration_ms=generate_duration(level),
+                        message=message,
+                    )
+                    writer.write(formatter(entry))
+
+                # Generate a random log
                 entry = _make_random_entry(config)
                 writer.write(formatter(entry))
                 logs_generated += 1
