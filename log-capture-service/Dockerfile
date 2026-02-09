@@ -5,4 +5,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 RUN mkdir -p /app/logs /app/collected_logs
 ENV PYTHONUNBUFFERED=1
-CMD ["python", "-c", "from src.buffer import BatchWriter; print('imports OK')"]
+CMD ["python", "-m", "src.main", "--log-files", "/app/logs/app.log", \
+     "--output-dir", "/app/collected_logs"]
