@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+project_requirement.md
+.claude/
+
+# Environment
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Output
+collected_logs/
+
+# Plan (development artifact)
+plan.md
+
+# OS
+.DS_Store
+Thumbs.db

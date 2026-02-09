@@ -23,7 +23,7 @@ class EntryProcessor:
                 self._include_patterns.append(compiled)
 
         for rule in tag_rules:
-            self._tag_rules.append((rule.name, re.compile(rule.pattern), rule.field))
+            self._tag_rules.append((rule.name, re.compile(rule.pattern, re.IGNORECASE), rule.field))
 
     def should_include(self, entry: LogEntry) -> bool:
         """Check if entry passes filter rules.

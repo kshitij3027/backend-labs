@@ -1,0 +1,29 @@
+services:
+  log-generator:
+    build:
+      context: ../configurable-log-generator
+    container_name: log_generator
+    volumes:
+      - shared-logs:/app/logs
+    env_file:
+      - ../configurable-log-generator/.env.example
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+
+  log-collector:
+    build: .
+    container_name: log_collector
+    volumes:
+      - shared-logs:/app/logs:ro
+      - ./collected_logs:/app/collected_logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BATCH_SIZE=50
+      - FLUSH_INTERVAL=5
+    depends_on:
+      - log-generator
+    restart: unless-stopped
+
+volumes:
+  shared-logs:
