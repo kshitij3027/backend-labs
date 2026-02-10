@@ -1,0 +1,4 @@
+<13>Jan  5 14:30:01 myhost sshd[12345]: Accepted publickey for user from 192.168.1.50 port 22
+<11>Jan  5 14:31:00 myhost kernel: Out of memory: Kill process 5678 (java) score 900
+<14>Jan  5 14:32:15 myhost cron[999]: (root) CMD (/usr/bin/backup.sh)
+<12>Jan  5 14:33:00 myhost systemd[1]: Started Daily apt download activities.

@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Output directories
+logs/
+parsed_logs/
+
+# Development artifacts
+plan.md
+project_requirements.md
+
+# OS
+.DS_Store

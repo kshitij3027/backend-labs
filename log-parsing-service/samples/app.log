@@ -1,0 +1,4 @@
+{"timestamp": "2024-01-15T10:30:00Z", "level": "INFO", "message": "Application started", "service": "auth-service"}
+{"timestamp": "2024-01-15T10:30:05Z", "level": "DEBUG", "message": "Loaded 42 config entries", "service": "auth-service", "config_count": 42}
+{"timestamp": "2024-01-15T10:31:00Z", "level": "ERROR", "message": "Database connection failed", "service": "user-service", "retry_count": 3, "db_host": "db.internal"}
+{"timestamp": "2024-01-15T10:32:00Z", "level": "WARNING", "message": "Rate limit approaching", "service": "api-gateway", "current_rate": 950, "max_rate": 1000}

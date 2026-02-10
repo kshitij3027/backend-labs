@@ -1,0 +1,5 @@
+192.168.1.1 - frank [10/Oct/2000:13:55:36 -0700] "GET /index.html HTTP/1.0" 200 1024
+{"timestamp": "2024-01-15T10:30:00Z", "level": "INFO", "message": "Mixed format test", "service": "test"}
+<14>Jan  5 14:30:01 myhost cron[100]: (root) CMD (run-parts /etc/cron.daily)
+93.180.71.3 - - [17/May/2015:08:05:32 +0000] "GET /downloads/product_1 HTTP/1.1" 304 0 "-" "Debian APT-HTTP/1.3"
+this is an unparseable garbage line that should fail gracefully
