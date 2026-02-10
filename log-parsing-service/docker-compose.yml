@@ -1,0 +1,9 @@
+services:
+  log-parser:
+    build: .
+    environment:
+      - LOG_INPUT_DIR=/app/logs
+      - LOG_OUTPUT_DIR=/app/parsed_logs
+    volumes:
+      - ./logs:/app/logs
+      - ./parsed_logs:/app/parsed_logs
