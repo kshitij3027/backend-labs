@@ -1,0 +1,20 @@
+services:
+  log-storage:
+    build: .
+    container_name: log_storage
+    environment:
+      - LOG_DIR=/app/logs
+      - MAX_FILE_SIZE_BYTES=1024
+      - ROTATION_INTERVAL_SECONDS=30
+      - MAX_FILE_COUNT=5
+      - MAX_AGE_DAYS=1
+      - COMPRESSION_ENABLED=true
+    volumes:
+      - ./logs:/app/logs
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test

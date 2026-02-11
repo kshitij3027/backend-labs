@@ -1,0 +1,1 @@
+"""Log inspector CLI — placeholder."""
