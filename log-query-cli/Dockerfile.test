@@ -1,0 +1,9 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+
+COPY src/ src/
+COPY tests/ tests/
+COPY main.py main.py
+
+CMD ["python", "-m", "unittest", "discover", "tests", "-v"]

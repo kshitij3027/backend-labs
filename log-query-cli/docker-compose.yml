@@ -1,0 +1,12 @@
+services:
+  log-query:
+    build: .
+    volumes:
+      - ./logs:/logs
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
