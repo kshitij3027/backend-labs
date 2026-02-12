@@ -1,0 +1,20 @@
+[2025-05-15 14:25:00] [INFO] Application starting up
+[2025-05-15 14:25:01] [DEBUG] Loading configuration from /etc/app/config.yml
+[2025-05-15 14:25:02] [INFO] Database connection pool initialized (size=10)
+[2025-05-15 14:25:03] [INFO] Server listening on port 8080
+[2025-05-15 14:26:10] [INFO] GET /api/health - 200 OK (2ms)
+[2025-05-15 14:27:15] [WARN] Slow query detected: SELECT * FROM users WHERE active=1 (450ms)
+[2025-05-15 14:28:00] [INFO] POST /api/users - 201 Created (15ms)
+[2025-05-15 14:28:30] [ERROR] Database connection timeout after 30s
+[2025-05-15 14:28:31] [ERROR] Failed to process request: connection pool exhausted
+[2025-05-15 14:28:32] [WARN] Retrying database connection (attempt 1/3)
+[2025-05-15 14:28:35] [INFO] Database connection restored
+[2025-05-15 14:29:00] [DEBUG] Cache hit for key: user_session_abc123
+[2025-05-15 14:30:00] [INFO] GET /api/users/42 - 200 OK (8ms)
+[2025-05-15 14:30:15] [WARN] Deprecated endpoint called: /api/v1/legacy
+[2025-05-15 14:31:00] [ERROR] NullPointerException in UserService.getProfile(line 142)
+[2025-05-15 14:31:01] [ERROR] Stack trace: at com.app.service.UserService.getProfile(UserService.java:142)
+[2025-05-15 14:32:00] [INFO] Scheduled job completed: cleanup_expired_sessions (removed 23 sessions)
+[2025-05-15 14:33:00] [DEBUG] Memory usage: heap=256MB, non-heap=64MB
+[2025-05-15 14:34:00] [INFO] PUT /api/users/42 - 200 OK (12ms)
+[2025-05-15 14:35:00] [ERROR] Disk space critical: /var/log is 95% full
