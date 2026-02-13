@@ -9,6 +9,7 @@ project_requirements.md
 # Runtime data
 logs/
 data/
+.pipeline.pids
 
 # Environment
 .env
