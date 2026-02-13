@@ -1,0 +1,11 @@
+FROM python:3.12-alpine
+RUN pip install --no-cache-dir pyyaml==6.0.2
+WORKDIR /app
+COPY shared/ shared/
+COPY generator/ generator/
+COPY collector/ collector/
+COPY parser/ parser/
+COPY storage/ storage/
+COPY query/ query/
+COPY config.yml config.yml
+CMD ["python", "-m", "unittest", "discover", "-v", "-s", ".", "-p", "test_*.py"]
