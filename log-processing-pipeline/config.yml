@@ -5,7 +5,7 @@
 generator:
   log_file: /logs/app.log
   rate: 10                    # lines per second
-  format: apache              # apache | nginx | syslog | json | multi
+  format: multi               # apache | nginx | syslog | json | multi
 
 collector:
   source_file: /logs/app.log

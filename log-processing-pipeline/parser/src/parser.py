@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 
-from parser.src.apache_parser import parse_apache_line
+from parser.src.auto_detect import parse_line
 from parser.src.state_tracker import StateTracker
 
 
@@ -46,7 +46,7 @@ class Parser:
                 line = line.rstrip("\n")
                 if not line:
                     continue
-                entry = parse_apache_line(line)
+                entry = parse_line(line)
                 if entry:
                     entries.append(entry)
         return entries
