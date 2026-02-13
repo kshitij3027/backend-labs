@@ -69,6 +69,23 @@ services:
     profiles:
       - query
 
+  web-query:
+    build:
+      context: .
+      dockerfile: query/Dockerfile.web
+    container_name: pipeline_web_query
+    ports:
+      - "8000:8000"
+    volumes:
+      - storage:/data/storage:ro
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - storage
+    profiles:
+      - web
+
 volumes:
   logs:
   collected:

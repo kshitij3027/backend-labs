@@ -1,4 +1,4 @@
-.PHONY: build run stop clean query logs local-setup local-run local-stop
+.PHONY: build run stop clean query logs web web-stop local-setup local-run local-stop
 
 build:
 	docker compose build
@@ -17,6 +17,12 @@ query:
 
 logs:
 	docker compose logs -f --tail=20
+
+web:
+	docker compose --profile web up -d
+
+web-stop:
+	docker compose --profile web down
 
 local-setup:
 	mkdir -p logs data/collected data/parsed data/storage/active data/storage/archive data/storage/index
