@@ -8,12 +8,14 @@ from shared.metrics import Metrics
 from collector.src.config import CollectorConfig
 from collector.src.offset_tracker import OffsetTracker
 from collector.src.collector import Collector
+from collector.src.filter import RawLineFilter
 
 
 def main() -> None:
     cfg = CollectorConfig.from_dict(load_yaml()["collector"])
     tracker = OffsetTracker(cfg.state_file)
-    collector = Collector(cfg.source_file, cfg.output_dir, cfg.batch_size, tracker)
+    line_filter = RawLineFilter(list(cfg.filters)) if cfg.filters else None
+    collector = Collector(cfg.source_file, cfg.output_dir, cfg.batch_size, tracker, line_filter)
     metrics = Metrics("/data/collected/.collector_metrics.json")
 
     running = True

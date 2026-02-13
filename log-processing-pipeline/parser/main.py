@@ -8,12 +8,14 @@ from shared.metrics import Metrics
 from parser.src.config import ParserConfig
 from parser.src.state_tracker import StateTracker
 from parser.src.parser import Parser
+from parser.src.filter import EntryFilter
 
 
 def main() -> None:
     cfg = ParserConfig.from_dict(load_yaml()["parser"])
     tracker = StateTracker(cfg.state_file)
-    parser = Parser(cfg.input_dir, cfg.output_dir, tracker)
+    entry_filter = EntryFilter(list(cfg.filters)) if cfg.filters else None
+    parser = Parser(cfg.input_dir, cfg.output_dir, tracker, entry_filter)
     metrics = Metrics("/data/parsed/.parser_metrics.json")
 
     running = True

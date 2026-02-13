@@ -1,6 +1,6 @@
 """Collector configuration loaded from the YAML collector section."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -10,6 +10,7 @@ class CollectorConfig:
     poll_interval: int
     batch_size: int
     state_file: str
+    filters: tuple
 
     @classmethod
     def from_dict(cls, d: dict) -> "CollectorConfig":
@@ -19,4 +20,5 @@ class CollectorConfig:
             poll_interval=d.get("poll_interval", 2),
             batch_size=d.get("batch_size", 100),
             state_file=d["state_file"],
+            filters=tuple(d.get("filters", [])),
         )

@@ -13,12 +13,24 @@ collector:
   poll_interval: 2            # seconds
   batch_size: 100             # max lines per batch file
   state_file: /data/collected/.collector_state.json
+  filters: []                 # raw line filters, e.g.:
+  # - pattern: "health_check"
+  #   action: exclude
+  # - pattern: "CRITICAL"
+  #   action: include
 
 parser:
   input_dir: /data/collected
   output_dir: /data/parsed
   poll_interval: 2            # seconds
   state_file: /data/parsed/.parser_state.json
+  filters: []                 # parsed entry filters, e.g.:
+  # - field: level
+  #   pattern: "DEBUG"
+  #   action: exclude
+  # - field: status_code
+  #   pattern: "^5\\d{2}$"
+  #   action: include
 
 storage:
   input_dir: /data/parsed

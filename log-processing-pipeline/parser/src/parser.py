@@ -5,14 +5,17 @@ import os
 import tempfile
 
 from parser.src.auto_detect import parse_line
+from parser.src.filter import EntryFilter
 from parser.src.state_tracker import StateTracker
 
 
 class Parser:
-    def __init__(self, input_dir: str, output_dir: str, tracker: StateTracker):
+    def __init__(self, input_dir: str, output_dir: str, tracker: StateTracker,
+                 entry_filter: EntryFilter | None = None):
         self._input_dir = input_dir
         self._output_dir = output_dir
         self._tracker = tracker
+        self._filter = entry_filter
         os.makedirs(self._output_dir, exist_ok=True)
 
     def poll_once(self) -> int:
@@ -48,6 +51,8 @@ class Parser:
                     continue
                 entry = parse_line(line)
                 if entry:
+                    if self._filter and not self._filter.should_keep(entry):
+                        continue
                     entries.append(entry)
         return entries
 

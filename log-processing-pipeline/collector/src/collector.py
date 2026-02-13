@@ -5,16 +5,19 @@ import tempfile
 from datetime import datetime, timezone
 
 from collector.src.offset_tracker import OffsetTracker
+from collector.src.filter import RawLineFilter
 
 
 class Collector:
     def __init__(self, source_file: str, output_dir: str, batch_size: int,
-                 tracker: OffsetTracker):
+                 tracker: OffsetTracker, line_filter: RawLineFilter | None = None):
         self._source = source_file
         self._output_dir = output_dir
         self._batch_size = batch_size
         self._tracker = tracker
+        self._filter = line_filter
         self._batch_counter = 0
+        self._filtered_count = 0
         os.makedirs(self._output_dir, exist_ok=True)
 
     def poll_once(self) -> int:
@@ -35,6 +38,9 @@ class Collector:
             for line in f:
                 line = line.rstrip("\n")
                 if not line:
+                    continue
+                if self._filter and not self._filter.should_keep(line):
+                    self._filtered_count += 1
                     continue
                 batch.append(line)
                 if len(batch) >= self._batch_size:
