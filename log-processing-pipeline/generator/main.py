@@ -5,6 +5,7 @@ import signal
 import time
 
 from shared.config_loader import load_yaml
+from shared.metrics import Metrics
 from generator.src.config import GeneratorConfig
 from generator.src.apache_formatter import generate_apache_line
 from generator.src.nginx_formatter import generate_nginx_line
@@ -36,6 +37,7 @@ def main() -> None:
     cfg = GeneratorConfig.from_dict(load_yaml()["generator"])
     writer = LogFileWriter(cfg.log_file)
     gen_line = _get_line_generator(cfg.format)
+    metrics = Metrics("/logs/.generator_metrics.json")
 
     running = True
 
@@ -47,14 +49,24 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
 
     interval = 1.0 / cfg.rate
+    metrics_interval = 10
+    last_metrics_save = time.time()
     print(f"Generator: writing to {cfg.log_file} at {cfg.rate} lines/sec (format={cfg.format})",
           flush=True)
 
     while running:
         line = gen_line()
         writer.write(line)
+        metrics.increment("logs_generated")
+
+        now = time.time()
+        if now - last_metrics_save >= metrics_interval:
+            metrics.save()
+            last_metrics_save = now
+
         time.sleep(interval)
 
+    metrics.save()
     writer.close()
     print("Generator: shutdown complete", flush=True)
 

@@ -5,6 +5,7 @@ import signal
 import time
 
 from shared.config_loader import load_yaml
+from shared.metrics import Metrics
 from storage.src.config import StorageConfig
 from storage.src.state_tracker import StateTracker
 from storage.src.indexer import Indexer
@@ -23,6 +24,7 @@ def main() -> None:
         age_threshold_seconds=cfg.rotation_hours * 3600,
     )
     engine = StorageEngine(cfg.input_dir, cfg.storage_dir, tracker, indexer, rotator)
+    metrics = Metrics("/data/storage/.storage_metrics.json")
 
     running = True
 
@@ -35,12 +37,25 @@ def main() -> None:
 
     print(f"Storage: watching {cfg.input_dir}", flush=True)
 
+    metrics_interval = 10
+    last_metrics_save = time.time()
+
     while running:
         n = engine.poll_once()
         if n > 0:
+            metrics.increment("entries_stored", n)
+            metrics.increment("files_ingested")
+            metrics.increment("index_updates")
             print(f"Storage: stored {n} entries", flush=True)
+
+        now = time.time()
+        if now - last_metrics_save >= metrics_interval:
+            metrics.save()
+            last_metrics_save = now
+
         time.sleep(cfg.poll_interval)
 
+    metrics.save()
     print("Storage: shutdown complete", flush=True)
 
 
