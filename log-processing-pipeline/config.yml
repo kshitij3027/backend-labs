@@ -1,0 +1,32 @@
+# Log Processing Pipeline — Central Configuration
+# Each component reads its own section.
+# Environment variables can override values (see .env.example).
+
+generator:
+  log_file: /logs/app.log
+  rate: 10                    # lines per second
+  format: apache              # apache | nginx | syslog | json | multi
+
+collector:
+  source_file: /logs/app.log
+  output_dir: /data/collected
+  poll_interval: 2            # seconds
+  batch_size: 100             # max lines per batch file
+  state_file: /data/collected/.collector_state.json
+
+parser:
+  input_dir: /data/collected
+  output_dir: /data/parsed
+  poll_interval: 2            # seconds
+  state_file: /data/parsed/.parser_state.json
+
+storage:
+  input_dir: /data/parsed
+  storage_dir: /data/storage
+  poll_interval: 2            # seconds
+  rotation_size_mb: 5         # rotate active file when it exceeds this size
+  rotation_hours: 24          # rotate active file after this many hours
+  state_file: /data/storage/.storage_state.json
+
+query:
+  storage_dir: /data/storage
