@@ -7,5 +7,6 @@ COPY collector/ collector/
 COPY parser/ parser/
 COPY storage/ storage/
 COPY query/ query/
+COPY tests/ tests/
 COPY config.yml config.yml
 CMD ["python", "-m", "unittest", "discover", "-v", "-s", ".", "-p", "test_*.py"]
