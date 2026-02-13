@@ -23,7 +23,8 @@ def main() -> None:
         size_threshold_bytes=int(cfg.rotation_size_mb * 1024 * 1024),
         age_threshold_seconds=cfg.rotation_hours * 3600,
     )
-    engine = StorageEngine(cfg.input_dir, cfg.storage_dir, tracker, indexer, rotator)
+    engine = StorageEngine(cfg.input_dir, cfg.storage_dir, tracker, indexer, rotator,
+                           cfg.compression_enabled)
     metrics = Metrics("/data/storage/.storage_metrics.json")
 
     running = True

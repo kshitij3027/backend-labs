@@ -1,9 +1,17 @@
 """Search NDJSON storage by pattern or by index lookup."""
 
+import gzip
 import json
 import os
 import re
 from typing import Iterator
+
+
+def _open_ndjson(path: str):
+    """Open an NDJSON file, handling .gz transparently."""
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "r")
 
 
 def _ndjson_files(storage_dir: str) -> list[str]:
@@ -15,7 +23,7 @@ def _ndjson_files(storage_dir: str) -> list[str]:
     archive_dir = os.path.join(storage_dir, "archive")
     if os.path.isdir(archive_dir):
         for f in sorted(os.listdir(archive_dir)):
-            if f.endswith(".ndjson"):
+            if f.endswith(".ndjson") or f.endswith(".ndjson.gz"):
                 files.append(os.path.join(archive_dir, f))
     return files
 
@@ -25,7 +33,7 @@ def search_by_pattern(storage_dir: str, pattern: str, limit: int = 50) -> Iterat
     regex = re.compile(pattern, re.IGNORECASE)
     count = 0
     for path in _ndjson_files(storage_dir):
-        with open(path, "r") as f:
+        with _open_ndjson(path) as f:
             for line in f:
                 line = line.rstrip("\n")
                 if not line:
@@ -57,14 +65,16 @@ def search_by_index(storage_dir: str, index_type: str, index_value: str,
         filename = item["file"]
         line_numbers = set(item["line_numbers"])
 
-        # Resolve file path
+        # Resolve file path (try plain, then .gz)
         path = os.path.join(storage_dir, "active", filename)
         if not os.path.exists(path):
             path = os.path.join(storage_dir, "archive", filename)
         if not os.path.exists(path):
+            path = os.path.join(storage_dir, "archive", filename + ".gz")
+        if not os.path.exists(path):
             continue
 
-        with open(path, "r") as f:
+        with _open_ndjson(path) as f:
             for i, line in enumerate(f):
                 if i in line_numbers:
                     line = line.rstrip("\n")

@@ -1,6 +1,8 @@
 """Handles rotation of the active NDJSON data file."""
 
+import gzip
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 
@@ -33,3 +35,12 @@ class Rotator:
         os.replace(active_path, archive_path)
         self._created_at = time.time()
         return archive_path
+
+    def compress(self, archive_path: str) -> str:
+        """Gzip an archived NDJSON file. Returns path to .gz file."""
+        gz_path = archive_path + ".gz"
+        with open(archive_path, "rb") as f_in:
+            with gzip.open(gz_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        os.remove(archive_path)
+        return gz_path

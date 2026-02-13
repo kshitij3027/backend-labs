@@ -10,12 +10,14 @@ from storage.src.rotator import Rotator
 
 class StorageEngine:
     def __init__(self, input_dir: str, storage_dir: str,
-                 tracker: StateTracker, indexer: Indexer, rotator: Rotator):
+                 tracker: StateTracker, indexer: Indexer, rotator: Rotator,
+                 compression_enabled: bool = True):
         self._input_dir = input_dir
         self._storage_dir = storage_dir
         self._tracker = tracker
         self._indexer = indexer
         self._rotator = rotator
+        self._compression_enabled = compression_enabled
         self._active_dir = os.path.join(storage_dir, "active")
         os.makedirs(self._active_dir, exist_ok=True)
 
@@ -49,6 +51,8 @@ class StorageEngine:
         if self._rotator.needs_rotation(self._active_path):
             archive = self._rotator.rotate(self._active_path)
             if archive:
+                if self._compression_enabled:
+                    archive = self._rotator.compress(archive)
                 print(f"Storage: rotated to {archive}", flush=True)
 
         return total

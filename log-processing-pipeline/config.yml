@@ -39,6 +39,7 @@ storage:
   rotation_size_mb: 5         # rotate active file when it exceeds this size
   rotation_hours: 24          # rotate active file after this many hours
   state_file: /data/storage/.storage_state.json
+  compression_enabled: true   # gzip archive files after rotation
 
 query:
   storage_dir: /data/storage
