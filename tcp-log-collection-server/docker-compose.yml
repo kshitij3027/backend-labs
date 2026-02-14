@@ -1,0 +1,33 @@
+services:
+  tcp-log-server:
+    build: .
+    container_name: tcp_log_server
+    ports:
+      - "9000:9000"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=9000
+      - MIN_LOG_LEVEL=INFO
+      - ENABLE_LOG_PERSISTENCE=true
+      - LOG_DIR=/app/logs
+      - LOG_FILENAME=server.log
+      - RATE_LIMIT_ENABLED=true
+      - RATE_LIMIT_MAX_REQUESTS=100
+      - RATE_LIMIT_WINDOW_SECONDS=60
+    volumes:
+      - ./logs:/app/logs
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+
+  client:
+    build: .
+    command: ["python", "test_client.py", "tcp-log-server", "9000"]
+    depends_on:
+      - tcp-log-server
+    profiles:
+      - client
