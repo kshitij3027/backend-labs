@@ -12,3 +12,4 @@ A collection of independent mini-projects built during a backend engineering lea
 | [log-storage-service](./log-storage-service/) | File-based log storage engine with automatic rotation, compression, and purging based on configurable policies, plus a CLI log inspector | Python 3.12, Docker Compose |
 | [log-query-cli](./log-query-cli/) | CLI tool that parses, filters, and searches log files using a memory-efficient generator pipeline with text/JSON/color output and statistics | Python 3.12, Docker |
 | [log-processing-pipeline](./log-processing-pipeline/) | End-to-end pipeline that generates, collects, parses, stores, and queries log data using five Docker containers with shared volumes | Python 3.12, Docker Compose |
+| [tcp-log-collection-server](./tcp-log-collection-server/) | Multi-threaded TCP server that receives NDJSON log messages, filters by level, persists to disk, and rate-limits per client IP | Python 3.12, Docker Compose |
