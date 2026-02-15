@@ -6,6 +6,7 @@ import sys
 import threading
 
 from src.config import load_config
+from src.resilient_shipper import ResilientLogShipper
 from src.shipper import LogShipper
 
 
@@ -31,7 +32,11 @@ def main():
                 "batch" if config.batch_mode else "continuous",
                 config.log_file, config.server_host, config.server_port)
 
-    shipper = LogShipper(config, shutdown_event)
+    if config.resilient:
+        logger.info("Using resilient shipper (buffered producer-consumer)")
+        shipper = ResilientLogShipper(config, shutdown_event)
+    else:
+        shipper = LogShipper(config, shutdown_event)
     shipper.run()
 
 
