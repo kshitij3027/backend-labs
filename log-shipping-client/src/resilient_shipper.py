@@ -8,6 +8,7 @@ from src.compressor import compress_payload
 from src.config import Config
 from src.file_reader import read_batch, FileTailer
 from src.formatter import parse_log_line, format_ndjson
+from src.health import HealthMonitor
 from src.tcp_client import TCPClient
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,9 @@ class ResilientLogShipper:
         self._shutdown = shutdown_event
         self._client = TCPClient(config.server_host, config.server_port, shutdown_event)
         self._queue: queue.Queue = queue.Queue(maxsize=config.buffer_size)
+        self._health = HealthMonitor(
+            config.server_host, config.server_port, shutdown_event, interval=5.0,
+        )
         self._sent = 0
         self._failed = 0
         self._lock = threading.Lock()
@@ -40,7 +44,8 @@ class ResilientLogShipper:
             return self._failed
 
     def run(self):
-        """Start consumer thread, then produce messages from the file."""
+        """Start health monitor and consumer thread, then produce messages."""
+        self._health.start()
         consumer = threading.Thread(target=self._consumer_loop, daemon=True)
         consumer.start()
 
@@ -54,6 +59,7 @@ class ResilientLogShipper:
             self._queue.put(None)
             consumer.join(timeout=10)
             self._client.close()
+            self._health.stop()
             logger.info(
                 "Resilient shipper finished: sent=%d, failed=%d",
                 self._sent, self._failed,
@@ -147,6 +153,9 @@ class ResilientLogShipper:
                 return
 
             if not self._client.connected:
+                if not self._health.is_healthy:
+                    logger.debug("Server unhealthy, waiting before reconnect")
+                    self._health.wait_for_healthy(timeout=5.0)
                 if not self._client.connect_with_backoff(max_attempts=3):
                     continue
 
