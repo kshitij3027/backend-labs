@@ -1,0 +1,48 @@
+services:
+  log-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: log_shipping_server
+    ports:
+      - "9000:9000"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=9000
+
+  log-client:
+    build: .
+    container_name: log_shipping_client
+    depends_on:
+      - log-server
+    environment:
+      - SERVER_HOST=log-server
+      - SERVER_PORT=9000
+      - LOG_FILE=/app/logs/app.log
+      - SHIPPING_MODE=continuous
+    volumes:
+      - ./logs:/app/logs
+    profiles:
+      - client
+
+  log-client-batch:
+    build: .
+    container_name: log_shipping_client_batch
+    depends_on:
+      - log-server
+    environment:
+      - SERVER_HOST=log-server
+      - SERVER_PORT=9000
+      - LOG_FILE=/app/sample_logs.txt
+      - SHIPPING_MODE=batch
+    volumes:
+      - ./sample_logs.txt:/app/sample_logs.txt:ro
+    profiles:
+      - batch
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test

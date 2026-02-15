@@ -9,5 +9,6 @@ dist/
 build/
 .pytest_cache/
 .mypy_cache/
+logs/*.log
 project_requirements.md
 plan.md
