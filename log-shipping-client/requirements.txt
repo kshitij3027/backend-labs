@@ -1,0 +1,4 @@
+# No external dependencies — stdlib only
+# Test dependencies
+pytest==8.3.4
+pytest-cov==6.0.0

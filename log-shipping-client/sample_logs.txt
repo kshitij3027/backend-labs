@@ -1,0 +1,5 @@
+2024-01-15 08:23:45 INFO Application started successfully
+2024-01-15 08:24:01 WARNING High memory usage detected: 85%
+2024-01-15 08:24:15 ERROR Failed to connect to database: timeout after 30s
+2024-01-15 08:25:00 INFO User authentication successful for user_id=12345
+2024-01-15 08:25:30 DEBUG Cache hit ratio: 0.92 for session abc-def
