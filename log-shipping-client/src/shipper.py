@@ -3,6 +3,7 @@
 import logging
 import threading
 
+from src.compressor import compress_payload
 from src.config import Config
 from src.file_reader import read_batch, FileTailer
 from src.formatter import parse_log_line, format_ndjson
@@ -70,6 +71,8 @@ class LogShipper:
             return
 
         payload = format_ndjson(entry)
+        if self._config.compress:
+            payload = compress_payload(payload)
         result = self._client.send_and_recv(payload)
 
         if result and result.get("status") == "ok":

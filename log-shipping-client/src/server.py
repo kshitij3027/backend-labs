@@ -3,7 +3,10 @@
 import json
 import logging
 import socket
+import struct
 import threading
+
+from src.compressor import decompress_frame, is_compressed
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +65,7 @@ class SimpleLogServer:
                 pass
 
     def _handle_client(self, conn: socket.socket, addr: tuple):
-        """Handle a single client connection: read NDJSON lines, send acks."""
+        """Handle a single client connection: auto-detect plain or compressed."""
         logger.info("Client connected from %s:%d", *addr)
         buf = b""
         conn.settimeout(1.0)
@@ -79,12 +82,40 @@ class SimpleLogServer:
                     break
 
                 buf += data
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    self._process_line(conn, line)
+                buf = self._process_buffer(conn, buf)
         finally:
             conn.close()
             logger.info("Client disconnected: %s:%d", *addr)
+
+    def _process_buffer(self, conn: socket.socket, buf: bytes) -> bytes:
+        """Process buffer, auto-detecting plain NDJSON vs compressed frames."""
+        while buf:
+            if not is_compressed(buf):
+                # Plain NDJSON mode: process complete lines
+                if b"\n" not in buf:
+                    break
+                line, buf = buf.split(b"\n", 1)
+                self._process_line(conn, line)
+            else:
+                # Compressed mode: read 4-byte header + payload
+                if len(buf) < 4:
+                    break
+                payload_len = struct.unpack("!I", buf[:4])[0]
+                total_len = 4 + payload_len
+                if len(buf) < total_len:
+                    break
+                frame = buf[:total_len]
+                buf = buf[total_len:]
+                try:
+                    decompressed = decompress_frame(frame)
+                    # Process each NDJSON line in the decompressed data
+                    for line in decompressed.split(b"\n"):
+                        if line.strip():
+                            self._process_line(conn, line)
+                except (ValueError, Exception) as e:
+                    logger.warning("Failed to decompress frame: %s", e)
+                    self._send_error(conn, f"decompression failed: {e}")
+        return buf
 
     def _process_line(self, conn: socket.socket, line: bytes):
         """Parse one NDJSON line, validate, store, and ack."""
