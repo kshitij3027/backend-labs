@@ -46,37 +46,61 @@ class LogShipper:
             logger.info("Shipper finished: sent=%d, failed=%d", self._sent, self._failed)
 
     def _run_batch(self):
-        """Read all lines from file and send them."""
+        """Read all lines from file and send them in batches."""
         lines = read_batch(self._config.log_file)
+        batch: list[bytes] = []
         for line in lines:
             if self._shutdown.is_set():
                 break
-            self._send_line(line)
+            entry = parse_log_line(line)
+            if entry is None:
+                logger.debug("Skipping unparseable line: %s", line[:100])
+                continue
+            batch.append(format_ndjson(entry))
+            if len(batch) >= self._config.batch_size:
+                self._flush_batch(batch)
+                batch = []
+        if batch:
+            self._flush_batch(batch)
 
     def _run_continuous(self):
-        """Tail the file and send new lines as they appear."""
+        """Tail the file and send new lines in batches."""
+        self._batch_buffer: list[bytes] = []
         tailer = FileTailer(
             self._config.log_file,
             self._shutdown,
-            callback=self._send_line,
+            callback=self._buffer_line,
             poll_interval=self._config.poll_interval,
         )
         tailer.run()
+        if self._batch_buffer:
+            self._flush_batch(self._batch_buffer)
+            self._batch_buffer = []
 
-    def _send_line(self, raw: str):
-        """Parse, format, and send a single log line."""
+    def _buffer_line(self, raw: str):
+        """Parse and buffer a line, flushing when batch is full."""
         entry = parse_log_line(raw)
         if entry is None:
             logger.debug("Skipping unparseable line: %s", raw[:100])
             return
+        self._batch_buffer.append(format_ndjson(entry))
+        if len(self._batch_buffer) >= self._config.batch_size:
+            self._flush_batch(self._batch_buffer)
+            self._batch_buffer = []
 
-        payload = format_ndjson(entry)
+    def _flush_batch(self, batch: list[bytes]):
+        """Concatenate batch, optionally compress, send, and read acks."""
+        if not batch:
+            return
+        payload = b"".join(batch)
         if self._config.compress:
             payload = compress_payload(payload)
-        result = self._client.send_and_recv(payload)
-
-        if result and result.get("status") == "ok":
-            self._sent += 1
-        else:
-            self._failed += 1
-            logger.warning("Failed to ship line: %s", raw[:100])
+        if not self._client.send(payload):
+            self._failed += len(batch)
+            return
+        for _ in range(len(batch)):
+            result = self._client.recv_line()
+            if result and result.get("status") == "ok":
+                self._sent += 1
+            else:
+                self._failed += 1

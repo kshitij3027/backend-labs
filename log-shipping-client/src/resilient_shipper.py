@@ -78,14 +78,12 @@ class ResilientLogShipper:
         tailer.run()
 
     def _enqueue_line(self, raw: str):
-        """Parse and enqueue a single log line."""
+        """Parse and enqueue a single log line (uncompressed)."""
         entry = parse_log_line(raw)
         if entry is None:
             return
 
         payload = format_ndjson(entry)
-        if self._config.compress:
-            payload = compress_payload(payload)
         try:
             self._queue.put_nowait(payload)
         except queue.Full:
@@ -94,50 +92,80 @@ class ResilientLogShipper:
             logger.warning("Buffer full, dropping log line")
 
     def _consumer_loop(self):
-        """Dequeue messages and send them with retry."""
+        """Dequeue messages in batches and send them with retry."""
         while not self._shutdown.is_set():
             try:
-                payload = self._queue.get(timeout=1.0)
+                first = self._queue.get(timeout=1.0)
             except queue.Empty:
                 continue
 
-            # Poison pill — clean shutdown
-            if payload is None:
-                # Drain remaining items
+            if first is None:
                 self._drain_queue()
                 return
 
-            self._send_with_retry(payload, max_retries=3)
+            batch = [first]
+            while len(batch) < self._config.batch_size:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    self._send_batch_with_retry(batch)
+                    self._drain_queue()
+                    return
+                batch.append(item)
+
+            self._send_batch_with_retry(batch)
 
     def _drain_queue(self):
         """Send any remaining queued messages before shutdown."""
+        batch: list[bytes] = []
         while True:
             try:
                 payload = self._queue.get_nowait()
             except queue.Empty:
-                return
+                break
             if payload is None:
-                return
-            self._send_with_retry(payload, max_retries=1)
+                break
+            batch.append(payload)
+            if len(batch) >= self._config.batch_size:
+                self._send_batch_with_retry(batch, max_retries=1)
+                batch = []
+        if batch:
+            self._send_batch_with_retry(batch, max_retries=1)
 
-    def _send_with_retry(self, payload: bytes, max_retries: int = 3):
-        """Send a payload, retrying with reconnect on failure."""
+    def _send_batch_with_retry(self, batch: list[bytes], max_retries: int = 3):
+        """Send a batch of payloads, retrying with reconnect on failure."""
+        payload = b"".join(batch)
+        if self._config.compress:
+            payload = compress_payload(payload)
+
         for attempt in range(max_retries):
             if self._shutdown.is_set():
                 with self._lock:
-                    self._failed += 1
+                    self._failed += len(batch)
                 return
 
             if not self._client.connected:
                 if not self._client.connect_with_backoff(max_attempts=3):
                     continue
 
-            result = self._client.send_and_recv(payload)
-            if result and result.get("status") == "ok":
-                with self._lock:
-                    self._sent += 1
-                return
+            if not self._client.send(payload):
+                continue
+
+            acked = 0
+            for _ in range(len(batch)):
+                result = self._client.recv_line()
+                if result and result.get("status") == "ok":
+                    acked += 1
+                else:
+                    break
+
+            with self._lock:
+                self._sent += acked
+                self._failed += len(batch) - acked
+            return
 
         with self._lock:
-            self._failed += 1
-        logger.warning("Failed to send after %d retries", max_retries)
+            self._failed += len(batch)
+        logger.warning("Failed to send batch of %d after %d retries", len(batch), max_retries)

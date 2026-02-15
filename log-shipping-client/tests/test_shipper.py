@@ -109,6 +109,83 @@ class TestLogShipperContinuous:
             shutdown.set()
 
 
+class TestBatchSending:
+    def test_batch_size_5_with_10_lines(self, tmp_path):
+        server, host, port, shutdown = _start_test_server()
+        try:
+            log_file = tmp_path / "test.log"
+            lines = "".join(
+                f"2024-01-15 08:{i:02d}:00 INFO Line {i + 1}\n"
+                for i in range(10)
+            )
+            log_file.write_text(lines)
+            config = Config(
+                log_file=str(log_file),
+                server_host=host,
+                server_port=port,
+                batch_mode=True,
+                batch_size=5,
+            )
+            shipper = LogShipper(config, shutdown)
+            shipper.run()
+
+            assert shipper.sent == 10
+            assert shipper.failed == 0
+            assert len(server.received) == 10
+        finally:
+            shutdown.set()
+
+    def test_batch_size_5_with_7_lines(self, tmp_path):
+        server, host, port, shutdown = _start_test_server()
+        try:
+            log_file = tmp_path / "test.log"
+            lines = "".join(
+                f"2024-01-15 08:{i:02d}:00 INFO Line {i + 1}\n"
+                for i in range(7)
+            )
+            log_file.write_text(lines)
+            config = Config(
+                log_file=str(log_file),
+                server_host=host,
+                server_port=port,
+                batch_mode=True,
+                batch_size=5,
+            )
+            shipper = LogShipper(config, shutdown)
+            shipper.run()
+
+            assert shipper.sent == 7
+            assert shipper.failed == 0
+            assert len(server.received) == 7
+        finally:
+            shutdown.set()
+
+    def test_batch_size_1_no_regression(self, tmp_path):
+        server, host, port, shutdown = _start_test_server()
+        try:
+            log_file = tmp_path / "test.log"
+            log_file.write_text(
+                "2024-01-15 08:23:45 INFO Line one\n"
+                "2024-01-15 08:24:01 WARNING Line two\n"
+                "2024-01-15 08:24:15 ERROR Line three\n"
+            )
+            config = Config(
+                log_file=str(log_file),
+                server_host=host,
+                server_port=port,
+                batch_mode=True,
+                batch_size=1,
+            )
+            shipper = LogShipper(config, shutdown)
+            shipper.run()
+
+            assert shipper.sent == 3
+            assert shipper.failed == 0
+            assert len(server.received) == 3
+        finally:
+            shutdown.set()
+
+
 class TestLogShipperConnectionFailure:
     def test_no_crash_on_connection_failure(self, tmp_path):
         shutdown = threading.Event()
