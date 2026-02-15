@@ -3,12 +3,14 @@
 import logging
 import queue
 import threading
+import time
 
 from src.compressor import compress_payload
 from src.config import Config
 from src.file_reader import read_batch, FileTailer
 from src.formatter import parse_log_line, format_ndjson
 from src.health import HealthMonitor
+from src.metrics import Metrics
 from src.tcp_client import TCPClient
 
 logger = logging.getLogger(__name__)
@@ -29,9 +31,14 @@ class ResilientLogShipper:
         self._health = HealthMonitor(
             config.server_host, config.server_port, shutdown_event, interval=5.0,
         )
+        self._metrics = Metrics()
         self._sent = 0
         self._failed = 0
         self._lock = threading.Lock()
+
+    @property
+    def metrics(self) -> Metrics:
+        return self._metrics
 
     @property
     def sent(self) -> int:
@@ -159,6 +166,9 @@ class ResilientLogShipper:
                 if not self._client.connect_with_backoff(max_attempts=3):
                     continue
 
+            self._metrics.record_buffer_usage(self._queue.qsize())
+
+            t0 = time.monotonic()
             if not self._client.send(payload):
                 continue
 
@@ -170,11 +180,19 @@ class ResilientLogShipper:
                 else:
                     break
 
+            latency_ms = (time.monotonic() - t0) * 1000
+            for _ in range(acked):
+                self._metrics.record_sent(latency_ms / max(acked, 1))
+            for _ in range(len(batch) - acked):
+                self._metrics.record_failed()
+
             with self._lock:
                 self._sent += acked
                 self._failed += len(batch) - acked
             return
 
+        for _ in range(len(batch)):
+            self._metrics.record_failed()
         with self._lock:
             self._failed += len(batch)
         logger.warning("Failed to send batch of %d after %d retries", len(batch), max_retries)
