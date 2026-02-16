@@ -66,10 +66,23 @@ class UDPLogServer:
             if level == "ERROR":
                 self._writer.write_immediate(message)
                 self.error_tracker.add(message)
+                self._send_ack(addr, message)
             else:
                 self._writer.append(message)
 
             logger.debug("Received from %s: %s", addr, message)
+
+    def _send_ack(self, addr, message: dict):
+        """Send an ACK back to the client for ERROR-level logs."""
+        ack = {
+            "ack": True,
+            "sequence": message.get("sequence"),
+            "timestamp": message.get("timestamp"),
+        }
+        try:
+            self._sock.sendto(json.dumps(ack).encode("utf-8"), addr)
+        except OSError as exc:
+            logger.warning("Failed to send ACK to %s: %s", addr, exc)
 
     def stop(self):
         self._shutdown.set()

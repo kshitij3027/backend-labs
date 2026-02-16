@@ -4,6 +4,7 @@ import json
 import logging
 import random
 import socket
+import threading
 import time
 
 from src.formatter import format_log_entry
@@ -33,6 +34,15 @@ class UDPLogClient:
         self._seq = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("", 0))
+        self._sock.settimeout(0.5)
+
+        self._acks: dict[int, dict] = {}
+        self._ack_lock = threading.Lock()
+        self._stop_event = threading.Event()
+
+        self._ack_thread = threading.Thread(target=self._ack_listener, daemon=True)
+        self._ack_thread.start()
+
         logger.info("Client bound to %s", self._sock.getsockname())
 
     def send_log(self, level: str, message: str):
@@ -53,7 +63,34 @@ class UDPLogClient:
                 time.sleep(interval)
         logger.info("Sent %d sample logs", count)
 
+    def get_acks(self) -> dict[int, dict]:
+        """Return all received ACKs."""
+        with self._ack_lock:
+            return dict(self._acks)
+
     def close(self):
-        """Close the socket."""
+        """Stop the ACK listener and close the socket."""
+        self._stop_event.set()
+        self._ack_thread.join(timeout=2)
         self._sock.close()
         logger.info("Client closed")
+
+    def _ack_listener(self):
+        """Background thread that listens for ACK datagrams from the server."""
+        while not self._stop_event.is_set():
+            try:
+                data, _ = self._sock.recvfrom(65536)
+                ack = json.loads(data.decode("utf-8"))
+                if ack.get("ack"):
+                    seq = ack.get("sequence")
+                    with self._ack_lock:
+                        self._acks[seq] = ack
+                    logger.debug("Received ACK for seq=%s", seq)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop_event.is_set():
+                    break
+                raise
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue

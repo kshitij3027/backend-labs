@@ -8,6 +8,8 @@ import time
 import pytest
 
 from src.client import UDPLogClient
+from src.config import Config
+from src.server import UDPLogServer
 
 
 def _make_receiver(port=0):
@@ -74,3 +76,70 @@ class TestClientSend:
             client.close()
         finally:
             recv_sock.close()
+
+
+class TestClientAcks:
+    def test_receives_ack_for_error_log(self, tmp_path):
+        """Send an ERROR log to a real server and verify ACK is received."""
+        config = Config(
+            host="127.0.0.1", port=0,
+            log_dir=str(tmp_path / "logs"), log_filename="test.log",
+            flush_count=1000, flush_timeout_sec=60, max_errors=100,
+        )
+        shutdown = threading.Event()
+        server = UDPLogServer(config, shutdown)
+        thread = threading.Thread(target=server.start, daemon=True)
+        thread.start()
+
+        for _ in range(50):
+            if server.server_address is not None:
+                break
+            time.sleep(0.05)
+
+        try:
+            host, port = server.server_address
+            client = UDPLogClient(host, port)
+            client.send_log("ERROR", "disk full")
+            time.sleep(0.5)
+
+            acks = client.get_acks()
+            assert len(acks) == 1
+            assert 1 in acks
+            assert acks[1]["ack"] is True
+            assert acks[1]["sequence"] == 1
+
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)
+
+    def test_no_ack_for_info_log(self, tmp_path):
+        """INFO logs should not trigger ACKs."""
+        config = Config(
+            host="127.0.0.1", port=0,
+            log_dir=str(tmp_path / "logs"), log_filename="test.log",
+            flush_count=1000, flush_timeout_sec=60, max_errors=100,
+        )
+        shutdown = threading.Event()
+        server = UDPLogServer(config, shutdown)
+        thread = threading.Thread(target=server.start, daemon=True)
+        thread.start()
+
+        for _ in range(50):
+            if server.server_address is not None:
+                break
+            time.sleep(0.05)
+
+        try:
+            host, port = server.server_address
+            client = UDPLogClient(host, port)
+            client.send_log("INFO", "all good")
+            time.sleep(0.5)
+
+            acks = client.get_acks()
+            assert len(acks) == 0
+
+            client.close()
+        finally:
+            server.stop()
+            thread.join(timeout=5)

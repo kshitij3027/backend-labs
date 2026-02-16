@@ -3,8 +3,11 @@
 import argparse
 import logging
 import sys
+import time
 
 from src.client import UDPLogClient
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -25,6 +28,9 @@ def main():
     client = UDPLogClient(args.server, args.port, args.app)
     try:
         client.generate_sample_logs(args.count, args.interval)
+        time.sleep(0.5)
+        acks = client.get_acks()
+        logger.info("Received %d ACKs for ERROR logs: sequences %s", len(acks), list(acks.keys()))
     finally:
         client.close()
 
