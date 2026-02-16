@@ -7,6 +7,7 @@ import threading
 
 from src.buffer import BufferedWriter
 from src.config import Config
+from src.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class UDPLogServer:
         self._received_count = 0
         self._lock = threading.Lock()
         self.server_address = None
+        self.metrics = Metrics()
         self._writer = BufferedWriter(
             config.log_dir, config.log_filename,
             config.flush_count, config.flush_timeout_sec,
@@ -56,6 +58,8 @@ class UDPLogServer:
             with self._lock:
                 self._received_count += 1
 
+            level = message.get("level", "UNKNOWN")
+            self.metrics.increment(level)
             self._writer.append(message)
             logger.debug("Received from %s: %s", addr, message)
 
@@ -65,7 +69,8 @@ class UDPLogServer:
             self._sock.close()
             self._sock = None
         self._writer.close()
-        logger.info("UDP server stopped. Total received: %d", self._received_count)
+        snap = self.metrics.snapshot()
+        logger.info("UDP server stopped. Stats: %s", snap)
 
     @property
     def received_count(self) -> int:
