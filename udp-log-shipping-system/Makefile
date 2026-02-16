@@ -1,4 +1,4 @@
-.PHONY: build run stop test clean logs client
+.PHONY: build run stop test clean logs client loadtest
 
 build:
 	docker compose build
@@ -14,6 +14,9 @@ test:
 
 client:
 	docker compose --profile client run --build --rm udp-client
+
+loadtest:
+	docker compose --profile loadtest run --build --rm loadtest
 
 logs:
 	docker compose logs -f udp-server

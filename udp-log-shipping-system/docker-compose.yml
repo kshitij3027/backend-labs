@@ -29,3 +29,14 @@ services:
       - udp-server
     profiles:
       - client
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    entrypoint: ["python", "loadtest.py"]
+    command: ["--server", "udp-server", "--port", "5514", "--logs", "10000", "--rate", "1000", "--clients", "4"]
+    depends_on:
+      - udp-server
+    profiles:
+      - loadtest
