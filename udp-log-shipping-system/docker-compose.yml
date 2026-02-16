@@ -1,0 +1,20 @@
+services:
+  udp-server:
+    build: .
+    container_name: udp_log_server
+    ports:
+      - "5514:5514/udp"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5514
+      - LOG_DIR=/app/logs
+      - LOG_FILENAME=server.log
+    volumes:
+      - ./logs:/app/logs
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
