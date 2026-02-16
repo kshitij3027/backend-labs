@@ -5,6 +5,7 @@ import logging
 import socket
 import threading
 
+from src.buffer import BufferedWriter
 from src.config import Config
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ class UDPLogServer:
         self._received_count = 0
         self._lock = threading.Lock()
         self.server_address = None
+        self._writer = BufferedWriter(
+            config.log_dir, config.log_filename,
+            config.flush_count, config.flush_timeout_sec,
+        )
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -51,6 +56,7 @@ class UDPLogServer:
             with self._lock:
                 self._received_count += 1
 
+            self._writer.append(message)
             logger.debug("Received from %s: %s", addr, message)
 
     def stop(self):
@@ -58,6 +64,7 @@ class UDPLogServer:
         if self._sock:
             self._sock.close()
             self._sock = None
+        self._writer.close()
         logger.info("UDP server stopped. Total received: %d", self._received_count)
 
     @property
