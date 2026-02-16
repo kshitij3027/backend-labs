@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UDP Log Server Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; background: #f8f9fa; }
+    h1 { margin-bottom: 0.5rem; }
+    .subtitle { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+    .stat-card { background: #fff; border-radius: 8px; padding: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .stat-label { font-size: 0.8rem; color: #666; text-transform: uppercase; }
+    .stat-value { font-size: 1.8rem; font-weight: bold; margin-top: 0.25rem; }
+    h2 { margin-top: 2rem; margin-bottom: 0.5rem; }
+    .bar-container { display: flex; align-items: center; margin: 0.3rem 0; }
+    .bar-label { width: 80px; font-size: 0.85rem; }
+    .bar { height: 20px; border-radius: 4px; min-width: 4px; transition: width 0.3s; }
+    .bar-count { margin-left: 0.5rem; font-size: 0.85rem; color: #666; }
+    .bar-DEBUG { background: #6b7280; }
+    .bar-INFO { background: #16a34a; }
+    .bar-WARNING { background: #d97706; }
+    .bar-ERROR { background: #dc2626; }
+    .bar-CRITICAL { background: #7c2d12; }
+    .bar-UNKNOWN { background: #9ca3af; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.5rem; }
+    th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #eee; }
+    th { background: #f7f7f7; position: sticky; top: 0; }
+    .level-ERROR { color: #dc2626; font-weight: bold; }
+    .empty-msg { color: #999; font-style: italic; }
+  </style>
+</head>
+<body>
+  <h1>UDP Log Server Dashboard</h1>
+  <p class="subtitle">Auto-refreshes every 2 seconds</p>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="stat-label">Total Received</div>
+      <div class="stat-value" id="total">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Logs/sec</div>
+      <div class="stat-value" id="rate">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Uptime (sec)</div>
+      <div class="stat-value" id="uptime">0</div>
+    </div>
+  </div>
+
+  <h2>Level Distribution</h2>
+  <div id="distribution"></div>
+
+  <h2>Recent Errors</h2>
+  <table>
+    <thead>
+      <tr><th>Timestamp</th><th>Level</th><th>Sequence</th><th>Message</th></tr>
+    </thead>
+    <tbody id="errors">
+      <tr><td colspan="4" class="empty-msg">No errors yet</td></tr>
+    </tbody>
+  </table>
+
+  <script>
+    function update() {
+      fetch('/stats')
+        .then(r => r.json())
+        .then(data => {
+          document.getElementById('total').textContent = data.total_received;
+          document.getElementById('rate').textContent = data.logs_per_second;
+          document.getElementById('uptime').textContent = data.elapsed_seconds;
+
+          const dist = data.level_distribution || {};
+          const max = Math.max(1, ...Object.values(dist));
+          const distEl = document.getElementById('distribution');
+          distEl.innerHTML = '';
+          for (const [level, count] of Object.entries(dist)) {
+            const pct = (count / max) * 100;
+            distEl.innerHTML += `
+              <div class="bar-container">
+                <span class="bar-label">${level}</span>
+                <div class="bar bar-${level}" style="width: ${pct}%"></div>
+                <span class="bar-count">${count}</span>
+              </div>`;
+          }
+
+          const errors = data.recent_errors || [];
+          const tbody = document.getElementById('errors');
+          if (errors.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="4" class="empty-msg">No errors yet</td></tr>';
+          } else {
+            tbody.innerHTML = errors.map(e => `
+              <tr>
+                <td>${e.timestamp || ''}</td>
+                <td class="level-ERROR">${e.level || 'ERROR'}</td>
+                <td>${e.sequence || ''}</td>
+                <td>${e.message || ''}</td>
+              </tr>`).join('');
+          }
+        })
+        .catch(err => console.error('Failed to fetch stats:', err));
+    }
+
+    update();
+    setInterval(update, 2000);
+  </script>
+</body>
+</html>
