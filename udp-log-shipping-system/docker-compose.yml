@@ -18,3 +18,13 @@ services:
       dockerfile: Dockerfile.test
     profiles:
       - test
+
+  udp-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    command: ["--server", "udp-server", "--port", "5514", "--count", "20"]
+    depends_on:
+      - udp-server
+    profiles:
+      - client
