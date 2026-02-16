@@ -7,6 +7,7 @@ import threading
 
 from src.buffer import BufferedWriter
 from src.config import Config
+from src.error_tracker import ErrorTracker
 from src.metrics import Metrics
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ class UDPLogServer:
         self._lock = threading.Lock()
         self.server_address = None
         self.metrics = Metrics()
+        self.error_tracker = ErrorTracker(config.max_errors)
         self._writer = BufferedWriter(
             config.log_dir, config.log_filename,
             config.flush_count, config.flush_timeout_sec,
@@ -60,7 +62,13 @@ class UDPLogServer:
 
             level = message.get("level", "UNKNOWN")
             self.metrics.increment(level)
-            self._writer.append(message)
+
+            if level == "ERROR":
+                self._writer.write_immediate(message)
+                self.error_tracker.add(message)
+            else:
+                self._writer.append(message)
+
             logger.debug("Received from %s: %s", addr, message)
 
     def stop(self):

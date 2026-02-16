@@ -37,6 +37,11 @@ class BufferedWriter:
             if len(self._buffer) >= self._flush_count:
                 self._flush_locked()
 
+    def write_immediate(self, entry: dict):
+        """Write a single entry directly to disk, bypassing the buffer."""
+        with open(self._log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
     def flush(self):
         """Public flush — write all buffered entries to disk."""
         with self._lock:
