@@ -14,6 +14,9 @@ class Config:
     flush_count: int = 100
     flush_timeout_sec: int = 5
     max_errors: int = 100
+    rcvbuf_size: int = 4194304       # 4 MB
+    sndbuf_size: int = 1048576       # 1 MB
+    max_log_size_mb: float = 100
 
 
 def load_config() -> Config:
@@ -27,4 +30,7 @@ def load_config() -> Config:
         flush_count=int(os.environ.get("FLUSH_COUNT", Config.flush_count)),
         flush_timeout_sec=int(os.environ.get("FLUSH_TIMEOUT_SEC", Config.flush_timeout_sec)),
         max_errors=int(os.environ.get("MAX_ERRORS", Config.max_errors)),
+        rcvbuf_size=int(os.environ.get("RCVBUF_SIZE", Config.rcvbuf_size)),
+        sndbuf_size=int(os.environ.get("SNDBUF_SIZE", Config.sndbuf_size)),
+        max_log_size_mb=float(os.environ.get("MAX_LOG_SIZE_MB", Config.max_log_size_mb)),
     )

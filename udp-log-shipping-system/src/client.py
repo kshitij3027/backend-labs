@@ -27,13 +27,14 @@ SAMPLE_MESSAGES = [
 
 
 class UDPLogClient:
-    def __init__(self, server_host: str, server_port: int, app_name: str = "udp-client"):
+    def __init__(self, server_host: str, server_port: int, app_name: str = "udp-client", sndbuf_size: int = 1048576):
         self._server_host = server_host
         self._server_port = server_port
         self._app_name = app_name
         self._seq = 0
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.bind(("", 0))
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf_size)
         self._sock.settimeout(0.5)
 
         self._acks: dict[int, dict] = {}

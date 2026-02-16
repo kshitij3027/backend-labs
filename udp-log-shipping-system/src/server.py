@@ -26,11 +26,12 @@ class UDPLogServer:
         self._writer = BufferedWriter(
             config.log_dir, config.log_filename,
             config.flush_count, config.flush_timeout_sec,
+            max_log_size_mb=config.max_log_size_mb,
         )
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self._config.rcvbuf_size)
         self._sock.settimeout(1.0)
         self._sock.bind((self._config.host, self._config.port))
 
