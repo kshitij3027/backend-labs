@@ -98,3 +98,58 @@ class TestAppendMode:
             assert len(lines) == 15
         finally:
             writer.close()
+
+
+class TestLogRotation:
+    def test_rotation_triggered(self, tmp_path):
+        """Write enough entries to exceed 1KB and verify .1 rotated file exists."""
+        writer = BufferedWriter(
+            str(tmp_path), "test.log",
+            flush_count=5, flush_timeout_sec=60,
+            max_log_size_mb=0.001,  # ~1 KB
+        )
+        try:
+            # Each JSON entry is roughly 60-70 bytes; 50 entries > 1 KB.
+            for i in range(50):
+                writer.append(_make_entry(i))
+
+            time.sleep(0.1)
+
+            rotated_path = os.path.join(str(tmp_path), "test.log.1")
+            assert os.path.isfile(rotated_path), "Rotated file .1 should exist after exceeding size limit"
+        finally:
+            writer.close()
+
+    def test_rotation_preserves_data(self, tmp_path):
+        """After rotation, new writes still go to the original log path."""
+        writer = BufferedWriter(
+            str(tmp_path), "test.log",
+            flush_count=5, flush_timeout_sec=60,
+            max_log_size_mb=0.001,  # ~1 KB
+        )
+        try:
+            # Write enough to trigger at least one rotation.
+            for i in range(50):
+                writer.append(_make_entry(i))
+
+            time.sleep(0.1)
+
+            log_path = os.path.join(str(tmp_path), "test.log")
+            rotated_path = os.path.join(str(tmp_path), "test.log.1")
+
+            assert os.path.isfile(rotated_path), "Rotated file .1 should exist"
+
+            # Write more entries — they should land in the original log path.
+            for i in range(50, 55):
+                writer.append(_make_entry(i))
+            writer.flush()
+
+            assert os.path.isfile(log_path), "Original log path should still accept new writes"
+            with open(log_path) as f:
+                lines = f.readlines()
+            # At least the 5 new entries should be present in the current log.
+            sequences = [json.loads(line)["sequence"] for line in lines]
+            for seq in range(50, 55):
+                assert seq in sequences, f"Entry {seq} should be in the current log file"
+        finally:
+            writer.close()
