@@ -1,0 +1,36 @@
+services:
+  log-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: batch-log-server
+    ports:
+      - "${SERVER_PORT:-9999}:9999/udp"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=9999
+      - BUFFER_SIZE=65535
+    restart: unless-stopped
+
+  log-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: batch-log-client
+    depends_on:
+      - log-server
+    environment:
+      - TARGET_HOST=log-server
+      - TARGET_PORT=9999
+      - BATCH_SIZE=${BATCH_SIZE:-10}
+      - FLUSH_INTERVAL=${FLUSH_INTERVAL:-5.0}
+    profiles:
+      - client
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: batch-log-tests
+    profiles:
+      - test
