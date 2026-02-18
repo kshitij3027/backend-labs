@@ -1,0 +1,42 @@
+services:
+  log-receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: log-compression-server
+    ports:
+      - "${SERVER_PORT:-5000}:5000"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=5000
+    restart: unless-stopped
+
+  log-shipper:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: log-compression-client
+    depends_on:
+      - log-receiver
+    environment:
+      - SERVER_HOST=log-receiver
+      - SERVER_PORT=5000
+      - BATCH_SIZE=${BATCH_SIZE:-50}
+      - BATCH_INTERVAL=${BATCH_INTERVAL:-5.0}
+      - COMPRESSION_ALGORITHM=${COMPRESSION_ALGORITHM:-gzip}
+      - COMPRESSION_LEVEL=${COMPRESSION_LEVEL:-6}
+      - LOG_RATE=${LOG_RATE:-100}
+      - RUN_TIME=${RUN_TIME:-30}
+      - COMPRESSION_ENABLED=${COMPRESSION_ENABLED:-true}
+      - BYPASS_THRESHOLD=${BYPASS_THRESHOLD:-256}
+      - ADAPTIVE_ENABLED=${ADAPTIVE_ENABLED:-false}
+    profiles:
+      - client
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: log-compression-tests
+    profiles:
+      - test
