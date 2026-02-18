@@ -6,6 +6,7 @@ services:
     container_name: log-compression-server
     ports:
       - "${SERVER_PORT:-5000}:5000"
+      - "${DASHBOARD_PORT:-8080}:8080"
     environment:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=5000

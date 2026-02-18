@@ -8,6 +8,7 @@ import threading
 from src.config import load_server_config
 from src.tcp_server import TCPLogReceiver
 from src.metrics import ReceiverMetrics
+from src.dashboard import DashboardServer
 
 
 def main():
@@ -22,6 +23,9 @@ def main():
 
     server = TCPLogReceiver(config.host, config.port, shutdown, metrics)
 
+    dashboard = DashboardServer(port=8080, metrics=metrics)
+    dashboard.start()
+
     def handle_signal(signum, frame):
         logging.info("Received signal %d, shutting down...", signum)
         server.stop()
@@ -34,6 +38,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        dashboard.stop()
         server.stop()
         stats = metrics.snapshot()
         print("\n--- Server Statistics ---")
