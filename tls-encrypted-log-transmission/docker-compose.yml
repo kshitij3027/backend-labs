@@ -30,6 +30,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - shared-certs:/shared-certs
+      - ./logs:/app/logs
 
   tls-client:
     build:
