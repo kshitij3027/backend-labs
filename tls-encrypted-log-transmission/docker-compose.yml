@@ -10,6 +10,7 @@ services:
       - CERT_FILE=/app/certs/server.crt
       - KEY_FILE=/app/certs/server.key
       - LOG_DIR=/app/logs
+      - MAX_LOGS_PER_FILE=10
     healthcheck:
       test: ["CMD", "python", "healthcheck.py"]
       interval: 10s
@@ -29,6 +30,20 @@ services:
         condition: service_healthy
     profiles:
       - client
+
+  healthcare-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    command: ["python", "-u", "client_main.py", "--healthcare"]
+    environment:
+      - SERVER_HOST=tls-server
+      - SERVER_PORT=8443
+    depends_on:
+      tls-server:
+        condition: service_healthy
+    profiles:
+      - healthcare
 
   tests:
     build:

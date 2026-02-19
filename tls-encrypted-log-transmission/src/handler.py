@@ -10,6 +10,15 @@ from src.protocol import encode_frame, decode_frame_header, recv_exact
 
 logger = logging.getLogger(__name__)
 
+# Module-level writer, set by server_main before accepting connections
+_log_writer = None
+
+
+def set_log_writer(writer):
+    """Set the module-level log writer for all handlers."""
+    global _log_writer
+    _log_writer = writer
+
 
 def handle_client(conn, addr, config, shutdown_event: threading.Event):
     """Handle a single TLS client connection.
@@ -41,6 +50,9 @@ def handle_client(conn, addr, config, shutdown_event: threading.Event):
             level = log_entry.get("level", "?")
             message = log_entry.get("message", "")
             print(f"[{now}] [{level}] {message}")
+
+            if _log_writer:
+                _log_writer.write(log_entry)
 
             ack = json.dumps({"status": "ok"}).encode("utf-8")
             conn.sendall(encode_frame(ack))

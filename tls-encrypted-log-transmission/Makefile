@@ -1,4 +1,4 @@
-.PHONY: build run stop test client logs clean
+.PHONY: build run stop test client healthcare logs clean
 
 build:
 	docker compose build
@@ -14,6 +14,9 @@ test:
 
 client:
 	docker compose --profile client run --build --rm tls-client
+
+healthcare:
+	docker compose --profile healthcare run --build --rm healthcare-client
 
 logs:
 	docker compose logs -f tls-server
