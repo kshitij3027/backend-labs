@@ -4,6 +4,7 @@ services:
     container_name: tls_log_server
     ports:
       - "8443:8443"
+      - "8081:8080"
     environment:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8443

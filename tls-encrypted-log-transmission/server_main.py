@@ -8,7 +8,9 @@ import threading
 from src.config import load_server_config
 from src.server import TLSLogServer
 from src.log_rotation import RotatingLogWriter
-from src.handler import set_log_writer
+from src.handler import set_log_writer, set_metrics
+from src.metrics import TransmissionMetrics
+from src.dashboard import DashboardServer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,11 +26,18 @@ def main():
     set_log_writer(log_writer)
     print(f"[SERVER] Log rotation enabled — max {config.max_logs_per_file} entries/file in {config.log_dir}")
 
+    metrics = TransmissionMetrics()
+    set_metrics(metrics)
+
+    dashboard = DashboardServer(port=8080, metrics=metrics)
+    dashboard.start()
+
     server = TLSLogServer(config, shutdown_event)
 
     def handle_signal(signum, frame):
         print(f"\n[SERVER] Received signal {signum}, shutting down...")
         server.stop()
+        dashboard.stop()
         log_writer.close()
 
     signal.signal(signal.SIGINT, handle_signal)
@@ -38,6 +47,7 @@ def main():
         server.start()
     except KeyboardInterrupt:
         server.stop()
+        dashboard.stop()
         log_writer.close()
 
 

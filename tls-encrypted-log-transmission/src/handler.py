@@ -10,14 +10,20 @@ from src.protocol import encode_frame, decode_frame_header, recv_exact
 
 logger = logging.getLogger(__name__)
 
-# Module-level writer, set by server_main before accepting connections
 _log_writer = None
+_metrics = None
 
 
 def set_log_writer(writer):
     """Set the module-level log writer for all handlers."""
     global _log_writer
     _log_writer = writer
+
+
+def set_metrics(metrics):
+    """Set the module-level metrics tracker for all handlers."""
+    global _metrics
+    _metrics = metrics
 
 
 def handle_client(conn, addr, config, shutdown_event: threading.Event):
@@ -29,6 +35,9 @@ def handle_client(conn, addr, config, shutdown_event: threading.Event):
     """
     client_id = f"{addr[0]}:{addr[1]}"
     logs_received = 0
+
+    if _metrics:
+        _metrics.record_connection()
 
     try:
         conn.settimeout(30.0)
@@ -46,6 +55,9 @@ def handle_client(conn, addr, config, shutdown_event: threading.Event):
             log_entry = json.loads(raw_json.decode("utf-8"))
             logs_received += 1
 
+            if _metrics:
+                _metrics.record_log(len(compressed_data), len(raw_json))
+
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
             level = log_entry.get("level", "?")
             message = log_entry.get("message", "")
@@ -60,6 +72,8 @@ def handle_client(conn, addr, config, shutdown_event: threading.Event):
     except Exception as e:
         logger.error("Error handling client %s: %s", client_id, e)
     finally:
+        if _metrics:
+            _metrics.record_disconnection()
         conn.close()
         logger.info("Client %s disconnected (%d logs received)", client_id, logs_received)
         print(f"[SERVER] Client {client_id} disconnected ({logs_received} logs received)")
