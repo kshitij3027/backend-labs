@@ -1,0 +1,10 @@
+FROM python:3.12-alpine
+
+WORKDIR /app
+
+RUN pip install pytest --no-cache-dir
+
+COPY src/ src/
+COPY tests/ tests/
+
+CMD ["pytest", "-v", "tests/"]
