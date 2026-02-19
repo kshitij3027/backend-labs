@@ -1,0 +1,38 @@
+services:
+  tls-server:
+    build: .
+    container_name: tls_log_server
+    ports:
+      - "8443:8443"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8443
+      - CERT_FILE=/app/certs/server.crt
+      - KEY_FILE=/app/certs/server.key
+      - LOG_DIR=/app/logs
+    healthcheck:
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      retries: 3
+
+  tls-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      - SERVER_HOST=tls-server
+      - SERVER_PORT=8443
+    depends_on:
+      tls-server:
+        condition: service_healthy
+    profiles:
+      - client
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
