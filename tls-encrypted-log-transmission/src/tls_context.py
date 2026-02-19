@@ -17,3 +17,12 @@ def create_client_context_unverified() -> ssl.SSLContext:
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def create_client_context_verified(ca_file: str) -> ssl.SSLContext:
+    """Create an SSL context that verifies the server cert against a CA."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.load_verify_locations(ca_file)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    return ctx

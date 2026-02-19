@@ -1,4 +1,11 @@
 services:
+  cert-gen:
+    build: .
+    container_name: tls_cert_gen
+    entrypoint: ["sh", "-c", "cp /app/certs/ca.crt /shared-certs/ca.crt && echo 'CA cert copied to shared volume'"]
+    volumes:
+      - shared-certs:/shared-certs
+
   tls-server:
     build: .
     container_name: tls_log_server
@@ -18,6 +25,11 @@ services:
       timeout: 5s
       start_period: 5s
       retries: 3
+    depends_on:
+      cert-gen:
+        condition: service_completed_successfully
+    volumes:
+      - shared-certs:/shared-certs
 
   tls-client:
     build:
@@ -46,9 +58,29 @@ services:
     profiles:
       - healthcare
 
+  verified-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      - SERVER_HOST=tls-server
+      - SERVER_PORT=8443
+      - VERIFY_CERTS=true
+      - CA_FILE=/shared-certs/ca.crt
+    depends_on:
+      tls-server:
+        condition: service_healthy
+    volumes:
+      - shared-certs:/shared-certs
+    profiles:
+      - verified
+
   tests:
     build:
       context: .
       dockerfile: Dockerfile.test
     profiles:
       - test
+
+volumes:
+  shared-certs:

@@ -8,7 +8,7 @@ import ssl
 import time
 
 from src.config import ClientConfig
-from src.tls_context import create_client_context_unverified
+from src.tls_context import create_client_context_unverified, create_client_context_verified
 from src.protocol import encode_frame, decode_frame_header, recv_exact
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,11 @@ class TLSLogClient:
 
     def __init__(self, config: ClientConfig):
         self._config = config
-        self._ssl_ctx = create_client_context_unverified()
+        if config.verify_certs and config.ca_file:
+            self._ssl_ctx = create_client_context_verified(config.ca_file)
+            print("[CLIENT] Using verified TLS (CA cert loaded)")
+        else:
+            self._ssl_ctx = create_client_context_unverified()
         self._sock = None
         self._total_raw = 0
         self._total_compressed = 0
