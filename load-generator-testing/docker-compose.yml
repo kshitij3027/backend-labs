@@ -35,6 +35,22 @@ services:
     networks:
       - perf-net
 
+  generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.generator
+    environment:
+      - SERVER_HOST=perf-server
+      - SERVER_PORT=9000
+      - ENABLE_TLS=false
+    depends_on:
+      perf-server:
+        condition: service_healthy
+    profiles:
+      - generator
+    networks:
+      - perf-net
+
 volumes:
   server-logs:
 
