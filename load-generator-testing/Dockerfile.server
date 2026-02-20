@@ -1,0 +1,8 @@
+FROM python:3.12-alpine
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server/ server/
+RUN mkdir -p logs certs
+EXPOSE 9000 9001
+CMD ["python", "-m", "server.main"]
