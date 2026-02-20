@@ -3,4 +3,5 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY generator/ generator/
-CMD ["python", "-m", "generator.main", "1000", "10", "5"]
+COPY benchmark/ benchmark/
+CMD ["python", "-m", "generator.main"]

@@ -51,6 +51,22 @@ services:
     networks:
       - perf-net
 
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile.generator
+    entrypoint: ["python", "-m", "benchmark.main", "--no-tls"]
+    environment:
+      - SERVER_HOST=perf-server
+      - SERVER_PORT=9000
+    depends_on:
+      perf-server:
+        condition: service_healthy
+    profiles:
+      - benchmark
+    networks:
+      - perf-net
+
 volumes:
   server-logs:
 
