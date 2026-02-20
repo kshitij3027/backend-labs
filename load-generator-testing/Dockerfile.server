@@ -3,6 +3,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server/ server/
-RUN mkdir -p logs certs
+COPY generate_certs.sh .
+RUN chmod +x generate_certs.sh && apk add --no-cache openssl && ./generate_certs.sh
+RUN mkdir -p logs
 EXPOSE 9000 9001
 CMD ["python", "-m", "server.main"]

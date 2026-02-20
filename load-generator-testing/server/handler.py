@@ -1,11 +1,18 @@
 """Per-connection message handler for NDJSON protocol."""
 
+from __future__ import annotations
+
 import asyncio
+import gzip
 import json
 import time
+from typing import TYPE_CHECKING
 
 from server.config import ServerConfig
 from server.persistence import LogPersistence
+
+if TYPE_CHECKING:
+    from server.circuit_breaker import CircuitBreaker
 
 # Log level hierarchy (higher index = higher severity)
 LOG_LEVELS = {
@@ -16,13 +23,22 @@ LOG_LEVELS = {
     "CRITICAL": 4,
 }
 
+# Gzip magic bytes
+_GZIP_MAGIC = b"\x1f\x8b"
+
 
 class ConnectionHandler:
     """Handles a single TCP client connection using NDJSON protocol."""
 
-    def __init__(self, config: ServerConfig, persistence: LogPersistence) -> None:
+    def __init__(
+        self,
+        config: ServerConfig,
+        persistence: LogPersistence,
+        circuit_breaker: CircuitBreaker | None = None,
+    ) -> None:
         self.config = config
         self.persistence = persistence
+        self.circuit_breaker = circuit_breaker
         self.batch: list[dict] = []
         self.last_flush = time.monotonic()
 
@@ -32,7 +48,8 @@ class ConnectionHandler:
         """Handle an incoming client connection.
 
         Reads NDJSON lines, validates them, batches for persistence,
-        and sends responses.
+        and sends responses.  Supports optional gzip-compressed lines
+        and circuit-breaker overload protection.
         """
         peer = writer.get_extra_info("peername")
         peer_str = f"{peer[0]}:{peer[1]}" if peer else "unknown"
@@ -45,6 +62,33 @@ class ConnectionHandler:
                     # EOF — client disconnected
                     break
 
+                # ── Circuit breaker gate ─────────────────────────
+                if self.circuit_breaker is not None:
+                    allowed = await self.circuit_breaker.check()
+                    if not allowed:
+                        response = {
+                            "status": "error",
+                            "message": "circuit open",
+                        }
+                        writer.write(json.dumps(response).encode() + b"\n")
+                        await writer.drain()
+                        continue
+
+                # ── Gzip decompression ───────────────────────────
+                if line[:2] == _GZIP_MAGIC:
+                    try:
+                        line = gzip.decompress(line)
+                    except Exception:
+                        response = {
+                            "status": "error",
+                            "message": "gzip decompression failed",
+                        }
+                        writer.write(json.dumps(response).encode() + b"\n")
+                        await writer.drain()
+                        if self.circuit_breaker is not None:
+                            await self.circuit_breaker.record_failure()
+                        continue
+
                 line_str = line.decode("utf-8", errors="replace").strip()
                 if not line_str:
                     continue
@@ -56,6 +100,8 @@ class ConnectionHandler:
                     response = {"status": "error", "message": "invalid JSON"}
                     writer.write(json.dumps(response).encode() + b"\n")
                     await writer.drain()
+                    if self.circuit_breaker is not None:
+                        await self.circuit_breaker.record_failure()
                     continue
 
                 # Validate required fields
@@ -66,6 +112,8 @@ class ConnectionHandler:
                     }
                     writer.write(json.dumps(response).encode() + b"\n")
                     await writer.drain()
+                    if self.circuit_breaker is not None:
+                        await self.circuit_breaker.record_failure()
                     continue
 
                 # Check log level filter — still respond ok, just don't persist
@@ -84,6 +132,9 @@ class ConnectionHandler:
                 response = {"status": "ok", "message": "received"}
                 writer.write(json.dumps(response).encode() + b"\n")
                 await writer.drain()
+
+                if self.circuit_breaker is not None:
+                    await self.circuit_breaker.record_success()
 
         except ConnectionResetError:
             print(f"[CONN] Connection reset by {peer_str}")
