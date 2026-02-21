@@ -1,0 +1,20 @@
+server:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+
+storage:
+  max_logs: 1000
+
+analytics:
+  time_bucket_minutes: 1
+  max_buckets: 60
+
+alerting:
+  error_rate_threshold: 0.10
+  high_volume_threshold: 100
+  service_down_minutes: 2
+  cooldown_seconds: 300
+
+schema:
+  path: "schemas/log_schema.json"
