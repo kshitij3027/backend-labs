@@ -7,3 +7,10 @@ services:
       - ./logs:/app/logs
     environment:
       - PYTHONUNBUFFERED=1
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
