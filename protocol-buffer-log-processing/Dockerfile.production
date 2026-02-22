@@ -1,0 +1,36 @@
+# Stage 1: Builder — compile protos and install Python dependencies
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends protobuf-compiler libprotobuf-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+COPY proto/ proto/
+COPY compile_proto.sh .
+RUN chmod +x compile_proto.sh && ./compile_proto.sh
+
+# Stage 2: Runtime — lean image without compiler toolchain
+FROM python:3.12-slim
+
+RUN useradd --create-home appuser
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+COPY --from=builder /build/src/generated/ src/generated/
+COPY src/ src/
+COPY main.py verify.sh ./
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "from src.generated.log_entry_pb2 import LogEntry; print('healthy')" || exit 1
+
+CMD ["python", "main.py"]

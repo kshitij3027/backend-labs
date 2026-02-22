@@ -24,3 +24,14 @@ services:
       - ./logs:/app/logs
     profiles:
       - verify
+
+  app-production:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+    profiles:
+      - production
