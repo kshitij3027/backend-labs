@@ -7,10 +7,19 @@ import sys
 
 from src.benchmark import run_all_benchmarks
 from src.config import Config
+from src.high_load import print_high_load_report, run_high_load_simulation
 from src.log_generator import generate_log_batch
+from src.schema_evolution import run_schema_evolution_demo
 from src.report import generate_report
 from src.serializer import serialize_json, serialize_protobuf
 from src.validator import validate_log_entry
+
+
+def _is_high_load_mode() -> bool:
+    """Check if high-load mode was requested via CLI arg or env var."""
+    if "--high-load" in sys.argv:
+        return True
+    return os.environ.get("HIGH_LOAD", "").lower() in ("true", "1", "yes")
 
 
 def _banner() -> None:
@@ -36,6 +45,21 @@ def main() -> None:
 
     # --- Config ---
     config = Config.from_env()
+
+    # --- Schema evolution mode ---
+    if "--schema-evolution" in sys.argv:
+        _banner()
+        print("Mode: SCHEMA EVOLUTION DEMO\n")
+        run_schema_evolution_demo()
+        return
+
+    # --- High-load mode ---
+    if _is_high_load_mode():
+        _banner()
+        print("Mode: HIGH-LOAD CONCURRENT SIMULATION\n")
+        results = run_high_load_simulation(config)
+        print_high_load_report(results)
+        return
     _banner()
 
     # --- Generate ---
