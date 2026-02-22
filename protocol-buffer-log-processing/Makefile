@@ -1,4 +1,4 @@
-.PHONY: build run test clean build-prod run-prod compare-images
+.PHONY: build run test clean build-prod run-prod compare-images run-perf run-datagen run-high-load run-verify run-all-profiles
 
 build:
 	docker compose build app
@@ -26,3 +26,25 @@ compare-images:
 	@echo ""
 	@echo "Production image:"
 	@docker images protocol-buffer-log-processing-app-production --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+
+# Complete compose targets
+run-perf:
+	docker compose -f docker-compose.complete.yml --profile perf run --rm perf
+
+run-datagen:
+	docker compose -f docker-compose.complete.yml --profile datagen run --rm datagen
+
+run-high-load:
+	docker compose -f docker-compose.complete.yml --profile high-load run --rm high-load
+
+run-verify:
+	docker compose -f docker-compose.complete.yml --profile verify run --rm verify
+
+run-all-profiles:
+	@echo "=== Running tests ==="
+	docker compose -f docker-compose.complete.yml --profile test run --rm tests
+	@echo "\n=== Running verification ==="
+	docker compose -f docker-compose.complete.yml --profile verify run --rm verify
+	@echo "\n=== Running normal pipeline ==="
+	docker compose -f docker-compose.complete.yml run --rm app python main.py
+	@echo "\nAll profiles completed successfully."

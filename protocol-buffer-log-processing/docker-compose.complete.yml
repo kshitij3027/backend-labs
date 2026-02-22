@@ -1,0 +1,86 @@
+services:
+  # Default: normal pipeline
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # Profile: test — run unit tests
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+
+  # Profile: perf — run benchmark with higher iterations
+  perf:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BENCHMARK_ITERATIONS=500
+      - NUM_LOGS=5000
+    command: python main.py
+    profiles:
+      - perf
+
+  # Profile: datagen — generate logs only (lower count for quick data generation)
+  datagen:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NUM_LOGS=10000
+    command: python main.py
+    profiles:
+      - datagen
+
+  # Profile: high-load — concurrent multi-service simulation
+  high-load:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HIGH_LOAD=true
+      - HIGH_SCALE_RATE=500
+      - HIGH_LOAD_DURATION=10
+    command: python main.py
+    profiles:
+      - high-load
+
+  # Profile: verify — comprehensive verification
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+    command: bash verify.sh
+    profiles:
+      - verify
+
+  # Profile: production — multi-stage production image
+  app-production:
+    build:
+      context: .
+      dockerfile: Dockerfile.production
+    volumes:
+      - ./logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
+    profiles:
+      - production
