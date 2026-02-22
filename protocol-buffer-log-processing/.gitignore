@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Protobuf generated files
+*_pb2.py
+*_pb2.pyi
+*_pb2_grpc.py
+
+# Project
+plan.md
+*.log
+output/
+benchmark_results/
+project_requirements.md
+logs/
+.pytest_cache/

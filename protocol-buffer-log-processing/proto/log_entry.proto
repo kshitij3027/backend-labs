@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package logprocessing;
+
+import "google/protobuf/timestamp.proto";
+
+enum LogLevel {
+  LOG_LEVEL_DEBUG = 0;
+  LOG_LEVEL_INFO = 1;
+  LOG_LEVEL_WARNING = 2;
+  LOG_LEVEL_ERROR = 3;
+  LOG_LEVEL_CRITICAL = 4;
+}
+
+message LogEntry {
+  google.protobuf.Timestamp timestamp = 1;
+  string service_name = 2;
+  LogLevel level = 3;
+  string message = 4;
+  map<string, string> metadata = 5;
+}
+
+message LogBatch {
+  repeated LogEntry entries = 1;
+}
