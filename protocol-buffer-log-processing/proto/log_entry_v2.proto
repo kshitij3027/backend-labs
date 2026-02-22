@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package logprocessing_v2;
+
+import "google/protobuf/timestamp.proto";
+
+// LogLevel enum — same values as v1 to ensure wire compatibility.
+// Enum values are encoded as varints, so identical numeric values
+// mean the binary representation is the same.
+enum LogLevel {
+  LOG_LEVEL_DEBUG = 0;
+  LOG_LEVEL_INFO = 1;
+  LOG_LEVEL_WARNING = 2;
+  LOG_LEVEL_ERROR = 3;
+  LOG_LEVEL_CRITICAL = 4;
+}
+
+// LogEntryV2 extends the original LogEntry with new fields.
+// Fields 1-5 use the SAME field numbers as v1, which is what makes
+// forward and backward compatibility work at the wire level.
+message LogEntryV2 {
+  google.protobuf.Timestamp timestamp = 1;
+  string service_name = 2;
+  LogLevel level = 3;
+  string message = 4;
+  map<string, string> metadata = 5;
+
+  // New fields added in v2 — these use field numbers > 5
+  // so they don't conflict with any v1 fields.
+  string trace_id = 6;
+  int32 response_code = 7;
+  double duration_ms = 8;
+}
+
+message LogBatchV2 {
+  repeated LogEntryV2 entries = 1;
+}
