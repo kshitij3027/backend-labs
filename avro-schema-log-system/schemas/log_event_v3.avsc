@@ -1,0 +1,15 @@
+{
+  "type": "record",
+  "name": "LogEvent",
+  "namespace": "com.logging",
+  "fields": [
+    {"name": "timestamp", "type": "string"},
+    {"name": "level", "type": "string"},
+    {"name": "message", "type": "string"},
+    {"name": "source", "type": "string"},
+    {"name": "trace_id", "type": ["null", "string"], "default": null},
+    {"name": "span_id", "type": ["null", "string"], "default": null},
+    {"name": "tags", "type": {"type": "map", "values": "string"}, "default": {}},
+    {"name": "hostname", "type": ["null", "string"], "default": null}
+  ]
+}
