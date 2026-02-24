@@ -5,6 +5,7 @@ import sys
 import click
 
 from src.normalizer import LogNormalizer
+from src.performance import PerformanceAwareNormalizer
 
 # Import handlers to trigger auto-registration
 import src.handlers  # noqa: F401
@@ -32,7 +33,8 @@ def cli():
     default="json",
     help="Output format (default: json).",
 )
-def translate(input_file: str, fmt: str | None, output_fmt: str) -> None:
+@click.option("--adaptive", is_flag=True, help="Enable adaptive performance tracking")
+def translate(input_file: str, fmt: str | None, output_fmt: str, adaptive: bool) -> None:
     """Translate a log file into a normalized format.
 
     INPUT_FILE is a path to a log file, or '-' to read from stdin.
@@ -48,7 +50,7 @@ def translate(input_file: str, fmt: str | None, output_fmt: str) -> None:
     except OSError as e:
         raise click.ClickException(f"Error reading file: {e}")
 
-    normalizer = LogNormalizer()
+    normalizer = PerformanceAwareNormalizer() if adaptive else LogNormalizer()
 
     try:
         entry = normalizer.normalize(raw_data, source_format=fmt)
