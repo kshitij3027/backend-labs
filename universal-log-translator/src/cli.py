@@ -67,6 +67,122 @@ def translate(input_file: str, fmt: str | None, output_fmt: str, adaptive: bool)
 
 
 @cli.command()
+@click.option("--count", default=10000, help="Number of logs to process")
+@click.option("--adaptive", is_flag=True, help="Enable adaptive performance tracking")
+def benchmark(count, adaptive):
+    """Run a benchmark with mixed-format logs."""
+    import time
+    import random
+    import json as json_module
+    import io
+    import fastavro
+    from src.generated import log_entry_pb2
+
+    click.echo(f"Benchmarking with {count} mixed-format logs...")
+    click.echo("")
+
+    if adaptive:
+        normalizer = PerformanceAwareNormalizer()
+    else:
+        normalizer = LogNormalizer()
+
+    # Generate sample data for each format
+    json_data = json_module.dumps({
+        "timestamp": "2024-01-15T10:30:00",
+        "level": "INFO",
+        "message": "Benchmark test message",
+        "source": "benchmark",
+        "hostname": "bench-host",
+        "service": "bench-service",
+    }).encode()
+
+    text_data = b"<165>1 2024-01-15T10:30:00.000Z bench-host bench-service 1234 - - Benchmark test message"
+
+    pb_entry = log_entry_pb2.LogEntry()
+    pb_entry.timestamp = "2024-01-15T10:30:00"
+    pb_entry.level = log_entry_pb2.LOG_LEVEL_INFO
+    pb_entry.message = "Benchmark test message"
+    pb_entry.source = "benchmark"
+    pb_entry.hostname = "bench-host"
+    pb_entry.service = "bench-service"
+    pb_data = pb_entry.SerializeToString()
+
+    avro_schema = {
+        "type": "record",
+        "name": "LogEntry",
+        "namespace": "com.logtranslator",
+        "fields": [
+            {"name": "timestamp", "type": "string"},
+            {"name": "level", "type": "string"},
+            {"name": "message", "type": "string"},
+            {"name": "source", "type": ["null", "string"], "default": None},
+            {"name": "hostname", "type": ["null", "string"], "default": None},
+            {"name": "service", "type": ["null", "string"], "default": None},
+            {"name": "metadata", "type": {"type": "map", "values": "string"}, "default": {}},
+        ],
+    }
+    parsed_schema = fastavro.parse_schema(avro_schema)
+    buf = io.BytesIO()
+    fastavro.writer(buf, parsed_schema, [{
+        "timestamp": "2024-01-15T10:30:00",
+        "level": "INFO",
+        "message": "Benchmark test message",
+        "source": "benchmark",
+        "hostname": "bench-host",
+        "service": "bench-service",
+        "metadata": {},
+    }])
+    avro_data = buf.getvalue()
+
+    samples = [json_data, text_data, pb_data, avro_data]
+    format_names = ["json", "text", "protobuf", "avro"]
+    format_counts = {name: 0 for name in format_names}
+
+    successes = 0
+    errors = 0
+    error_details = []
+
+    start_time = time.perf_counter()
+
+    for i in range(count):
+        idx = random.randint(0, 3)
+        data = samples[idx]
+        format_counts[format_names[idx]] += 1
+        try:
+            normalizer.normalize(data)
+            successes += 1
+        except Exception as e:
+            errors += 1
+            if len(error_details) < 5:
+                error_details.append(f"{format_names[idx]}: {e}")
+
+    elapsed = time.perf_counter() - start_time
+    throughput = count / elapsed
+
+    click.echo("=== Benchmark Results ===")
+    click.echo(f"Total logs:     {count}")
+    click.echo(f"Successes:      {successes}")
+    click.echo(f"Errors:         {errors}")
+    click.echo(f"Success rate:   {successes/count:.1%}")
+    click.echo(f"Elapsed:        {elapsed:.3f}s")
+    click.echo(f"Throughput:     {throughput:.0f} logs/sec")
+    click.echo("")
+    click.echo("Format distribution:")
+    for name, cnt in sorted(format_counts.items()):
+        click.echo(f"  {name}: {cnt}")
+
+    if adaptive and isinstance(normalizer, PerformanceAwareNormalizer):
+        click.echo("")
+        click.echo(normalizer.stats_report)
+
+    if error_details:
+        click.echo("")
+        click.echo("Sample errors:")
+        for detail in error_details:
+            click.echo(f"  {detail}")
+
+
+@cli.command()
 @click.argument("input_file")
 def detect(input_file: str) -> None:
     """Detect the log format of a file.

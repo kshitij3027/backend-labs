@@ -20,3 +20,11 @@ services:
     entrypoint: ["bash", "/app/verify.sh"]
     profiles:
       - verify
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["python", "-m", "src", "benchmark", "--count", "10000", "--adaptive"]
+    profiles:
+      - benchmark
