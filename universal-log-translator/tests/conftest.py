@@ -70,6 +70,40 @@ def sample_protobuf_bytes():
 
 
 @pytest.fixture
+def sample_avro_bytes():
+    """Sample Avro OCF-encoded log entry."""
+    import io
+    import fastavro
+    schema = {
+        "type": "record",
+        "name": "LogEntry",
+        "namespace": "com.logtranslator",
+        "fields": [
+            {"name": "timestamp", "type": "string"},
+            {"name": "level", "type": "string"},
+            {"name": "message", "type": "string"},
+            {"name": "source", "type": ["null", "string"], "default": None},
+            {"name": "hostname", "type": ["null", "string"], "default": None},
+            {"name": "service", "type": ["null", "string"], "default": None},
+            {"name": "metadata", "type": {"type": "map", "values": "string"}, "default": {}},
+        ],
+    }
+    parsed = fastavro.parse_schema(schema)
+    record = {
+        "timestamp": "2024-01-15T10:30:00",
+        "level": "INFO",
+        "message": "Application started successfully",
+        "source": "app-server",
+        "hostname": "web-01",
+        "service": "api-gateway",
+        "metadata": {},
+    }
+    buf = io.BytesIO()
+    fastavro.writer(buf, parsed, [record])
+    return buf.getvalue()
+
+
+@pytest.fixture
 def sample_malformed_json_bytes():
     """Malformed JSON bytes."""
     return b'{"key": "value", broken'

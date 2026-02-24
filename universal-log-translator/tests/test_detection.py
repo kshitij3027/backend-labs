@@ -5,6 +5,7 @@ import pytest
 
 import src.handlers  # noqa: F401 - triggers handler registration
 from src.detector import FormatDetector
+from src.handlers.avro_handler import AvroHandler
 from src.handlers.json_handler import JsonHandler
 from src.handlers.protobuf_handler import ProtobufHandler
 from src.handlers.text_handler import TextHandler
@@ -49,6 +50,39 @@ class TestFormatDetection:
         handler = detector.detect(sample_protobuf_bytes)
         assert isinstance(handler, ProtobufHandler)
         assert handler.format_name == "protobuf"
+
+    def test_detect_avro(self, sample_avro_bytes):
+        """Avro OCF bytes should be detected as avro handler."""
+        detector = FormatDetector()
+        handler = detector.detect(sample_avro_bytes)
+        assert isinstance(handler, AvroHandler)
+        assert handler.format_name == "avro"
+
+    def test_cross_format_detection(
+        self,
+        sample_json_bytes,
+        sample_syslog_rfc5424_bytes,
+        sample_protobuf_bytes,
+        sample_avro_bytes,
+    ):
+        """Each format should be detected by its correct handler."""
+        detector = FormatDetector()
+
+        json_handler = detector.detect(sample_json_bytes)
+        assert isinstance(json_handler, JsonHandler)
+        assert json_handler.format_name == "json"
+
+        syslog_handler = detector.detect(sample_syslog_rfc5424_bytes)
+        assert isinstance(syslog_handler, TextHandler)
+        assert syslog_handler.format_name == "text"
+
+        proto_handler = detector.detect(sample_protobuf_bytes)
+        assert isinstance(proto_handler, ProtobufHandler)
+        assert proto_handler.format_name == "protobuf"
+
+        avro_handler = detector.detect(sample_avro_bytes)
+        assert isinstance(avro_handler, AvroHandler)
+        assert avro_handler.format_name == "avro"
 
     def test_detect_unknown_format(self):
         detector = FormatDetector()

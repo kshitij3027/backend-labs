@@ -1,0 +1,14 @@
+{
+  "type": "record",
+  "name": "LogEntry",
+  "namespace": "com.logtranslator",
+  "fields": [
+    {"name": "timestamp", "type": "string"},
+    {"name": "level", "type": "string"},
+    {"name": "message", "type": "string"},
+    {"name": "source", "type": ["null", "string"], "default": null},
+    {"name": "hostname", "type": ["null", "string"], "default": null},
+    {"name": "service", "type": ["null", "string"], "default": null},
+    {"name": "metadata", "type": {"type": "map", "values": "string"}, "default": {}}
+  ]
+}
