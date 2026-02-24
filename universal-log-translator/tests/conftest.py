@@ -2,6 +2,7 @@
 import pytest
 from datetime import datetime
 
+import src.handlers  # noqa: F401 - triggers handler registration
 from src.models import LogEntry, LogLevel
 
 
@@ -52,3 +53,9 @@ def sample_syslog_rfc3164_bytes():
 def sample_text_bytes():
     """Sample plain text log with timestamp."""
     return b"2024-01-15 10:30:00 INFO Application started successfully"
+
+
+@pytest.fixture
+def sample_malformed_json_bytes():
+    """Malformed JSON bytes."""
+    return b'{"key": "value", broken'
