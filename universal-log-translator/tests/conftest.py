@@ -56,6 +56,20 @@ def sample_text_bytes():
 
 
 @pytest.fixture
+def sample_protobuf_bytes():
+    """Sample protobuf-encoded log entry."""
+    from src.generated import log_entry_pb2
+    entry = log_entry_pb2.LogEntry()
+    entry.timestamp = "2024-01-15T10:30:00"
+    entry.level = log_entry_pb2.LOG_LEVEL_INFO
+    entry.message = "Application started successfully"
+    entry.source = "app-server"
+    entry.hostname = "web-01"
+    entry.service = "api-gateway"
+    return entry.SerializeToString()
+
+
+@pytest.fixture
 def sample_malformed_json_bytes():
     """Malformed JSON bytes."""
     return b'{"key": "value", broken'

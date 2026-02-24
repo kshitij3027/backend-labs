@@ -6,6 +6,7 @@ import pytest
 import src.handlers  # noqa: F401 - triggers handler registration
 from src.detector import FormatDetector
 from src.handlers.json_handler import JsonHandler
+from src.handlers.protobuf_handler import ProtobufHandler
 from src.handlers.text_handler import TextHandler
 from src.models import UnsupportedFormatError
 
@@ -41,6 +42,13 @@ class TestFormatDetection:
         handler = detector.detect(data)
         assert isinstance(handler, JsonHandler)
         assert handler.format_name == "json"
+
+    def test_detect_protobuf(self, sample_protobuf_bytes):
+        """Protobuf binary data should be detected as protobuf handler."""
+        detector = FormatDetector()
+        handler = detector.detect(sample_protobuf_bytes)
+        assert isinstance(handler, ProtobufHandler)
+        assert handler.format_name == "protobuf"
 
     def test_detect_unknown_format(self):
         detector = FormatDetector()

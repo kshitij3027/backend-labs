@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package logtranslator;
+
+enum LogLevel {
+  LOG_LEVEL_UNKNOWN = 0;
+  LOG_LEVEL_DEBUG = 1;
+  LOG_LEVEL_INFO = 2;
+  LOG_LEVEL_WARNING = 3;
+  LOG_LEVEL_ERROR = 4;
+  LOG_LEVEL_CRITICAL = 5;
+}
+
+message LogEntry {
+  string timestamp = 1;
+  LogLevel level = 2;
+  string message = 3;
+  string source = 4;
+  string hostname = 5;
+  string service = 6;
+  map<string, string> metadata = 7;
+}
