@@ -19,7 +19,7 @@ class FormatDetector:
     def handlers(self) -> list[BaseHandler]:
         """Get handler instances in probe order."""
         registry = BaseHandler.get_registry()
-        if self._handler_order:
+        if self._handler_order is not None:
             return [registry[name]() for name in self._handler_order if name in registry]
         return [cls() for cls in registry.values()]
 

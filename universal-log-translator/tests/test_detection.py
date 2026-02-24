@@ -6,15 +6,38 @@ import pytest
 import src.handlers  # noqa: F401 - triggers handler registration
 from src.detector import FormatDetector
 from src.handlers.json_handler import JsonHandler
+from src.handlers.text_handler import TextHandler
 from src.models import UnsupportedFormatError
 
 
 class TestFormatDetection:
-    """Test format detection with the JSON handler registered."""
+    """Test format detection with the JSON and text handlers registered."""
 
     def test_detect_json(self):
         detector = FormatDetector()
         data = json.dumps({"message": "hello", "level": "INFO"}).encode("utf-8")
+        handler = detector.detect(data)
+        assert isinstance(handler, JsonHandler)
+        assert handler.format_name == "json"
+
+    def test_detect_text_syslog(self):
+        detector = FormatDetector()
+        data = b"<165>1 2024-01-15T10:30:00Z web-01 api-gateway 1234 - - Application started"
+        handler = detector.detect(data)
+        assert isinstance(handler, TextHandler)
+        assert handler.format_name == "text"
+
+    def test_detect_text_generic(self):
+        detector = FormatDetector()
+        data = b"2024-01-15 10:30:00 INFO Application started successfully"
+        handler = detector.detect(data)
+        assert isinstance(handler, TextHandler)
+        assert handler.format_name == "text"
+
+    def test_detect_json_over_text(self):
+        """JSON-looking data should be detected as JSON, not text."""
+        detector = FormatDetector()
+        data = json.dumps({"message": "hello"}).encode("utf-8")
         handler = detector.detect(data)
         assert isinstance(handler, JsonHandler)
         assert handler.format_name == "json"
