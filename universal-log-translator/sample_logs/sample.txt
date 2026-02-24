@@ -1,0 +1,1 @@
+<165>1 2024-01-15T10:30:00.000Z web-01 api-gateway 1234 - - Application started successfully

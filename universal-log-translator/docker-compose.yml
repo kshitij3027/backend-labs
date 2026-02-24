@@ -12,3 +12,11 @@ services:
       dockerfile: Dockerfile.test
     profiles:
       - test
+
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["bash", "/app/verify.sh"]
+    profiles:
+      - verify
