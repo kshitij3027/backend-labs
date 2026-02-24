@@ -1,0 +1,13 @@
+# Core
+click>=8.1.0
+python-json-logger>=2.0.0
+
+# Format support
+grpcio-tools>=1.60.0
+protobuf>=4.25.0
+avro-python3>=1.10.0
+fastavro>=1.9.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0

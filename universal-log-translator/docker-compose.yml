@@ -1,0 +1,14 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./sample_logs:/app/sample_logs:ro
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
