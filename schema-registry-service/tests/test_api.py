@@ -254,3 +254,42 @@ class TestDashboard:
     def test_dashboard_contains_html(self, client):
         resp = client.get("/")
         assert b"Schema Registry Service" in resp.data
+
+
+class TestPerformance:
+    """Performance benchmarks to ensure acceptable response times."""
+
+    def _register(self, client, subject, schema):
+        return client.post("/schemas", json={"subject": subject, "schema": schema})
+
+    def test_1000_validations_under_5_seconds(self, client):
+        import time
+        schema = {
+            "type": "object",
+            "properties": {
+                "user_id": {"type": "string"},
+                "event_type": {"type": "string"},
+                "timestamp": {"type": "string"},
+            },
+            "required": ["user_id", "event_type", "timestamp"],
+        }
+        self._register(client, "perf-test", schema)
+
+        start = time.time()
+        for i in range(1000):
+            client.post("/validate", json={
+                "subject": "perf-test",
+                "data": {"user_id": f"u{i}", "event_type": "click", "timestamp": "2024-01-01T00:00:00Z"},
+            })
+        elapsed = time.time() - start
+        assert elapsed < 5.0, f"1000 validations took {elapsed:.2f}s (target: <5s)"
+
+    def test_100_lookups_under_1_second(self, client):
+        import time
+        self._register(client, "lookup-test", {"type": "object", "properties": {"x": {"type": "string"}}})
+
+        start = time.time()
+        for _ in range(100):
+            client.get("/schemas/subjects/lookup-test")
+        elapsed = time.time() - start
+        assert elapsed < 1.0, f"100 lookups took {elapsed:.2f}s (target: <1s)"
