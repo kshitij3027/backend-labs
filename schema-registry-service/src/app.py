@@ -1,8 +1,9 @@
 """Flask application factory for Schema Registry Service."""
 import os
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from src.storage import FileStorage
+from src.registry import SchemaRegistry
 
 
 def create_app(storage_path=None):
@@ -18,6 +19,7 @@ def create_app(storage_path=None):
 
     path = storage_path or os.environ.get("STORAGE_PATH", "data/registry.json")
     storage = FileStorage(path)
+    registry = SchemaRegistry(storage)
 
     @app.route("/health")
     def health():
@@ -30,8 +32,55 @@ def create_app(storage_path=None):
             "subject_count": subject_count,
         })
 
+    @app.route("/schemas", methods=["POST"])
+    def register_schema():
+        body = request.get_json(silent=True) or {}
+        subject = body.get("subject")
+        schema = body.get("schema")
+        schema_type = body.get("schema_type", "json")
+
+        if not subject or schema is None:
+            return jsonify({"status": "error", "message": "Missing required fields: subject, schema"}), 400
+
+        if schema_type not in ("json", "avro"):
+            return jsonify({"status": "error", "message": f"Invalid schema_type: {schema_type}. Must be 'json' or 'avro'"}), 400
+
+        record, created = registry.register(subject, schema, schema_type)
+        status_code = 201 if created else 200
+        return jsonify({"status": "success", "data": record}), status_code
+
+    @app.route("/schemas/subjects")
+    def list_subjects():
+        subjects = registry.list_subjects()
+        return jsonify({"status": "success", "data": subjects})
+
+    @app.route("/schemas/subjects/<subject>")
+    def get_latest_schema(subject):
+        try:
+            record = registry.get_latest(subject)
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+        return jsonify({"status": "success", "data": record})
+
+    @app.route("/schemas/subjects/<subject>/versions")
+    def list_versions(subject):
+        try:
+            versions = registry.list_versions(subject)
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+        return jsonify({"status": "success", "data": versions})
+
+    @app.route("/schemas/subjects/<subject>/versions/<int:version>")
+    def get_version(subject, version):
+        try:
+            record = registry.get_version(subject, version)
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+        return jsonify({"status": "success", "data": record})
+
     # Store references on app for use by other modules/phases
     app.storage = storage
+    app.registry = registry
 
     return app
 
