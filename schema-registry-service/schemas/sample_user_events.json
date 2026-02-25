@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "user_id": {"type": "string"},
+    "event_type": {"type": "string"},
+    "timestamp": {"type": "string", "format": "date-time"}
+  },
+  "required": ["user_id", "event_type", "timestamp"],
+  "additionalProperties": false
+}

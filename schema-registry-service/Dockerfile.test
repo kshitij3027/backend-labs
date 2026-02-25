@@ -1,0 +1,13 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY schemas/ schemas/
+COPY src/ src/
+COPY tests/ tests/
+COPY data/ data/
+
+CMD ["pytest", "tests/", "-v", "--tb=short", "--cov=src", "--cov-report=term-missing"]

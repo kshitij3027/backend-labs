@@ -1,0 +1,6 @@
+flask==3.1.0
+jsonschema==4.23.0
+fastavro==1.9.7
+pytest==8.3.4
+pytest-cov==6.0.0
+requests==2.32.3
