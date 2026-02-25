@@ -14,6 +14,17 @@ services:
       retries: 3
       start_period: 5s
 
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8080"
+    volumes:
+      - registry-data:/app/data
+    profiles:
+      - dev
+
   tests:
     build:
       context: .
