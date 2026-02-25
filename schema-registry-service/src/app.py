@@ -5,6 +5,7 @@ from flask import Flask, jsonify, request
 from src.storage import FileStorage
 from src.registry import SchemaRegistry
 from src.validators import ValidatorManager
+from src.compatibility import CompatibilityChecker
 
 
 def create_app(storage_path=None):
@@ -22,6 +23,7 @@ def create_app(storage_path=None):
     storage = FileStorage(path)
     registry = SchemaRegistry(storage)
     validators = ValidatorManager()
+    compat_checker = CompatibilityChecker()
 
     # Recompile validators for existing schemas on startup
     state = storage.get_state()
@@ -124,10 +126,39 @@ def create_app(storage_path=None):
             }
         })
 
+    @app.route("/compatibility/subjects/<subject>", methods=["POST"])
+    def check_compatibility(subject):
+        body = request.get_json(silent=True) or {}
+        schema = body.get("schema")
+        schema_type = body.get("schema_type", "json")
+
+        if schema is None:
+            return jsonify({"status": "error", "message": "Missing required field: schema"}), 400
+
+        try:
+            latest = registry.get_latest(subject)
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+
+        compatible, issues = compat_checker.check_backward(schema, latest["schema"], schema_type)
+        return jsonify({
+            "status": "success",
+            "data": {
+                "compatible": compatible,
+                "issues": issues,
+                "checked_against": {
+                    "subject": subject,
+                    "version": latest["version"],
+                    "schema_id": latest["id"],
+                },
+            }
+        })
+
     # Store references on app for use by other modules/phases
     app.storage = storage
     app.registry = registry
     app.validators = validators
+    app.compat_checker = compat_checker
 
     return app
 

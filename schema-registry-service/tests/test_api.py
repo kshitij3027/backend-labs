@@ -129,3 +129,80 @@ class TestValidation:
     def test_validate_missing_fields(self, client):
         resp = client.post("/validate", json={"subject": "test"})
         assert resp.status_code == 400
+
+
+class TestCompatibility:
+    def _register(self, client, subject, schema, schema_type="json"):
+        return client.post("/schemas", json={
+            "subject": subject, "schema": schema, "schema_type": schema_type,
+        })
+
+    def test_compatible_change(self, client):
+        old = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        self._register(client, "compat-test", old)
+        new = {"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name"]}
+        resp = client.post("/compatibility/subjects/compat-test", json={"schema": new})
+        data = resp.get_json()["data"]
+        assert data["compatible"] is True
+        assert data["issues"] == []
+
+    def test_breaking_change(self, client):
+        old = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        self._register(client, "compat-test", old)
+        new = {"type": "object", "properties": {"name": {"type": "string"}, "email": {"type": "string"}}, "required": ["name", "email"]}
+        resp = client.post("/compatibility/subjects/compat-test", json={"schema": new})
+        data = resp.get_json()["data"]
+        assert data["compatible"] is False
+        assert len(data["issues"]) > 0
+
+    def test_compat_missing_subject(self, client):
+        resp = client.post("/compatibility/subjects/nonexistent", json={"schema": {"type": "object"}})
+        assert resp.status_code == 404
+
+    def test_compat_missing_schema(self, client):
+        old = {"type": "object", "properties": {"name": {"type": "string"}}}
+        self._register(client, "compat-test", old)
+        resp = client.post("/compatibility/subjects/compat-test", json={})
+        assert resp.status_code == 400
+
+
+class TestAvroRegistration:
+    def test_register_avro_schema(self, client):
+        schema = {
+            "type": "record",
+            "name": "UserEvent",
+            "fields": [
+                {"name": "user_id", "type": "string"},
+                {"name": "event_type", "type": "string"},
+            ]
+        }
+        resp = client.post("/schemas", json={
+            "subject": "avro-test",
+            "schema": schema,
+            "schema_type": "avro",
+        })
+        assert resp.status_code == 201
+        assert resp.get_json()["data"]["schema_type"] == "avro"
+
+    def test_validate_avro_data(self, client):
+        schema = {
+            "type": "record",
+            "name": "UserEvent",
+            "fields": [
+                {"name": "user_id", "type": "string"},
+                {"name": "event_type", "type": "string"},
+            ]
+        }
+        client.post("/schemas", json={"subject": "avro-val", "schema": schema, "schema_type": "avro"})
+        resp = client.post("/validate", json={
+            "subject": "avro-val",
+            "data": {"user_id": "u1", "event_type": "click"},
+        })
+        assert resp.get_json()["data"]["valid"] is True
+
+    def test_avro_compat_check(self, client):
+        old = {"type": "record", "name": "T", "fields": [{"name": "a", "type": "string"}]}
+        client.post("/schemas", json={"subject": "avro-compat", "schema": old, "schema_type": "avro"})
+        new = {"type": "record", "name": "T", "fields": [{"name": "a", "type": "string"}, {"name": "b", "type": "string", "default": ""}]}
+        resp = client.post("/compatibility/subjects/avro-compat", json={"schema": new, "schema_type": "avro"})
+        assert resp.get_json()["data"]["compatible"] is True
