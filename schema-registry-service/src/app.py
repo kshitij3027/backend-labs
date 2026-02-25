@@ -1,11 +1,12 @@
 """Flask application factory for Schema Registry Service."""
 import os
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 
 from src.storage import FileStorage
 from src.registry import SchemaRegistry
 from src.validators import ValidatorManager
 from src.compatibility import CompatibilityChecker
+from src.metrics import MetricsTracker
 
 
 def create_app(storage_path=None):
@@ -24,6 +25,7 @@ def create_app(storage_path=None):
     registry = SchemaRegistry(storage)
     validators = ValidatorManager()
     compat_checker = CompatibilityChecker()
+    metrics = MetricsTracker()
 
     # Recompile validators for existing schemas on startup
     state = storage.get_state()
@@ -66,6 +68,8 @@ def create_app(storage_path=None):
                 return jsonify({"status": "error", "message": f"Invalid schema: {str(e)}"}), 400
 
         status_code = 201 if created else 200
+        if created:
+            metrics.record_registration()
         return jsonify({"status": "success", "data": record}), status_code
 
     @app.route("/schemas/subjects")
@@ -116,6 +120,7 @@ def create_app(storage_path=None):
             return jsonify({"status": "error", "message": str(e)}), 404
 
         valid, errors = validators.validate(record["id"], data, record["schema_type"])
+        metrics.record_validation(subject, valid)
         return jsonify({
             "status": "success",
             "data": {
@@ -154,11 +159,20 @@ def create_app(storage_path=None):
             }
         })
 
+    @app.route("/metrics")
+    def get_metrics():
+        return jsonify({"status": "success", "data": metrics.get_metrics()})
+
+    @app.route("/")
+    def dashboard():
+        return render_template("dashboard.html")
+
     # Store references on app for use by other modules/phases
     app.storage = storage
     app.registry = registry
     app.validators = validators
     app.compat_checker = compat_checker
+    app.metrics = metrics
 
     return app
 

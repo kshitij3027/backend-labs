@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Schema Registry Service</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', system-ui, sans-serif; background: #1a1a2e; color: #e0e0e0; min-height: 100vh; }
+        .header { background: #16213e; padding: 1.5rem 2rem; border-bottom: 2px solid #0f3460; }
+        .header h1 { font-size: 1.5rem; color: #e94560; }
+        .header p { font-size: 0.85rem; color: #888; margin-top: 0.3rem; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 1.5rem; display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+        .card { background: #16213e; border-radius: 8px; padding: 1.5rem; border: 1px solid #0f3460; }
+        .card h2 { color: #e94560; font-size: 1.1rem; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid #0f3460; }
+        .full-width { grid-column: 1 / -1; }
+        label { display: block; font-size: 0.85rem; color: #aaa; margin-bottom: 0.3rem; }
+        input, textarea, select { width: 100%; padding: 0.6rem; background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px; color: #e0e0e0; font-family: monospace; font-size: 0.85rem; margin-bottom: 0.8rem; }
+        textarea { min-height: 100px; resize: vertical; }
+        button { background: #e94560; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 4px; cursor: pointer; font-size: 0.85rem; margin-right: 0.5rem; }
+        button:hover { background: #c73e54; }
+        button.secondary { background: #0f3460; }
+        button.secondary:hover { background: #1a4a8a; }
+        .result { background: #1a1a2e; border: 1px solid #0f3460; border-radius: 4px; padding: 0.8rem; margin-top: 0.8rem; font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; max-height: 300px; overflow-y: auto; }
+        .result.success { border-color: #2ecc71; }
+        .result.error { border-color: #e94560; }
+        .metric { display: inline-block; background: #1a1a2e; border-radius: 6px; padding: 0.8rem 1.2rem; margin: 0.3rem; text-align: center; border: 1px solid #0f3460; }
+        .metric .value { font-size: 1.5rem; font-weight: bold; color: #e94560; }
+        .metric .label { font-size: 0.75rem; color: #888; }
+        .subject-list { list-style: none; }
+        .subject-list li { padding: 0.5rem; border-bottom: 1px solid #0f3460; cursor: pointer; font-size: 0.85rem; }
+        .subject-list li:hover { background: #0f3460; }
+        @media (max-width: 768px) { .container { grid-template-columns: 1fr; } }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Schema Registry Service</h1>
+        <p>Register, version, and validate log message schemas</p>
+    </div>
+    <div class="container">
+        <div class="card">
+            <h2>Register Schema</h2>
+            <label>Subject</label>
+            <input type="text" id="reg-subject" placeholder="e.g., user-events">
+            <label>Schema Type</label>
+            <select id="reg-type">
+                <option value="json">JSON Schema</option>
+                <option value="avro">Avro</option>
+            </select>
+            <label>Schema (JSON)</label>
+            <textarea id="reg-schema" placeholder='{"type": "object", "properties": {...}}'></textarea>
+            <button onclick="registerSchema()">Register</button>
+            <div id="reg-result" class="result" style="display:none"></div>
+        </div>
+
+        <div class="card">
+            <h2>Validate Data</h2>
+            <label>Subject</label>
+            <input type="text" id="val-subject" placeholder="e.g., user-events">
+            <label>Version (optional)</label>
+            <input type="text" id="val-version" placeholder="latest">
+            <label>Data (JSON)</label>
+            <textarea id="val-data" placeholder='{"user_id": "abc", "event_type": "click"}'></textarea>
+            <button onclick="validateData()">Validate</button>
+            <div id="val-result" class="result" style="display:none"></div>
+        </div>
+
+        <div class="card">
+            <h2>Metrics</h2>
+            <div id="metrics-panel">
+                <div class="metric"><div class="value" id="m-total">0</div><div class="label">Validations</div></div>
+                <div class="metric"><div class="value" id="m-success">0</div><div class="label">Successes</div></div>
+                <div class="metric"><div class="value" id="m-failed">0</div><div class="label">Failures</div></div>
+                <div class="metric"><div class="value" id="m-rate">0%</div><div class="label">Success Rate</div></div>
+                <div class="metric"><div class="value" id="m-regs">0</div><div class="label">Registrations</div></div>
+            </div>
+            <button class="secondary" onclick="refreshMetrics()" style="margin-top:1rem">Refresh</button>
+        </div>
+
+        <div class="card">
+            <h2>Subjects</h2>
+            <ul id="subject-list" class="subject-list"><li>Loading...</li></ul>
+            <button class="secondary" onclick="refreshSubjects()" style="margin-top:1rem">Refresh</button>
+            <div id="subject-detail" class="result" style="display:none"></div>
+        </div>
+    </div>
+
+    <script>
+        async function api(method, path, body) {
+            const opts = { method, headers: { 'Content-Type': 'application/json' } };
+            if (body) opts.body = JSON.stringify(body);
+            const r = await fetch(path, opts);
+            return r.json();
+        }
+
+        function showResult(id, data, isError) {
+            const el = document.getElementById(id);
+            el.style.display = 'block';
+            el.className = 'result ' + (isError ? 'error' : 'success');
+            el.textContent = JSON.stringify(data, null, 2);
+        }
+
+        async function registerSchema() {
+            try {
+                const schema = JSON.parse(document.getElementById('reg-schema').value);
+                const data = await api('POST', '/schemas', {
+                    subject: document.getElementById('reg-subject').value,
+                    schema: schema,
+                    schema_type: document.getElementById('reg-type').value,
+                });
+                showResult('reg-result', data, data.status === 'error');
+                refreshSubjects();
+                refreshMetrics();
+            } catch (e) { showResult('reg-result', { error: e.message }, true); }
+        }
+
+        async function validateData() {
+            try {
+                const payload = {
+                    subject: document.getElementById('val-subject').value,
+                    data: JSON.parse(document.getElementById('val-data').value),
+                };
+                const ver = document.getElementById('val-version').value;
+                if (ver) payload.version = parseInt(ver);
+                const data = await api('POST', '/validate', payload);
+                showResult('val-result', data, data.status === 'error');
+                refreshMetrics();
+            } catch (e) { showResult('val-result', { error: e.message }, true); }
+        }
+
+        async function refreshMetrics() {
+            const data = await api('GET', '/metrics');
+            if (data.status === 'success') {
+                const m = data.data;
+                document.getElementById('m-total').textContent = m.total_validations;
+                document.getElementById('m-success').textContent = m.successful_validations;
+                document.getElementById('m-failed').textContent = m.failed_validations;
+                document.getElementById('m-rate').textContent = m.success_rate + '%';
+                document.getElementById('m-regs').textContent = m.total_registrations;
+            }
+        }
+
+        async function refreshSubjects() {
+            const data = await api('GET', '/schemas/subjects');
+            const list = document.getElementById('subject-list');
+            if (data.data && data.data.length > 0) {
+                list.innerHTML = data.data.map(s => `<li onclick="showSubject('${s}')">${s}</li>`).join('');
+            } else {
+                list.innerHTML = '<li>No subjects registered</li>';
+            }
+        }
+
+        async function showSubject(subject) {
+            const data = await api('GET', '/schemas/subjects/' + subject);
+            showResult('subject-detail', data, false);
+        }
+
+        refreshSubjects();
+        refreshMetrics();
+    </script>
+</body>
+</html>

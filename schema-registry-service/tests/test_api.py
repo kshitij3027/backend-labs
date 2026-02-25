@@ -206,3 +206,51 @@ class TestAvroRegistration:
         new = {"type": "record", "name": "T", "fields": [{"name": "a", "type": "string"}, {"name": "b", "type": "string", "default": ""}]}
         resp = client.post("/compatibility/subjects/avro-compat", json={"schema": new, "schema_type": "avro"})
         assert resp.get_json()["data"]["compatible"] is True
+
+
+class TestMetrics:
+    def _register(self, client, subject, schema):
+        return client.post("/schemas", json={"subject": subject, "schema": schema})
+
+    def test_metrics_initial_zeros(self, client):
+        resp = client.get("/metrics")
+        data = resp.get_json()["data"]
+        assert data["total_validations"] == 0
+        assert data["total_registrations"] == 0
+        assert data["success_rate"] == 0.0
+
+    def test_metrics_after_registration(self, client):
+        self._register(client, "m-test", {"type": "object"})
+        resp = client.get("/metrics")
+        assert resp.get_json()["data"]["total_registrations"] == 1
+
+    def test_metrics_after_validation(self, client):
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+        self._register(client, "m-val", schema)
+        client.post("/validate", json={"subject": "m-val", "data": {"x": "ok"}})
+        client.post("/validate", json={"subject": "m-val", "data": {"x": 123}})
+        resp = client.get("/metrics")
+        data = resp.get_json()["data"]
+        assert data["total_validations"] == 2
+        assert data["successful_validations"] == 1
+        assert data["failed_validations"] == 1
+        assert data["success_rate"] == 50.0
+
+    def test_metrics_per_subject(self, client):
+        schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
+        self._register(client, "subj-a", schema)
+        client.post("/validate", json={"subject": "subj-a", "data": {"x": "ok"}})
+        resp = client.get("/metrics")
+        per = resp.get_json()["data"]["per_subject"]
+        assert "subj-a" in per
+        assert per["subj-a"]["validations"] == 1
+
+
+class TestDashboard:
+    def test_dashboard_returns_200(self, client):
+        resp = client.get("/")
+        assert resp.status_code == 200
+
+    def test_dashboard_contains_html(self, client):
+        resp = client.get("/")
+        assert b"Schema Registry Service" in resp.data
