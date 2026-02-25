@@ -88,3 +88,44 @@ class TestRetrieval:
         self._register(client, "v", {"type": "object"})
         resp = client.get("/schemas/subjects/v/versions/99")
         assert resp.status_code == 404
+
+
+class TestValidation:
+    def _register(self, client, subject, schema, schema_type="json"):
+        return client.post("/schemas", json={
+            "subject": subject, "schema": schema, "schema_type": schema_type,
+        })
+
+    def test_validate_valid_data(self, client):
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        self._register(client, "val-test", schema)
+        resp = client.post("/validate", json={"subject": "val-test", "data": {"name": "Alice"}})
+        data = resp.get_json()["data"]
+        assert data["valid"] is True
+        assert data["errors"] == []
+
+    def test_validate_invalid_data(self, client):
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}
+        self._register(client, "val-test", schema)
+        resp = client.post("/validate", json={"subject": "val-test", "data": {"name": 123}})
+        data = resp.get_json()["data"]
+        assert data["valid"] is False
+        assert len(data["errors"]) > 0
+
+    def test_validate_specific_version(self, client):
+        schema1 = {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}
+        schema2 = {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "integer"}}, "required": ["a", "b"]}
+        self._register(client, "ver-test", schema1)
+        self._register(client, "ver-test", schema2)
+        # Valid for v1, would fail v2
+        resp = client.post("/validate", json={"subject": "ver-test", "data": {"a": "hello"}, "version": 1})
+        assert resp.get_json()["data"]["valid"] is True
+        assert resp.get_json()["data"]["schema_version"] == 1
+
+    def test_validate_missing_subject(self, client):
+        resp = client.post("/validate", json={"subject": "nope", "data": {}})
+        assert resp.status_code == 404
+
+    def test_validate_missing_fields(self, client):
+        resp = client.post("/validate", json={"subject": "test"})
+        assert resp.status_code == 400

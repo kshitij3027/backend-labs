@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request
 
 from src.storage import FileStorage
 from src.registry import SchemaRegistry
+from src.validators import ValidatorManager
 
 
 def create_app(storage_path=None):
@@ -20,6 +21,15 @@ def create_app(storage_path=None):
     path = storage_path or os.environ.get("STORAGE_PATH", "data/registry.json")
     storage = FileStorage(path)
     registry = SchemaRegistry(storage)
+    validators = ValidatorManager()
+
+    # Recompile validators for existing schemas on startup
+    state = storage.get_state()
+    for sid, record in state.get("schemas", {}).items():
+        try:
+            validators.compile(record["id"], record["schema"], record["schema_type"])
+        except Exception:
+            pass  # Skip invalid schemas on startup
 
     @app.route("/health")
     def health():
@@ -46,6 +56,13 @@ def create_app(storage_path=None):
             return jsonify({"status": "error", "message": f"Invalid schema_type: {schema_type}. Must be 'json' or 'avro'"}), 400
 
         record, created = registry.register(subject, schema, schema_type)
+
+        if created:
+            try:
+                validators.compile(record["id"], record["schema"], record["schema_type"])
+            except Exception as e:
+                return jsonify({"status": "error", "message": f"Invalid schema: {str(e)}"}), 400
+
         status_code = 201 if created else 200
         return jsonify({"status": "success", "data": record}), status_code
 
@@ -78,9 +95,39 @@ def create_app(storage_path=None):
             return jsonify({"status": "error", "message": str(e)}), 404
         return jsonify({"status": "success", "data": record})
 
+    @app.route("/validate", methods=["POST"])
+    def validate_data():
+        body = request.get_json(silent=True) or {}
+        subject = body.get("subject")
+        data = body.get("data")
+        version = body.get("version")
+
+        if not subject or data is None:
+            return jsonify({"status": "error", "message": "Missing required fields: subject, data"}), 400
+
+        try:
+            if version:
+                record = registry.get_version(subject, version)
+            else:
+                record = registry.get_latest(subject)
+        except KeyError as e:
+            return jsonify({"status": "error", "message": str(e)}), 404
+
+        valid, errors = validators.validate(record["id"], data, record["schema_type"])
+        return jsonify({
+            "status": "success",
+            "data": {
+                "valid": valid,
+                "schema_id": record["id"],
+                "schema_version": record["version"],
+                "errors": errors,
+            }
+        })
+
     # Store references on app for use by other modules/phases
     app.storage = storage
     app.registry = registry
+    app.validators = validators
 
     return app
 
