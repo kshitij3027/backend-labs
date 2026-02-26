@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Format Compatibility Layer</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        header {
+            background: #16213e;
+            border-bottom: 2px solid #0f3460;
+            padding: 1rem 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        header h1 {
+            font-size: 1.4rem;
+            color: #e94560;
+        }
+
+        header .version {
+            font-size: 0.85rem;
+            color: #888;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 1.5rem;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 1.5rem;
+            border-bottom: 2px solid #0f3460;
+        }
+
+        .tab-btn {
+            padding: 0.7rem 1.5rem;
+            background: transparent;
+            color: #888;
+            border: none;
+            cursor: pointer;
+            font-size: 0.95rem;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: color 0.2s, border-color 0.2s;
+        }
+
+        .tab-btn:hover { color: #e0e0e0; }
+
+        .tab-btn.active {
+            color: #e94560;
+            border-bottom-color: #e94560;
+        }
+
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Input section */
+        .input-section {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .input-area {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 180px;
+            background: #0f1127;
+            color: #e0e0e0;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 0.75rem;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 0.85rem;
+            resize: vertical;
+            line-height: 1.5;
+        }
+
+        textarea:focus {
+            outline: none;
+            border-color: #e94560;
+        }
+
+        textarea.dragover {
+            border-color: #e94560;
+            background: #1a1a3e;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 0.75rem;
+            min-width: 180px;
+        }
+
+        label {
+            font-size: 0.8rem;
+            color: #888;
+            margin-bottom: 0.2rem;
+        }
+
+        select {
+            background: #0f1127;
+            color: #e0e0e0;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        select:focus { outline: none; border-color: #e94560; }
+
+        .file-input-wrapper {
+            position: relative;
+        }
+
+        .file-input-wrapper input[type="file"] {
+            display: none;
+        }
+
+        .file-label {
+            display: block;
+            padding: 0.5rem;
+            background: #0f1127;
+            border: 1px dashed #555;
+            border-radius: 6px;
+            text-align: center;
+            cursor: pointer;
+            font-size: 0.8rem;
+            color: #888;
+            transition: border-color 0.2s;
+        }
+
+        .file-label:hover { border-color: #e94560; color: #e0e0e0; }
+
+        button {
+            padding: 0.6rem 1.2rem;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        button:active { transform: scale(0.98); }
+
+        .btn-primary {
+            background: #e94560;
+            color: white;
+        }
+
+        .btn-primary:hover { background: #d63851; }
+        .btn-primary:disabled { background: #555; cursor: not-allowed; }
+
+        .btn-secondary {
+            background: #16213e;
+            color: #e0e0e0;
+            border: 1px solid #333;
+        }
+
+        .btn-secondary:hover { background: #1a2a4e; }
+
+        /* Results */
+        .results-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 0.75rem;
+        }
+
+        .results-header h3 { font-size: 1rem; color: #e94560; }
+
+        .result-count {
+            font-size: 0.85rem;
+            color: #888;
+        }
+
+        .output-area {
+            background: #0f1127;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: 1rem;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 0.8rem;
+            line-height: 1.6;
+            max-height: 500px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
+        /* Metrics */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .metric-card {
+            background: #16213e;
+            border: 1px solid #0f3460;
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .metric-card .metric-label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .metric-card .metric-value {
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #e94560;
+            margin-top: 0.25rem;
+        }
+
+        .metric-card .metric-detail {
+            font-size: 0.8rem;
+            color: #aaa;
+            margin-top: 0.25rem;
+        }
+
+        /* Format distribution */
+        .format-dist {
+            margin-top: 1rem;
+        }
+
+        .format-bar {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .format-bar .fmt-name {
+            min-width: 100px;
+            font-size: 0.85rem;
+            color: #ccc;
+        }
+
+        .format-bar .bar-track {
+            flex: 1;
+            height: 8px;
+            background: #0f1127;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .format-bar .bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .format-bar .fmt-count {
+            min-width: 30px;
+            text-align: right;
+            font-size: 0.85rem;
+            color: #888;
+        }
+
+        /* Config table */
+        .config-section {
+            margin-bottom: 1.5rem;
+        }
+
+        .config-section h3 {
+            font-size: 1rem;
+            color: #e94560;
+            margin-bottom: 0.75rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th, td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid #222;
+            font-size: 0.85rem;
+        }
+
+        th {
+            color: #888;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+        }
+
+        /* Status bar */
+        .status-bar {
+            margin-top: 0.5rem;
+            font-size: 0.8rem;
+            color: #888;
+            min-height: 1.2rem;
+        }
+
+        .status-bar.error { color: #e94560; }
+        .status-bar.success { color: #4ade80; }
+
+        /* Loading spinner */
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #555;
+            border-top-color: #e94560;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            vertical-align: middle;
+            margin-right: 0.4rem;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Color palette for format bars */
+        .color-0 { background: #e94560; }
+        .color-1 { background: #4cc9f0; }
+        .color-2 { background: #f4a261; }
+        .color-3 { background: #7209b7; }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: #555;
+            font-size: 0.95rem;
+        }
+
+        @media (max-width: 768px) {
+            .input-section {
+                grid-template-columns: 1fr;
+            }
+
+            .controls {
+                flex-direction: row;
+                flex-wrap: wrap;
+                min-width: unset;
+            }
+
+            .metrics-grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Log Format Compatibility Layer</h1>
+        <span class="version">v1.0.0</span>
+    </header>
+
+    <div class="container">
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="process">Process Logs</button>
+            <button class="tab-btn" data-tab="samples">Sample Data</button>
+            <button class="tab-btn" data-tab="config">Configuration</button>
+        </div>
+
+        <!-- Process Tab -->
+        <div id="tab-process" class="tab-content active">
+            <div class="input-section">
+                <div class="input-area">
+                    <textarea
+                        id="log-input"
+                        placeholder="Paste log lines here, or drag and drop a log file..."
+                    ></textarea>
+                    <div class="status-bar" id="status"></div>
+                </div>
+                <div class="controls">
+                    <div>
+                        <label for="format-select">Output Format</label>
+                        <select id="format-select">
+                            <option value="json">JSON</option>
+                            <option value="structured">Structured</option>
+                            <option value="plain">Plain Text</option>
+                        </select>
+                    </div>
+                    <div class="file-input-wrapper">
+                        <label class="file-label" for="file-upload">Upload File</label>
+                        <input type="file" id="file-upload" accept=".log,.txt,.json">
+                    </div>
+                    <button class="btn-primary" id="btn-process" onclick="processLogs()">Process</button>
+                    <button class="btn-secondary" onclick="loadSample('mixed')">Load Sample</button>
+                    <button class="btn-secondary" onclick="clearAll()">Clear</button>
+                </div>
+            </div>
+
+            <!-- Metrics -->
+            <div id="metrics-section" style="display:none;">
+                <div class="metrics-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Total Lines</div>
+                        <div class="metric-value" id="m-total">-</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Success Rate</div>
+                        <div class="metric-value" id="m-rate">-</div>
+                        <div class="metric-detail" id="m-rate-detail"></div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Throughput</div>
+                        <div class="metric-value" id="m-throughput">-</div>
+                        <div class="metric-detail">lines/sec</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Elapsed</div>
+                        <div class="metric-value" id="m-elapsed">-</div>
+                        <div class="metric-detail">seconds</div>
+                    </div>
+                </div>
+                <div class="format-dist" id="format-dist"></div>
+            </div>
+
+            <!-- Results -->
+            <div id="results-section" style="display:none;">
+                <div class="results-header">
+                    <h3>Results</h3>
+                    <span class="result-count" id="result-count"></span>
+                </div>
+                <div class="output-area" id="output"></div>
+            </div>
+
+            <div class="empty-state" id="empty-state">
+                Paste log data above or load a sample to get started.
+            </div>
+        </div>
+
+        <!-- Samples Tab -->
+        <div id="tab-samples" class="tab-content">
+            <div style="display:flex; gap:0.5rem; margin-bottom:1rem; flex-wrap:wrap;">
+                <button class="btn-secondary" onclick="loadSampleTab('mixed')">Mixed</button>
+                <button class="btn-secondary" onclick="loadSampleTab('syslog')">Syslog</button>
+                <button class="btn-secondary" onclick="loadSampleTab('journald')">Journald</button>
+                <button class="btn-secondary" onclick="loadSampleTab('json')">JSON</button>
+            </div>
+
+            <div id="sample-raw-section" style="display:none;">
+                <h3 style="color:#e94560; margin-bottom:0.75rem;">Raw Input</h3>
+                <div class="output-area" id="sample-raw" style="max-height:200px;"></div>
+            </div>
+
+            <div id="sample-results-section" style="display:none; margin-top:1rem;">
+                <div class="results-header">
+                    <h3>Parsed Output</h3>
+                    <span class="result-count" id="sample-count"></span>
+                </div>
+                <div class="output-area" id="sample-output"></div>
+            </div>
+
+            <div id="sample-metrics-section" style="display:none; margin-top:1rem;">
+                <div class="metrics-grid" id="sample-metrics-grid"></div>
+            </div>
+
+            <div class="empty-state" id="sample-empty">
+                Select a sample type above to load and preview.
+            </div>
+        </div>
+
+        <!-- Config Tab -->
+        <div id="tab-config" class="tab-content">
+            <div class="config-section" id="config-adapters">
+                <h3>Registered Adapters</h3>
+                <table>
+                    <thead><tr><th>Format</th><th>Class</th></tr></thead>
+                    <tbody id="adapter-table"></tbody>
+                </table>
+            </div>
+
+            <div class="config-section" id="config-thresholds">
+                <h3>Thresholds</h3>
+                <table>
+                    <thead><tr><th>Setting</th><th>Value</th></tr></thead>
+                    <tbody id="threshold-table"></tbody>
+                </table>
+            </div>
+
+            <div class="config-section">
+                <h3>Supported Output Formats</h3>
+                <div id="config-formats" style="padding:0.5rem 0; color:#ccc;"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab switching
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                btn.classList.add('active');
+                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+
+                if (btn.dataset.tab === 'config') loadConfig();
+            });
+        });
+
+        // Drag and drop
+        const textarea = document.getElementById('log-input');
+
+        textarea.addEventListener('dragover', e => {
+            e.preventDefault();
+            textarea.classList.add('dragover');
+        });
+
+        textarea.addEventListener('dragleave', () => {
+            textarea.classList.remove('dragover');
+        });
+
+        textarea.addEventListener('drop', e => {
+            e.preventDefault();
+            textarea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) readFile(file);
+        });
+
+        // File upload
+        document.getElementById('file-upload').addEventListener('change', e => {
+            const file = e.target.files[0];
+            if (file) readFile(file);
+        });
+
+        function readFile(file) {
+            const reader = new FileReader();
+            reader.onload = ev => {
+                textarea.value = ev.target.result;
+                setStatus('Loaded file: ' + file.name, 'success');
+            };
+            reader.readAsText(file);
+        }
+
+        function setStatus(msg, type) {
+            const el = document.getElementById('status');
+            el.textContent = msg;
+            el.className = 'status-bar' + (type ? ' ' + type : '');
+        }
+
+        function clearAll() {
+            textarea.value = '';
+            document.getElementById('output').textContent = '';
+            document.getElementById('metrics-section').style.display = 'none';
+            document.getElementById('results-section').style.display = 'none';
+            document.getElementById('empty-state').style.display = 'block';
+            setStatus('');
+        }
+
+        async function processLogs() {
+            const text = textarea.value.trim();
+            if (!text) {
+                setStatus('No log data to process.', 'error');
+                return;
+            }
+
+            const format = document.getElementById('format-select').value;
+            const btn = document.getElementById('btn-process');
+            btn.disabled = true;
+            setStatus('<span class="spinner"></span> Processing...', '');
+            document.getElementById('status').innerHTML = '<span class="spinner"></span> Processing...';
+
+            try {
+                const formData = new FormData();
+                formData.append('text', text);
+                formData.append('format', format);
+
+                const resp = await fetch('/api/upload', { method: 'POST', body: formData });
+                const data = await resp.json();
+
+                if (!resp.ok) {
+                    setStatus('Error: ' + (data.error || 'Unknown error'), 'error');
+                    return;
+                }
+
+                renderResults(data, format);
+                setStatus('Processed ' + data.count + ' log entries.', 'success');
+            } catch (err) {
+                setStatus('Request failed: ' + err.message, 'error');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        function renderResults(data, format) {
+            document.getElementById('empty-state').style.display = 'none';
+
+            // Metrics
+            if (data.metrics) {
+                const m = data.metrics;
+                document.getElementById('m-total').textContent = m.total_lines;
+                document.getElementById('m-rate').textContent = m.success_rate_percent.toFixed(1) + '%';
+                document.getElementById('m-rate-detail').textContent =
+                    m.successful + ' ok / ' + m.failed + ' fail / ' + m.skipped + ' skip';
+                document.getElementById('m-throughput').textContent = Math.round(m.throughput_per_second);
+                document.getElementById('m-elapsed').textContent = m.elapsed_seconds.toFixed(4);
+                document.getElementById('metrics-section').style.display = 'block';
+
+                renderFormatDist(m.format_distribution, m.successful);
+            }
+
+            // Results
+            const outputEl = document.getElementById('output');
+            if (format === 'json') {
+                outputEl.textContent = JSON.stringify(data.results, null, 2);
+            } else {
+                outputEl.textContent = data.results.join('\n');
+            }
+            document.getElementById('result-count').textContent = data.count + ' entries';
+            document.getElementById('results-section').style.display = 'block';
+        }
+
+        function renderFormatDist(dist, total) {
+            const container = document.getElementById('format-dist');
+            const colors = ['color-0', 'color-1', 'color-2', 'color-3'];
+            let html = '<h3 style="color:#e94560;font-size:1rem;margin-bottom:0.75rem;">Format Distribution</h3>';
+            let i = 0;
+            for (const [fmt, count] of Object.entries(dist)) {
+                const pct = total > 0 ? (count / total * 100) : 0;
+                html += `
+                    <div class="format-bar">
+                        <span class="fmt-name">${fmt}</span>
+                        <div class="bar-track">
+                            <div class="bar-fill ${colors[i % colors.length]}" style="width:${pct}%"></div>
+                        </div>
+                        <span class="fmt-count">${count}</span>
+                    </div>`;
+                i++;
+            }
+            container.innerHTML = html;
+        }
+
+        // Sample loading (into process tab)
+        async function loadSample(type) {
+            setStatus('<span class="spinner"></span> Loading sample...', '');
+            document.getElementById('status').innerHTML = '<span class="spinner"></span> Loading sample...';
+            try {
+                const resp = await fetch('/api/sample?type=' + type);
+                const data = await resp.json();
+                if (!resp.ok) {
+                    setStatus('Error: ' + (data.error || 'Unknown'), 'error');
+                    return;
+                }
+                textarea.value = data.raw;
+                renderResults(data, 'json');
+                setStatus('Loaded ' + type + ' sample (' + data.count + ' entries).', 'success');
+            } catch (err) {
+                setStatus('Failed to load sample: ' + err.message, 'error');
+            }
+        }
+
+        // Sample tab loading
+        async function loadSampleTab(type) {
+            document.getElementById('sample-empty').style.display = 'none';
+            try {
+                const resp = await fetch('/api/sample?type=' + type);
+                const data = await resp.json();
+                if (!resp.ok) return;
+
+                document.getElementById('sample-raw').textContent = data.raw;
+                document.getElementById('sample-raw-section').style.display = 'block';
+
+                document.getElementById('sample-output').textContent =
+                    JSON.stringify(data.results, null, 2);
+                document.getElementById('sample-count').textContent = data.count + ' entries';
+                document.getElementById('sample-results-section').style.display = 'block';
+
+                if (data.metrics) {
+                    const m = data.metrics;
+                    document.getElementById('sample-metrics-grid').innerHTML = `
+                        <div class="metric-card">
+                            <div class="metric-label">Total Lines</div>
+                            <div class="metric-value">${m.total_lines}</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Success Rate</div>
+                            <div class="metric-value">${m.success_rate_percent.toFixed(1)}%</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Throughput</div>
+                            <div class="metric-value">${Math.round(m.throughput_per_second)}</div>
+                            <div class="metric-detail">lines/sec</div>
+                        </div>`;
+                    document.getElementById('sample-metrics-section').style.display = 'block';
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        // Config loading
+        async function loadConfig() {
+            try {
+                const resp = await fetch('/api/config');
+                const data = await resp.json();
+
+                // Adapters
+                const tbody = document.getElementById('adapter-table');
+                tbody.innerHTML = data.adapters.map(a =>
+                    `<tr><td>${a.name}</td><td>${a.class}</td></tr>`
+                ).join('');
+
+                // Thresholds
+                const ttbody = document.getElementById('threshold-table');
+                ttbody.innerHTML = `
+                    <tr><td>Confidence Threshold</td><td>${data.confidence_threshold}</td></tr>
+                    <tr><td>High Confidence Threshold</td><td>${data.high_confidence_threshold}</td></tr>`;
+
+                // Formats
+                document.getElementById('config-formats').textContent =
+                    data.supported_output_formats.join(', ');
+            } catch (err) {
+                console.error(err);
+            }
+        }
+    </script>
+</body>
+</html>

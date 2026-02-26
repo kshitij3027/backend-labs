@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    command: ["serve", "--host", "0.0.0.0", "--port", "8080"]
     volumes:
       - ./logs:/app/logs
       - ./output:/app/output

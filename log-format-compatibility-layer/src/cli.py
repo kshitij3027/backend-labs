@@ -97,6 +97,18 @@ def detect(input_file):
 
 
 @cli.command()
+@click.option("--host", "-H", default="0.0.0.0", help="Host to bind to")
+@click.option("--port", "-p", default=8080, type=int, help="Port to listen on")
+@click.option("--debug/--no-debug", default=False, help="Enable debug mode")
+def serve(host, port, debug):
+    """Start the web UI server."""
+    from src.web.app import create_app
+    app = create_app()
+    click.echo(f"Starting web UI on {host}:{port}")
+    app.run(host=host, port=port, debug=debug)
+
+
+@cli.command()
 @click.option("--type", "-t", "sample_type", default="mixed",
               type=click.Choice(["syslog", "journald", "json", "mixed"]),
               help="Type of sample data to show")
