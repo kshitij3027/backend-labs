@@ -1,0 +1,5 @@
+<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8
+<13>Feb 15 10:22:33 webserver nginx: GET /index.html 200 1234
+<165>Aug  5 09:00:00 mailhost postfix/smtpd[2345]: connect from unknown[10.0.0.1]
+<86>Mar 22 14:55:00 dbhost mysqld: Warning: Table 'users' is marked as crashed
+<38>Jan  1 00:00:00 router sshd[4567]: Accepted publickey for admin from 192.168.1.100 port 22 ssh2

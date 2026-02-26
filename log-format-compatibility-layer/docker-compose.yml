@@ -1,0 +1,19 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./logs:/app/logs
+      - ./output:/app/output
+    ports:
+      - "8080:8080"
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ./logs:/app/logs
+      - ./tests:/app/tests
+      - ./src:/app/src

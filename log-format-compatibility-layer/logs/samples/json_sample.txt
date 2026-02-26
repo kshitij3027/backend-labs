@@ -1,0 +1,5 @@
+{"timestamp": "2024-01-15T10:30:00Z", "level": "ERROR", "message": "Connection timeout", "hostname": "web-01"}
+{"timestamp": "2024-01-15T10:30:05Z", "level": "INFO", "message": "Request processed successfully", "hostname": "web-01", "request_id": "abc-123"}
+{"timestamp": "2024-01-15T10:30:10Z", "level": "WARNING", "message": "High memory usage detected", "hostname": "web-02", "memory_pct": 85.5}
+{"ts": "2024-01-15T10:30:15.000Z", "severity": "DEBUG", "msg": "Cache hit for key: user:42", "host": "cache-01"}
+{"@timestamp": "2024-01-15T10:30:20Z", "loglevel": "CRITICAL", "message": "Database connection pool exhausted", "hostname": "db-01"}
