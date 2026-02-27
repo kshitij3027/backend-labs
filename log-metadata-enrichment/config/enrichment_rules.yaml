@@ -1,0 +1,13 @@
+rules:
+  - name: critical_errors
+    keywords: ["error", "critical", "fatal", "exception", "traceback"]
+    match_all: false
+    collectors: ["system_info", "environment", "performance"]
+  - name: warnings
+    keywords: ["warning", "warn", "deprecated"]
+    match_all: false
+    collectors: ["system_info", "environment", "performance"]
+  - name: default
+    keywords: []
+    match_all: true
+    collectors: ["system_info", "environment"]
