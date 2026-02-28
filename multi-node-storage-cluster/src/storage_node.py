@@ -12,7 +12,7 @@ from src.config import ClusterConfig
 from src.file_store import FileStore
 
 
-def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=None) -> Flask:
+def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=None, version_manager=None) -> Flask:
     """Create and configure the Flask application for a storage node.
 
     Args:
@@ -21,6 +21,8 @@ def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=
             replication to peer nodes.
         cluster_manager: Optional ClusterManager for health monitoring
             and quorum enforcement.
+        version_manager: Optional VersionManager for file version
+            tracking and background read-repair.
 
     Returns:
         A fully configured Flask app instance.
@@ -28,7 +30,7 @@ def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=
     app = Flask(__name__)
     app.config["CLUSTER_CONFIG"] = config
 
-    file_store = FileStore(config.storage_dir, config.node_id)
+    file_store = FileStore(config.storage_dir, config.node_id, version_manager=version_manager)
     app.config["FILE_STORE"] = file_store
 
     @app.route("/health", methods=["GET"])
@@ -70,6 +72,13 @@ def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=
         record = file_store.read(file_path)
         if record is None:
             return jsonify({"error": "File not found"}), 404
+
+        # Fire read-repair in background
+        if version_manager:
+            version_manager.read_repair(
+                file_path, record, config.cluster_nodes, config.node_id
+            )
+
         return jsonify(record)
 
     @app.route("/files", methods=["GET"])

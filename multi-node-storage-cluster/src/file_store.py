@@ -20,9 +20,10 @@ class FileStore:
     All public methods are thread-safe.
     """
 
-    def __init__(self, storage_dir: str, node_id: str):
+    def __init__(self, storage_dir: str, node_id: str, version_manager=None):
         self.storage_dir = storage_dir
         self.node_id = node_id
+        self.version_manager = version_manager
         os.makedirs(storage_dir, exist_ok=True)
         # Thread-safe counters
         self._lock = threading.Lock()
@@ -45,10 +46,12 @@ class FileStore:
             json.dumps(data, sort_keys=True).encode()
         ).hexdigest()
 
+        version = self.version_manager.next_version(file_path) if self.version_manager else 1
+
         record = {
             "data": data,
             "metadata": {
-                "version": 1,
+                "version": version,
                 "checksum": checksum,
                 "created_at": time.time(),
                 "node_id": self.node_id,
@@ -63,7 +66,7 @@ class FileStore:
         with self._lock:
             self._stats["writes"] += 1
 
-        return {"file_path": file_path, "checksum": checksum, "version": 1}
+        return {"file_path": file_path, "checksum": checksum, "version": version}
 
     def read(self, file_path: str) -> dict | None:
         """Read a stored file by its path.
@@ -109,6 +112,9 @@ class FileStore:
         full_path = os.path.join(self.storage_dir, file_path)
         with open(full_path, "w") as f:
             json.dump(record, f, indent=2)
+
+        if self.version_manager:
+            self.version_manager.set_version(file_path, metadata.get("version", 1))
 
         with self._lock:
             self._stats["replications_received"] += 1
