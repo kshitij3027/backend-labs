@@ -1,0 +1,67 @@
+services:
+  node1:
+    build: .
+    container_name: storage-node1
+    ports:
+      - "5001:5001"
+    environment:
+      NODE_ID: node1
+      HOST: "0.0.0.0"
+      PORT: "5001"
+      STORAGE_DIR: /data
+      CLUSTER_NODES: '[{"id":"node1","host":"node1","port":5001},{"id":"node2","host":"node2","port":5002},{"id":"node3","host":"node3","port":5003}]'
+    volumes:
+      - node1-data:/data
+    networks:
+      - cluster-net
+
+  node2:
+    build: .
+    container_name: storage-node2
+    ports:
+      - "5002:5002"
+    environment:
+      NODE_ID: node2
+      HOST: "0.0.0.0"
+      PORT: "5002"
+      STORAGE_DIR: /data
+      CLUSTER_NODES: '[{"id":"node1","host":"node1","port":5001},{"id":"node2","host":"node2","port":5002},{"id":"node3","host":"node3","port":5003}]'
+    volumes:
+      - node2-data:/data
+    networks:
+      - cluster-net
+
+  node3:
+    build: .
+    container_name: storage-node3
+    ports:
+      - "5003:5003"
+    environment:
+      NODE_ID: node3
+      HOST: "0.0.0.0"
+      PORT: "5003"
+      STORAGE_DIR: /data
+      CLUSTER_NODES: '[{"id":"node1","host":"node1","port":5001},{"id":"node2","host":"node2","port":5002},{"id":"node3","host":"node3","port":5003}]'
+    volumes:
+      - node3-data:/data
+    networks:
+      - cluster-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: storage-test
+    profiles:
+      - test
+    networks:
+      - cluster-net
+
+networks:
+  cluster-net:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
