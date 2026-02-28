@@ -4,17 +4,21 @@ Exposes REST endpoints for health checks, reading/writing log data,
 listing stored files, receiving replicas, and viewing node statistics.
 """
 
+import time
+
 from flask import Flask, jsonify, request
 
 from src.config import ClusterConfig
 from src.file_store import FileStore
 
 
-def create_app(config: ClusterConfig) -> Flask:
+def create_app(config: ClusterConfig, replication_manager=None) -> Flask:
     """Create and configure the Flask application for a storage node.
 
     Args:
         config: The cluster configuration for this node.
+        replication_manager: Optional ReplicationManager for async
+            replication to peer nodes.
 
     Returns:
         A fully configured Flask app instance.
@@ -39,6 +43,17 @@ def create_app(config: ClusterConfig) -> Flask:
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         result = file_store.write(data)
+
+        # Trigger async replication to peer nodes
+        if replication_manager:
+            metadata = {
+                "version": result["version"],
+                "checksum": result["checksum"],
+                "node_id": config.node_id,
+                "created_at": time.time(),
+            }
+            replication_manager.replicate(result["file_path"], data, metadata)
+
         return jsonify(result), 201
 
     @app.route("/read/<path:file_path>", methods=["GET"])
@@ -72,5 +87,11 @@ def create_app(config: ClusterConfig) -> Flask:
             "stats": file_store.get_stats(),
             "files_count": len(file_store.list_files()),
         })
+
+    @app.route("/replication/status", methods=["GET"])
+    def replication_status():
+        if replication_manager:
+            return jsonify(replication_manager.get_stats())
+        return jsonify({"status": "replication not configured"})
 
     return app
