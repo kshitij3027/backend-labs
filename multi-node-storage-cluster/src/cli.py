@@ -10,9 +10,17 @@ def cli():
 
 
 @cli.command()
-def serve():
-    """Start a storage node (to be implemented in Commit 2)."""
-    click.echo("Starting storage node...")
+@click.option("--node-id", envvar="NODE_ID", default=None)
+@click.option("--port", envvar="PORT", type=int, default=5001)
+def serve(node_id, port):
+    """Start a storage node."""
+    from src.config import load_config
+    from src.storage_node import create_app
+
+    config = load_config()
+    app = create_app(config)
+    click.echo(f"Starting storage node {config.node_id} on port {config.port}...")
+    app.run(host=config.host, port=config.port, threaded=True)
 
 
 @cli.command()
