@@ -73,6 +73,21 @@ services:
     networks:
       - cluster-net
 
+  load-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: storage-loadtest
+    profiles:
+      - loadtest
+    command: ["python", "scripts/load_test.py", "--host", "node1", "--port", "5001", "--requests", "100", "--concurrency", "10"]
+    depends_on:
+      - node1
+      - node2
+      - node3
+    networks:
+      - cluster-net
+
 networks:
   cluster-net:
     driver: bridge

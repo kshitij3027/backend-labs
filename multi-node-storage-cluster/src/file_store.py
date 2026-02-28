@@ -121,6 +121,71 @@ class FileStore:
 
         return {"file_path": file_path, "status": "replicated"}
 
+    def rotate(self, max_files: int = 1000, max_age_hours: int = 24) -> dict:
+        """Remove old files to keep storage under limits.
+
+        Args:
+            max_files: Maximum number of files to retain.
+            max_age_hours: Remove files older than this many hours.
+
+        Returns:
+            Dict with rotation stats.
+        """
+        files = self.list_files()
+        removed_count = 0
+        now = time.time()
+        max_age_seconds = max_age_hours * 3600
+
+        # Remove files older than max_age
+        for f in files:
+            full_path = os.path.join(self.storage_dir, f)
+            try:
+                mtime = os.path.getmtime(full_path)
+                if now - mtime > max_age_seconds:
+                    os.remove(full_path)
+                    removed_count += 1
+            except OSError:
+                pass
+
+        # If still over max_files, remove oldest first
+        remaining = self.list_files()
+        if len(remaining) > max_files:
+            # Sort by modification time, oldest first
+            by_mtime = sorted(
+                remaining,
+                key=lambda f: os.path.getmtime(os.path.join(self.storage_dir, f)),
+            )
+            to_remove = by_mtime[: len(remaining) - max_files]
+            for f in to_remove:
+                try:
+                    os.remove(os.path.join(self.storage_dir, f))
+                    removed_count += 1
+                except OSError:
+                    pass
+
+        return {
+            "removed": removed_count,
+            "remaining": len(self.list_files()),
+        }
+
+    def get_storage_stats(self) -> dict:
+        """Return storage statistics."""
+        files = self.list_files()
+        total_size = 0
+        for f in files:
+            full_path = os.path.join(self.storage_dir, f)
+            try:
+                total_size += os.path.getsize(full_path)
+            except OSError:
+                pass
+
+        return {
+            "files_count": len(files),
+            "total_size_bytes": total_size,
+            "total_size_mb": round(total_size / (1024 * 1024), 2),
+            "storage_dir": self.storage_dir,
+        }
+
     def get_stats(self) -> dict:
         """Return a snapshot of the current operation counters."""
         with self._lock:
