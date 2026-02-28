@@ -47,6 +47,22 @@ services:
     networks:
       - cluster-net
 
+  dashboard:
+    build: .
+    container_name: storage-dashboard
+    ports:
+      - "8080:8080"
+    environment:
+      DASHBOARD_PORT: "8080"
+      CLUSTER_NODES: '[{"id":"node1","host":"node1","port":5001},{"id":"node2","host":"node2","port":5002},{"id":"node3","host":"node3","port":5003}]'
+    command: ["dashboard"]
+    depends_on:
+      - node1
+      - node2
+      - node3
+    networks:
+      - cluster-net
+
   test:
     build:
       context: .

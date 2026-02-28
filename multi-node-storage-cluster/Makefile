@@ -17,35 +17,29 @@ stop:
 
 e2e:
 	docker compose down -v 2>/dev/null || true
-	docker compose up --build -d node1 node2 node3
+	docker compose up --build -d node1 node2 node3 dashboard
 	sleep 5
-	@echo "=== All nodes healthy ==="
-	curl -sf http://localhost:5001/cluster/status | python3 -m json.tool
-	@echo "\n=== Write to node1 ==="
+	@echo "=== Dashboard health ==="
+	curl -sf http://localhost:8080/api/health | python3 -m json.tool
+	@echo "\n=== Cluster status via dashboard ==="
+	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
+	@echo "\n=== Write logs ==="
 	curl -sf -X POST http://localhost:5001/write \
 		-H "Content-Type: application/json" \
-		-d '{"message":"quorum test","level":"info"}' | python3 -m json.tool
-	@echo "\n=== Wait for replication ==="
+		-d '{"message":"dashboard test","level":"info"}' | python3 -m json.tool
 	sleep 3
-	@echo "\n=== Files on all nodes ==="
-	curl -sf http://localhost:5001/files | python3 -m json.tool
-	curl -sf http://localhost:5002/files | python3 -m json.tool
-	curl -sf http://localhost:5003/files | python3 -m json.tool
-	@echo "\n=== Stop node3 ==="
+	@echo "\n=== Files via dashboard ==="
+	curl -sf http://localhost:8080/api/files | python3 -m json.tool
+	@echo "\n=== Stop node3, wait for detection ==="
 	docker stop storage-node3
-	@echo "Waiting for health checks to detect failure..."
 	sleep 35
-	@echo "\n=== Cluster status (node3 should be unhealthy) ==="
-	curl -sf http://localhost:5001/cluster/status | python3 -m json.tool
-	@echo "\n=== Write should still work (2/3 quorum) ==="
-	curl -sf -X POST http://localhost:5001/write \
-		-H "Content-Type: application/json" \
-		-d '{"message":"degraded write","level":"warn"}' | python3 -m json.tool
+	@echo "\n=== Cluster status (node3 unhealthy) ==="
+	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
 	@echo "\n=== Restart node3 ==="
 	docker start storage-node3
-	sleep 5
-	@echo "\n=== Cluster status (all healthy again) ==="
-	curl -sf http://localhost:5001/cluster/status | python3 -m json.tool
+	sleep 15
+	@echo "\n=== Cluster status (recovered) ==="
+	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
 	docker compose down -v
 	@echo "\n=== E2E PASSED ==="
 

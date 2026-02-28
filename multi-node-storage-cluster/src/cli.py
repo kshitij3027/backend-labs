@@ -38,6 +38,11 @@ def serve():
 
 
 @cli.command()
-def dashboard():
-    """Start the monitoring dashboard (to be implemented in Commit 7)."""
-    click.echo("Starting dashboard...")
+@click.option("--port", envvar="DASHBOARD_PORT", type=int, default=8080)
+def dashboard(port):
+    """Start the monitoring dashboard."""
+    from src.dashboard import create_dashboard_app
+
+    app = create_dashboard_app()
+    click.echo(f"Starting dashboard on port {port}...")
+    app.run(host="0.0.0.0", port=port, threaded=True)

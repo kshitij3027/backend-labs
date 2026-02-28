@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Storage Cluster Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            padding: 20px;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #333;
+        }
+        h1 { font-size: 24px; color: #fff; }
+        .badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .badge-ok { background: #2d5a27; color: #7aff6e; }
+        .badge-fail { background: #5a2727; color: #ff6e6e; }
+        .nodes-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .node-card {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid #2a2a4a;
+        }
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .node-id { font-size: 18px; font-weight: bold; }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .status-healthy { background: #4caf50; box-shadow: 0 0 8px #4caf50; }
+        .status-unhealthy { background: #f44336; box-shadow: 0 0 8px #f44336; }
+        .node-detail { color: #888; font-size: 13px; margin-bottom: 8px; }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .stat-item {
+            background: #1a1a2e;
+            padding: 8px 12px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value { font-size: 20px; font-weight: bold; color: #64b5f6; }
+        .stat-label { font-size: 11px; color: #888; margin-top: 2px; }
+        .section-title {
+            font-size: 18px;
+            margin-bottom: 12px;
+            color: #fff;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
+            border: 1px solid #2a2a4a;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        th { color: #888; font-size: 12px; text-transform: uppercase; }
+        td { font-size: 13px; }
+        .replica-badge {
+            background: #2a3f5f;
+            color: #64b5f6;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-right: 4px;
+        }
+        .refresh-info {
+            color: #555;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Storage Cluster Dashboard</h1>
+        <div>
+            <span id="quorum-badge" class="badge badge-ok">QUORUM OK</span>
+            <span class="refresh-info" style="margin-left: 12px;">Auto-refresh: 5s</span>
+        </div>
+    </div>
+
+    <div id="nodes-grid" class="nodes-grid"></div>
+
+    <div class="panel">
+        <h2 class="section-title">Replication Overview</h2>
+        <div id="replication-panel" class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));"></div>
+    </div>
+
+    <div class="panel">
+        <h2 class="section-title">Files Across Cluster</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>File Path</th>
+                    <th>Replicas</th>
+                </tr>
+            </thead>
+            <tbody id="files-body"></tbody>
+        </table>
+        <div id="files-count" style="margin-top: 12px; color: #888; font-size: 13px;"></div>
+    </div>
+
+    <script>
+        function updateDashboard() {
+            fetch('/api/cluster')
+                .then(r => r.json())
+                .then(data => {
+                    // Quorum badge
+                    const badge = document.getElementById('quorum-badge');
+                    if (data.quorum) {
+                        badge.textContent = `QUORUM OK (${data.healthy_count}/${data.total_count})`;
+                        badge.className = 'badge badge-ok';
+                    } else {
+                        badge.textContent = `QUORUM LOST (${data.healthy_count}/${data.total_count})`;
+                        badge.className = 'badge badge-fail';
+                    }
+
+                    // Node cards
+                    const grid = document.getElementById('nodes-grid');
+                    grid.innerHTML = data.nodes.map(node => {
+                        const statusClass = node.status === 'healthy' ? 'status-healthy' : 'status-unhealthy';
+                        const stats = node.stats?.stats || {};
+                        const filesCount = node.files?.count || 0;
+                        const repl = node.replication || {};
+
+                        return `
+                            <div class="node-card">
+                                <div class="node-header">
+                                    <span class="node-id">${node.id}</span>
+                                    <span class="status-dot ${statusClass}"></span>
+                                </div>
+                                <div class="node-detail">${node.host}:${node.port} — ${node.status}</div>
+                                <div class="stats-grid">
+                                    <div class="stat-item">
+                                        <div class="stat-value">${stats.writes || 0}</div>
+                                        <div class="stat-label">Writes</div>
+                                    </div>
+                                    <div class="stat-item">
+                                        <div class="stat-value">${stats.reads || 0}</div>
+                                        <div class="stat-label">Reads</div>
+                                    </div>
+                                    <div class="stat-item">
+                                        <div class="stat-value">${filesCount}</div>
+                                        <div class="stat-label">Files</div>
+                                    </div>
+                                    <div class="stat-item">
+                                        <div class="stat-value">${stats.replications_received || 0}</div>
+                                        <div class="stat-label">Replicas Recv</div>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+
+                    // Replication overview
+                    let totalSent = 0, totalFailed = 0, totalPending = 0, totalReplayed = 0;
+                    data.nodes.forEach(n => {
+                        const r = n.replication || {};
+                        totalSent += r.replications_sent || 0;
+                        totalFailed += r.replications_failed || 0;
+                        totalPending += r.hints_pending || 0;
+                        totalReplayed += r.hints_replayed || 0;
+                    });
+
+                    document.getElementById('replication-panel').innerHTML = `
+                        <div class="stat-item"><div class="stat-value">${totalSent}</div><div class="stat-label">Sent</div></div>
+                        <div class="stat-item"><div class="stat-value">${totalFailed}</div><div class="stat-label">Failed</div></div>
+                        <div class="stat-item"><div class="stat-value">${totalPending}</div><div class="stat-label">Pending Hints</div></div>
+                        <div class="stat-item"><div class="stat-value">${totalReplayed}</div><div class="stat-label">Hints Replayed</div></div>
+                    `;
+                })
+                .catch(err => console.error('Dashboard poll failed:', err));
+
+            fetch('/api/files')
+                .then(r => r.json())
+                .then(data => {
+                    const tbody = document.getElementById('files-body');
+                    tbody.innerHTML = data.files.map(f => `
+                        <tr>
+                            <td>${f.path}</td>
+                            <td>${f.replicas.map(r => `<span class="replica-badge">${r}</span>`).join('')}</td>
+                        </tr>
+                    `).join('');
+                    document.getElementById('files-count').textContent = `Total unique files: ${data.total}`;
+                })
+                .catch(err => console.error('Files poll failed:', err));
+        }
+
+        // Initial load + 5s refresh
+        updateDashboard();
+        setInterval(updateDashboard, 5000);
+    </script>
+</body>
+</html>
