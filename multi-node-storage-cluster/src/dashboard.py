@@ -4,7 +4,7 @@ import json
 import os
 
 import requests
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 
 def create_dashboard_app(cluster_nodes=None) -> Flask:
@@ -127,5 +127,21 @@ def create_dashboard_app(cluster_nodes=None) -> Flask:
     @app.route("/api/health")
     def api_health():
         return jsonify({"status": "dashboard running"})
+
+    @app.route("/api/write", methods=["POST"])
+    def api_write():
+        """Write log data to the cluster via ClusterClient."""
+        from src.cluster_client import ClusterClient, ClusterUnavailableError
+
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        client = ClusterClient(cluster_nodes=cluster_nodes)
+        try:
+            result = client.write(data)
+            return jsonify(result), 201
+        except ClusterUnavailableError as e:
+            return jsonify({"error": str(e)}), 503
 
     return app

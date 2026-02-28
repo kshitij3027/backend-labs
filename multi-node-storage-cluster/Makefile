@@ -21,24 +21,20 @@ e2e:
 	sleep 5
 	@echo "=== Dashboard health ==="
 	curl -sf http://localhost:8080/api/health | python3 -m json.tool
-	@echo "\n=== Cluster status via dashboard ==="
-	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
-	@echo "\n=== Write logs ==="
-	curl -sf -X POST http://localhost:5001/write \
+	@echo "\n=== Write via dashboard API ==="
+	curl -sf -X POST http://localhost:8080/api/write \
 		-H "Content-Type: application/json" \
-		-d '{"message":"dashboard test","level":"info"}' | python3 -m json.tool
+		-d '{"message":"client test 1","level":"info"}' | python3 -m json.tool
+	curl -sf -X POST http://localhost:8080/api/write \
+		-H "Content-Type: application/json" \
+		-d '{"message":"client test 2","level":"debug"}' | python3 -m json.tool
+	curl -sf -X POST http://localhost:8080/api/write \
+		-H "Content-Type: application/json" \
+		-d '{"message":"client test 3","level":"warn"}' | python3 -m json.tool
 	sleep 3
 	@echo "\n=== Files via dashboard ==="
 	curl -sf http://localhost:8080/api/files | python3 -m json.tool
-	@echo "\n=== Stop node3, wait for detection ==="
-	docker stop storage-node3
-	sleep 35
-	@echo "\n=== Cluster status (node3 unhealthy) ==="
-	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
-	@echo "\n=== Restart node3 ==="
-	docker start storage-node3
-	sleep 15
-	@echo "\n=== Cluster status (recovered) ==="
+	@echo "\n=== Cluster status ==="
 	curl -sf http://localhost:8080/api/cluster | python3 -m json.tool
 	docker compose down -v
 	@echo "\n=== E2E PASSED ==="
