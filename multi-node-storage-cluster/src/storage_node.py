@@ -12,13 +12,15 @@ from src.config import ClusterConfig
 from src.file_store import FileStore
 
 
-def create_app(config: ClusterConfig, replication_manager=None) -> Flask:
+def create_app(config: ClusterConfig, replication_manager=None, cluster_manager=None) -> Flask:
     """Create and configure the Flask application for a storage node.
 
     Args:
         config: The cluster configuration for this node.
         replication_manager: Optional ReplicationManager for async
             replication to peer nodes.
+        cluster_manager: Optional ClusterManager for health monitoring
+            and quorum enforcement.
 
     Returns:
         A fully configured Flask app instance.
@@ -39,6 +41,13 @@ def create_app(config: ClusterConfig, replication_manager=None) -> Flask:
 
     @app.route("/write", methods=["POST"])
     def write():
+        # Quorum gate
+        if cluster_manager and not cluster_manager.has_quorum():
+            return jsonify({
+                "error": "No quorum — not enough healthy nodes",
+                "healthy_nodes": cluster_manager.get_healthy_nodes(),
+            }), 503
+
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
@@ -93,5 +102,20 @@ def create_app(config: ClusterConfig, replication_manager=None) -> Flask:
         if replication_manager:
             return jsonify(replication_manager.get_stats())
         return jsonify({"status": "replication not configured"})
+
+    @app.route("/cluster/status", methods=["GET"])
+    def cluster_status():
+        if cluster_manager:
+            return jsonify(cluster_manager.get_cluster_status())
+        return jsonify({"status": "cluster manager not configured"})
+
+    @app.route("/cluster/nodes", methods=["GET"])
+    def cluster_nodes():
+        if cluster_manager:
+            return jsonify({
+                "healthy": cluster_manager.get_healthy_nodes(),
+                "quorum": cluster_manager.has_quorum(),
+            })
+        return jsonify({"status": "cluster manager not configured"})
 
     return app

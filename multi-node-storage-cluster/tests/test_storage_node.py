@@ -1,5 +1,7 @@
 """Tests for the Flask storage node REST API."""
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.config import ClusterConfig
@@ -116,3 +118,90 @@ class TestStatsEndpoint:
         assert body["node_id"] == "test-node"
         assert body["stats"]["writes"] == 1
         assert body["files_count"] == 1
+
+
+class TestQuorumEnforcement:
+    """Verify quorum gating on write endpoint."""
+
+    @pytest.fixture
+    def no_quorum_client(self, tmp_path):
+        """Provide a test client where the cluster manager reports no quorum."""
+        config = ClusterConfig(
+            node_id="test-node",
+            port=5099,
+            storage_dir=str(tmp_path / "data"),
+        )
+        mock_cm = MagicMock()
+        mock_cm.has_quorum.return_value = False
+        mock_cm.get_healthy_nodes.return_value = ["test-node"]
+
+        app = create_app(config, cluster_manager=mock_cm)
+        app.config["TESTING"] = True
+        with app.test_client() as client:
+            yield client
+
+    @pytest.fixture
+    def quorum_client(self, tmp_path):
+        """Provide a test client where the cluster manager reports quorum."""
+        config = ClusterConfig(
+            node_id="test-node",
+            port=5099,
+            storage_dir=str(tmp_path / "data"),
+        )
+        mock_cm = MagicMock()
+        mock_cm.has_quorum.return_value = True
+        mock_cm.get_healthy_nodes.return_value = ["test-node", "node2"]
+        mock_cm.get_cluster_status.return_value = {
+            "quorum": True,
+            "healthy_nodes": 2,
+            "total_nodes": 3,
+            "nodes": {},
+        }
+
+        app = create_app(config, cluster_manager=mock_cm)
+        app.config["TESTING"] = True
+        with app.test_client() as client:
+            yield client
+
+    def test_write_returns_503_when_no_quorum(self, no_quorum_client):
+        resp = no_quorum_client.post("/write", json={"msg": "test"})
+
+        assert resp.status_code == 503
+        body = resp.get_json()
+        assert "quorum" in body["error"].lower() or "No quorum" in body["error"]
+        assert "healthy_nodes" in body
+
+    def test_write_succeeds_with_quorum(self, quorum_client):
+        resp = quorum_client.post("/write", json={"msg": "test"})
+
+        assert resp.status_code == 201
+
+    def test_cluster_status_endpoint(self, quorum_client):
+        resp = quorum_client.get("/cluster/status")
+
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert body["quorum"] is True
+        assert body["healthy_nodes"] == 2
+
+    def test_cluster_nodes_endpoint(self, quorum_client):
+        resp = quorum_client.get("/cluster/nodes")
+
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert "healthy" in body
+        assert body["quorum"] is True
+
+    def test_cluster_status_without_manager(self, app_client):
+        resp = app_client.get("/cluster/status")
+
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert "status" in body
+
+    def test_cluster_nodes_without_manager(self, app_client):
+        resp = app_client.get("/cluster/nodes")
+
+        assert resp.status_code == 200
+        body = resp.get_json()
+        assert "status" in body
