@@ -1,3 +1,496 @@
 <!DOCTYPE html>
-<html><head><title>Smart Log Partitioning Dashboard</title></head>
-<body><h1>Dashboard</h1><p>Coming soon...</p></body></html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Log Partitioning Dashboard</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 24px;
+    }
+
+    .mono {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    }
+
+    /* Header */
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+    }
+
+    .header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      color: #ffffff;
+      letter-spacing: -0.02em;
+    }
+
+    .strategy-badge {
+      display: inline-flex;
+      align-items: center;
+      background: #0f3460;
+      color: #e94560;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 20px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .disconnected-badge {
+      display: none;
+      align-items: center;
+      background: #5c1a1a;
+      color: #ff6b6b;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 20px;
+      margin-left: auto;
+    }
+
+    .disconnected-badge.visible {
+      display: inline-flex;
+    }
+
+    /* Summary Cards */
+    .summary-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+
+    .card {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 20px 24px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 28px rgba(0, 0, 0, 0.35);
+    }
+
+    .card-label {
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8892a4;
+      margin-bottom: 8px;
+    }
+
+    .card-value {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 1.9rem;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .card-value.small {
+      font-size: 1.4rem;
+    }
+
+    .variance-green { color: #2ecc71; }
+    .variance-yellow { color: #f1c40f; }
+    .variance-red { color: #e94560; }
+
+    /* Sections */
+    .section {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+    }
+
+    .section-title {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #ffffff;
+      margin-bottom: 20px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    /* Partition Bar Chart */
+    .partition-bars {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .partition-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .partition-label {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 0.85rem;
+      color: #8892a4;
+      min-width: 90px;
+      flex-shrink: 0;
+    }
+
+    .partition-bar-track {
+      flex: 1;
+      background: rgba(255, 255, 255, 0.04);
+      border-radius: 6px;
+      height: 32px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .partition-bar-fill {
+      height: 100%;
+      border-radius: 6px;
+      background: linear-gradient(90deg, #0f3460, #1a5276);
+      transition: width 0.6s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+      display: flex;
+      align-items: center;
+      padding-left: 12px;
+      min-width: 60px;
+    }
+
+    .partition-bar-fill.hotspot {
+      background: linear-gradient(90deg, #e94560, #c0392b);
+    }
+
+    .partition-bar-count {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 0.8rem;
+      color: #ffffff;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    /* Query Efficiency */
+    .query-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+    }
+
+    .query-card {
+      background: rgba(15, 52, 96, 0.35);
+      border-radius: 10px;
+      padding: 16px 20px;
+      border: 1px solid rgba(15, 52, 96, 0.5);
+    }
+
+    .query-card-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: #8892a4;
+      margin-bottom: 6px;
+    }
+
+    .query-card-value {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+      font-size: 1.4rem;
+      font-weight: 700;
+      color: #ffffff;
+    }
+
+    .no-queries {
+      color: #8892a4;
+      font-style: italic;
+      font-size: 0.95rem;
+      padding: 8px 0;
+    }
+
+    /* Footer */
+    .footer {
+      margin-top: auto;
+      padding-top: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      color: #5a6478;
+      font-size: 0.82rem;
+    }
+
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #2ecc71;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    .pulse-dot.error {
+      background: #e94560;
+      animation: none;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+
+    /* Responsive */
+    @media (max-width: 640px) {
+      body { padding: 16px; }
+      .header h1 { font-size: 1.2rem; }
+      .card-value { font-size: 1.5rem; }
+      .partition-label { min-width: 70px; font-size: 0.75rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <div class="header">
+    <h1>Smart Log Partitioning System</h1>
+    <span class="strategy-badge" id="strategy-badge">--</span>
+    <span class="disconnected-badge" id="disconnected-badge">Disconnected</span>
+  </div>
+
+  <!-- Summary Cards -->
+  <div class="summary-cards">
+    <div class="card">
+      <div class="card-label">Total Logs</div>
+      <div class="card-value mono" id="total-logs">--</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Partitions</div>
+      <div class="card-value mono" id="num-partitions">--</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Variance</div>
+      <div class="card-value mono" id="variance">--</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Strategy</div>
+      <div class="card-value small" id="strategy-value">--</div>
+    </div>
+  </div>
+
+  <!-- Partition Distribution -->
+  <div class="section">
+    <div class="section-title">Partition Distribution</div>
+    <div class="partition-bars" id="partition-bars">
+      <div class="no-queries">Loading...</div>
+    </div>
+  </div>
+
+  <!-- Query Efficiency -->
+  <div class="section">
+    <div class="section-title">Query Efficiency</div>
+    <div id="query-content">
+      <div class="no-queries">Loading...</div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="pulse-dot" id="pulse-dot"></span>
+    <span id="footer-text">Auto-refreshing every 3s</span>
+  </div>
+
+  <script>
+    function formatNumber(n) {
+      if (n == null) return '--';
+      return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    }
+
+    function getVarianceClass(pct) {
+      if (pct < 20) return 'variance-green';
+      if (pct < 40) return 'variance-yellow';
+      return 'variance-red';
+    }
+
+    function renderPartitionBars(partitions, hotspots) {
+      var container = document.getElementById('partition-bars');
+      var entries = Object.entries(partitions);
+      if (entries.length === 0) {
+        container.innerHTML = '<div class="no-queries">No partitions</div>';
+        return;
+      }
+
+      var maxCount = Math.max.apply(null, entries.map(function(e) { return e[1]; }));
+      if (maxCount === 0) maxCount = 1;
+
+      var hotspotSet = {};
+      if (hotspots && hotspots.length) {
+        for (var h = 0; h < hotspots.length; h++) {
+          hotspotSet[String(hotspots[h])] = true;
+        }
+      }
+
+      // Sort by partition ID
+      entries.sort(function(a, b) {
+        return parseInt(a[0]) - parseInt(b[0]);
+      });
+
+      // Build or update rows
+      var existingRows = container.querySelectorAll('.partition-row');
+      var existingMap = {};
+      for (var r = 0; r < existingRows.length; r++) {
+        var key = existingRows[r].getAttribute('data-pid');
+        existingMap[key] = existingRows[r];
+      }
+
+      // Remove rows that no longer exist
+      var newKeys = {};
+      for (var i = 0; i < entries.length; i++) {
+        newKeys[entries[i][0]] = true;
+      }
+      for (var r = 0; r < existingRows.length; r++) {
+        var k = existingRows[r].getAttribute('data-pid');
+        if (!newKeys[k]) {
+          container.removeChild(existingRows[r]);
+        }
+      }
+
+      for (var i = 0; i < entries.length; i++) {
+        var pid = entries[i][0];
+        var count = entries[i][1];
+        var widthPct = (count / maxCount) * 100;
+        var isHotspot = hotspotSet[pid] === true;
+
+        var row = existingMap[pid];
+        if (row) {
+          // Update existing row
+          var fill = row.querySelector('.partition-bar-fill');
+          fill.style.width = widthPct + '%';
+          fill.className = 'partition-bar-fill' + (isHotspot ? ' hotspot' : '');
+          row.querySelector('.partition-bar-count').textContent = formatNumber(count);
+        } else {
+          // Create new row
+          row = document.createElement('div');
+          row.className = 'partition-row';
+          row.setAttribute('data-pid', pid);
+
+          row.innerHTML =
+            '<div class="partition-label">Partition ' + pid + '</div>' +
+            '<div class="partition-bar-track">' +
+              '<div class="partition-bar-fill' + (isHotspot ? ' hotspot' : '') + '" style="width: ' + widthPct + '%">' +
+                '<span class="partition-bar-count">' + formatNumber(count) + '</span>' +
+              '</div>' +
+            '</div>';
+
+          container.appendChild(row);
+        }
+      }
+    }
+
+    function renderQueryEfficiency(qe) {
+      var container = document.getElementById('query-content');
+
+      if (!qe || qe.total_queries === 0) {
+        container.innerHTML = '<div class="no-queries">No queries yet</div>';
+        return;
+      }
+
+      // Only rebuild structure once, then update values
+      var grid = container.querySelector('.query-grid');
+      if (!grid) {
+        container.innerHTML =
+          '<div class="query-grid">' +
+            '<div class="query-card">' +
+              '<div class="query-card-label">Total Queries</div>' +
+              '<div class="query-card-value mono" id="qe-total">--</div>' +
+            '</div>' +
+            '<div class="query-card">' +
+              '<div class="query-card-label">Avg Improvement Factor</div>' +
+              '<div class="query-card-value mono" id="qe-improvement">--</div>' +
+            '</div>' +
+            '<div class="query-card">' +
+              '<div class="query-card-label">Avg Partitions Scanned</div>' +
+              '<div class="query-card-value mono" id="qe-scanned">--</div>' +
+            '</div>' +
+            '<div class="query-card">' +
+              '<div class="query-card-label">Partitions Pruned</div>' +
+              '<div class="query-card-value mono" id="qe-pruned">--</div>' +
+            '</div>' +
+          '</div>';
+      }
+
+      document.getElementById('qe-total').textContent = formatNumber(qe.total_queries);
+      document.getElementById('qe-improvement').textContent = qe.avg_improvement_factor.toFixed(1) + 'x';
+      document.getElementById('qe-scanned').textContent = qe.avg_partitions_scanned_pct.toFixed(1) + '%';
+      document.getElementById('qe-pruned').textContent = formatNumber(qe.total_partitions_pruned);
+    }
+
+    function setDisconnected(isDisconnected) {
+      var badge = document.getElementById('disconnected-badge');
+      var dot = document.getElementById('pulse-dot');
+      var footerText = document.getElementById('footer-text');
+
+      if (isDisconnected) {
+        badge.classList.add('visible');
+        dot.classList.add('error');
+        footerText.textContent = 'Connection lost - retrying...';
+      } else {
+        badge.classList.remove('visible');
+        dot.classList.remove('error');
+        footerText.textContent = 'Auto-refreshing every 3s';
+      }
+    }
+
+    function updateDashboard(data) {
+      // Strategy badge and card
+      document.getElementById('strategy-badge').textContent = data.strategy;
+      document.getElementById('strategy-value').textContent = data.strategy;
+
+      // Summary cards
+      document.getElementById('total-logs').textContent = formatNumber(data.partitions.total_entries);
+      document.getElementById('num-partitions').textContent = formatNumber(data.partitions.num_partitions);
+
+      var varianceEl = document.getElementById('variance');
+      varianceEl.textContent = data.partitions.variance_pct.toFixed(2) + '%';
+      varianceEl.className = 'card-value mono ' + getVarianceClass(data.partitions.variance_pct);
+
+      // Partition bars
+      renderPartitionBars(data.partitions.partitions, data.partitions.hotspots);
+
+      // Query efficiency
+      renderQueryEfficiency(data.query_efficiency);
+    }
+
+    function pollStats() {
+      fetch('/api/stats')
+        .then(function(res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function(data) {
+          setDisconnected(false);
+          updateDashboard(data);
+        })
+        .catch(function() {
+          setDisconnected(true);
+        });
+    }
+
+    // Initial poll, then every 3 seconds
+    pollStats();
+    setInterval(pollStats, 3000);
+  </script>
+
+</body>
+</html>

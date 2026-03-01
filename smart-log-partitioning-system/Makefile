@@ -1,6 +1,6 @@
 .PHONY: build test run stop e2e clean logs
 
-HOST_PORT ?= 5000
+HOST_PORT ?= 5050
 
 build:
 	docker compose build
