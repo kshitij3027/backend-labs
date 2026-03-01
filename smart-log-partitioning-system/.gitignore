@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+plan.md
+*.log
+data/
+partitions/
+project_requirements.md
