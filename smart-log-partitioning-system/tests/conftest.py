@@ -3,6 +3,7 @@
 import pytest
 
 from src.config import PartitionConfig
+from src.manager import PartitionManager
 from src.router import PartitionRouter
 
 
@@ -34,3 +35,9 @@ def time_router(time_config):
 @pytest.fixture
 def hybrid_router(hybrid_config):
     return PartitionRouter(hybrid_config)
+
+
+@pytest.fixture
+def source_manager(tmp_path, source_config):
+    config = PartitionConfig(strategy="source", num_nodes=3, data_dir=str(tmp_path))
+    return PartitionManager(config)
