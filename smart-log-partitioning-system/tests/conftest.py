@@ -4,6 +4,7 @@ import pytest
 
 from src.config import PartitionConfig
 from src.manager import PartitionManager
+from src.optimizer import QueryOptimizer
 from src.router import PartitionRouter
 
 
@@ -41,3 +42,8 @@ def hybrid_router(hybrid_config):
 def source_manager(tmp_path, source_config):
     config = PartitionConfig(strategy="source", num_nodes=3, data_dir=str(tmp_path))
     return PartitionManager(config)
+
+
+@pytest.fixture
+def source_optimizer(source_router, source_manager):
+    return QueryOptimizer(source_router, source_manager)
