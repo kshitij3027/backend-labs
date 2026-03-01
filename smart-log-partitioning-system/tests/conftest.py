@@ -2,6 +2,7 @@
 
 import pytest
 
+from src.app import create_app
 from src.config import PartitionConfig
 from src.manager import PartitionManager
 from src.optimizer import QueryOptimizer
@@ -47,3 +48,16 @@ def source_manager(tmp_path, source_config):
 @pytest.fixture
 def source_optimizer(source_router, source_manager):
     return QueryOptimizer(source_router, source_manager)
+
+
+@pytest.fixture
+def app(tmp_path):
+    config = PartitionConfig(strategy="source", num_nodes=3, data_dir=str(tmp_path))
+    app = create_app(config)
+    app.config["TESTING"] = True
+    return app
+
+
+@pytest.fixture
+def client(app):
+    return app.test_client()
