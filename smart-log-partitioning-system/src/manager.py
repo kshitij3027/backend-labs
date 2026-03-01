@@ -1,10 +1,46 @@
 """Partition manager for storing and querying log entries across partitions."""
 
+import hashlib
 import json
 import os
 from collections import defaultdict
 
 from src.config import PartitionConfig
+
+
+class BloomFilter:
+    """Space-efficient probabilistic set membership test.
+
+    Uses multiple hash functions (MD5-based) for low false-positive rates.
+    No false negatives guaranteed.
+    """
+
+    def __init__(self, size: int = 1000, num_hashes: int = 3):
+        self.size = size
+        self.num_hashes = num_hashes
+        self.bit_array = [False] * size
+
+    def _hashes(self, item: str) -> list[int]:
+        """Generate multiple hash positions for an item."""
+        positions = []
+        for i in range(self.num_hashes):
+            h = hashlib.md5(f"{item}_{i}".encode()).hexdigest()
+            positions.append(int(h, 16) % self.size)
+        return positions
+
+    def add(self, item: str) -> None:
+        """Add an item to the bloom filter."""
+        for pos in self._hashes(item):
+            self.bit_array[pos] = True
+
+    def might_contain(self, item: str) -> bool:
+        """Check if an item might be in the set. No false negatives."""
+        return all(self.bit_array[pos] for pos in self._hashes(item))
+
+    @property
+    def fill_ratio(self) -> float:
+        """Fraction of bits set to True."""
+        return sum(self.bit_array) / self.size
 
 
 class PartitionManager:
@@ -13,11 +49,13 @@ class PartitionManager:
     def __init__(self, config: PartitionConfig):
         self.config = config
         self.partitions = defaultdict(list)  # partition_id -> [entries]
+        self.bloom_filters = defaultdict(lambda: BloomFilter())  # partition_id -> BloomFilter
         os.makedirs(config.data_dir, exist_ok=True)
 
     def store(self, partition_id: str, entry: dict) -> None:
         """Store a log entry in the specified partition (memory + JSONL file)."""
         self.partitions[partition_id].append(entry)
+        self.bloom_filters[partition_id].add(entry.get("source", ""))
         self._append_to_file(partition_id, entry)
 
     def _append_to_file(self, partition_id: str, entry: dict) -> None:
@@ -43,6 +81,22 @@ class PartitionManager:
                     results.append(entry)
 
         return results
+
+    def query_with_bloom(self, partition_ids: list[str], filters: dict | None = None) -> list[dict]:
+        """Query with bloom filter pre-filtering for source-based queries."""
+        filters = filters or {}
+        source = filters.get("source")
+
+        if source:
+            # Use bloom filters to skip partitions that definitely don't have this source
+            filtered_pids = [
+                pid for pid in partition_ids
+                if pid in self.bloom_filters and self.bloom_filters[pid].might_contain(source)
+            ]
+        else:
+            filtered_pids = partition_ids
+
+        return self.query(filtered_pids, filters)
 
     def _matches_filters(self, entry: dict, filters: dict) -> bool:
         """Check if an entry matches all provided filters."""
@@ -71,6 +125,7 @@ class PartitionManager:
                 "partitions": {},
                 "variance_pct": 0.0,
                 "hotspots": [],
+                "bloom_filters": {},
             }
 
         avg = total / num_partitions
@@ -92,6 +147,10 @@ class PartitionManager:
             "partitions": counts,
             "variance_pct": round(variance_pct, 2),
             "hotspots": hotspots,
+            "bloom_filters": {
+                pid: {"fill_ratio": round(bf.fill_ratio, 4)}
+                for pid, bf in self.bloom_filters.items()
+            },
         }
 
     def get_all_partition_ids(self) -> list[str]:
@@ -101,6 +160,7 @@ class PartitionManager:
     def load_from_disk(self) -> None:
         """Load all partition data from JSONL files on disk."""
         self.partitions.clear()
+        self.bloom_filters.clear()
         if not os.path.exists(self.config.data_dir):
             return
 
@@ -115,9 +175,15 @@ class PartitionManager:
                         if line:
                             self.partitions[pid].append(json.loads(line))
 
+        # Rebuild bloom filters from loaded data
+        for pid, entries in self.partitions.items():
+            for entry in entries:
+                self.bloom_filters[pid].add(entry.get("source", ""))
+
     def clear(self) -> None:
         """Clear all in-memory data and remove JSONL files."""
         self.partitions.clear()
+        self.bloom_filters.clear()
         if os.path.exists(self.config.data_dir):
             for filename in os.listdir(self.config.data_dir):
                 if filename.endswith(".jsonl"):
