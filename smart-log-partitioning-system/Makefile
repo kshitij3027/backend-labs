@@ -1,4 +1,4 @@
-.PHONY: build test run stop e2e clean logs
+.PHONY: build test run stop e2e demo clean logs
 
 HOST_PORT ?= 5050
 
@@ -40,6 +40,9 @@ e2e: build
 	@echo ""
 	@echo "=== E2E Tests Complete ==="
 	docker compose down
+
+demo: build
+	docker compose run --rm app python -m src demo --count 1000 --nodes 3 --strategy source
 
 clean:
 	docker compose down -v --rmi local
