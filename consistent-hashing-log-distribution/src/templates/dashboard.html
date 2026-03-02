@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Consistent Hashing Log Distribution</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 28px;
+        }
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+        .cluster-badge {
+            background: #e94560;
+            color: #fff;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+
+        /* Summary Cards */
+        .cards-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px 24px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        }
+        .card-label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #8892b0;
+            margin-bottom: 8px;
+        }
+        .card-value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #e94560;
+        }
+
+        /* Sections */
+        .section {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+        }
+        .section h2 {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 16px;
+        }
+
+        /* Ring Visualization */
+        .ring-container {
+            display: flex;
+            align-items: center;
+            gap: 32px;
+        }
+        .ring-svg {
+            flex-shrink: 0;
+        }
+        .ring-legend {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.9rem;
+        }
+        .legend-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            flex-shrink: 0;
+        }
+        .legend-label {
+            color: #c0c0c0;
+        }
+        .legend-stats {
+            color: #8892b0;
+            font-size: 0.8rem;
+            margin-left: auto;
+        }
+
+        /* Bar Chart */
+        .bar-chart {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        .bar-row {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .bar-label {
+            width: 100px;
+            font-size: 0.85rem;
+            color: #c0c0c0;
+            text-align: right;
+            flex-shrink: 0;
+        }
+        .bar-track {
+            flex: 1;
+            height: 28px;
+            background: #0f3460;
+            border-radius: 6px;
+            overflow: hidden;
+            position: relative;
+        }
+        .bar-fill {
+            height: 100%;
+            border-radius: 6px;
+            transition: width 0.5s ease;
+            min-width: 2px;
+        }
+        .bar-text {
+            position: absolute;
+            right: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 0.75rem;
+            color: #e0e0e0;
+            font-weight: 500;
+        }
+
+        /* Node Management */
+        .controls-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .control-group {
+            flex: 1;
+        }
+        .control-group label {
+            display: block;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #8892b0;
+            margin-bottom: 8px;
+        }
+        .input-row {
+            display: flex;
+            gap: 8px;
+        }
+        input[type="text"],
+        input[type="number"] {
+            background: #0f3460;
+            border: 1px solid #233554;
+            border-radius: 8px;
+            color: #e0e0e0;
+            padding: 10px 14px;
+            font-size: 0.9rem;
+            outline: none;
+            flex: 1;
+        }
+        input[type="text"]:focus,
+        input[type="number"]:focus {
+            border-color: #e94560;
+        }
+        button {
+            background: #e94560;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            white-space: nowrap;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #d63851;
+        }
+        button.btn-danger {
+            background: #c0392b;
+        }
+        button.btn-danger:hover {
+            background: #a93226;
+        }
+        button.btn-secondary {
+            background: #0f3460;
+            border: 1px solid #233554;
+        }
+        button.btn-secondary:hover {
+            background: #162d50;
+        }
+
+        /* Node list */
+        .node-list {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 12px;
+        }
+        .node-chip {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: #0f3460;
+            border-radius: 8px;
+            padding: 8px 14px;
+            font-size: 0.85rem;
+        }
+        .node-chip .remove-btn {
+            background: none;
+            border: none;
+            color: #e94560;
+            cursor: pointer;
+            font-size: 1rem;
+            padding: 0 2px;
+            line-height: 1;
+        }
+        .node-chip .remove-btn:hover {
+            color: #ff6b81;
+        }
+
+        /* Footer */
+        footer {
+            text-align: center;
+            padding: 20px 0;
+            color: #8892b0;
+            font-size: 0.8rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        .pulse-dot {
+            width: 8px;
+            height: 8px;
+            background: #2ecc71;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        /* Status messages */
+        .status-msg {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #16213e;
+            border: 1px solid #233554;
+            border-radius: 8px;
+            padding: 12px 20px;
+            font-size: 0.85rem;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            z-index: 1000;
+            transition: opacity 0.3s;
+        }
+        .status-msg.success { border-color: #2ecc71; color: #2ecc71; }
+        .status-msg.error { border-color: #e94560; color: #e94560; }
+
+        @media (max-width: 768px) {
+            .cards-row { grid-template-columns: repeat(2, 1fr); }
+            .ring-container { flex-direction: column; }
+            .controls-row { flex-direction: column; }
+            .bar-label { width: 70px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Consistent Hashing Log Distribution</h1>
+            <span class="cluster-badge" id="cluster-name">Loading...</span>
+        </header>
+
+        <!-- Summary Cards -->
+        <div class="cards-row">
+            <div class="card">
+                <div class="card-label">Total Logs</div>
+                <div class="card-value" id="total-logs">0</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Active Nodes</div>
+                <div class="card-value" id="active-nodes">0</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Total VNodes</div>
+                <div class="card-value" id="total-vnodes">0</div>
+            </div>
+            <div class="card">
+                <div class="card-label">Load Variance</div>
+                <div class="card-value" id="load-variance">0%</div>
+            </div>
+        </div>
+
+        <!-- Hash Ring Visualization -->
+        <div class="section">
+            <h2>Hash Ring</h2>
+            <div class="ring-container">
+                <svg class="ring-svg" width="300" height="300" viewBox="0 0 300 300">
+                    <!-- Ring background -->
+                    <circle cx="150" cy="150" r="120" fill="none" stroke="#233554" stroke-width="2"/>
+                    <!-- VNode dots rendered here -->
+                    <g id="ring-vnodes"></g>
+                </svg>
+                <div class="ring-legend" id="ring-legend"></div>
+            </div>
+        </div>
+
+        <!-- Log Distribution Bar Chart -->
+        <div class="section">
+            <h2>Log Distribution</h2>
+            <div class="bar-chart" id="bar-chart"></div>
+        </div>
+
+        <!-- Controls -->
+        <div class="section">
+            <h2>Cluster Management</h2>
+            <div class="controls-row">
+                <div class="control-group">
+                    <label>Add Node</label>
+                    <div class="input-row">
+                        <input type="text" id="new-node-id" placeholder="e.g. node4">
+                        <button onclick="addNode()">Add Node</button>
+                    </div>
+                </div>
+                <div class="control-group">
+                    <label>Simulate Logs</label>
+                    <div class="input-row">
+                        <input type="number" id="sim-count" placeholder="Count" value="1000" min="1" max="100000">
+                        <button class="btn-secondary" onclick="simulateLogs()">Simulate</button>
+                    </div>
+                </div>
+            </div>
+            <label style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:#8892b0; display:block; margin-bottom:8px;">Active Nodes</label>
+            <div class="node-list" id="node-list"></div>
+        </div>
+
+        <footer>
+            <div class="pulse-dot"></div>
+            Auto-refreshing every 3 seconds
+        </footer>
+    </div>
+
+    <script>
+        let nodeColors = {};
+
+        function showStatus(message, type) {
+            var el = document.createElement("div");
+            el.className = "status-msg " + type;
+            el.textContent = message;
+            document.body.appendChild(el);
+            setTimeout(function() {
+                el.style.opacity = "0";
+                setTimeout(function() { el.remove(); }, 300);
+            }, 2000);
+        }
+
+        function formatNumber(n) {
+            if (n >= 1000000) return (n / 1000000).toFixed(1) + "M";
+            if (n >= 1000) return (n / 1000).toFixed(1) + "K";
+            return String(n);
+        }
+
+        function fetchStats() {
+            fetch("/api/stats")
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById("total-logs").textContent = formatNumber(data.total_logs);
+                    document.getElementById("active-nodes").textContent = data.node_count;
+                    document.getElementById("load-variance").textContent = data.balance_variance.toFixed(1) + "%";
+
+                    if (data.ring_metrics) {
+                        document.getElementById("total-vnodes").textContent = data.ring_metrics.total_vnodes;
+                    }
+
+                    renderBarChart(data.nodes);
+                    renderNodeList(Object.keys(data.nodes));
+                })
+                .catch(function(err) { console.error("Stats fetch error:", err); });
+        }
+
+        function fetchRing() {
+            fetch("/api/ring")
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    nodeColors = data.node_colors || {};
+                    renderRing(data.vnodes);
+                    renderLegend(data.ring_metrics, data.node_colors);
+                })
+                .catch(function(err) { console.error("Ring fetch error:", err); });
+        }
+
+        function fetchHealth() {
+            fetch("/health")
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById("cluster-name").textContent = data.cluster_name;
+                })
+                .catch(function() {});
+        }
+
+        function renderRing(vnodes) {
+            var g = document.getElementById("ring-vnodes");
+            g.innerHTML = "";
+            var cx = 150, cy = 150, r = 120;
+
+            for (var i = 0; i < vnodes.length; i++) {
+                var vn = vnodes[i];
+                var angle = (vn.position_pct / 100) * 2 * Math.PI - Math.PI / 2;
+                var x = cx + r * Math.cos(angle);
+                var y = cy + r * Math.sin(angle);
+
+                var dot = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+                dot.setAttribute("cx", x.toFixed(2));
+                dot.setAttribute("cy", y.toFixed(2));
+                dot.setAttribute("r", "2");
+                dot.setAttribute("fill", vn.color);
+                dot.setAttribute("opacity", "0.7");
+                g.appendChild(dot);
+            }
+        }
+
+        function renderLegend(ringMetrics, colors) {
+            var container = document.getElementById("ring-legend");
+            container.innerHTML = "";
+
+            if (!ringMetrics || !ringMetrics.nodes) return;
+
+            var nodeIds = Object.keys(ringMetrics.nodes).sort();
+            for (var i = 0; i < nodeIds.length; i++) {
+                var nid = nodeIds[i];
+                var nm = ringMetrics.nodes[nid];
+                var color = colors[nid] || "#888";
+
+                var item = document.createElement("div");
+                item.className = "legend-item";
+                item.innerHTML =
+                    '<div class="legend-dot" style="background:' + color + '"></div>' +
+                    '<span class="legend-label">' + nid + '</span>' +
+                    '<span class="legend-stats">' + nm.vnode_count + ' vnodes / ' + nm.load_percent.toFixed(1) + '%</span>';
+                container.appendChild(item);
+            }
+        }
+
+        function renderBarChart(nodes) {
+            var container = document.getElementById("bar-chart");
+            container.innerHTML = "";
+
+            if (!nodes) return;
+
+            var nodeIds = Object.keys(nodes).sort();
+            var maxCount = 0;
+            for (var i = 0; i < nodeIds.length; i++) {
+                if (nodes[nodeIds[i]].log_count > maxCount) {
+                    maxCount = nodes[nodeIds[i]].log_count;
+                }
+            }
+            if (maxCount === 0) maxCount = 1;
+
+            for (var i = 0; i < nodeIds.length; i++) {
+                var nid = nodeIds[i];
+                var nd = nodes[nid];
+                var pct = (nd.log_count / maxCount) * 100;
+                var color = nodeColors[nid] || "#e94560";
+
+                var row = document.createElement("div");
+                row.className = "bar-row";
+                row.innerHTML =
+                    '<div class="bar-label">' + nid + '</div>' +
+                    '<div class="bar-track">' +
+                        '<div class="bar-fill" style="width:' + pct + '%; background:' + color + ';"></div>' +
+                        '<span class="bar-text">' + formatNumber(nd.log_count) + ' (' + nd.log_percent.toFixed(1) + '%)</span>' +
+                    '</div>';
+                container.appendChild(row);
+            }
+        }
+
+        function renderNodeList(nodeIds) {
+            var container = document.getElementById("node-list");
+            container.innerHTML = "";
+
+            nodeIds.sort();
+            for (var i = 0; i < nodeIds.length; i++) {
+                var nid = nodeIds[i];
+                var chip = document.createElement("div");
+                chip.className = "node-chip";
+                chip.innerHTML =
+                    '<span>' + nid + '</span>' +
+                    '<button class="remove-btn" onclick="removeNode(\'' + nid + '\')" title="Remove node">&times;</button>';
+                container.appendChild(chip);
+            }
+        }
+
+        function addNode() {
+            var input = document.getElementById("new-node-id");
+            var nodeId = input.value.trim();
+            if (!nodeId) {
+                showStatus("Enter a node ID", "error");
+                return;
+            }
+
+            fetch("/api/nodes", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({node_id: nodeId}),
+            })
+            .then(function(r) {
+                if (!r.ok) return r.json().then(function(d) { throw new Error(d.error); });
+                return r.json();
+            })
+            .then(function(data) {
+                showStatus("Added " + nodeId + " (" + data.logs_migrated + " logs migrated)", "success");
+                input.value = "";
+                refresh();
+            })
+            .catch(function(err) { showStatus(err.message, "error"); });
+        }
+
+        function removeNode(nodeId) {
+            fetch("/api/nodes/" + nodeId, {method: "DELETE"})
+                .then(function(r) {
+                    if (!r.ok) return r.json().then(function(d) { throw new Error(d.error); });
+                    return r.json();
+                })
+                .then(function(data) {
+                    showStatus("Removed " + nodeId + " (" + data.logs_migrated + " logs migrated)", "success");
+                    refresh();
+                })
+                .catch(function(err) { showStatus(err.message, "error"); });
+        }
+
+        function simulateLogs() {
+            var input = document.getElementById("sim-count");
+            var count = parseInt(input.value, 10) || 100;
+
+            fetch("/api/simulate", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({count: count}),
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                showStatus("Generated " + formatNumber(data.generated) + " logs", "success");
+                refresh();
+            })
+            .catch(function(err) { showStatus("Simulation failed", "error"); });
+        }
+
+        function refresh() {
+            fetchStats();
+            fetchRing();
+        }
+
+        // Initial load
+        fetchHealth();
+        refresh();
+
+        // Auto-refresh every 3 seconds
+        setInterval(refresh, 3000);
+    </script>
+</body>
+</html>

@@ -4,6 +4,7 @@ from src.hash_ring import HashRing
 from src.storage_node import StorageNode
 from src.config import ClusterConfig, NodeConfig
 from src.cluster_coordinator import ClusterCoordinator
+from src.app import create_app
 
 
 @pytest.fixture
@@ -42,3 +43,11 @@ def cluster_config():
 @pytest.fixture
 def coordinator(cluster_config):
     return ClusterCoordinator(cluster_config)
+
+
+@pytest.fixture
+def app_client(cluster_config):
+    app = create_app(cluster_config)
+    app.config["TESTING"] = True
+    with app.test_client() as client:
+        yield client
