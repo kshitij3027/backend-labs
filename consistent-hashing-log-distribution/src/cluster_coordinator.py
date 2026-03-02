@@ -163,6 +163,75 @@ class ClusterCoordinator:
                 "migration_time_ms": round(elapsed_ms, 2),
             }
 
+    def adjust_node_capacity(self, node_id: str, weight: float) -> dict:
+        """Adjust a node's capacity by changing its vnode count proportionally.
+
+        A weight of 1.0 means default vnode count, 2.0 means double, 0.5 means half.
+
+        Args:
+            node_id: The node to adjust.
+            weight: Capacity weight multiplier (0.1 to 10.0).
+
+        Returns:
+            Dict with node_id, weight, new_vnode_count, ring_adjustment,
+            logs_rebalanced, rebalance_time_ms.
+        """
+        with self._lock:
+            if node_id not in self._storage_nodes:
+                raise ValueError(f"Node {node_id} not in cluster")
+
+            weight = max(0.1, min(10.0, weight))
+            base_vnodes = self._ring.virtual_nodes
+            new_count = max(1, int(base_vnodes * weight))
+
+            start_time = time.time()
+
+            ring_adjustment = self._ring.adjust_vnodes(node_id, new_count)
+
+            # Rebalance all logs across all nodes
+            logs_rebalanced = self._rebalance_all()
+
+            elapsed_ms = (time.time() - start_time) * 1000
+
+            return {
+                "node_id": node_id,
+                "weight": weight,
+                "new_vnode_count": new_count,
+                "ring_adjustment": ring_adjustment,
+                "logs_rebalanced": logs_rebalanced,
+                "rebalance_time_ms": round(elapsed_ms, 2),
+            }
+
+    def _rebalance_all(self) -> int:
+        """Rebalance all logs across all nodes. Returns number of logs moved.
+
+        Caller must hold self._lock.
+        """
+        # Collect all logs from all nodes
+        all_logs = []
+        for node_id, storage_node in self._storage_nodes.items():
+            logs = storage_node.get_logs()
+            # Clean metadata
+            for log in logs:
+                clean = {k: v for k, v in log.items() if k not in ("stored_at", "node_id")}
+                all_logs.append((clean, node_id))  # (clean_log, original_node_id)
+
+        # Clear all nodes
+        for storage_node in self._storage_nodes.values():
+            storage_node.remove_logs(lambda _: True)
+
+        # Re-route all logs
+        moved = 0
+        for clean_log, original_node_id in all_logs:
+            log_key = self._generate_log_key(clean_log)
+            target_node_id = self._ring.get_node(log_key)
+            if target_node_id and target_node_id in self._storage_nodes:
+                self._storage_nodes[target_node_id].store(clean_log)
+                if target_node_id != original_node_id:
+                    moved += 1
+
+        return moved
+
     def get_cluster_metrics(self) -> dict:
         """Get comprehensive cluster metrics.
 

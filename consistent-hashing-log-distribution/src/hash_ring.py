@@ -261,6 +261,57 @@ class HashRing:
                 "nodes": node_metrics,
             }
 
+    def adjust_vnodes(self, node_id: str, new_count: int) -> dict:
+        """Adjust the number of virtual nodes for a specific node.
+
+        This allows nodes with different capacities to have different
+        numbers of vnodes, affecting their share of the key space.
+
+        Args:
+            node_id: The node to adjust.
+            new_count: New number of virtual nodes for this node.
+
+        Returns:
+            Metadata dict with node_id, old_count, new_count, vnodes_added, vnodes_removed.
+
+        Raises:
+            ValueError: If node_id is not in the ring.
+        """
+        with self._lock:
+            if node_id not in self._nodes:
+                raise ValueError(f"Node {node_id} not in ring")
+
+            # Count current vnodes for this node
+            current_positions = []
+            for pos, nid in list(self.ring.items()):
+                if nid == node_id:
+                    current_positions.append(pos)
+            old_count = len(current_positions)
+
+            # Remove all existing vnodes for this node
+            for pos in current_positions:
+                del self.ring[pos]
+
+            # Re-add with new count
+            vnodes_added = 0
+            for i in range(new_count):
+                vnode_key = f"{node_id}:vn{i}"
+                h = self._hash(vnode_key)
+                if h not in self.ring:
+                    self.ring[h] = node_id
+                    vnodes_added += 1
+
+            # Rebuild sorted keys
+            self.sorted_keys = sorted(self.ring.keys())
+
+            return {
+                "node_id": node_id,
+                "old_count": old_count,
+                "new_count": vnodes_added,
+                "vnodes_added": max(0, vnodes_added - old_count),
+                "vnodes_removed": max(0, old_count - vnodes_added),
+            }
+
     @property
     def nodes(self) -> set[str]:
         """Return set of physical nodes currently in the ring."""

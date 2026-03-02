@@ -188,6 +188,100 @@ class TestRebalancing:
         assert metrics["node_count"] == 3
 
 
+class TestCapacityAdjustment:
+
+    def _store_n_logs(self, coordinator, n=5000):
+        """Store n diverse logs and return total count."""
+        logs = [
+            _make_log(
+                f"src-{i % 10}",
+                f"msg-{i}",
+                ts=f"2026-01-01T{i % 24:02d}:{i % 60:02d}:00Z",
+            )
+            for i in range(n)
+        ]
+        coordinator.store_logs(logs)
+        return n
+
+    def test_adjust_node_capacity(self, coordinator):
+        """After doubling node1 weight, node1 should get more logs than other nodes."""
+        self._store_n_logs(coordinator, 5000)
+
+        result = coordinator.adjust_node_capacity("node1", weight=2.0)
+
+        assert result["node_id"] == "node1"
+        assert result["weight"] == 2.0
+        assert result["new_vnode_count"] == 300  # 150 * 2.0
+        assert "ring_adjustment" in result
+        assert "logs_rebalanced" in result
+        assert "rebalance_time_ms" in result
+
+        metrics = coordinator.get_cluster_metrics()
+        node1_logs = metrics["nodes"]["node1"]["log_count"]
+        node2_logs = metrics["nodes"]["node2"]["log_count"]
+        node3_logs = metrics["nodes"]["node3"]["log_count"]
+
+        # node1 should have more logs than either of the other nodes
+        assert node1_logs > node2_logs, (
+            f"node1 ({node1_logs}) should have more logs than node2 ({node2_logs})"
+        )
+        assert node1_logs > node3_logs, (
+            f"node1 ({node1_logs}) should have more logs than node3 ({node3_logs})"
+        )
+
+    def test_adjust_node_capacity_half(self, coordinator):
+        """After halving node1 weight, node1 should get fewer logs than other nodes."""
+        self._store_n_logs(coordinator, 5000)
+
+        result = coordinator.adjust_node_capacity("node1", weight=0.5)
+
+        assert result["new_vnode_count"] == 75  # 150 * 0.5
+
+        metrics = coordinator.get_cluster_metrics()
+        node1_logs = metrics["nodes"]["node1"]["log_count"]
+        node2_logs = metrics["nodes"]["node2"]["log_count"]
+        node3_logs = metrics["nodes"]["node3"]["log_count"]
+
+        # node1 should have fewer logs than either of the other nodes
+        assert node1_logs < node2_logs, (
+            f"node1 ({node1_logs}) should have fewer logs than node2 ({node2_logs})"
+        )
+        assert node1_logs < node3_logs, (
+            f"node1 ({node1_logs}) should have fewer logs than node3 ({node3_logs})"
+        )
+
+    def test_adjust_node_capacity_invalid_node(self, coordinator):
+        """Adjusting capacity for a nonexistent node should raise ValueError."""
+        with pytest.raises(ValueError, match="not in cluster"):
+            coordinator.adjust_node_capacity("nonexistent-node", weight=1.0)
+
+    def test_adjust_node_capacity_weight_clamping(self, coordinator):
+        """Weights below 0.1 or above 10.0 should be clamped."""
+        self._store_n_logs(coordinator, 100)
+
+        result_low = coordinator.adjust_node_capacity("node1", weight=0.01)
+        assert result_low["weight"] == 0.1
+        assert result_low["new_vnode_count"] == max(1, int(150 * 0.1))
+
+        result_high = coordinator.adjust_node_capacity("node2", weight=20.0)
+        assert result_high["weight"] == 10.0
+        assert result_high["new_vnode_count"] == int(150 * 10.0)
+
+    def test_zero_data_loss_after_capacity_change(self, coordinator):
+        """Store 5000 logs, adjust capacity, verify total count unchanged."""
+        total = self._store_n_logs(coordinator, 5000)
+
+        metrics_before = coordinator.get_cluster_metrics()
+        assert metrics_before["total_logs"] == total
+
+        coordinator.adjust_node_capacity("node1", weight=2.0)
+
+        metrics_after = coordinator.get_cluster_metrics()
+        assert metrics_after["total_logs"] == total, (
+            f"Data loss detected: before={total}, after={metrics_after['total_logs']}"
+        )
+
+
 class TestMetrics:
 
     def test_ring_update_timing(self, coordinator):

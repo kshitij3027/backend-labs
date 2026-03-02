@@ -349,6 +349,48 @@ class TestThreadSafety:
         assert len(errors) == 0, f"Concurrent metrics errors: {errors}"
 
 
+class TestAdjustVnodes:
+    """Tests for dynamic virtual node adjustment."""
+
+    def test_adjust_vnodes_increase(self, three_node_ring):
+        """Increasing vnodes for a node should reflect in the result."""
+        result = three_node_ring.adjust_vnodes("node1", 300)
+        assert result["node_id"] == "node1"
+        assert result["new_count"] == 300
+        assert result["old_count"] == 150
+        assert result["vnodes_added"] == 150
+        assert result["vnodes_removed"] == 0
+
+    def test_adjust_vnodes_decrease(self, three_node_ring):
+        """Decreasing vnodes for a node should reflect in the result."""
+        result = three_node_ring.adjust_vnodes("node1", 50)
+        assert result["node_id"] == "node1"
+        assert result["old_count"] == 150
+        assert result["new_count"] == 50
+        assert result["vnodes_removed"] == 100
+        assert result["vnodes_added"] == 0
+
+    def test_adjust_vnodes_nonexistent_node(self, three_node_ring):
+        """Adjusting vnodes for a node not in the ring should raise ValueError."""
+        with pytest.raises(ValueError, match="not in ring"):
+            three_node_ring.adjust_vnodes("nonexistent-node", 100)
+
+    def test_adjust_vnodes_load_changes(self, three_node_ring):
+        """After doubling node1's vnodes, node1 should have a higher load_percent."""
+        metrics_before = three_node_ring.get_ring_metrics()
+        load_before = metrics_before["nodes"]["node1"]["load_percent"]
+
+        three_node_ring.adjust_vnodes("node1", 300)
+
+        metrics_after = three_node_ring.get_ring_metrics()
+        load_after = metrics_after["nodes"]["node1"]["load_percent"]
+
+        assert load_after > load_before, (
+            f"Expected node1 load to increase after doubling vnodes: "
+            f"before={load_before:.2f}%, after={load_after:.2f}%"
+        )
+
+
 class TestRingMetrics:
     """Tests for ring distribution metrics."""
 
