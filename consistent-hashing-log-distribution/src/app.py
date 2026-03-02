@@ -125,6 +125,17 @@ def create_app(config: ClusterConfig | None = None) -> Flask:
             "ring_metrics": ring_metrics,
         })
 
+    @app.route("/api/monitoring")
+    def monitoring():
+        """Return aggregated monitoring data."""
+        return jsonify(coordinator.get_monitoring_data())
+
+    @app.route("/api/predict/<node_id>")
+    def predict_rebalance(node_id):
+        """Predict the impact of adding a node."""
+        prediction = coordinator.predict_rebalance_impact(node_id)
+        return jsonify(prediction)
+
     @app.route("/api/simulate", methods=["POST"])
     def simulate():
         """Generate N random logs."""

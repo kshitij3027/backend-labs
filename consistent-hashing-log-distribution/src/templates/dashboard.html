@@ -293,6 +293,25 @@
         .status-msg.success { border-color: #2ecc71; color: #2ecc71; }
         .status-msg.error { border-color: #e94560; color: #e94560; }
 
+        /* Monitoring alerts */
+        .alert-banner {
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+            font-weight: 500;
+        }
+        .alert-banner.overloaded {
+            background: rgba(231, 76, 60, 0.15);
+            border: 1px solid #e74c3c;
+            color: #e74c3c;
+        }
+        .alert-banner.underloaded {
+            background: rgba(241, 196, 15, 0.15);
+            border: 1px solid #f1c40f;
+            color: #f1c40f;
+        }
+
         @media (max-width: 768px) {
             .cards-row { grid-template-columns: repeat(2, 1fr); }
             .ring-container { flex-direction: column; }
@@ -346,6 +365,26 @@
         <div class="section">
             <h2>Log Distribution</h2>
             <div class="bar-chart" id="bar-chart"></div>
+        </div>
+
+        <!-- Monitoring -->
+        <div class="section">
+            <h2>Monitoring</h2>
+            <div style="display:flex; gap:24px; margin-bottom:16px; flex-wrap:wrap;">
+                <div>
+                    <span style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:#8892b0;">Ingestion Rate</span>
+                    <div style="font-size:1.5rem; font-weight:700; color:#2ecc71; margin-top:4px;" id="ingestion-rate">0 logs/sec</div>
+                </div>
+                <div>
+                    <span style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:#8892b0;">Ring Balance Variance</span>
+                    <div style="font-size:1.5rem; font-weight:700; color:#3498db; margin-top:4px;" id="ring-balance-variance">0</div>
+                </div>
+                <div>
+                    <span style="font-size:0.8rem; text-transform:uppercase; letter-spacing:0.08em; color:#8892b0;">Total VNodes (Ring)</span>
+                    <div style="font-size:1.5rem; font-weight:700; color:#f1c40f; margin-top:4px;" id="ring-total-vnodes">0</div>
+                </div>
+            </div>
+            <div id="monitoring-alerts"></div>
         </div>
 
         <!-- Controls -->
@@ -582,9 +621,39 @@
             .catch(function(err) { showStatus("Simulation failed", "error"); });
         }
 
+        function fetchMonitoring() {
+            fetch("/api/monitoring")
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    document.getElementById("ingestion-rate").textContent =
+                        data.ingestion_rate.toFixed(1) + " logs/sec";
+
+                    var rh = data.ring_health || {};
+                    document.getElementById("ring-balance-variance").textContent =
+                        (rh.balance_variance || 0).toFixed(4);
+                    document.getElementById("ring-total-vnodes").textContent =
+                        rh.total_vnodes || 0;
+
+                    var alertsContainer = document.getElementById("monitoring-alerts");
+                    alertsContainer.innerHTML = "";
+                    var alerts = data.alerts || [];
+                    for (var i = 0; i < alerts.length; i++) {
+                        var a = alerts[i];
+                        var banner = document.createElement("div");
+                        banner.className = "alert-banner " + a.status;
+                        banner.textContent = a.node_id + ": " + a.log_percent.toFixed(1) +
+                            "% (expected " + a.expected_percent.toFixed(1) + "%, deviation " +
+                            (a.deviation > 0 ? "+" : "") + a.deviation.toFixed(1) + "%) - " + a.status;
+                        alertsContainer.appendChild(banner);
+                    }
+                })
+                .catch(function(err) { console.error("Monitoring fetch error:", err); });
+        }
+
         function refresh() {
             fetchStats();
             fetchRing();
+            fetchMonitoring();
         }
 
         // Initial load

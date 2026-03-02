@@ -1,10 +1,14 @@
 """Cluster coordinator managing log distribution across storage nodes."""
 
+import copy
 import time
 import threading
 from src.hash_ring import HashRing
 from src.storage_node import StorageNode
 from src.config import ClusterConfig, NodeConfig
+
+# EMA smoothing factor for ingestion rate tracking
+EMA_ALPHA = 0.3
 
 
 class ClusterCoordinator:
@@ -22,6 +26,12 @@ class ClusterCoordinator:
         self._ring = HashRing(virtual_nodes=virtual_nodes)
         self._storage_nodes: dict[str, StorageNode] = {}
         self._total_stored = 0
+
+        # EMA-based ingestion rate tracking
+        self._ema_rate = 0.0
+        self._last_store_time: float | None = None
+        self._store_count_window = 0
+        self._window_start: float | None = None
 
         if config and config.nodes:
             for node_config in config.nodes:
@@ -57,6 +67,19 @@ class ClusterCoordinator:
 
             stored_entry = self._storage_nodes[node_id].store(log_entry)
             self._total_stored += 1
+
+            # Update EMA-based ingestion rate
+            now = time.time()
+            if self._window_start is None:
+                self._window_start = now
+            self._store_count_window += 1
+            elapsed = now - self._window_start
+            if elapsed >= 1.0:
+                current_rate = self._store_count_window / elapsed
+                self._ema_rate = EMA_ALPHA * current_rate + (1 - EMA_ALPHA) * self._ema_rate
+                self._store_count_window = 0
+                self._window_start = now
+            self._last_store_time = now
 
             return {
                 "node_id": node_id,
@@ -277,3 +300,140 @@ class ClusterCoordinator:
         """Return list of active node IDs."""
         with self._lock:
             return list(self._storage_nodes.keys())
+
+    @property
+    def ingestion_rate(self) -> float:
+        """Return the current EMA-smoothed ingestion rate (logs/sec)."""
+        with self._lock:
+            return self._ema_rate
+
+    def detect_load_skew(self, threshold: float = 10.0) -> list[dict]:
+        """Detect nodes with disproportionate load.
+
+        If any node's log percentage deviates by more than `threshold`
+        from the expected average, it is flagged.
+
+        Args:
+            threshold: Maximum allowed deviation in percentage points (default 10%).
+
+        Returns:
+            List of dicts with node_id, log_percent, expected_percent, deviation, status.
+        """
+        with self._lock:
+            node_count = len(self._storage_nodes)
+            if node_count == 0:
+                return []
+
+            total_logs = sum(
+                node.get_log_count() for node in self._storage_nodes.values()
+            )
+            if total_logs == 0:
+                return []
+
+            expected_pct = 100.0 / node_count
+            alerts = []
+
+            for node_id, node in self._storage_nodes.items():
+                count = node.get_log_count()
+                pct = (count / total_logs) * 100.0
+                deviation = pct - expected_pct
+
+                if abs(deviation) > threshold:
+                    status = "overloaded" if deviation > 0 else "underloaded"
+                    alerts.append({
+                        "node_id": node_id,
+                        "log_percent": round(pct, 2),
+                        "expected_percent": round(expected_pct, 2),
+                        "deviation": round(deviation, 2),
+                        "status": status,
+                    })
+
+            return alerts
+
+    def predict_rebalance_impact(self, node_id_to_add: str) -> dict:
+        """Predict the impact of adding a node without modifying the ring.
+
+        Creates a temporary copy of the hash ring, adds the proposed node,
+        and calculates how many existing log keys would move.
+
+        Args:
+            node_id_to_add: The node ID to simulate adding.
+
+        Returns:
+            Dict with predicted_logs_moved, predicted_movement_pct,
+            current_total, predicted_per_node.
+        """
+        with self._lock:
+            # Create a temporary ring copy
+            temp_ring = HashRing(virtual_nodes=self._ring.virtual_nodes)
+            for existing_node_id in self._storage_nodes:
+                temp_ring.add_node(existing_node_id)
+            temp_ring.add_node(node_id_to_add)
+
+            # Count how many existing logs would change their target node
+            logs_moved = 0
+            current_total = 0
+            predicted_counts: dict[str, int] = {nid: 0 for nid in self._storage_nodes}
+            predicted_counts[node_id_to_add] = 0
+
+            for node_id, storage_node in self._storage_nodes.items():
+                for log in storage_node.get_logs():
+                    current_total += 1
+                    log_key = self._generate_log_key(log)
+                    new_target = temp_ring.get_node(log_key)
+                    if new_target != node_id:
+                        logs_moved += 1
+                    if new_target in predicted_counts:
+                        predicted_counts[new_target] += 1
+
+            movement_pct = (logs_moved / current_total * 100.0) if current_total > 0 else 0.0
+
+            return {
+                "predicted_logs_moved": logs_moved,
+                "predicted_movement_pct": round(movement_pct, 2),
+                "current_total": current_total,
+                "predicted_per_node": predicted_counts,
+            }
+
+    def get_monitoring_data(self) -> dict:
+        """Aggregate monitoring data for the cluster.
+
+        Returns:
+            Dict with ingestion_rate, alerts, node_count, total_logs,
+            per_node_distribution, and ring_health.
+        """
+        with self._lock:
+            total_logs = sum(
+                node.get_log_count() for node in self._storage_nodes.values()
+            )
+
+            per_node_distribution = {}
+            for node_id, node in self._storage_nodes.items():
+                count = node.get_log_count()
+                pct = (count / total_logs * 100.0) if total_logs > 0 else 0.0
+                per_node_distribution[node_id] = {
+                    "count": count,
+                    "percent": round(pct, 2),
+                }
+
+            ring_metrics = self._ring.get_ring_metrics()
+
+            # Calculate balance variance
+            if per_node_distribution:
+                percentages = [d["percent"] for d in per_node_distribution.values()]
+                mean_pct = sum(percentages) / len(percentages)
+                variance = sum((p - mean_pct) ** 2 for p in percentages) / len(percentages)
+            else:
+                variance = 0.0
+
+            return {
+                "ingestion_rate": self._ema_rate,
+                "alerts": self.detect_load_skew(),
+                "node_count": len(self._storage_nodes),
+                "total_logs": total_logs,
+                "per_node_distribution": per_node_distribution,
+                "ring_health": {
+                    "total_vnodes": ring_metrics.get("total_vnodes", 0),
+                    "balance_variance": round(variance, 4),
+                },
+            }

@@ -171,6 +171,42 @@ class TestRingInfo:
         assert "color" in vn
 
 
+class TestMonitoringEndpoint:
+    """Tests for GET /api/monitoring."""
+
+    def test_monitoring_endpoint(self, app_client):
+        resp = app_client.get("/api/monitoring")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "ingestion_rate" in data
+        assert "alerts" in data
+        assert "node_count" in data
+        assert "total_logs" in data
+        assert "per_node_distribution" in data
+        assert "ring_health" in data
+
+
+class TestPredictEndpoint:
+    """Tests for GET /api/predict/<node_id>."""
+
+    def test_predict_endpoint(self, app_client):
+        # Store some logs first
+        app_client.post(
+            "/api/simulate",
+            data=json.dumps({"count": 100}),
+            content_type="application/json",
+        )
+
+        resp = app_client.get("/api/predict/node4")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "predicted_logs_moved" in data
+        assert "predicted_movement_pct" in data
+        assert "current_total" in data
+        assert "predicted_per_node" in data
+        assert data["current_total"] == 100
+
+
 class TestSimulate:
     """Tests for POST /api/simulate."""
 

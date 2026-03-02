@@ -282,6 +282,94 @@ class TestCapacityAdjustment:
         )
 
 
+class TestMonitoring:
+
+    def _store_n_logs(self, coordinator, n=1000):
+        """Store n diverse logs and return total count."""
+        logs = [
+            _make_log(
+                f"src-{i % 10}",
+                f"msg-{i}",
+                ts=f"2026-01-01T{i % 24:02d}:{i % 60:02d}:00Z",
+            )
+            for i in range(n)
+        ]
+        coordinator.store_logs(logs)
+        return n
+
+    def test_get_monitoring_data_structure(self, coordinator):
+        """Monitoring data contains all expected keys."""
+        self._store_n_logs(coordinator, 100)
+        data = coordinator.get_monitoring_data()
+
+        assert "ingestion_rate" in data
+        assert "alerts" in data
+        assert "node_count" in data
+        assert "total_logs" in data
+        assert "per_node_distribution" in data
+        assert "ring_health" in data
+
+        # ring_health sub-keys
+        assert "total_vnodes" in data["ring_health"]
+        assert "balance_variance" in data["ring_health"]
+
+        # per_node_distribution has entries for all nodes
+        assert len(data["per_node_distribution"]) == 3
+        for node_id, dist in data["per_node_distribution"].items():
+            assert "count" in dist
+            assert "percent" in dist
+
+    def test_detect_load_skew_balanced(self, coordinator):
+        """With balanced distribution (10K logs across 3 nodes), no alerts."""
+        self._store_n_logs(coordinator, 10_000)
+        alerts = coordinator.detect_load_skew()
+        assert alerts == [], f"Expected no alerts for balanced load, got: {alerts}"
+
+    def test_detect_load_skew_unbalanced(self, coordinator):
+        """Manually adding many logs to one node creates detectable skew."""
+        self._store_n_logs(coordinator, 1000)
+
+        # Artificially add a lot of extra logs to node1 to create skew
+        extra_logs = [{"source": "skew", "message": f"extra-{i}", "level": "info",
+                       "timestamp": "2026-01-01T00:00:00Z"} for i in range(5000)]
+        coordinator._storage_nodes["node1"].add_logs(extra_logs)
+
+        alerts = coordinator.detect_load_skew()
+        assert len(alerts) > 0, "Expected alerts for unbalanced load"
+
+        # node1 should be flagged as overloaded
+        node1_alerts = [a for a in alerts if a["node_id"] == "node1"]
+        assert len(node1_alerts) == 1
+        assert node1_alerts[0]["status"] == "overloaded"
+
+    def test_predict_rebalance_impact(self, coordinator):
+        """Predicting adding a 4th node should show ~25% log movement."""
+        self._store_n_logs(coordinator, 1000)
+
+        prediction = coordinator.predict_rebalance_impact("node4")
+
+        assert "predicted_logs_moved" in prediction
+        assert "predicted_movement_pct" in prediction
+        assert "current_total" in prediction
+        assert "predicted_per_node" in prediction
+
+        assert prediction["current_total"] == 1000
+
+        # ~25% should move (within +-10%)
+        assert abs(prediction["predicted_movement_pct"] - 25.0) < 10.0, (
+            f"Expected ~25% movement, got {prediction['predicted_movement_pct']}%"
+        )
+
+        # The new node should appear in predicted_per_node
+        assert "node4" in prediction["predicted_per_node"]
+        assert prediction["predicted_per_node"]["node4"] > 0
+
+    def test_ingestion_rate_tracking(self, coordinator):
+        """After storing logs, ingestion rate should be >= 0."""
+        self._store_n_logs(coordinator, 100)
+        assert coordinator.ingestion_rate >= 0
+
+
 class TestMetrics:
 
     def test_ring_update_timing(self, coordinator):
