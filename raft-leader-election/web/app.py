@@ -101,6 +101,59 @@ class ClusterManager:
                 }
         return {"killed": None, "success": False, "error": "No leader found"}
 
+    def create_partition(self, group_a, group_b):
+        """Create a network partition between two groups of nodes.
+
+        Each node in group_a blocks all nodes in group_b and vice versa.
+        """
+        results = []
+        for node_a in group_a:
+            for node_b in group_b:
+                addr_b = self._nodes[node_b]
+                results.append(self._block_peer(node_a, addr_b))
+                addr_a = self._nodes[node_a]
+                results.append(self._block_peer(node_b, addr_a))
+        return all(results)
+
+    def heal_partition(self):
+        """Remove all partition blocks from all nodes."""
+        results = []
+        for node_id in self._nodes:
+            blocked = self._get_blocked_peers(node_id)
+            for peer in blocked:
+                results.append(self._unblock_peer(node_id, peer))
+        return all(results)
+
+    def _block_peer(self, node_id, peer_address):
+        try:
+            stub = self._get_stub(node_id)
+            response = stub.BlockPeer(
+                raft_pb2.BlockPeerRequest(peer_address=peer_address), timeout=2.0
+            )
+            return response.success
+        except grpc.RpcError:
+            return False
+
+    def _unblock_peer(self, node_id, peer_address):
+        try:
+            stub = self._get_stub(node_id)
+            response = stub.UnblockPeer(
+                raft_pb2.BlockPeerRequest(peer_address=peer_address), timeout=2.0
+            )
+            return response.success
+        except grpc.RpcError:
+            return False
+
+    def _get_blocked_peers(self, node_id):
+        try:
+            stub = self._get_stub(node_id)
+            response = stub.GetBlockedPeers(
+                raft_pb2.GetBlockedPeersRequest(), timeout=2.0
+            )
+            return list(response.blocked_peers)
+        except grpc.RpcError:
+            return []
+
     def get_election_log(self, limit=50):
         """Get election events from all nodes."""
         all_events = []
@@ -162,6 +215,23 @@ def api_election_log():
     limit = request.args.get("limit", 50, type=int)
     events = cluster_manager.get_election_log(limit=limit)
     return jsonify(events)
+
+
+@app.route("/api/partition", methods=["POST"])
+def api_create_partition():
+    data = request.get_json()
+    group_a = data.get("group_a", [])
+    group_b = data.get("group_b", [])
+    if not group_a or not group_b:
+        return jsonify({"success": False, "error": "Both groups required"}), 400
+    success = cluster_manager.create_partition(group_a, group_b)
+    return jsonify({"success": success, "group_a": group_a, "group_b": group_b})
+
+
+@app.route("/api/heal-partition", methods=["POST"])
+def api_heal_partition():
+    success = cluster_manager.heal_partition()
+    return jsonify({"success": success})
 
 
 @socketio.on("connect")

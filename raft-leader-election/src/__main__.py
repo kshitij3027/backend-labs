@@ -38,6 +38,7 @@ async def run_node():
         host=config.host,
         port=config.port,
         on_heartbeat_received=election_manager.reset_election_timer,
+        rpc_client=rpc_client,
     )
 
     # Start the gRPC server

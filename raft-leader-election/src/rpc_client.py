@@ -15,6 +15,20 @@ class RpcClient:
         self._stubs: dict[str, raft_pb2_grpc.RaftServiceStub] = {}
         self._admin_stubs: dict[str, raft_pb2_grpc.NodeAdminServiceStub] = {}
         self._rpc_timeout = rpc_timeout  # seconds
+        self._blocked_peers: set[str] = set()
+
+    def block_peer(self, peer_address: str):
+        """Block all RPCs to a peer (simulate network partition)."""
+        self._blocked_peers.add(peer_address)
+
+    def unblock_peer(self, peer_address: str):
+        """Unblock RPCs to a peer (heal partition)."""
+        self._blocked_peers.discard(peer_address)
+
+    @property
+    def blocked_peers(self) -> set[str]:
+        """Return a copy of the blocked peers set."""
+        return set(self._blocked_peers)
 
     def _get_channel(self, peer_address: str) -> grpc.aio.Channel:
         """Get or create a gRPC channel to a peer."""
@@ -37,6 +51,8 @@ class RpcClient:
 
         Returns (term, vote_granted) or None on failure.
         """
+        if peer_address in self._blocked_peers:
+            return None
         try:
             self._get_channel(peer_address)
             stub = self._stubs[peer_address]
@@ -64,6 +80,8 @@ class RpcClient:
 
         Returns (term, success) or None on failure.
         """
+        if peer_address in self._blocked_peers:
+            return None
         try:
             self._get_channel(peer_address)
             stub = self._stubs[peer_address]
@@ -89,6 +107,8 @@ class RpcClient:
 
         Returns (term, vote_granted) or None on failure.
         """
+        if peer_address in self._blocked_peers:
+            return None
         try:
             self._get_channel(peer_address)
             stub = self._stubs[peer_address]

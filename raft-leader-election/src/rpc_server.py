@@ -67,8 +67,9 @@ class RaftServicer(raft_pb2_grpc.RaftServiceServicer):
 class NodeAdminServicer(raft_pb2_grpc.NodeAdminServiceServicer):
     """Handles admin RPCs for the dashboard."""
 
-    def __init__(self, node: RaftNode):
+    def __init__(self, node: RaftNode, rpc_client=None):
         self._node = node
+        self._rpc_client = rpc_client
 
     async def GetStatus(self, request, context):
         return raft_pb2.GetStatusResponse(
@@ -103,23 +104,44 @@ class NodeAdminServicer(raft_pb2_grpc.NodeAdminServiceServicer):
 
         return raft_pb2.GetElectionLogResponse(events=proto_events)
 
+    async def BlockPeer(self, request, context):
+        if self._rpc_client:
+            self._rpc_client.block_peer(request.peer_address)
+            return raft_pb2.BlockPeerResponse(
+                success=True, message=f"Blocked {request.peer_address}"
+            )
+        return raft_pb2.BlockPeerResponse(success=False, message="No RPC client")
+
+    async def UnblockPeer(self, request, context):
+        if self._rpc_client:
+            self._rpc_client.unblock_peer(request.peer_address)
+            return raft_pb2.BlockPeerResponse(
+                success=True, message=f"Unblocked {request.peer_address}"
+            )
+        return raft_pb2.BlockPeerResponse(success=False, message="No RPC client")
+
+    async def GetBlockedPeers(self, request, context):
+        blocked = list(self._rpc_client.blocked_peers) if self._rpc_client else []
+        return raft_pb2.GetBlockedPeersResponse(blocked_peers=blocked)
+
 
 class RaftRpcServer:
     """Manages the gRPC server lifecycle."""
 
-    def __init__(self, node: RaftNode, host: str, port: int, on_heartbeat_received=None):
+    def __init__(self, node: RaftNode, host: str, port: int, on_heartbeat_received=None, rpc_client=None):
         self._node = node
         self._host = host
         self._port = port
         self._server = None
         self._on_heartbeat_received = on_heartbeat_received
+        self._rpc_client = rpc_client
 
     async def start(self):
         """Start the gRPC server."""
         self._server = grpc.aio.server()
 
         raft_servicer = RaftServicer(self._node, self._on_heartbeat_received)
-        admin_servicer = NodeAdminServicer(self._node)
+        admin_servicer = NodeAdminServicer(self._node, rpc_client=self._rpc_client)
 
         raft_pb2_grpc.add_RaftServiceServicer_to_server(raft_servicer, self._server)
         raft_pb2_grpc.add_NodeAdminServiceServicer_to_server(admin_servicer, self._server)

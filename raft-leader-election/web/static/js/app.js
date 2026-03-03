@@ -130,3 +130,50 @@ async function fetchElectionLog() {
 // Poll election log every 1 second
 setInterval(fetchElectionLog, 1000);
 fetchElectionLog();
+
+// Partition button
+const partitionBtn = document.getElementById('partition-btn');
+partitionBtn.addEventListener('click', async () => {
+    partitionBtn.disabled = true;
+    partitionBtn.textContent = 'Partitioning...';
+
+    try {
+        const response = await fetch('/api/partition', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                group_a: ['node-1', 'node-2'],
+                group_b: ['node-3', 'node-4', 'node-5']
+            })
+        });
+        const data = await response.json();
+        partitionBtn.textContent = data.success ? 'Partitioned!' : 'Failed';
+    } catch (err) {
+        partitionBtn.textContent = 'Error';
+    }
+
+    setTimeout(() => {
+        partitionBtn.disabled = false;
+        partitionBtn.textContent = 'Partition [1,2] | [3,4,5]';
+    }, 2000);
+});
+
+// Heal button
+const healBtn = document.getElementById('heal-btn');
+healBtn.addEventListener('click', async () => {
+    healBtn.disabled = true;
+    healBtn.textContent = 'Healing...';
+
+    try {
+        const response = await fetch('/api/heal-partition', { method: 'POST' });
+        const data = await response.json();
+        healBtn.textContent = data.success ? 'Healed!' : 'Failed';
+    } catch (err) {
+        healBtn.textContent = 'Error';
+    }
+
+    setTimeout(() => {
+        healBtn.disabled = false;
+        healBtn.textContent = 'Heal Partition';
+    }, 2000);
+});

@@ -13,6 +13,9 @@ service NodeAdminService {
   rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
   rpc StopNode(StopNodeRequest) returns (StopNodeResponse);
   rpc GetElectionLog(GetElectionLogRequest) returns (GetElectionLogResponse);
+  rpc BlockPeer(BlockPeerRequest) returns (BlockPeerResponse);
+  rpc UnblockPeer(BlockPeerRequest) returns (BlockPeerResponse);
+  rpc GetBlockedPeers(GetBlockedPeersRequest) returns (GetBlockedPeersResponse);
 }
 
 // === Raft consensus messages ===
@@ -84,4 +87,20 @@ message ElectionEvent {
   string node_id = 3;
   uint64 term = 4;
   string details = 5;
+}
+
+// === Partition simulation messages ===
+message BlockPeerRequest {
+  string peer_address = 1;
+}
+
+message BlockPeerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message GetBlockedPeersRequest {}
+
+message GetBlockedPeersResponse {
+  repeated string blocked_peers = 1;
 }

@@ -158,6 +158,24 @@ header h1 {
     cursor: not-allowed;
 }
 
+.btn-warning {
+    background: #f97316;
+    color: white;
+}
+
+.btn-warning:hover {
+    background: #ea580c;
+}
+
+.btn-success {
+    background: #22c55e;
+    color: white;
+}
+
+.btn-success:hover {
+    background: #16a34a;
+}
+
 .election-log {
     background: #1e293b;
     border-radius: 0.5rem;
