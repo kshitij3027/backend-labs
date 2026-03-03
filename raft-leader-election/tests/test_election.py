@@ -57,6 +57,8 @@ def five_node(five_node_config):
 @pytest.fixture
 def mock_rpc_client():
     client = AsyncMock(spec=RpcClient)
+    # Default: pre-vote always passes so existing tests work
+    client.send_pre_vote.return_value = (1, True)
     return client
 
 
@@ -113,6 +115,7 @@ class TestStartElection:
         """3-node cluster: self + 1 peer = 2 = majority of 3."""
         node = RaftNode(three_node_config)
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(node, three_node_config, client)
 
         # One peer grants, one denies
@@ -127,6 +130,7 @@ class TestStartElection:
         """3-node cluster: only self vote = 1 < majority of 2."""
         node = RaftNode(three_node_config)
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(node, three_node_config, client)
 
         # Both peers deny
@@ -140,6 +144,7 @@ class TestStartElection:
     async def test_loses_in_five_node_cluster(self, five_node, five_node_config):
         """5-node cluster: need 3 votes. Self + 1 = 2 < 3."""
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(five_node, five_node_config, client)
 
         # Only one peer grants, three deny
@@ -155,6 +160,7 @@ class TestStartElection:
     async def test_wins_in_five_node_cluster(self, five_node, five_node_config):
         """5-node cluster: self + 2 peers = 3 = majority."""
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(five_node, five_node_config, client)
 
         # Two peers grant, two deny
@@ -187,6 +193,7 @@ class TestStartElection:
         """Election still works if some peers are unreachable."""
         node = RaftNode(three_node_config)
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(node, three_node_config, client)
 
         # One peer unreachable (None), one grants
@@ -201,6 +208,7 @@ class TestStartElection:
         """If all peers are unreachable, election fails."""
         node = RaftNode(three_node_config)
         client = AsyncMock(spec=RpcClient)
+        client.send_pre_vote.return_value = (1, True)
         em = ElectionManager(node, three_node_config, client)
 
         # All peers unreachable

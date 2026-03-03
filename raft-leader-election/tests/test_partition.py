@@ -87,6 +87,10 @@ class TestPartitionElection:
         )
         node = RaftNode(config)
         client = AsyncMock(spec=RpcClient)
+        # Pre-vote: minority also can't get majority of pre-votes
+        client.send_pre_vote.side_effect = [
+            (1, True), None, None, None,
+        ]
         em = ElectionManager(node, config, client)
 
         # Simulate partition: only node-2 is reachable, others blocked
@@ -100,8 +104,9 @@ class TestPartitionElection:
 
         await em.start_election()
 
-        # self (1) + node-2 (1) = 2 votes, need 3 for majority of 5
-        assert node.state == NodeState.CANDIDATE  # Cannot become leader
+        # self (1) + node-2 (1) = 2 pre-votes, need 3 for majority of 5
+        # Pre-vote fails, so node stays follower (never becomes candidate)
+        assert node.state == NodeState.FOLLOWER
 
     @pytest.mark.asyncio
     async def test_majority_can_elect_leader(self):
@@ -114,6 +119,10 @@ class TestPartitionElection:
         )
         node = RaftNode(config)
         client = AsyncMock(spec=RpcClient)
+        # Pre-vote: majority partition can get enough pre-votes
+        client.send_pre_vote.side_effect = [
+            None, None, (1, True), (1, True),
+        ]
         em = ElectionManager(node, config, client)
 
         # node-3 can reach node-4 and node-5, blocked from 1,2

@@ -30,12 +30,21 @@ class ElectionManager:
         self._reset_event.set()
 
     def _random_timeout(self) -> float:
-        """Generate a random election timeout in seconds."""
+        """Generate a random election timeout in seconds.
+
+        Higher priority nodes get shorter timeouts, making them
+        more likely to start elections first and become leader.
+        Priority scaling: timeout is divided by (1 + (priority - 1) * 0.1)
+        So priority=1 is baseline, priority=10 gets ~half the timeout.
+        """
         ms = random.randint(
             self._config.election_timeout_min,
             self._config.election_timeout_max,
         )
-        return ms / 1000.0
+        # Scale by priority (higher priority = shorter timeout)
+        priority_scale = 1.0 + (self._config.priority - 1) * 0.1
+        scaled_ms = ms / priority_scale
+        return scaled_ms / 1000.0
 
     async def run_election_timer(self):
         """Main election timer coroutine.
@@ -69,6 +78,11 @@ class ElectionManager:
     async def start_election(self):
         """Start a new election.
 
+        If pre-vote is enabled:
+        1. Send PreVote RPCs to check if we could win
+        2. Only proceed to real election if pre-vote majority achieved
+
+        Real election:
         1. Become candidate (increments term, votes for self)
         2. Send RequestVote RPCs to all peers in parallel
         3. Count votes (need strict majority)
@@ -77,6 +91,17 @@ class ElectionManager:
         """
         if not self._node.is_alive:
             return
+
+        # Pre-vote phase: check if we could win without incrementing term
+        if self._config.peers:  # Skip pre-vote for single-node cluster
+            pre_vote_ok = await self._run_pre_vote()
+            if not pre_vote_ok:
+                logger.info(
+                    "pre_vote_failed",
+                    node_id=self._node.node_id,
+                    term=self._node.current_term,
+                )
+                return  # Don't start real election
 
         # Step 1: Become candidate
         new_term = await self._node.become_candidate()
@@ -156,6 +181,58 @@ class ElectionManager:
                 votes=votes_received,
                 majority_needed=majority,
             )
+
+    async def _run_pre_vote(self) -> bool:
+        """Run pre-vote phase to check if we could win an election.
+
+        Sends PreVote RPCs with term+1 (without actually incrementing).
+        Returns True if we got a majority of pre-votes.
+        """
+        pre_vote_term = self._node.current_term + 1
+        votes = 1  # Vote for self
+        majority = self._config.majority
+
+        logger.info(
+            "pre_vote_started",
+            node_id=self._node.node_id,
+            pre_vote_term=pre_vote_term,
+        )
+
+        tasks = []
+        for peer in self._config.peers:
+            tasks.append(
+                self._rpc_client.send_pre_vote(
+                    peer_address=peer,
+                    term=pre_vote_term,
+                    candidate_id=self._node.node_id,
+                    priority=self._config.priority,
+                )
+            )
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for result in results:
+            if isinstance(result, Exception) or result is None:
+                continue
+            resp_term, vote_granted = result
+
+            # If we discover a term higher than our proposed term, step down
+            if resp_term > pre_vote_term:
+                await self._node.step_down(resp_term)
+                return False
+
+            if vote_granted:
+                votes += 1
+
+        pre_vote_passed = votes >= majority
+        logger.info(
+            "pre_vote_result",
+            node_id=self._node.node_id,
+            votes=votes,
+            majority=majority,
+            passed=pre_vote_passed,
+        )
+        return pre_vote_passed
 
     async def stop(self):
         """Stop the election timer."""
