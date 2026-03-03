@@ -1,0 +1,79 @@
+services:
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-node-1
+    environment:
+      NODE_ID: node-1
+      HOST: "0.0.0.0"
+      PORT: "5001"
+      PEERS: "node-2:5002,node-3:5003,node-4:5004,node-5:5005"
+    ports:
+      - "5001:5001"
+    networks:
+      - raft-net
+
+  node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-node-2
+    environment:
+      NODE_ID: node-2
+      HOST: "0.0.0.0"
+      PORT: "5002"
+      PEERS: "node-1:5001,node-3:5003,node-4:5004,node-5:5005"
+    ports:
+      - "5002:5002"
+    networks:
+      - raft-net
+
+  node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-node-3
+    environment:
+      NODE_ID: node-3
+      HOST: "0.0.0.0"
+      PORT: "5003"
+      PEERS: "node-1:5001,node-2:5002,node-4:5004,node-5:5005"
+    ports:
+      - "5003:5003"
+    networks:
+      - raft-net
+
+  node-4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-node-4
+    environment:
+      NODE_ID: node-4
+      HOST: "0.0.0.0"
+      PORT: "5004"
+      PEERS: "node-1:5001,node-2:5002,node-3:5003,node-5:5005"
+    ports:
+      - "5004:5004"
+    networks:
+      - raft-net
+
+  node-5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: raft-node-5
+    environment:
+      NODE_ID: node-5
+      HOST: "0.0.0.0"
+      PORT: "5005"
+      PEERS: "node-1:5001,node-2:5002,node-3:5003,node-4:5004"
+    ports:
+      - "5005:5005"
+    networks:
+      - raft-net
+
+networks:
+  raft-net:
+    driver: bridge
