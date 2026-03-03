@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Raft Leader Election Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Raft Leader Election</h1>
+            <p class="subtitle">Real-time cluster visualization</p>
+        </header>
+
+        <div class="cluster-info">
+            <span id="cluster-term">Term: --</span>
+            <span id="cluster-leader">Leader: --</span>
+            <span id="cluster-status">Status: Connecting...</span>
+        </div>
+
+        <div class="nodes-grid" id="nodes-grid">
+            <!-- Nodes rendered by JS -->
+        </div>
+
+        <div class="actions">
+            <button id="kill-leader-btn" class="btn btn-danger">Kill Leader</button>
+        </div>
+
+        <div class="election-log">
+            <h2>Election Log</h2>
+            <div id="election-log-container" class="log-container">
+                <p class="log-empty">Waiting for events...</p>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

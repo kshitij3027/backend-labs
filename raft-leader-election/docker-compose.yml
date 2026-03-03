@@ -74,6 +74,22 @@ services:
     networks:
       - raft-net
 
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: raft-web
+    ports:
+      - "8080:8080"
+    depends_on:
+      - node-1
+      - node-2
+      - node-3
+      - node-4
+      - node-5
+    networks:
+      - raft-net
+
 networks:
   raft-net:
     driver: bridge

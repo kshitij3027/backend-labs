@@ -193,6 +193,51 @@ def verify_node_rejoin(killed_node, current_leader):
     return True
 
 
+def verify_dashboard():
+    """Verify the web dashboard is running and responsive."""
+    print("\n=== Test: Web Dashboard ===")
+
+    import urllib.request
+    import json
+
+    # Test 1: Dashboard serves HTML
+    try:
+        req = urllib.request.urlopen("http://web:8080/", timeout=5)
+        if req.status != 200:
+            print(f"  FAIL: Dashboard returned status {req.status}")
+            return False
+        content = req.read().decode()
+        if "Raft Leader Election" not in content:
+            print("  FAIL: Dashboard HTML missing expected title")
+            return False
+        print("  Dashboard HTML: OK")
+    except Exception as e:
+        print(f"  FAIL: Could not reach dashboard: {e}")
+        return False
+
+    # Test 2: API status endpoint
+    try:
+        req = urllib.request.urlopen("http://web:8080/api/status", timeout=5)
+        data = json.loads(req.read().decode())
+        assert len(data) == 5, f"Expected 5 nodes, got {len(data)}"
+        print(f"  API /api/status: OK ({len(data)} nodes)")
+    except Exception as e:
+        print(f"  FAIL: API status failed: {e}")
+        return False
+
+    # Test 3: Election log endpoint
+    try:
+        req = urllib.request.urlopen("http://web:8080/api/election-log?limit=10", timeout=5)
+        events = json.loads(req.read().decode())
+        print(f"  API /api/election-log: OK ({len(events)} events)")
+    except Exception as e:
+        print(f"  FAIL: Election log failed: {e}")
+        return False
+
+    print("  PASS")
+    return True
+
+
 def main():
     print("Raft Cluster E2E Verification")
     print("=" * 40)
@@ -210,6 +255,10 @@ def main():
     if not passed or not leader:
         print("\nCannot continue without initial leader")
         sys.exit(1)
+
+    # Test: Dashboard
+    passed = verify_dashboard()
+    results.append(("Web Dashboard", passed))
 
     # Test 2: Kill leader and verify re-election
     passed, new_leader = verify_leader_failure_reelection(leader)

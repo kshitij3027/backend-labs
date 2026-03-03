@@ -1,0 +1,216 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+}
+
+.container {
+    max-width: 900px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+}
+
+header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+header h1 {
+    font-size: 1.75rem;
+    color: #f8fafc;
+    margin-bottom: 0.25rem;
+}
+
+.subtitle {
+    color: #94a3b8;
+    font-size: 0.875rem;
+}
+
+.cluster-info {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin-bottom: 2rem;
+    padding: 1rem;
+    background: #1e293b;
+    border-radius: 0.5rem;
+    font-size: 0.9rem;
+}
+
+.cluster-info span {
+    color: #cbd5e1;
+}
+
+.nodes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1rem;
+    margin-bottom: 2rem;
+}
+
+.node-card {
+    background: #1e293b;
+    border-radius: 0.75rem;
+    padding: 1.25rem;
+    text-align: center;
+    border: 2px solid transparent;
+    transition: all 0.3s ease;
+}
+
+.node-card.leader {
+    border-color: #22c55e;
+    box-shadow: 0 0 20px rgba(34, 197, 94, 0.2);
+}
+
+.node-card.follower {
+    border-color: #3b82f6;
+}
+
+.node-card.candidate {
+    border-color: #f97316;
+    animation: pulse 1s ease-in-out infinite;
+}
+
+.node-card.stopped {
+    border-color: #6b7280;
+    opacity: 0.5;
+}
+
+.node-card.unreachable {
+    border-color: #ef4444;
+    opacity: 0.4;
+}
+
+@keyframes pulse {
+    0%, 100% { box-shadow: 0 0 5px rgba(249, 115, 22, 0.3); }
+    50% { box-shadow: 0 0 20px rgba(249, 115, 22, 0.6); }
+}
+
+.node-circle {
+    width: 60px;
+    height: 60px;
+    border-radius: 50%;
+    margin: 0 auto 0.75rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    font-size: 0.8rem;
+}
+
+.node-card.leader .node-circle { background: #22c55e; color: #0f172a; }
+.node-card.follower .node-circle { background: #3b82f6; color: #fff; }
+.node-card.candidate .node-circle { background: #f97316; color: #0f172a; }
+.node-card.stopped .node-circle { background: #6b7280; color: #fff; }
+.node-card.unreachable .node-circle { background: #ef4444; color: #fff; }
+
+.node-name {
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+    font-size: 0.9rem;
+}
+
+.node-state {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.25rem;
+}
+
+.node-term {
+    font-size: 0.8rem;
+    color: #94a3b8;
+}
+
+.actions {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+
+.btn {
+    padding: 0.625rem 1.5rem;
+    border: none;
+    border-radius: 0.375rem;
+    font-size: 0.875rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-danger {
+    background: #dc2626;
+    color: white;
+}
+
+.btn-danger:hover {
+    background: #b91c1c;
+}
+
+.btn-danger:disabled {
+    background: #6b7280;
+    cursor: not-allowed;
+}
+
+.election-log {
+    background: #1e293b;
+    border-radius: 0.5rem;
+    padding: 1rem;
+}
+
+.election-log h2 {
+    font-size: 1rem;
+    margin-bottom: 0.75rem;
+    color: #f8fafc;
+}
+
+.log-container {
+    max-height: 300px;
+    overflow-y: auto;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 0.75rem;
+}
+
+.log-entry {
+    padding: 0.25rem 0.5rem;
+    border-bottom: 1px solid #334155;
+    display: flex;
+    gap: 0.75rem;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-time {
+    color: #64748b;
+    white-space: nowrap;
+}
+
+.log-node {
+    color: #818cf8;
+    white-space: nowrap;
+    min-width: 60px;
+}
+
+.log-event {
+    color: #e2e8f0;
+}
+
+.log-event.became_leader { color: #22c55e; }
+.log-event.became_candidate { color: #f97316; }
+.log-event.stepped_down { color: #f87171; }
+.log-event.vote_granted { color: #60a5fa; }
+.log-event.vote_denied { color: #fbbf24; }
+
+.log-empty {
+    color: #64748b;
+    text-align: center;
+    padding: 1rem;
+}
