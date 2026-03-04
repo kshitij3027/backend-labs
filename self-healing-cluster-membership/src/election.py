@@ -22,11 +22,23 @@ class LeaderElection:
     async def elect_leader(self) -> Optional[str]:
         """Elect the leader as the highest-ID healthy node.
 
-        Returns the node_id of the new leader, or None if no healthy nodes.
+        Returns the node_id of the new leader, or None if no healthy nodes
+        or if healthy nodes do not form a majority of the cluster.
         """
         healthy = await self._registry.get_healthy_nodes()
         if not healthy:
             logger.warning("No healthy nodes available for leader election")
+            return None
+
+        # Only elect if healthy nodes form a majority
+        all_nodes = await self._registry.get_all_nodes()
+        total = len(all_nodes)
+        if total > 1 and len(healthy) <= total / 2:
+            logger.warning(
+                "Cannot elect leader: healthy nodes (%d) <= total/2 (%d)",
+                len(healthy),
+                total,
+            )
             return None
 
         # Sort by node_id and pick highest

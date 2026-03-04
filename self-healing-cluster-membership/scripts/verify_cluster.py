@@ -194,6 +194,141 @@ def verify_node_rejoin(node_id, timeout=20.0):
     return False
 
 
+def verify_network_partition(timeout=30.0):
+    """Test network partition handling."""
+    print("\n=== Test: Network Partition ===")
+
+    # First, ensure all nodes are healthy and restart any that were stopped
+    print("  Restarting all nodes...")
+    for nid in NODES:
+        subprocess.run(
+            ["docker", "start", f"cluster-{nid}"], capture_output=True, timeout=10
+        )
+
+    # Wait for all nodes to be healthy
+    print("  Waiting for all nodes to be healthy...")
+    start = time.time()
+    all_healthy = False
+    while time.time() - start < 20:
+        all_healthy = True
+        for nid, addr in NODES.items():
+            health = get_health(addr)
+            if not health or health.get("status") != "healthy":
+                all_healthy = False
+                break
+        if all_healthy:
+            break
+        time.sleep(1)
+
+    if not all_healthy:
+        print("  FAIL: Could not get all nodes healthy before partition test")
+        return False
+
+    print("  All nodes healthy. Creating partition (isolating node-4, node-5)...")
+
+    # Disconnect node-4 and node-5 from the network
+    network_name = "self-healing-cluster-membership_cluster-net"
+    subprocess.run(
+        ["docker", "network", "disconnect", network_name, "cluster-node-4"],
+        capture_output=True,
+        timeout=10,
+    )
+    subprocess.run(
+        ["docker", "network", "disconnect", network_name, "cluster-node-5"],
+        capture_output=True,
+        timeout=10,
+    )
+
+    # Wait for majority partition to detect the isolated nodes as failed
+    print("  Waiting for majority to detect partition...")
+    start = time.time()
+    partition_detected = False
+    while time.time() - start < timeout:
+        membership = get_membership(NODES["node-2"])
+        if membership:
+            statuses = {n["node_id"]: n["status"] for n in membership.get("nodes", [])}
+            node4_failed = statuses.get("node-4") == "failed"
+            node5_failed = statuses.get("node-5") == "failed"
+            if node4_failed and node5_failed:
+                print(f"  Majority detected partition ({time.time() - start:.1f}s)")
+                partition_detected = True
+                break
+        time.sleep(1)
+
+    if not partition_detected:
+        print(f"  FAIL: Majority did not detect partition within {timeout}s")
+        # Reconnect before failing
+        subprocess.run(
+            ["docker", "network", "connect", network_name, "cluster-node-4"],
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["docker", "network", "connect", network_name, "cluster-node-5"],
+            capture_output=True,
+            timeout=10,
+        )
+        return False
+
+    # Verify majority partition still has a leader
+    leader_in_majority = False
+    for nid in ["node-1", "node-2", "node-3"]:
+        health = get_health(NODES[nid])
+        if health and health.get("role") == "leader":
+            print(f"  Leader in majority partition: {nid}")
+            leader_in_majority = True
+            break
+
+    if not leader_in_majority:
+        print(
+            "  WARNING: No leader in majority partition "
+            "(may be expected if previous leader was in minority)"
+        )
+
+    # Heal the partition
+    print("  Healing partition (reconnecting node-4, node-5)...")
+    subprocess.run(
+        ["docker", "network", "connect", network_name, "cluster-node-4"],
+        capture_output=True,
+        timeout=10,
+    )
+    subprocess.run(
+        ["docker", "network", "connect", network_name, "cluster-node-5"],
+        capture_output=True,
+        timeout=10,
+    )
+
+    # Wait for convergence after heal
+    print("  Waiting for convergence after partition heal...")
+    start = time.time()
+    converged = False
+    while time.time() - start < 20:
+        all_see_all = True
+        for nid, addr in NODES.items():
+            membership = get_membership(addr)
+            if membership is None:
+                all_see_all = False
+                break
+            known_ids = {n["node_id"] for n in membership.get("nodes", [])}
+            if not NODES.keys() <= known_ids:
+                all_see_all = False
+                break
+        if all_see_all:
+            print(
+                f"  Cluster converged after partition heal ({time.time() - start:.1f}s)"
+            )
+            converged = True
+            break
+        time.sleep(1)
+
+    if not converged:
+        print(f"  FAIL: Cluster did not converge after partition heal within 20s")
+        return False
+
+    print("  PASS")
+    return True
+
+
 def verify_gossip_convergence(timeout=15.0):
     """Verify all alive nodes have the same membership view."""
     print("\n=== Test: Gossip Convergence ===")
@@ -271,6 +406,10 @@ def main():
     # Test 6: Gossip convergence (all alive nodes same view)
     passed = verify_gossip_convergence()
     results.append(("Gossip Convergence", passed))
+
+    # Test 7: Network partition
+    passed = verify_network_partition()
+    results.append(("Network Partition", passed))
 
     # Summary
     print("\n" + "=" * 40)

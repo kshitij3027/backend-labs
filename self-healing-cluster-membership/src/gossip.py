@@ -77,6 +77,8 @@ class GossipProtocol:
         peers = await self._registry.get_peers(self._config.node_id)
         # Include healthy and suspected peers for gossip, exclude failed
         eligible = [p for p in peers if p.status != NodeStatus.FAILED]
+        if not eligible and peers:
+            logger.warning("No eligible gossip targets — possible network partition")
         if not eligible:
             return []
         k = min(self._config.gossip_fanout, len(eligible))

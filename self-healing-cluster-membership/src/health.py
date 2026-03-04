@@ -76,15 +76,23 @@ class HealthMonitor:
                     if phi >= self._config.phi_threshold:
                         # Probable failure
                         if peer.status != NodeStatus.FAILED:
-                            logger.warning(
-                                "Node %s FAILED (phi=%.2f >= %.2f)",
-                                peer.node_id,
-                                phi,
-                                self._config.phi_threshold,
-                            )
-                            await self._registry.mark_failed(peer.node_id)
-                            if self._on_node_failed:
-                                await self._on_node_failed(peer.node_id)
+                            if await self._has_majority():
+                                logger.warning(
+                                    "Node %s FAILED (phi=%.2f >= %.2f)",
+                                    peer.node_id,
+                                    phi,
+                                    self._config.phi_threshold,
+                                )
+                                await self._registry.mark_failed(peer.node_id)
+                                if self._on_node_failed:
+                                    await self._on_node_failed(peer.node_id)
+                            else:
+                                logger.warning(
+                                    "Node %s may be failed (phi=%.2f) but we "
+                                    "don't have majority, skipping",
+                                    peer.node_id,
+                                    phi,
+                                )
                     elif phi >= 1.0:
                         # Suspected
                         if peer.status == NodeStatus.HEALTHY:
@@ -113,6 +121,25 @@ class HealthMonitor:
             except Exception:
                 logger.exception("Error in health check loop")
                 await asyncio.sleep(self._config.health_check_interval)
+
+    async def _has_majority(self) -> bool:
+        """Check if this node can reach a majority of known nodes.
+
+        A node has majority when the count of reachable (non-FAILED) nodes
+        including itself exceeds total / 2. This prevents minority partitions
+        from incorrectly marking nodes as FAILED.
+        """
+        all_nodes = await self._registry.get_all_nodes()
+        total = len(all_nodes)
+        if total <= 1:
+            return True
+        reachable = sum(
+            1 for n in all_nodes.values()
+            if n.status != NodeStatus.FAILED and n.node_id != self._config.node_id
+        )
+        # Count self as reachable
+        reachable += 1
+        return reachable > total / 2
 
     async def _heartbeat_loop(self) -> None:
         """Periodically send heartbeats to all healthy peers."""
