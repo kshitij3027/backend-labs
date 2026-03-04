@@ -1,0 +1,89 @@
+services:
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cluster-node-1
+    environment:
+      NODE_ID: "node-1"
+      ADDRESS: "0.0.0.0"
+      PORT: "5000"
+      ROLE: "leader"
+      SEED_NODES: "node-2:5000,node-3:5000,node-4:5000,node-5:5000"
+    ports:
+      - "5001:5000"
+    networks:
+      - cluster-net
+    restart: "no"
+
+  node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cluster-node-2
+    environment:
+      NODE_ID: "node-2"
+      ADDRESS: "0.0.0.0"
+      PORT: "5000"
+      ROLE: "worker"
+      SEED_NODES: "node-1:5000,node-3:5000,node-4:5000,node-5:5000"
+    ports:
+      - "5002:5000"
+    networks:
+      - cluster-net
+    restart: "no"
+
+  node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cluster-node-3
+    environment:
+      NODE_ID: "node-3"
+      ADDRESS: "0.0.0.0"
+      PORT: "5000"
+      ROLE: "worker"
+      SEED_NODES: "node-1:5000,node-2:5000,node-4:5000,node-5:5000"
+    ports:
+      - "5003:5000"
+    networks:
+      - cluster-net
+    restart: "no"
+
+  node-4:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cluster-node-4
+    environment:
+      NODE_ID: "node-4"
+      ADDRESS: "0.0.0.0"
+      PORT: "5000"
+      ROLE: "worker"
+      SEED_NODES: "node-1:5000,node-2:5000,node-3:5000,node-5:5000"
+    ports:
+      - "5004:5000"
+    networks:
+      - cluster-net
+    restart: "no"
+
+  node-5:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cluster-node-5
+    environment:
+      NODE_ID: "node-5"
+      ADDRESS: "0.0.0.0"
+      PORT: "5000"
+      ROLE: "worker"
+      SEED_NODES: "node-1:5000,node-2:5000,node-3:5000,node-4:5000"
+    ports:
+      - "5005:5000"
+    networks:
+      - cluster-net
+    restart: "no"
+
+networks:
+  cluster-net:
+    driver: bridge
