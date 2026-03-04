@@ -1,18 +1,19 @@
 """E2E verification script for the self-healing cluster."""
 
 import json
+import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 
 NODES = {
-    "node-1": "node-1:5000",
-    "node-2": "node-2:5000",
-    "node-3": "node-3:5000",
-    "node-4": "node-4:5000",
-    "node-5": "node-5:5000",
+    "node-1": "localhost:5001",
+    "node-2": "localhost:5002",
+    "node-3": "localhost:5003",
+    "node-4": "localhost:5004",
+    "node-5": "localhost:5005",
 }
 
 
@@ -92,6 +93,145 @@ def verify_leader_elected(timeout=10.0):
     return False, None
 
 
+def verify_failure_detection(timeout=20.0):
+    """Stop a worker node and verify it's detected as FAILED."""
+    print("\n=== Test: Failure Detection ===")
+
+    print("  Stopping node-3...")
+    subprocess.run(["docker", "stop", "cluster-node-3"], capture_output=True, timeout=10)
+
+    start = time.time()
+    while time.time() - start < timeout:
+        # Check from node-1's perspective
+        membership = get_membership(NODES["node-1"])
+        if membership:
+            for node in membership.get("nodes", []):
+                if node["node_id"] == "node-3" and node["status"] == "failed":
+                    print(f"  node-3 detected as FAILED ({time.time() - start:.1f}s)")
+                    print("  PASS")
+                    return True
+        time.sleep(1)
+
+    print(f"  FAIL: node-3 not detected as FAILED within {timeout}s")
+    # Debug: show all node statuses
+    membership = get_membership(NODES["node-1"])
+    if membership:
+        for node in membership.get("nodes", []):
+            print(f"    {node['node_id']}: {node['status']}")
+    return False
+
+
+def verify_leader_reelection(old_leader, timeout=20.0):
+    """Kill the leader and verify a new leader is elected."""
+    print(f"\n=== Test: Leader Re-election (killing {old_leader}) ===")
+
+    print(f"  Stopping {old_leader}...")
+    subprocess.run(
+        ["docker", "stop", f"cluster-{old_leader}"], capture_output=True, timeout=10
+    )
+
+    start = time.time()
+    while time.time() - start < timeout:
+        # Check remaining nodes for new leader
+        new_leaders = []
+        for node_id, address in NODES.items():
+            if node_id == old_leader:
+                continue
+            health = get_health(address)
+            if health and health.get("role") == "leader":
+                new_leaders.append(node_id)
+
+        if len(new_leaders) == 1 and new_leaders[0] != old_leader:
+            print(f"  New leader: {new_leaders[0]} ({time.time() - start:.1f}s)")
+            print("  PASS")
+            return True, new_leaders[0]
+        time.sleep(1)
+
+    print(f"  FAIL: No new leader elected within {timeout}s")
+    return False, None
+
+
+def verify_node_rejoin(node_id, timeout=20.0):
+    """Restart a stopped node and verify it rejoins as HEALTHY."""
+    print(f"\n=== Test: Node Rejoin ({node_id}) ===")
+
+    print(f"  Restarting {node_id}...")
+    subprocess.run(
+        ["docker", "start", f"cluster-{node_id}"], capture_output=True, timeout=10
+    )
+
+    # Find a surviving node to check from (not node-3 or the old leader which may be down)
+    check_from = None
+    for nid, addr in NODES.items():
+        if nid == node_id:
+            continue
+        health = get_health(addr)
+        if health:
+            check_from = nid
+            break
+
+    if check_from is None:
+        print(f"  FAIL: No surviving node to verify from")
+        return False
+
+    start = time.time()
+    while time.time() - start < timeout:
+        health = get_health(NODES[node_id])
+        if health and health.get("status") == "healthy":
+            # Also verify other nodes see it as healthy
+            membership = get_membership(NODES[check_from])
+            if membership:
+                for node in membership.get("nodes", []):
+                    if node["node_id"] == node_id and node["status"] == "healthy":
+                        print(
+                            f"  {node_id} rejoined as HEALTHY ({time.time() - start:.1f}s)"
+                        )
+                        print("  PASS")
+                        return True
+        time.sleep(1)
+
+    print(f"  FAIL: {node_id} did not rejoin within {timeout}s")
+    return False
+
+
+def verify_gossip_convergence(timeout=15.0):
+    """Verify all alive nodes have the same membership view."""
+    print("\n=== Test: Gossip Convergence ===")
+
+    start = time.time()
+    views = {}
+    while time.time() - start < timeout:
+        views = {}
+
+        for node_id, address in NODES.items():
+            membership = get_membership(address)
+            if membership is None:
+                continue  # Node might be down
+            # Build a sorted view of node statuses
+            view = tuple(
+                sorted(
+                    (n["node_id"], n["status"]) for n in membership.get("nodes", [])
+                )
+            )
+            views[node_id] = view
+
+        if len(views) >= 2:
+            unique_views = set(views.values())
+            if len(unique_views) == 1:
+                print(
+                    f"  All {len(views)} alive nodes have consistent view ({time.time() - start:.1f}s)"
+                )
+                print("  PASS")
+                return True
+
+        time.sleep(1)
+
+    print(f"  FAIL: Views not converged within {timeout}s")
+    for nid, view in views.items():
+        print(f"    {nid}: {view}")
+    return False
+
+
 def main():
     print("Self-Healing Cluster E2E Verification")
     print("=" * 40)
@@ -112,6 +252,25 @@ def main():
     # Test 2: Leader election
     passed, leader = verify_leader_elected()
     results.append(("Leader Election", passed))
+    if not passed:
+        print("\nCannot continue without a leader")
+        sys.exit(1)
+
+    # Test 3: Failure detection (stop node-3, verify FAILED)
+    passed = verify_failure_detection()
+    results.append(("Failure Detection", passed))
+
+    # Test 4: Leader re-election (stop the leader, verify new leader)
+    passed, new_leader = verify_leader_reelection(leader)
+    results.append(("Leader Re-election", passed))
+
+    # Test 5: Node rejoin (restart node-3, verify HEALTHY)
+    passed = verify_node_rejoin("node-3")
+    results.append(("Node Rejoin", passed))
+
+    # Test 6: Gossip convergence (all alive nodes same view)
+    passed = verify_gossip_convergence()
+    results.append(("Gossip Convergence", passed))
 
     # Summary
     print("\n" + "=" * 40)

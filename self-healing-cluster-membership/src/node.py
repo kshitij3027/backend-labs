@@ -83,6 +83,7 @@ class ClusterMember:
             return
 
         joined = False
+        cluster_digest = []
         for seed in self._config.seed_nodes:
             try:
                 url = f"http://{seed}/join"
@@ -96,10 +97,8 @@ class ClusterMember:
                     ) as resp:
                         if resp.status == 200:
                             data = orjson.loads(await resp.read())
-                            digest = data.get("digest", [])
-                            if digest:
-                                await self._registry.merge_digest(digest)
-                            logger.info("Joined cluster via seed %s (got %d nodes)", seed, len(digest))
+                            cluster_digest = data.get("digest", [])
+                            logger.info("Joined cluster via seed %s (got %d nodes)", seed, len(cluster_digest))
                             joined = True
                             break
             except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -109,8 +108,76 @@ class ClusterMember:
         if not joined:
             logger.warning("Could not join any seed node, will discover via gossip")
 
+        # Before merging the cluster digest, check if the cluster has
+        # a stale FAILED/SUSPECTED entry for us and bump our incarnation
+        # above it so our HEALTHY status wins in SWIM merge rules.
+        await self._refute_stale_status(cluster_digest)
+
+        # Now merge the rest of the digest (peers only; our own entry
+        # is already correct with the bumped incarnation)
+        if cluster_digest:
+            await self._registry.merge_digest(cluster_digest)
+
+        # After merge, ensure we are still HEALTHY (in case merge
+        # overwrote us with a stale entry at same incarnation)
+        await self._ensure_self_healthy()
+
         # Trigger an immediate gossip round to spread our presence
         await self._gossip.do_gossip_round()
+
+    async def _refute_stale_status(self, digest: list[dict]) -> None:
+        """Bump our incarnation above any stale entry the cluster has for us.
+
+        Before merging the cluster digest, we examine it for our own
+        node_id. If the cluster has us as FAILED or SUSPECTED, we
+        increment our incarnation above theirs so our HEALTHY gossip
+        will win under SWIM merge rules (higher incarnation always wins).
+        """
+        if not digest:
+            return
+
+        self_node = await self._registry.get_node(self._config.node_id)
+        if self_node is None:
+            return
+
+        for entry in digest:
+            if entry.get("node_id") == self._config.node_id:
+                cluster_incarnation = entry.get("incarnation", 0)
+                cluster_status = entry.get("status", "healthy")
+                if cluster_status in ("failed", "suspected") or cluster_incarnation >= self_node.incarnation:
+                    new_incarnation = max(self_node.incarnation, cluster_incarnation) + 1
+                    self_node.incarnation = new_incarnation
+                    self_node.status = NodeStatus.HEALTHY
+                    self_node.suspicion_level = 0.0
+                    await self._registry.update_node(self_node)
+                    logger.info(
+                        "Refuted stale cluster status (%s, inc=%d) on rejoin, "
+                        "incarnation bumped to %d",
+                        cluster_status,
+                        cluster_incarnation,
+                        new_incarnation,
+                    )
+                break
+
+    async def _ensure_self_healthy(self) -> None:
+        """Ensure this node's own registry entry is HEALTHY after digest merge.
+
+        A safety net: if merge_digest overwrote our entry with a stale
+        status, force it back to HEALTHY with a bumped incarnation.
+        """
+        self_node = await self._registry.get_node(self._config.node_id)
+        if self_node is None:
+            return
+
+        if self_node.status != NodeStatus.HEALTHY:
+            self_node.incarnation += 1
+            self_node.status = NodeStatus.HEALTHY
+            self_node.suspicion_level = 0.0
+            await self._registry.update_node(self_node)
+            logger.info(
+                "Forced self back to HEALTHY (incarnation=%d) after digest merge",
+                self_node.incarnation,
+            )
 
     async def stop(self) -> None:
         """Gracefully stop the cluster member."""

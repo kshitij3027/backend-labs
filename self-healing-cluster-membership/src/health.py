@@ -157,7 +157,8 @@ class HealthMonitor:
         """Handle a received heartbeat from another node.
 
         Records the heartbeat in the failure detector and updates the registry.
-        If the node was SUSPECTED, resets it to HEALTHY.
+        If the node was SUSPECTED or FAILED, resets it to HEALTHY (it's
+        clearly alive if it's sending heartbeats).
         """
         self._detector.record_heartbeat(sender_id)
 
@@ -167,6 +168,6 @@ class HealthMonitor:
             node.heartbeat_count += 1
             await self._registry.update_node(node)
 
-            if node.status == NodeStatus.SUSPECTED:
-                logger.info("Node %s recovered from SUSPECTED to HEALTHY", sender_id)
+            if node.status in (NodeStatus.SUSPECTED, NodeStatus.FAILED):
+                logger.info("Node %s recovered from %s to HEALTHY", sender_id, node.status.value)
                 await self._registry.mark_healthy(sender_id)

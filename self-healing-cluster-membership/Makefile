@@ -23,7 +23,7 @@ logs:
 e2e:
 	docker compose up --build -d
 	sleep 8
-	docker compose exec node-1 python scripts/verify_cluster.py || (docker compose down && exit 1)
+	PYTHONPATH=. python3 scripts/verify_cluster.py || (docker compose down && exit 1)
 	docker compose down
 
 clean:
