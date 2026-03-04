@@ -19,6 +19,12 @@ class ClusterConfig:
     suspected_health_check_multiplier: float = 0.5
     heartbeat_window_size: int = 20
     cleanup_interval: float = 30.0
+    advertise_address: str = ""
+
+    def __post_init__(self):
+        """Set advertise_address to node_id if not explicitly provided."""
+        if not self.advertise_address:
+            self.advertise_address = self.node_id
 
 
 def load_config() -> ClusterConfig:
@@ -26,8 +32,9 @@ def load_config() -> ClusterConfig:
     seed_nodes_raw = os.environ.get("SEED_NODES", "")
     seed_nodes = [s.strip() for s in seed_nodes_raw.split(",") if s.strip()]
 
+    node_id = os.environ.get("NODE_ID", "node-1")
     return ClusterConfig(
-        node_id=os.environ.get("NODE_ID", "node-1"),
+        node_id=node_id,
         address=os.environ.get("ADDRESS", "0.0.0.0"),
         port=int(os.environ.get("PORT", "5000")),
         role=os.environ.get("ROLE", "worker"),
@@ -41,4 +48,5 @@ def load_config() -> ClusterConfig:
         ),
         heartbeat_window_size=int(os.environ.get("HEARTBEAT_WINDOW_SIZE", "20")),
         cleanup_interval=float(os.environ.get("CLEANUP_INTERVAL", "30.0")),
+        advertise_address=os.environ.get("ADVERTISE_ADDRESS", node_id),
     )

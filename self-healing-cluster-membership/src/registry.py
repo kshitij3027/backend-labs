@@ -34,7 +34,7 @@ class MembershipRegistry:
         """Create and store a NodeInfo entry for this node."""
         node = NodeInfo(
             node_id=config.node_id,
-            address=config.address,
+            address=config.advertise_address,
             port=config.port,
             role=NodeRole(config.role),
             status=NodeStatus.HEALTHY,
