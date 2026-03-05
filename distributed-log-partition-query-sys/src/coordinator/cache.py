@@ -23,6 +23,8 @@ class QueryCache:
             "sort_field": query.sort_field,
             "sort_order": query.sort_order,
             "limit": query.limit,
+            "page": query.page,
+            "page_size": query.page_size,
         }
         key_str = json.dumps(key_data, sort_keys=True, default=str)
         return hashlib.sha256(key_str.encode()).hexdigest()[:16]

@@ -326,6 +326,21 @@
                     <input type="number" id="limit" value="50" min="1" max="10000" style="width: 100px;">
                 </div>
                 <div class="form-group">
+                    <label>Page</label>
+                    <input type="number" id="page" placeholder="--" min="1" style="width: 80px;">
+                </div>
+                <div class="form-group">
+                    <label>Page Size</label>
+                    <input type="number" id="page-size" value="50" min="1" max="1000" style="width: 80px;">
+                </div>
+                <div class="form-group">
+                    <label>&nbsp;</label>
+                    <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; text-transform: none; color: #e0e0e0; font-size: 14px;">
+                        <input type="checkbox" id="stream-toggle" style="width: auto;">
+                        Stream (SSE)
+                    </label>
+                </div>
+                <div class="form-group">
                     <label>&nbsp;</label>
                     <button type="submit" class="btn-primary">Run Query</button>
                 </div>
@@ -367,6 +382,13 @@
             </table>
         </div>
         <div id="no-results" class="no-results hidden">No log entries found matching your query.</div>
+
+        <!-- Pagination Controls -->
+        <div id="pagination-controls" style="display:none; margin-top: 16px; text-align: center; padding: 12px 0;">
+            <button onclick="prevPage()" id="prev-btn" style="margin-right: 12px;">Previous</button>
+            <span id="page-info" style="color: #aaa; font-size: 14px;"></span>
+            <button onclick="nextPage()" id="next-btn" style="margin-left: 12px;">Next</button>
+        </div>
     </div>
 
     <script>
@@ -433,17 +455,28 @@
             list.appendChild(row);
         }
 
-        // --- Query submission ---
-        function submitQuery(e) {
-            e.preventDefault();
+        // --- Pagination state ---
+        let currentPage = null;
+        let lastPayload = null;
 
-            const loading = document.getElementById('loading');
-            const resultsPanel = document.getElementById('results-panel');
+        function prevPage() {
+            if (currentPage && currentPage > 1) {
+                currentPage--;
+                document.getElementById('page').value = currentPage;
+                runQuery();
+            }
+        }
 
-            loading.classList.add('active');
-            resultsPanel.classList.add('hidden');
+        function nextPage() {
+            if (currentPage) {
+                currentPage++;
+                document.getElementById('page').value = currentPage;
+                runQuery();
+            }
+        }
 
-            // Build query payload
+        // --- Build query payload ---
+        function buildPayload() {
             const payload = {};
 
             // Time range
@@ -480,6 +513,46 @@
                 payload.limit = limitVal;
             }
 
+            // Pagination
+            const pageVal = document.getElementById('page').value;
+            if (pageVal) {
+                payload.page = parseInt(pageVal, 10);
+                const pageSizeVal = parseInt(document.getElementById('page-size').value, 10);
+                if (pageSizeVal > 0) {
+                    payload.page_size = pageSizeVal;
+                }
+            }
+
+            return payload;
+        }
+
+        // --- Query submission ---
+        function submitQuery(e) {
+            e.preventDefault();
+            runQuery();
+        }
+
+        function runQuery() {
+            const loading = document.getElementById('loading');
+            const resultsPanel = document.getElementById('results-panel');
+
+            loading.classList.add('active');
+            resultsPanel.classList.add('hidden');
+
+            const payload = buildPayload();
+            lastPayload = payload;
+
+            const streaming = document.getElementById('stream-toggle').checked;
+
+            if (streaming) {
+                runStreamingQuery(payload);
+            } else {
+                runNormalQuery(payload);
+            }
+        }
+
+        function runNormalQuery(payload) {
+            const loading = document.getElementById('loading');
             fetch('/query', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -496,6 +569,98 @@
             });
         }
 
+        async function runStreamingQuery(payload) {
+            const loading = document.getElementById('loading');
+            const panel = document.getElementById('results-panel');
+            const tbody = document.getElementById('results-body');
+            const noResults = document.getElementById('no-results');
+            const paginationControls = document.getElementById('pagination-controls');
+
+            // Show results panel immediately for streaming
+            tbody.innerHTML = '';
+            noResults.classList.add('hidden');
+            paginationControls.style.display = 'none';
+            panel.classList.remove('hidden');
+
+            // Update metadata placeholder
+            const meta = document.getElementById('query-meta');
+            meta.innerHTML = '<span class="meta-item">Streaming results...</span>';
+            const cachedContainer = document.getElementById('cached-badge-container');
+            cachedContainer.innerHTML = '<span class="badge-cached">STREAMING</span>';
+
+            let count = 0;
+            const startTime = performance.now();
+
+            try {
+                const response = await fetch('/query/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                loading.classList.remove('active');
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const jsonStr = line.substring(6);
+                            try {
+                                const entry = JSON.parse(jsonStr);
+                                if (entry.total !== undefined) {
+                                    // Done event
+                                    const elapsed = (performance.now() - startTime).toFixed(2);
+                                    meta.innerHTML = `
+                                        <span class="meta-item"><strong>Streaming complete</strong></span>
+                                        <span class="meta-item"><strong>Results:</strong> ${entry.total}</span>
+                                        <span class="meta-item"><strong>Time:</strong> ${elapsed}ms</span>
+                                    `;
+                                } else {
+                                    // Regular entry
+                                    count++;
+                                    const ts = entry.timestamp ? entry.timestamp.replace('T', ' ').substring(0, 19) : '';
+                                    const levelClass = 'level-' + (entry.level || '').toUpperCase();
+                                    const row = document.createElement('tr');
+                                    row.innerHTML = `
+                                        <td style="white-space: nowrap; font-family: monospace; font-size: 12px;">${escapeHtml(ts)}</td>
+                                        <td class="${levelClass}">${escapeHtml(entry.level)}</td>
+                                        <td>${escapeHtml(entry.service)}</td>
+                                        <td style="max-width: 500px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(entry.message)}</td>
+                                        <td style="color: #64b5f6;">${escapeHtml(entry.partition_id)}</td>
+                                    `;
+                                    tbody.appendChild(row);
+                                    meta.innerHTML = `<span class="meta-item">Streamed <strong>${count}</strong> results...</span>`;
+                                }
+                            } catch (parseErr) {
+                                // skip malformed lines
+                            }
+                        } else if (line.startsWith('event: done')) {
+                            // Next line will be the done data
+                        }
+                    }
+                }
+
+                if (count === 0) {
+                    noResults.classList.remove('hidden');
+                }
+
+                pollHealth();
+            } catch (err) {
+                loading.classList.remove('active');
+                alert('Streaming query failed: ' + err.message);
+            }
+        }
+
         // --- Render results ---
         function renderResults(data) {
             const panel = document.getElementById('results-panel');
@@ -509,12 +674,29 @@
 
             // Metadata
             const meta = document.getElementById('query-meta');
-            meta.innerHTML = `
+            let metaHtml = `
                 <span class="meta-item"><strong>Query ID:</strong> ${data.query_id}</span>
                 <span class="meta-item"><strong>Execution:</strong> ${data.total_execution_time_ms}ms</span>
                 <span class="meta-item"><strong>Results:</strong> ${data.total_results}</span>
                 <span class="meta-item"><strong>Partitions:</strong> ${data.partitions_successful}/${data.partitions_queried}</span>
             `;
+            if (data.page !== undefined) {
+                metaHtml += `<span class="meta-item"><strong>Page:</strong> ${data.page}/${data.total_pages}</span>`;
+            }
+            meta.innerHTML = metaHtml;
+
+            // Pagination controls
+            const paginationControls = document.getElementById('pagination-controls');
+            if (data.page !== undefined && data.total_pages > 1) {
+                currentPage = data.page;
+                paginationControls.style.display = 'block';
+                document.getElementById('page-info').textContent = `Page ${data.page} of ${data.total_pages}`;
+                document.getElementById('prev-btn').disabled = !data.has_previous;
+                document.getElementById('next-btn').disabled = !data.has_next;
+            } else {
+                paginationControls.style.display = 'none';
+                currentPage = null;
+            }
 
             // Results table
             const tbody = document.getElementById('results-body');

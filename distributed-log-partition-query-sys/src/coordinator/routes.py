@@ -1,12 +1,14 @@
+import json
 import time
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 
-from src.models import Query, QueryResponse
+from src.coordinator.streaming import StreamingMerger
+from src.models import Query, QueryResponse, PaginatedQueryResponse
 
 router = APIRouter()
 
@@ -110,6 +112,39 @@ async def query_logs(query: Query, request: Request):
     partition_results = [r.entries for r in scatter_results if r.success]
     partitions_successful = len(partition_results)
 
+    # Check if pagination is requested
+    if query.page is not None:
+        page = query.page
+        page_size = query.page_size or 50
+        page_results, total_count = merger.merge_paginated(
+            partition_results,
+            sort_field=query.sort_field,
+            sort_order=query.sort_order,
+            page=page,
+            page_size=page_size,
+        )
+
+        total_pages = (
+            (total_count + page_size - 1) // page_size if total_count > 0 else 1
+        )
+        elapsed_ms = (time.time() - start_time) * 1000
+
+        response = PaginatedQueryResponse(
+            query_id=query.query_id,
+            total_results=total_count,
+            partitions_queried=len(relevant_partitions),
+            partitions_successful=partitions_successful,
+            total_execution_time_ms=round(elapsed_ms, 2),
+            results=page_results,
+            page=page,
+            page_size=page_size,
+            total_pages=total_pages,
+            has_next=page < total_pages,
+            has_previous=page > 1,
+        )
+        cache.put(query, response)
+        return response
+
     # Merge results
     merged = merger.merge(
         partition_results,
@@ -133,3 +168,43 @@ async def query_logs(query: Query, request: Request):
     cache.put(query, response)
 
     return response
+
+
+@router.post("/query/stream")
+async def query_stream(query: Query, request: Request):
+    """Stream query results as Server-Sent Events."""
+    partition_map = request.app.state.partition_map
+    scatter_gather = request.app.state.scatter_gather
+
+    relevant_partitions = partition_map.get_relevant_partitions(query)
+    scatter_results = await scatter_gather.scatter(relevant_partitions, query)
+
+    # Update health
+    for result in scatter_results:
+        if result.success:
+            partition_map.mark_healthy(result.partition_id)
+        else:
+            partition_map.mark_unhealthy(result.partition_id)
+
+    partition_results = [r.entries for r in scatter_results if r.success]
+
+    streaming_merger = StreamingMerger()
+
+    async def event_generator():
+        count = 0
+        async for entry in streaming_merger.merge_stream(
+            partition_results,
+            sort_field=query.sort_field,
+            sort_order=query.sort_order,
+            limit=query.limit,
+        ):
+            data = entry.model_dump(mode="json")
+            yield f"data: {json.dumps(data, default=str)}\n\n"
+            count += 1
+        yield f"event: done\ndata: {{\"total\": {count}}}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )

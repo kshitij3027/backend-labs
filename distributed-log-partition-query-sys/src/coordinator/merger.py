@@ -91,3 +91,30 @@ class ResultMerger:
                     heapq.heappush(heap, new_comparable)
 
         return merged
+
+    def merge_paginated(
+        self,
+        partition_results: list[list[LogEntry]],
+        sort_field: str = "timestamp",
+        sort_order: str = "desc",
+        page: int = 1,
+        page_size: int = 50,
+    ) -> tuple[list[LogEntry], int]:
+        """Merge results with pagination. Returns (page_results, total_merged_count).
+
+        Merges all results first (up to max_merge_size), then slices for the requested page.
+        """
+        # Merge all (up to max_merge_size)
+        all_merged = self.merge(
+            partition_results,
+            sort_field=sort_field,
+            sort_order=sort_order,
+            limit=None,  # merge all, let max_merge_size cap it
+        )
+
+        total = len(all_merged)
+        start = (page - 1) * page_size
+        end = start + page_size
+        page_results = all_merged[start:end]
+
+        return page_results, total

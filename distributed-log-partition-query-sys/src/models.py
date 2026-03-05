@@ -21,6 +21,8 @@ class Query(BaseModel):
     sort_field: str = "timestamp"
     sort_order: str = "desc"  # "asc" or "desc"
     limit: int | None = None
+    page: int | None = None
+    page_size: int | None = None
 
 
 class LogEntry(BaseModel):
@@ -47,3 +49,11 @@ class QueryResponse(BaseModel):
     total_execution_time_ms: float
     results: list[LogEntry]
     cached: bool = False
+
+
+class PaginatedQueryResponse(QueryResponse):
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 1
+    has_next: bool = False
+    has_previous: bool = False
