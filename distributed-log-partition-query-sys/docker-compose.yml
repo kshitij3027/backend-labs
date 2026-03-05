@@ -1,0 +1,62 @@
+services:
+  coordinator:
+    build: .
+    container_name: query-coordinator
+    ports:
+      - "8080:8080"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      PARTITION_URLS: "http://partition-1:8081,http://partition-2:8082"
+      QUERY_TIMEOUT: "5.0"
+      MAX_CACHE_SIZE: "1000"
+    command: ["coordinator"]
+    depends_on:
+      - partition-1
+      - partition-2
+    networks:
+      - query-net
+
+  partition-1:
+    build: .
+    container_name: query-partition-1
+    ports:
+      - "8081:8081"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8081"
+      PARTITION_ID: "partition_1"
+      LOG_COUNT: "5000"
+      DAYS_BACK: "7"
+    command: ["partition"]
+    networks:
+      - query-net
+
+  partition-2:
+    build: .
+    container_name: query-partition-2
+    ports:
+      - "8082:8082"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8082"
+      PARTITION_ID: "partition_2"
+      LOG_COUNT: "5000"
+      DAYS_BACK: "7"
+    command: ["partition"]
+    networks:
+      - query-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: query-test
+    profiles:
+      - test
+    networks:
+      - query-net
+
+networks:
+  query-net:
+    driver: bridge
