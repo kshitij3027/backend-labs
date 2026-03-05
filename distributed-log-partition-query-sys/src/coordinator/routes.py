@@ -1,11 +1,21 @@
 import time
 import uuid
+from pathlib import Path
 
 from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from src.models import Query, QueryResponse
 
 router = APIRouter()
+
+
+@router.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    templates_dir = request.app.state.templates_dir
+    templates = Jinja2Templates(directory=str(templates_dir))
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 @router.get("/health")

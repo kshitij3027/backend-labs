@@ -1,0 +1,555 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Log Query System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            padding: 20px;
+            min-height: 100vh;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #333;
+        }
+        h1 { font-size: 24px; color: #fff; }
+        h2 { font-size: 18px; color: #fff; margin-bottom: 12px; }
+        .badge {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        .badge-ok { background: #2d5a27; color: #7aff6e; }
+        .badge-fail { background: #5a2727; color: #ff6e6e; }
+        .badge-cached {
+            background: #2d5a27;
+            color: #7aff6e;
+            padding: 4px 10px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-left: 8px;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
+            border: 1px solid #2a2a4a;
+        }
+        .form-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 16px;
+            align-items: flex-end;
+            flex-wrap: wrap;
+        }
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .form-group label {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        input, select {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+            color: #e0e0e0;
+            padding: 8px 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+        input:focus, select:focus {
+            outline: none;
+            border-color: #64b5f6;
+        }
+        input[type="datetime-local"] {
+            min-width: 220px;
+        }
+        button {
+            background: #2a3f5f;
+            color: #64b5f6;
+            border: 1px solid #2a2a4a;
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            font-family: inherit;
+            transition: background 0.2s;
+        }
+        button:hover {
+            background: #354f7f;
+        }
+        .btn-primary {
+            background: #1565c0;
+            color: #fff;
+            border-color: #1976d2;
+            padding: 10px 24px;
+            font-size: 15px;
+            font-weight: bold;
+        }
+        .btn-primary:hover {
+            background: #1976d2;
+        }
+        .btn-danger {
+            background: #5a2727;
+            color: #ff6e6e;
+            border-color: #5a2727;
+            padding: 6px 10px;
+            font-size: 13px;
+        }
+        .btn-danger:hover {
+            background: #6a3030;
+        }
+        .filter-row {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .filter-row select, .filter-row input {
+            flex: 1;
+        }
+        .filters-container {
+            margin-bottom: 16px;
+        }
+        .filters-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .filters-header span {
+            font-size: 12px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        /* Stats grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+        .stat-item {
+            background: #1a1a2e;
+            padding: 12px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        .stat-value { font-size: 22px; font-weight: bold; color: #64b5f6; }
+        .stat-label { font-size: 11px; color: #888; margin-top: 4px; }
+        /* Results table */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        th {
+            color: #888;
+            font-size: 12px;
+            text-transform: uppercase;
+            position: sticky;
+            top: 0;
+            background: #16213e;
+        }
+        td { font-size: 13px; }
+        .level-ERROR { color: #ff6e6e; font-weight: bold; }
+        .level-WARN { color: #ffd54f; font-weight: bold; }
+        .level-WARNING { color: #ffd54f; font-weight: bold; }
+        .level-INFO { color: #7aff6e; font-weight: bold; }
+        .level-DEBUG { color: #888; }
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 40px;
+            color: #888;
+            font-size: 16px;
+        }
+        .loading.active {
+            display: block;
+        }
+        .spinner {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            border: 3px solid #2a2a4a;
+            border-top-color: #64b5f6;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .hidden { display: none; }
+        .meta-row {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 8px;
+        }
+        .meta-item {
+            font-size: 13px;
+            color: #aaa;
+        }
+        .meta-item strong {
+            color: #e0e0e0;
+        }
+        .refresh-info {
+            color: #555;
+            font-size: 12px;
+        }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .no-results {
+            text-align: center;
+            padding: 30px;
+            color: #888;
+            font-size: 14px;
+        }
+        .table-wrapper {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Distributed Log Query System</h1>
+        <div class="header-right">
+            <span id="health-badge" class="badge badge-ok">HEALTHY</span>
+            <span class="refresh-info">Auto-refresh: 5s</span>
+        </div>
+    </div>
+
+    <!-- Stats Panel -->
+    <div class="panel" id="stats-panel">
+        <h2>System Stats</h2>
+        <div class="stats-grid" id="stats-grid">
+            <div class="stat-item">
+                <div class="stat-value" id="stat-partitions">-</div>
+                <div class="stat-label">Partitions</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-healthy">-</div>
+                <div class="stat-label">Healthy</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-cache-size">-</div>
+                <div class="stat-label">Cache Size</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-cache-hits">-</div>
+                <div class="stat-label">Cache Hits</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-cache-misses">-</div>
+                <div class="stat-label">Cache Misses</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value" id="stat-hit-rate">-</div>
+                <div class="stat-label">Hit Rate</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Query Builder -->
+    <div class="panel">
+        <h2>Query Builder</h2>
+        <form id="query-form" onsubmit="submitQuery(event)">
+            <!-- Time Range -->
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Start Time</label>
+                    <input type="datetime-local" id="time-start" step="1">
+                </div>
+                <div class="form-group">
+                    <label>End Time</label>
+                    <input type="datetime-local" id="time-end" step="1">
+                </div>
+            </div>
+
+            <!-- Filters -->
+            <div class="filters-container">
+                <div class="filters-header">
+                    <span>Filters</span>
+                    <button type="button" onclick="addFilter()">+ Add Filter</button>
+                </div>
+                <div id="filters-list"></div>
+            </div>
+
+            <!-- Sort & Limit -->
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Sort Field</label>
+                    <select id="sort-field">
+                        <option value="timestamp" selected>timestamp</option>
+                        <option value="level">level</option>
+                        <option value="service">service</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Sort Order</label>
+                    <select id="sort-order">
+                        <option value="desc" selected>Descending</option>
+                        <option value="asc">Ascending</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Limit</label>
+                    <input type="number" id="limit" value="50" min="1" max="10000" style="width: 100px;">
+                </div>
+                <div class="form-group">
+                    <label>&nbsp;</label>
+                    <button type="submit" class="btn-primary">Run Query</button>
+                </div>
+            </div>
+        </form>
+    </div>
+
+    <!-- Loading Indicator -->
+    <div class="loading" id="loading">
+        <span class="spinner"></span> Querying partitions...
+    </div>
+
+    <!-- Results Section -->
+    <div class="panel hidden" id="results-panel">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h2>Results</h2>
+            <div id="cached-badge-container"></div>
+        </div>
+
+        <!-- Query Metadata -->
+        <div class="meta-row" id="query-meta">
+        </div>
+        <div style="margin-bottom: 16px;"></div>
+
+        <!-- Results Table -->
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Timestamp</th>
+                        <th>Level</th>
+                        <th>Service</th>
+                        <th>Message</th>
+                        <th>Partition</th>
+                    </tr>
+                </thead>
+                <tbody id="results-body">
+                </tbody>
+            </table>
+        </div>
+        <div id="no-results" class="no-results hidden">No log entries found matching your query.</div>
+    </div>
+
+    <script>
+        // --- Health polling ---
+        function pollHealth() {
+            fetch('/health')
+                .then(r => r.json())
+                .then(data => {
+                    const badge = document.getElementById('health-badge');
+                    const healthy = data.partitions.healthy;
+                    const total = data.partitions.total;
+                    if (healthy === total && total > 0) {
+                        badge.textContent = `HEALTHY (${healthy}/${total})`;
+                        badge.className = 'badge badge-ok';
+                    } else if (healthy > 0) {
+                        badge.textContent = `DEGRADED (${healthy}/${total})`;
+                        badge.className = 'badge badge-fail';
+                    } else {
+                        badge.textContent = `UNHEALTHY (0/${total})`;
+                        badge.className = 'badge badge-fail';
+                    }
+
+                    // Update stats
+                    document.getElementById('stat-partitions').textContent = total;
+                    document.getElementById('stat-healthy').textContent = healthy;
+
+                    const cache = data.cache || {};
+                    document.getElementById('stat-cache-size').textContent = cache.size || 0;
+                    document.getElementById('stat-cache-hits').textContent = cache.hits || 0;
+                    document.getElementById('stat-cache-misses').textContent = cache.misses || 0;
+
+                    const totalReqs = (cache.hits || 0) + (cache.misses || 0);
+                    const hitRate = totalReqs > 0 ? ((cache.hits / totalReqs) * 100).toFixed(1) + '%' : '-';
+                    document.getElementById('stat-hit-rate').textContent = hitRate;
+                })
+                .catch(() => {
+                    const badge = document.getElementById('health-badge');
+                    badge.textContent = 'UNREACHABLE';
+                    badge.className = 'badge badge-fail';
+                });
+        }
+
+        pollHealth();
+        setInterval(pollHealth, 5000);
+
+        // --- Filter management ---
+        function addFilter() {
+            const list = document.getElementById('filters-list');
+            const row = document.createElement('div');
+            row.className = 'filter-row';
+            row.innerHTML = `
+                <select class="filter-field">
+                    <option value="level">level</option>
+                    <option value="service">service</option>
+                    <option value="message">message</option>
+                </select>
+                <select class="filter-op">
+                    <option value="eq">equals</option>
+                    <option value="contains">contains</option>
+                </select>
+                <input type="text" class="filter-value" placeholder="Value...">
+                <button type="button" class="btn-danger" onclick="this.parentElement.remove()">X</button>
+            `;
+            list.appendChild(row);
+        }
+
+        // --- Query submission ---
+        function submitQuery(e) {
+            e.preventDefault();
+
+            const loading = document.getElementById('loading');
+            const resultsPanel = document.getElementById('results-panel');
+
+            loading.classList.add('active');
+            resultsPanel.classList.add('hidden');
+
+            // Build query payload
+            const payload = {};
+
+            // Time range
+            const startVal = document.getElementById('time-start').value;
+            const endVal = document.getElementById('time-end').value;
+            if (startVal && endVal) {
+                payload.time_range = {
+                    start: new Date(startVal).toISOString(),
+                    end: new Date(endVal).toISOString()
+                };
+            }
+
+            // Filters
+            const filterRows = document.querySelectorAll('.filter-row');
+            if (filterRows.length > 0) {
+                payload.filters = [];
+                filterRows.forEach(row => {
+                    const field = row.querySelector('.filter-field').value;
+                    const op = row.querySelector('.filter-op').value;
+                    const val = row.querySelector('.filter-value').value.trim();
+                    if (val) {
+                        payload.filters.push({ field: field, operator: op, value: val });
+                    }
+                });
+            }
+
+            // Sort
+            payload.sort_field = document.getElementById('sort-field').value;
+            payload.sort_order = document.getElementById('sort-order').value;
+
+            // Limit
+            const limitVal = parseInt(document.getElementById('limit').value, 10);
+            if (limitVal > 0) {
+                payload.limit = limitVal;
+            }
+
+            fetch('/query', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(r => r.json())
+            .then(data => {
+                loading.classList.remove('active');
+                renderResults(data);
+            })
+            .catch(err => {
+                loading.classList.remove('active');
+                alert('Query failed: ' + err.message);
+            });
+        }
+
+        // --- Render results ---
+        function renderResults(data) {
+            const panel = document.getElementById('results-panel');
+            panel.classList.remove('hidden');
+
+            // Cached badge
+            const cachedContainer = document.getElementById('cached-badge-container');
+            cachedContainer.innerHTML = data.cached
+                ? '<span class="badge-cached">CACHED</span>'
+                : '';
+
+            // Metadata
+            const meta = document.getElementById('query-meta');
+            meta.innerHTML = `
+                <span class="meta-item"><strong>Query ID:</strong> ${data.query_id}</span>
+                <span class="meta-item"><strong>Execution:</strong> ${data.total_execution_time_ms}ms</span>
+                <span class="meta-item"><strong>Results:</strong> ${data.total_results}</span>
+                <span class="meta-item"><strong>Partitions:</strong> ${data.partitions_successful}/${data.partitions_queried}</span>
+            `;
+
+            // Results table
+            const tbody = document.getElementById('results-body');
+            const noResults = document.getElementById('no-results');
+
+            if (!data.results || data.results.length === 0) {
+                tbody.innerHTML = '';
+                noResults.classList.remove('hidden');
+                return;
+            }
+
+            noResults.classList.add('hidden');
+
+            tbody.innerHTML = data.results.map(entry => {
+                const ts = entry.timestamp ? entry.timestamp.replace('T', ' ').substring(0, 19) : '';
+                const levelClass = 'level-' + (entry.level || '').toUpperCase();
+                return `<tr>
+                    <td style="white-space: nowrap; font-family: monospace; font-size: 12px;">${escapeHtml(ts)}</td>
+                    <td class="${levelClass}">${escapeHtml(entry.level)}</td>
+                    <td>${escapeHtml(entry.service)}</td>
+                    <td style="max-width: 500px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(entry.message)}</td>
+                    <td style="color: #64b5f6;">${escapeHtml(entry.partition_id)}</td>
+                </tr>`;
+            }).join('');
+
+            // Refresh health/stats after query
+            pollHealth();
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
@@ -51,5 +52,8 @@ def create_coordinator_app(config: CoordinatorConfig) -> FastAPI:
     from src.coordinator.routes import router
 
     app.include_router(router)
+
+    templates_dir = Path(__file__).parent.parent / "templates"
+    app.state.templates_dir = templates_dir
 
     return app
