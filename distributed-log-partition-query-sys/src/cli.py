@@ -21,4 +21,15 @@ def coordinator(host, port):
 @click.option("--partition-id", envvar="PARTITION_ID", default="partition_1")
 def partition(host, port, partition_id):
     """Start a Partition Server."""
-    click.echo(f"Partition {partition_id} starting on {host}:{port}...")
+    import uvicorn
+    from src.config import load_partition_config
+    from src.partition.app import create_partition_app
+
+    config = load_partition_config()
+    config.host = host
+    config.port = port
+    config.partition_id = partition_id
+
+    app = create_partition_app(config)
+    click.echo(f"Starting partition {partition_id} on {host}:{port}...")
+    uvicorn.run(app, host=host, port=port)
