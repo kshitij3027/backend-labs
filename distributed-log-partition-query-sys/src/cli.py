@@ -12,7 +12,17 @@ def cli():
 @click.option("--port", envvar="PORT", type=int, default=8080)
 def coordinator(host, port):
     """Start the Query Coordinator server."""
-    click.echo(f"Coordinator starting on {host}:{port}...")
+    import uvicorn
+    from src.config import load_coordinator_config
+    from src.coordinator.app import create_coordinator_app
+
+    config = load_coordinator_config()
+    config.host = host
+    config.port = port
+
+    app = create_coordinator_app(config)
+    click.echo(f"Starting Query Coordinator on {host}:{port}...")
+    uvicorn.run(app, host=host, port=port)
 
 
 @cli.command()
