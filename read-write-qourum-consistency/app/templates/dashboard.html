@@ -1,8 +1,879 @@
 <!DOCTYPE html>
-<html>
-<head><title>Quorum Dashboard</title></head>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quorum Consistency Dashboard</title>
+  <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    .mono {
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    }
+
+    /* Header */
+    header {
+      background: linear-gradient(135deg, #0f3460 0%, #16213e 100%);
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 2px solid #e94560;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    header h1 {
+      font-size: 1.5rem;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: 0.5px;
+    }
+
+    .header-info {
+      display: flex;
+      align-items: center;
+      gap: 1.25rem;
+      flex-wrap: wrap;
+    }
+
+    .consistency-badge {
+      padding: 0.35rem 1rem;
+      border-radius: 20px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      transition: all 0.3s ease;
+    }
+
+    .badge-strong { background: #e94560; color: #fff; }
+    .badge-balanced { background: #2196f3; color: #fff; }
+    .badge-eventual { background: #4caf50; color: #fff; }
+
+    .nrw-display {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.9rem;
+      color: #aaa;
+      display: flex;
+      gap: 0.75rem;
+    }
+
+    .nrw-display span {
+      padding: 0.2rem 0.5rem;
+      background: rgba(255,255,255,0.05);
+      border-radius: 4px;
+    }
+
+    .nrw-display .label {
+      color: #e94560;
+      font-weight: 600;
+    }
+
+    /* Main grid */
+    .dashboard {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+      padding: 1.25rem 2rem;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+
+    .panel {
+      background: #16213e;
+      border-radius: 12px;
+      padding: 1.25rem;
+      border: 1px solid rgba(255,255,255,0.05);
+      transition: border-color 0.3s ease;
+    }
+
+    .panel:hover {
+      border-color: rgba(233, 69, 96, 0.2);
+    }
+
+    .panel-title {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 1.5px;
+      color: #e94560;
+      margin-bottom: 1rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .panel-title::before {
+      content: '';
+      width: 3px;
+      height: 14px;
+      background: #e94560;
+      border-radius: 2px;
+      display: inline-block;
+    }
+
+    .full-width {
+      grid-column: 1 / -1;
+    }
+
+    /* Cluster Status — Node Cards */
+    .nodes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 0.75rem;
+    }
+
+    .node-card {
+      background: #1a1a2e;
+      border-radius: 8px;
+      padding: 1rem;
+      border: 1px solid rgba(255,255,255,0.06);
+      transition: all 0.3s ease;
+    }
+
+    .node-card.failed {
+      border-color: rgba(233, 69, 96, 0.4);
+      background: rgba(233, 69, 96, 0.05);
+    }
+
+    .node-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 0.75rem;
+    }
+
+    .node-id {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-weight: 600;
+      font-size: 0.9rem;
+    }
+
+    .health-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      transition: background 0.3s ease;
+    }
+
+    .health-dot.healthy {
+      background: #4caf50;
+      box-shadow: 0 0 6px rgba(76, 175, 80, 0.5);
+    }
+
+    .health-dot.failed {
+      background: #e94560;
+      box-shadow: 0 0 6px rgba(233, 69, 96, 0.5);
+    }
+
+    .node-keys {
+      font-size: 0.8rem;
+      color: #888;
+      margin-bottom: 0.75rem;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+
+    .node-actions {
+      display: flex;
+      gap: 0.5rem;
+    }
+
+    .node-actions button {
+      flex: 1;
+      padding: 0.35rem 0;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-fail {
+      background: rgba(233, 69, 96, 0.15);
+      color: #e94560;
+      border: 1px solid rgba(233, 69, 96, 0.3) !important;
+    }
+
+    .btn-fail:hover {
+      background: rgba(233, 69, 96, 0.3);
+    }
+
+    .btn-recover {
+      background: rgba(76, 175, 80, 0.15);
+      color: #4caf50;
+      border: 1px solid rgba(76, 175, 80, 0.3) !important;
+    }
+
+    .btn-recover:hover {
+      background: rgba(76, 175, 80, 0.3);
+    }
+
+    /* Configuration Panel */
+    .config-buttons {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+
+    .config-btn {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-radius: 8px;
+      background: #1a1a2e;
+      color: #aaa;
+      cursor: pointer;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      transition: all 0.3s ease;
+    }
+
+    .config-btn:hover {
+      border-color: rgba(255,255,255,0.25);
+      color: #fff;
+    }
+
+    .config-btn.active-strong {
+      background: rgba(233, 69, 96, 0.2);
+      border-color: #e94560;
+      color: #e94560;
+    }
+
+    .config-btn.active-balanced {
+      background: rgba(33, 150, 243, 0.2);
+      border-color: #2196f3;
+      color: #2196f3;
+    }
+
+    .config-btn.active-eventual {
+      background: rgba(76, 175, 80, 0.2);
+      border-color: #4caf50;
+      color: #4caf50;
+    }
+
+    .config-values {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.85rem;
+      color: #888;
+      display: flex;
+      gap: 1.5rem;
+    }
+
+    .config-values .val {
+      color: #fff;
+      font-weight: 600;
+    }
+
+    /* Write / Read Panels */
+    .io-form {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    .input-row label {
+      font-size: 0.8rem;
+      color: #888;
+      min-width: 45px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-weight: 600;
+    }
+
+    .io-form input {
+      flex: 1;
+      padding: 0.6rem 0.75rem;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: #1a1a2e;
+      color: #fff;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.85rem;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    .io-form input:focus {
+      border-color: #2196f3;
+    }
+
+    .io-form input::placeholder {
+      color: #555;
+    }
+
+    .btn-action {
+      padding: 0.65rem 1.5rem;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: 700;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      transition: all 0.2s ease;
+    }
+
+    .btn-write {
+      background: #e94560;
+      color: #fff;
+    }
+
+    .btn-write:hover {
+      background: #d63851;
+      transform: translateY(-1px);
+    }
+
+    .btn-read {
+      background: #2196f3;
+      color: #fff;
+    }
+
+    .btn-read:hover {
+      background: #1976d2;
+      transform: translateY(-1px);
+    }
+
+    .result-box {
+      margin-top: 0.75rem;
+      padding: 0.75rem 1rem;
+      background: #1a1a2e;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.06);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.82rem;
+      min-height: 60px;
+      color: #888;
+      white-space: pre-wrap;
+      word-break: break-all;
+      transition: all 0.3s ease;
+    }
+
+    .result-box.success {
+      border-color: rgba(76, 175, 80, 0.3);
+      color: #4caf50;
+    }
+
+    .result-box.error {
+      border-color: rgba(233, 69, 96, 0.3);
+      color: #e94560;
+    }
+
+    /* Metrics Panel */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 0.75rem;
+    }
+
+    .metric-card {
+      background: #1a1a2e;
+      border-radius: 8px;
+      padding: 1rem;
+      text-align: center;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+
+    .metric-value {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 1.75rem;
+      font-weight: 700;
+      color: #fff;
+      transition: all 0.3s ease;
+    }
+
+    .metric-value.warn {
+      color: #e94560;
+    }
+
+    .metric-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: #666;
+      margin-top: 0.25rem;
+      font-weight: 600;
+    }
+
+    /* Activity Log */
+    .activity-list {
+      max-height: 300px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0.3rem;
+    }
+
+    .activity-list::-webkit-scrollbar {
+      width: 4px;
+    }
+
+    .activity-list::-webkit-scrollbar-track {
+      background: transparent;
+    }
+
+    .activity-list::-webkit-scrollbar-thumb {
+      background: #333;
+      border-radius: 2px;
+    }
+
+    .activity-entry {
+      display: flex;
+      gap: 0.75rem;
+      padding: 0.4rem 0.6rem;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      background: rgba(255,255,255,0.02);
+      animation: fadeIn 0.3s ease;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .activity-time {
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      color: #555;
+      white-space: nowrap;
+      font-size: 0.75rem;
+    }
+
+    .activity-msg {
+      color: #aaa;
+    }
+
+    .activity-msg.op-write { color: #e94560; }
+    .activity-msg.op-read { color: #2196f3; }
+    .activity-msg.op-config { color: #ffc107; }
+    .activity-msg.op-node { color: #4caf50; }
+    .activity-msg.op-error { color: #e94560; }
+
+    /* Loading / empty states */
+    .empty-state {
+      color: #555;
+      font-style: italic;
+      font-size: 0.85rem;
+      padding: 1rem 0;
+      text-align: center;
+    }
+
+    /* Responsive */
+    @media (max-width: 900px) {
+      .dashboard {
+        grid-template-columns: 1fr;
+        padding: 1rem;
+      }
+      header {
+        padding: 1rem;
+        flex-direction: column;
+        align-items: flex-start;
+      }
+      .nodes-grid {
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      }
+    }
+  </style>
+</head>
 <body>
-<h1>Quorum Consistency Dashboard</h1>
-<p>Dashboard coming in Commit 5.</p>
+
+  <header>
+    <h1>Quorum Consistency Dashboard</h1>
+    <div class="header-info">
+      <span id="consistency-badge" class="consistency-badge badge-balanced">BALANCED</span>
+      <div class="nrw-display">
+        <span><span class="label">N</span>=<span id="header-n">5</span></span>
+        <span><span class="label">R</span>=<span id="header-r">3</span></span>
+        <span><span class="label">W</span>=<span id="header-w">3</span></span>
+      </div>
+    </div>
+  </header>
+
+  <div class="dashboard">
+
+    <!-- Cluster Status -->
+    <div class="panel full-width">
+      <div class="panel-title">Cluster Status</div>
+      <div id="nodes-grid" class="nodes-grid">
+        <div class="empty-state">Loading nodes...</div>
+      </div>
+    </div>
+
+    <!-- Configuration Panel -->
+    <div class="panel">
+      <div class="panel-title">Configuration</div>
+      <div class="config-buttons">
+        <button class="config-btn" id="btn-strong" onclick="setConsistency('strong')">Strong</button>
+        <button class="config-btn active-balanced" id="btn-balanced" onclick="setConsistency('balanced')">Balanced</button>
+        <button class="config-btn" id="btn-eventual" onclick="setConsistency('eventual')">Eventual</button>
+      </div>
+      <div class="config-values">
+        <div>N = <span class="val" id="config-n">5</span></div>
+        <div>R = <span class="val" id="config-r">3</span></div>
+        <div>W = <span class="val" id="config-w">3</span></div>
+        <div>Level = <span class="val" id="config-level">balanced</span></div>
+      </div>
+    </div>
+
+    <!-- Metrics Panel -->
+    <div class="panel">
+      <div class="panel-title">Metrics</div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-value" id="metric-reads">0</div>
+          <div class="metric-label">Total Reads</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metric-writes">0</div>
+          <div class="metric-label">Total Writes</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metric-failed-reads">0</div>
+          <div class="metric-label">Failed Reads</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metric-failed-writes">0</div>
+          <div class="metric-label">Failed Writes</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-value" id="metric-violations">0</div>
+          <div class="metric-label">Violations</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Write Panel -->
+    <div class="panel">
+      <div class="panel-title">Write Log Entry</div>
+      <div class="io-form">
+        <div class="input-row">
+          <label>Key</label>
+          <input type="text" id="write-key" placeholder="e.g. user:1001" />
+        </div>
+        <div class="input-row">
+          <label>Value</label>
+          <input type="text" id="write-value" placeholder="e.g. {&quot;name&quot;: &quot;alice&quot;}" />
+        </div>
+        <button class="btn-action btn-write" onclick="writeLog()">Write</button>
+        <div id="write-result" class="result-box">Awaiting write operation...</div>
+      </div>
+    </div>
+
+    <!-- Read Panel -->
+    <div class="panel">
+      <div class="panel-title">Read Log Entry</div>
+      <div class="io-form">
+        <div class="input-row">
+          <label>Key</label>
+          <input type="text" id="read-key" placeholder="e.g. user:1001" />
+        </div>
+        <button class="btn-action btn-read" onclick="readLog()">Read</button>
+        <div id="read-result" class="result-box">Awaiting read operation...</div>
+      </div>
+    </div>
+
+    <!-- Activity Log -->
+    <div class="panel full-width">
+      <div class="panel-title">Activity Log</div>
+      <div id="activity-list" class="activity-list">
+        <div class="empty-state" id="activity-empty">No activity yet.</div>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    const MAX_ACTIVITY = 20;
+    let currentLevel = 'balanced';
+
+    // ---- Utility ----
+
+    function timestamp() {
+      const d = new Date();
+      return d.toLocaleTimeString('en-US', { hour12: false }) + '.' +
+             String(d.getMilliseconds()).padStart(3, '0');
+    }
+
+    function addActivity(message, type) {
+      type = type || 'info';
+      const list = document.getElementById('activity-list');
+      const empty = document.getElementById('activity-empty');
+      if (empty) empty.remove();
+
+      const entry = document.createElement('div');
+      entry.className = 'activity-entry';
+      entry.innerHTML =
+        '<span class="activity-time">' + timestamp() + '</span>' +
+        '<span class="activity-msg op-' + type + '">' + message + '</span>';
+      list.prepend(entry);
+
+      // Keep max entries
+      while (list.children.length > MAX_ACTIVITY) {
+        list.removeChild(list.lastChild);
+      }
+    }
+
+    async function apiCall(url, options) {
+      try {
+        const resp = await fetch(url, options);
+        return await resp.json();
+      } catch (err) {
+        console.error('API error:', url, err);
+        return null;
+      }
+    }
+
+    // ---- Fetch Status ----
+
+    async function fetchStatus() {
+      const data = await apiCall('/api/cluster/status');
+      if (!data) return;
+
+      // Update config display
+      const cfg = data.config || {};
+      const level = cfg.consistency_level || currentLevel;
+      currentLevel = level;
+
+      updateConsistencyDisplay(level, cfg.total_replicas || 5, cfg.read_quorum || 3, cfg.write_quorum || 3);
+
+      // Update nodes
+      const nodes = data.nodes || [];
+      renderNodes(nodes);
+    }
+
+    function updateConsistencyDisplay(level, n, r, w) {
+      // Badge
+      const badge = document.getElementById('consistency-badge');
+      badge.textContent = level.toUpperCase();
+      badge.className = 'consistency-badge badge-' + level;
+
+      // Header N/R/W
+      document.getElementById('header-n').textContent = n;
+      document.getElementById('header-r').textContent = r;
+      document.getElementById('header-w').textContent = w;
+
+      // Config panel
+      document.getElementById('config-n').textContent = n;
+      document.getElementById('config-r').textContent = r;
+      document.getElementById('config-w').textContent = w;
+      document.getElementById('config-level').textContent = level;
+
+      // Config buttons
+      ['strong', 'balanced', 'eventual'].forEach(function(lv) {
+        const btn = document.getElementById('btn-' + lv);
+        btn.className = 'config-btn' + (lv === level ? ' active-' + lv : '');
+      });
+    }
+
+    function renderNodes(nodes) {
+      const grid = document.getElementById('nodes-grid');
+      grid.innerHTML = '';
+
+      nodes.forEach(function(node) {
+        const healthy = node.is_healthy;
+        const keys = node.keys_count != null ? node.keys_count : '?';
+        const card = document.createElement('div');
+        card.className = 'node-card' + (healthy ? '' : ' failed');
+        card.innerHTML =
+          '<div class="node-header">' +
+            '<span class="node-id">' + node.node_id + '</span>' +
+            '<span class="health-dot ' + (healthy ? 'healthy' : 'failed') + '"></span>' +
+          '</div>' +
+          '<div class="node-keys">Keys: ' + keys + '</div>' +
+          '<div class="node-actions">' +
+            '<button class="btn-fail" onclick="failNode(\'' + node.node_id + '\')">Fail</button>' +
+            '<button class="btn-recover" onclick="recoverNode(\'' + node.node_id + '\')">Recover</button>' +
+          '</div>';
+        grid.appendChild(card);
+      });
+    }
+
+    // ---- Fetch Metrics ----
+
+    async function fetchMetrics() {
+      const data = await apiCall('/metrics');
+      if (!data) return;
+
+      document.getElementById('metric-reads').textContent = data.total_reads || 0;
+      document.getElementById('metric-writes').textContent = data.total_writes || 0;
+
+      const failedReads = data.failed_reads || 0;
+      const failedWrites = data.failed_writes || 0;
+      const violations = data.consistency_violations || 0;
+
+      const frEl = document.getElementById('metric-failed-reads');
+      frEl.textContent = failedReads;
+      frEl.className = 'metric-value' + (failedReads > 0 ? ' warn' : '');
+
+      const fwEl = document.getElementById('metric-failed-writes');
+      fwEl.textContent = failedWrites;
+      fwEl.className = 'metric-value' + (failedWrites > 0 ? ' warn' : '');
+
+      const vEl = document.getElementById('metric-violations');
+      vEl.textContent = violations;
+      vEl.className = 'metric-value' + (violations > 0 ? ' warn' : '');
+    }
+
+    // ---- Set Consistency Level ----
+
+    async function setConsistency(level) {
+      const data = await apiCall('/api/cluster/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ level: level })
+      });
+
+      if (data && !data.error) {
+        currentLevel = level;
+        updateConsistencyDisplay(
+          data.consistency_level || level,
+          data.total_replicas || 5,
+          data.read_quorum || 3,
+          data.write_quorum || 3
+        );
+        addActivity('Consistency set to ' + level.toUpperCase() + ' (R=' + data.read_quorum + ', W=' + data.write_quorum + ')', 'config');
+      } else {
+        addActivity('Failed to set consistency: ' + (data ? data.error : 'network error'), 'error');
+      }
+    }
+
+    // ---- Write Log ----
+
+    async function writeLog() {
+      const key = document.getElementById('write-key').value.trim();
+      const value = document.getElementById('write-value').value.trim();
+      const resultBox = document.getElementById('write-result');
+
+      if (!key || !value) {
+        resultBox.textContent = 'Error: key and value are required.';
+        resultBox.className = 'result-box error';
+        return;
+      }
+
+      resultBox.textContent = 'Writing...';
+      resultBox.className = 'result-box';
+
+      const data = await apiCall('/api/logs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: key, value: value })
+      });
+
+      if (data && data.success) {
+        resultBox.className = 'result-box success';
+        resultBox.textContent =
+          'OK  key="' + data.key + '"\n' +
+          '    value="' + data.value + '"\n' +
+          '    acked: ' + data.nodes_acked + '/' + data.total_nodes +
+          ' (required: ' + data.nodes_required + ')';
+        addActivity('WRITE "' + key + '" = "' + value + '" (' + data.nodes_acked + '/' + data.total_nodes + ' acked)', 'write');
+      } else {
+        resultBox.className = 'result-box error';
+        const reason = data ? (data.error || 'nodes_acked: ' + (data.nodes_acked || 0) + '/' + (data.nodes_required || '?')) : 'network error';
+        resultBox.textContent = 'FAIL  ' + reason;
+        addActivity('WRITE FAILED "' + key + '": ' + reason, 'error');
+      }
+    }
+
+    // ---- Read Log ----
+
+    async function readLog() {
+      const key = document.getElementById('read-key').value.trim();
+      const resultBox = document.getElementById('read-result');
+
+      if (!key) {
+        resultBox.textContent = 'Error: key is required.';
+        resultBox.className = 'result-box error';
+        return;
+      }
+
+      resultBox.textContent = 'Reading...';
+      resultBox.className = 'result-box';
+
+      const data = await apiCall('/api/logs/' + encodeURIComponent(key));
+
+      if (data && data.success) {
+        resultBox.className = 'result-box success';
+        const vc = data.vector_clock ? JSON.stringify(data.vector_clock) : 'n/a';
+        resultBox.textContent =
+          'OK  key="' + data.key + '"\n' +
+          '    value="' + data.value + '"\n' +
+          '    vector_clock: ' + vc + '\n' +
+          '    responded: ' + data.nodes_responded + '/' + data.total_nodes +
+          ' (required: ' + data.nodes_required + ')';
+        addActivity('READ "' + key + '" => "' + data.value + '" (' + data.nodes_responded + '/' + data.total_nodes + ')', 'read');
+      } else {
+        resultBox.className = 'result-box error';
+        const reason = data ? (data.error || 'insufficient responses') : 'network error';
+        resultBox.textContent = 'FAIL  ' + reason;
+        addActivity('READ FAILED "' + key + '": ' + reason, 'error');
+      }
+    }
+
+    // ---- Node Control ----
+
+    async function failNode(nodeId) {
+      const data = await apiCall('/api/nodes/' + nodeId + '/fail', { method: 'POST' });
+      if (data) {
+        addActivity(nodeId + ' marked as FAILED', 'node');
+        fetchStatus();
+      }
+    }
+
+    async function recoverNode(nodeId) {
+      const data = await apiCall('/api/nodes/' + nodeId + '/recover', { method: 'POST' });
+      if (data) {
+        addActivity(nodeId + ' marked as RECOVERED', 'node');
+        fetchStatus();
+      }
+    }
+
+    // ---- Keyboard shortcuts ----
+
+    document.addEventListener('keydown', function(e) {
+      if (e.target.tagName === 'INPUT') {
+        if (e.key === 'Enter') {
+          if (e.target.id === 'write-key' || e.target.id === 'write-value') {
+            writeLog();
+          } else if (e.target.id === 'read-key') {
+            readLog();
+          }
+        }
+        return;
+      }
+    });
+
+    // ---- Init ----
+
+    fetchStatus();
+    fetchMetrics();
+    setInterval(fetchStatus, 2000);
+    setInterval(fetchMetrics, 2000);
+  </script>
+
 </body>
 </html>
