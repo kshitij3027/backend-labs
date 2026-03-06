@@ -1,0 +1,81 @@
+services:
+  coordinator:
+    build: .
+    container_name: quorum-coordinator
+    ports:
+      - "8000:8000"
+    environment:
+      NODE_URLS: "http://node-1:8001,http://node-2:8001,http://node-3:8001,http://node-4:8001,http://node-5:8001"
+      PORT: "8000"
+    depends_on:
+      - node-1
+      - node-2
+      - node-3
+      - node-4
+      - node-5
+    networks:
+      - quorum-net
+
+  node-1:
+    build: .
+    container_name: quorum-node-1
+    command: uvicorn app.node_server:app --host 0.0.0.0 --port 8001
+    environment:
+      NODE_ID: "node-1"
+      PORT: "8001"
+    networks:
+      - quorum-net
+
+  node-2:
+    build: .
+    container_name: quorum-node-2
+    command: uvicorn app.node_server:app --host 0.0.0.0 --port 8001
+    environment:
+      NODE_ID: "node-2"
+      PORT: "8001"
+    networks:
+      - quorum-net
+
+  node-3:
+    build: .
+    container_name: quorum-node-3
+    command: uvicorn app.node_server:app --host 0.0.0.0 --port 8001
+    environment:
+      NODE_ID: "node-3"
+      PORT: "8001"
+    networks:
+      - quorum-net
+
+  node-4:
+    build: .
+    container_name: quorum-node-4
+    command: uvicorn app.node_server:app --host 0.0.0.0 --port 8001
+    environment:
+      NODE_ID: "node-4"
+      PORT: "8001"
+    networks:
+      - quorum-net
+
+  node-5:
+    build: .
+    container_name: quorum-node-5
+    command: uvicorn app.node_server:app --host 0.0.0.0 --port 8001
+    environment:
+      NODE_ID: "node-5"
+      PORT: "8001"
+    networks:
+      - quorum-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: quorum-test
+    profiles:
+      - test
+    networks:
+      - quorum-net
+
+networks:
+  quorum-net:
+    driver: bridge
