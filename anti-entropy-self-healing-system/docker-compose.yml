@@ -1,0 +1,82 @@
+services:
+  node-a:
+    build: .
+    container_name: ae-node-a
+    hostname: node-a
+    ports:
+      - "8001:8001"
+    environment:
+      - NODE_ID=node-a
+    networks:
+      - ae-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  node-b:
+    build: .
+    container_name: ae-node-b
+    hostname: node-b
+    ports:
+      - "8002:8001"
+    environment:
+      - NODE_ID=node-b
+    networks:
+      - ae-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  node-c:
+    build: .
+    container_name: ae-node-c
+    hostname: node-c
+    ports:
+      - "8003:8001"
+    environment:
+      - NODE_ID=node-c
+    networks:
+      - ae-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  coordinator:
+    build: .
+    container_name: ae-coordinator
+    hostname: coordinator
+    ports:
+      - "5000:5000"
+    environment:
+      - NODE_URLS=http://node-a:8001,http://node-b:8001,http://node-c:8001
+      - SCAN_INTERVAL=30
+    command: ["python", "-m", "src.coordinator.server"]
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy
+      node-c:
+        condition: service_healthy
+    networks:
+      - ae-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: ae-test
+    profiles:
+      - test
+    networks:
+      - ae-net
+
+networks:
+  ae-net:
+    driver: bridge

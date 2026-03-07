@@ -1,0 +1,34 @@
+# Web framework
+flask==3.1.0
+flask-socketio==5.5.1
+
+# Async task scheduling
+apscheduler==3.11.0
+
+# Hashing / Merkle tree
+# hashlib is stdlib
+
+# HTTP client for replica communication
+httpx==0.28.1
+
+# Data serialization
+msgpack==1.1.0
+
+# Metrics and monitoring
+prometheus-client==0.22.0
+
+# Configuration
+python-dotenv==1.1.0
+pyyaml==6.0.2
+
+# Logging
+structlog==25.1.0
+
+# Testing
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-cov==6.1.0
+requests==2.32.3
+
+# Type checking
+mypy==1.15.0
