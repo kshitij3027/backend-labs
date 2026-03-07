@@ -1,4 +1,4 @@
-.PHONY: build test run stop logs e2e clean
+.PHONY: build test run stop logs e2e seed clean
 
 build:
 	docker compose build
@@ -20,6 +20,9 @@ e2e: build
 	@sleep 8
 	python3 scripts/verify_e2e.py
 	docker compose down
+
+seed:
+	python3 scripts/seed_data.py
 
 clean:
 	docker compose down -v --rmi local
