@@ -1,4 +1,5 @@
 import time
+import httpx
 import structlog
 from flask import Flask, jsonify, request
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -20,6 +21,9 @@ read_repair_handler = ReadRepairHandler(clients)
 metrics = ConsistencyMetrics()
 
 app = Flask(__name__)
+
+from src.dashboard.routes import dashboard_bp
+app.register_blueprint(dashboard_bp)
 
 
 def run_scan_cycle():
@@ -161,6 +165,19 @@ def api_inject():
 
     success = target_client.put_data(key, value, version=999, timestamp=time.time())
     return jsonify({"injected": success, "node_id": node_id, "key": key, "value": value})
+
+
+@app.route("/api/node/<node_id>/keys", methods=["GET"])
+def api_node_keys(node_id: str):
+    """Proxy to a specific node to get its key list."""
+    for client in clients:
+        if client.node_id == node_id:
+            try:
+                resp = httpx.get(f"{client.node_url}/keys", timeout=3.0)
+                return jsonify(resp.json())
+            except Exception:
+                return jsonify({"keys": []}), 503
+    return jsonify({"error": "node not found"}), 404
 
 
 if __name__ == "__main__":

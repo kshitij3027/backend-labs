@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Anti-Entropy Self-Healing System Dashboard</title>
+    <style>
+        /* ===== Reset & Base ===== */
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background-color: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        /* ===== Header ===== */
+        .header {
+            background: linear-gradient(135deg, #16213e 0%, #0f3460 100%);
+            padding: 20px 32px;
+            border-bottom: 2px solid #00ff88;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header h1 {
+            font-size: 22px;
+            font-weight: 600;
+            color: #e0e0e0;
+            letter-spacing: 0.5px;
+        }
+
+        .header h1 span {
+            color: #00ff88;
+        }
+
+        .header-status {
+            font-size: 13px;
+            color: #888;
+        }
+
+        .header-status .dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #00ff88;
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* ===== Container ===== */
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* ===== Node Cards ===== */
+        .node-cards {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .node-card {
+            flex: 1;
+            min-width: 200px;
+            background: #16213e;
+            border: 1px solid #2a2a4a;
+            border-radius: 10px;
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .node-card:hover {
+            border-color: #4fc3f7;
+            box-shadow: 0 0 12px rgba(79, 195, 247, 0.15);
+        }
+
+        .node-dot {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            flex-shrink: 0;
+            transition: background-color 0.3s ease;
+        }
+
+        .node-dot.healthy {
+            background-color: #00ff88;
+            box-shadow: 0 0 8px rgba(0, 255, 136, 0.4);
+        }
+
+        .node-dot.unhealthy {
+            background-color: #ff4444;
+            box-shadow: 0 0 8px rgba(255, 68, 68, 0.4);
+        }
+
+        .node-info {
+            flex: 1;
+        }
+
+        .node-id {
+            font-weight: 600;
+            font-size: 15px;
+            color: #e0e0e0;
+        }
+
+        .node-meta {
+            font-size: 12px;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        .node-keys {
+            font-size: 12px;
+            color: #4fc3f7;
+            margin-top: 2px;
+        }
+
+        /* ===== Grid Layout ===== */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        @media (max-width: 768px) {
+            .main-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* ===== Cards ===== */
+        .card {
+            background: #16213e;
+            border: 1px solid #2a2a4a;
+            border-radius: 10px;
+            padding: 20px 24px;
+        }
+
+        .card-title {
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #4fc3f7;
+            margin-bottom: 16px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        /* ===== Metrics ===== */
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .metric-item {
+            background: #1a1a2e;
+            border-radius: 8px;
+            padding: 12px 14px;
+        }
+
+        .metric-label {
+            font-size: 11px;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-bottom: 4px;
+        }
+
+        .metric-value {
+            font-size: 22px;
+            font-weight: 700;
+            color: #00ff88;
+        }
+
+        .metric-value.warn {
+            color: #ffaa00;
+        }
+
+        .metric-value.error {
+            color: #ff4444;
+        }
+
+        .metric-value.info {
+            color: #4fc3f7;
+        }
+
+        .metric-value.neutral {
+            color: #e0e0e0;
+        }
+
+        /* ===== Actions ===== */
+        .action-group {
+            margin-bottom: 16px;
+        }
+
+        .action-group:last-child {
+            margin-bottom: 0;
+        }
+
+        .action-label {
+            font-size: 12px;
+            color: #888;
+            margin-bottom: 6px;
+            font-weight: 600;
+        }
+
+        .action-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        input[type="text"], select {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+            border-radius: 6px;
+            color: #e0e0e0;
+            padding: 8px 12px;
+            font-size: 13px;
+            outline: none;
+            transition: border-color 0.2s ease;
+            min-width: 0;
+            flex: 1;
+        }
+
+        input[type="text"]:focus, select:focus {
+            border-color: #4fc3f7;
+        }
+
+        input[type="text"]::placeholder {
+            color: #555;
+        }
+
+        select {
+            cursor: pointer;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            padding-right: 28px;
+        }
+
+        button {
+            background: linear-gradient(135deg, #00ff88 0%, #00cc6a 100%);
+            color: #1a1a2e;
+            border: none;
+            border-radius: 6px;
+            padding: 8px 18px;
+            font-size: 13px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: opacity 0.2s ease, transform 0.1s ease;
+            white-space: nowrap;
+            flex-shrink: 0;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        button:active {
+            transform: scale(0.97);
+        }
+
+        button.btn-blue {
+            background: linear-gradient(135deg, #4fc3f7 0%, #039be5 100%);
+        }
+
+        button.btn-orange {
+            background: linear-gradient(135deg, #ffaa00 0%, #ff8800 100%);
+        }
+
+        button.btn-red {
+            background: linear-gradient(135deg, #ff4444 0%, #cc0000 100%);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* ===== Activity Log ===== */
+        .activity-log-card {
+            background: #16213e;
+            border: 1px solid #2a2a4a;
+            border-radius: 10px;
+            padding: 20px 24px;
+        }
+
+        .log-entries {
+            max-height: 320px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.8;
+        }
+
+        .log-entries::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .log-entries::-webkit-scrollbar-track {
+            background: #1a1a2e;
+            border-radius: 3px;
+        }
+
+        .log-entries::-webkit-scrollbar-thumb {
+            background: #2a2a4a;
+            border-radius: 3px;
+        }
+
+        .log-entry {
+            padding: 4px 8px;
+            border-radius: 4px;
+            margin-bottom: 2px;
+            word-break: break-word;
+        }
+
+        .log-entry:hover {
+            background: #1a1a2e;
+        }
+
+        .log-time {
+            color: #555;
+            margin-right: 8px;
+        }
+
+        .log-entry.info { color: #4fc3f7; }
+        .log-entry.success { color: #00ff88; }
+        .log-entry.error { color: #ff4444; }
+        .log-entry.warn { color: #ffaa00; }
+
+        .log-empty {
+            color: #555;
+            font-style: italic;
+            text-align: center;
+            padding: 24px;
+        }
+
+        /* ===== Read Result Display ===== */
+        .read-result {
+            margin-top: 8px;
+            padding: 10px 14px;
+            background: #1a1a2e;
+            border-radius: 6px;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 12px;
+            color: #e0e0e0;
+            display: none;
+            word-break: break-all;
+        }
+
+        .read-result.visible {
+            display: block;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Header -->
+    <div class="header">
+        <h1><span>Anti-Entropy</span> Self-Healing System Dashboard</h1>
+        <div class="header-status">
+            <span class="dot"></span>
+            <span id="coordinator-status">Connecting...</span>
+        </div>
+    </div>
+
+    <div class="container">
+
+        <!-- Node Cards -->
+        <div class="node-cards" id="node-cards">
+            <!-- Populated by JS -->
+        </div>
+
+        <!-- Main Grid: Metrics + Actions -->
+        <div class="main-grid">
+
+            <!-- Metrics Card -->
+            <div class="card">
+                <div class="card-title">Metrics</div>
+                <div class="metrics-grid">
+                    <div class="metric-item">
+                        <div class="metric-label">Comparisons</div>
+                        <div class="metric-value neutral" id="m-comparisons">0</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Inconsistencies</div>
+                        <div class="metric-value warn" id="m-inconsistencies">0</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Repairs Done</div>
+                        <div class="metric-value" id="m-repairs-done">0</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Repairs Failed</div>
+                        <div class="metric-value error" id="m-repairs-failed">0</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Last Scan</div>
+                        <div class="metric-value info" id="m-last-scan" style="font-size: 14px;">--</div>
+                    </div>
+                    <div class="metric-item">
+                        <div class="metric-label">Avg Repair Time</div>
+                        <div class="metric-value neutral" id="m-avg-repair">0ms</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Actions Card -->
+            <div class="card">
+                <div class="card-title">Actions</div>
+
+                <!-- Trigger Scan -->
+                <div class="action-group">
+                    <div class="action-label">Scan</div>
+                    <div class="action-row">
+                        <button id="btn-scan" onclick="triggerScan()">Trigger Scan</button>
+                    </div>
+                </div>
+
+                <!-- Write -->
+                <div class="action-group">
+                    <div class="action-label">Write Data</div>
+                    <div class="action-row">
+                        <input type="text" id="write-key" placeholder="key">
+                        <input type="text" id="write-value" placeholder="value">
+                        <button class="btn-blue" onclick="writeData()">Write</button>
+                    </div>
+                </div>
+
+                <!-- Read -->
+                <div class="action-group">
+                    <div class="action-label">Read Data</div>
+                    <div class="action-row">
+                        <input type="text" id="read-key" placeholder="key">
+                        <button class="btn-blue" onclick="readData()">Read</button>
+                    </div>
+                    <div class="read-result" id="read-result"></div>
+                </div>
+
+                <!-- Inject Inconsistency -->
+                <div class="action-group">
+                    <div class="action-label">Inject Inconsistency</div>
+                    <div class="action-row">
+                        <select id="inject-node">
+                            <option value="">Select node...</option>
+                        </select>
+                        <input type="text" id="inject-key" placeholder="key">
+                        <input type="text" id="inject-value" placeholder="value">
+                        <button class="btn-red" onclick="injectInconsistency()">Inject</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Activity Log -->
+        <div class="activity-log-card">
+            <div class="card-title">Activity Log</div>
+            <div class="log-entries" id="log-entries">
+                <div class="log-empty">No activity yet. Waiting for events...</div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // ===== State =====
+        const MAX_LOG_ENTRIES = 50;
+        let logEntries = [];
+        let knownNodes = [];
+
+        // ===== Logging =====
+        function addLog(message, level) {
+            level = level || 'info';
+            var now = new Date();
+            var ts = now.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(now.getMilliseconds()).padStart(3, '0');
+            logEntries.unshift({ time: ts, message: message, level: level });
+
+            if (logEntries.length > MAX_LOG_ENTRIES) {
+                logEntries = logEntries.slice(0, MAX_LOG_ENTRIES);
+            }
+
+            renderLog();
+        }
+
+        function renderLog() {
+            var container = document.getElementById('log-entries');
+            if (logEntries.length === 0) {
+                container.innerHTML = '<div class="log-empty">No activity yet. Waiting for events...</div>';
+                return;
+            }
+
+            var html = '';
+            for (var i = 0; i < logEntries.length; i++) {
+                var entry = logEntries[i];
+                html += '<div class="log-entry ' + entry.level + '">';
+                html += '<span class="log-time">[' + entry.time + ']</span>';
+                html += entry.message;
+                html += '</div>';
+            }
+            container.innerHTML = html;
+        }
+
+        // ===== Node Cards =====
+        function renderNodes(replicas) {
+            var container = document.getElementById('node-cards');
+            var html = '';
+            knownNodes = [];
+
+            for (var i = 0; i < replicas.length; i++) {
+                var node = replicas[i];
+                knownNodes.push(node);
+                var dotClass = node.healthy ? 'healthy' : 'unhealthy';
+                var statusText = node.healthy ? 'Healthy' : 'Unreachable';
+
+                html += '<div class="node-card">';
+                html += '  <div class="node-dot ' + dotClass + '"></div>';
+                html += '  <div class="node-info">';
+                html += '    <div class="node-id">' + escapeHtml(node.node_id) + '</div>';
+                html += '    <div class="node-meta">' + statusText + '</div>';
+                html += '    <div class="node-keys" id="keys-' + escapeHtml(node.node_id) + '">Loading keys...</div>';
+                html += '  </div>';
+                html += '</div>';
+            }
+
+            container.innerHTML = html;
+            updateNodeDropdown(replicas);
+
+            // Fetch key counts for each node
+            for (var j = 0; j < replicas.length; j++) {
+                fetchNodeKeys(replicas[j].node_id);
+            }
+        }
+
+        function fetchNodeKeys(nodeId) {
+            fetch('/api/node/' + encodeURIComponent(nodeId) + '/keys')
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    var el = document.getElementById('keys-' + nodeId);
+                    if (el) {
+                        var keyCount = data.keys ? data.keys.length : 0;
+                        el.textContent = keyCount + ' key' + (keyCount !== 1 ? 's' : '');
+                    }
+                })
+                .catch(function() {
+                    var el = document.getElementById('keys-' + nodeId);
+                    if (el) {
+                        el.textContent = 'Keys unavailable';
+                    }
+                });
+        }
+
+        function updateNodeDropdown(replicas) {
+            var select = document.getElementById('inject-node');
+            // Preserve current selection
+            var current = select.value;
+            select.innerHTML = '<option value="">Select node...</option>';
+            for (var i = 0; i < replicas.length; i++) {
+                var opt = document.createElement('option');
+                opt.value = replicas[i].node_id;
+                opt.textContent = replicas[i].node_id;
+                select.appendChild(opt);
+            }
+            if (current) {
+                select.value = current;
+            }
+        }
+
+        // ===== Metrics =====
+        function updateMetrics(data) {
+            setText('m-comparisons', data.comparisons || 0);
+            setText('m-inconsistencies', data.inconsistencies_detected || 0);
+            setText('m-repairs-done', data.repairs_completed || 0);
+            setText('m-repairs-failed', data.repairs_failed || 0);
+
+            if (data.last_scan_time) {
+                var d = new Date(data.last_scan_time * 1000);
+                setText('m-last-scan', d.toLocaleTimeString('en-US', { hour12: false }));
+            } else {
+                setText('m-last-scan', '--');
+            }
+
+            var avgMs = data.avg_repair_time ? Math.round(data.avg_repair_time * 1000) : 0;
+            setText('m-avg-repair', avgMs + 'ms');
+        }
+
+        function setText(id, value) {
+            var el = document.getElementById(id);
+            if (el) el.textContent = value;
+        }
+
+        // ===== API Actions =====
+        function triggerScan() {
+            var btn = document.getElementById('btn-scan');
+            btn.disabled = true;
+            btn.textContent = 'Scanning...';
+            addLog('Triggering anti-entropy scan...', 'info');
+
+            fetch('/api/scan/trigger', { method: 'POST' })
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    var msg = 'Scan complete: ' + data.inconsistencies + ' inconsistencies, ' +
+                              data.repairs_completed + ' repairs done, ' +
+                              data.repairs_failed + ' failed (' + data.duration + 's)';
+                    var level = data.inconsistencies > 0 ? 'warn' : 'success';
+                    if (data.repairs_failed > 0) level = 'error';
+                    addLog(msg, level);
+                    refreshAll();
+                })
+                .catch(function(err) {
+                    addLog('Scan failed: ' + err.message, 'error');
+                })
+                .finally(function() {
+                    btn.disabled = false;
+                    btn.textContent = 'Trigger Scan';
+                });
+        }
+
+        function writeData() {
+            var key = document.getElementById('write-key').value.trim();
+            var value = document.getElementById('write-value').value.trim();
+
+            if (!key) {
+                addLog('Write error: key is required', 'error');
+                return;
+            }
+            if (!value) {
+                addLog('Write error: value is required', 'error');
+                return;
+            }
+
+            addLog('Writing key="' + escapeHtml(key) + '" value="' + escapeHtml(value) + '"...', 'info');
+
+            fetch('/api/data/' + encodeURIComponent(key), {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ value: value })
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                var successCount = 0;
+                if (data.nodes) {
+                    for (var i = 0; i < data.nodes.length; i++) {
+                        if (data.nodes[i].success) successCount++;
+                    }
+                }
+                var total = data.nodes ? data.nodes.length : 0;
+                addLog('Write complete: key="' + escapeHtml(key) + '" written to ' +
+                       successCount + '/' + total + ' nodes', 'success');
+                document.getElementById('write-key').value = '';
+                document.getElementById('write-value').value = '';
+            })
+            .catch(function(err) {
+                addLog('Write failed: ' + err.message, 'error');
+            });
+        }
+
+        function readData() {
+            var key = document.getElementById('read-key').value.trim();
+            if (!key) {
+                addLog('Read error: key is required', 'error');
+                return;
+            }
+
+            var resultEl = document.getElementById('read-result');
+            resultEl.classList.remove('visible');
+            addLog('Reading key="' + escapeHtml(key) + '"...', 'info');
+
+            fetch('/api/data/' + encodeURIComponent(key))
+                .then(function(resp) {
+                    if (resp.status === 404) {
+                        throw new Error('Key not found');
+                    }
+                    return resp.json();
+                })
+                .then(function(data) {
+                    var value = data.value !== undefined ? data.value : JSON.stringify(data);
+                    resultEl.textContent = 'Value: ' + value;
+                    resultEl.classList.add('visible');
+
+                    var repairMsg = '';
+                    if (data.read_repair_triggered) {
+                        repairMsg = ' (read repair triggered)';
+                    }
+                    addLog('Read key="' + escapeHtml(key) + '" => "' +
+                           escapeHtml(String(value)) + '"' + repairMsg,
+                           data.read_repair_triggered ? 'warn' : 'success');
+                })
+                .catch(function(err) {
+                    resultEl.textContent = 'Error: ' + err.message;
+                    resultEl.classList.add('visible');
+                    addLog('Read failed for key="' + escapeHtml(key) + '": ' + err.message, 'error');
+                });
+        }
+
+        function injectInconsistency() {
+            var nodeId = document.getElementById('inject-node').value;
+            var key = document.getElementById('inject-key').value.trim();
+            var value = document.getElementById('inject-value').value.trim();
+
+            if (!nodeId) {
+                addLog('Inject error: select a node', 'error');
+                return;
+            }
+            if (!key) {
+                addLog('Inject error: key is required', 'error');
+                return;
+            }
+            if (!value) {
+                addLog('Inject error: value is required', 'error');
+                return;
+            }
+
+            addLog('Injecting inconsistency: node=' + escapeHtml(nodeId) +
+                   ' key="' + escapeHtml(key) + '" value="' + escapeHtml(value) + '"', 'warn');
+
+            fetch('/api/inject', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ node_id: nodeId, key: key, value: value })
+            })
+            .then(function(resp) { return resp.json(); })
+            .then(function(data) {
+                if (data.injected) {
+                    addLog('Injected to ' + escapeHtml(nodeId) + ': key="' +
+                           escapeHtml(key) + '" value="' + escapeHtml(value) + '"', 'success');
+                } else if (data.error) {
+                    addLog('Inject failed: ' + data.error, 'error');
+                } else {
+                    addLog('Inject returned unexpected response', 'warn');
+                }
+                document.getElementById('inject-key').value = '';
+                document.getElementById('inject-value').value = '';
+            })
+            .catch(function(err) {
+                addLog('Inject failed: ' + err.message, 'error');
+            });
+        }
+
+        // ===== Polling & Refresh =====
+        function refreshMetrics() {
+            fetch('/api/metrics')
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) { updateMetrics(data); })
+                .catch(function() { /* silent */ });
+        }
+
+        function refreshReplicas() {
+            fetch('/api/replicas')
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    if (data.replicas) {
+                        renderNodes(data.replicas);
+                    }
+                })
+                .catch(function() { /* silent */ });
+        }
+
+        function refreshStatus() {
+            fetch('/api/status')
+                .then(function(resp) { return resp.json(); })
+                .then(function(data) {
+                    var statusEl = document.getElementById('coordinator-status');
+                    if (data.coordinator === 'healthy') {
+                        statusEl.textContent = 'Coordinator Online | Scan every ' + data.scan_interval + 's';
+                    } else {
+                        statusEl.textContent = 'Coordinator status unknown';
+                    }
+                })
+                .catch(function() {
+                    var statusEl = document.getElementById('coordinator-status');
+                    statusEl.textContent = 'Connection lost';
+                });
+        }
+
+        function refreshAll() {
+            refreshStatus();
+            refreshMetrics();
+            refreshReplicas();
+        }
+
+        // ===== Utility =====
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.appendChild(document.createTextNode(text));
+            return div.innerHTML;
+        }
+
+        // ===== Init =====
+        (function init() {
+            addLog('Dashboard initialized. Connecting to coordinator...', 'info');
+            refreshAll();
+
+            // Poll every 5 seconds
+            setInterval(function() {
+                refreshMetrics();
+                refreshReplicas();
+            }, 5000);
+
+            // Refresh status less frequently
+            setInterval(refreshStatus, 15000);
+        })();
+    </script>
+</body>
+</html>
