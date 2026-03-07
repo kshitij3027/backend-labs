@@ -1,7 +1,7 @@
 import time
 import httpx
 import structlog
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from apscheduler.schedulers.background import BackgroundScheduler
 from src.config import Config
 from src.coordinator.client import NodeClient
@@ -178,6 +178,12 @@ def api_node_keys(node_id: str):
             except Exception:
                 return jsonify({"keys": []}), 503
     return jsonify({"error": "node not found"}), 404
+
+
+@app.route("/metrics", methods=["GET"])
+def prometheus_metrics():
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 
 if __name__ == "__main__":
