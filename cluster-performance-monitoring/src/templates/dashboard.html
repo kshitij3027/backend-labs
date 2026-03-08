@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cluster Performance Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #f0f2f5;
+            color: #333;
+            line-height: 1.6;
+        }
+
+        /* Header */
+        .header {
+            background: #1a1a2e;
+            color: #fff;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .header h1 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            letter-spacing: -0.5px;
+        }
+
+        .health-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .health-badge .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .health-healthy { background: rgba(46, 204, 113, 0.15); color: #2ecc71; }
+        .health-healthy .dot { background: #2ecc71; }
+        .health-warning { background: rgba(243, 156, 18, 0.15); color: #f39c12; }
+        .health-warning .dot { background: #f39c12; }
+        .health-critical { background: rgba(231, 76, 60, 0.15); color: #e74c3c; }
+        .health-critical .dot { background: #e74c3c; }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .score-badge {
+            font-size: 0.9rem;
+            font-weight: 600;
+        }
+
+        .score-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+        }
+
+        .ws-status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.8rem;
+            opacity: 0.7;
+        }
+
+        .ws-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #e74c3c;
+        }
+
+        .ws-dot.connected {
+            background: #2ecc71;
+        }
+
+        /* Main content */
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Summary cards */
+        .summary-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .summary-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .summary-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.12);
+        }
+
+        .summary-card .label {
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .summary-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #1a1a2e;
+        }
+
+        .summary-card .unit {
+            font-size: 0.85rem;
+            color: #999;
+            margin-left: 4px;
+        }
+
+        .summary-card.cpu .label::before { content: "[ CPU ] "; color: #3498db; }
+        .summary-card.memory .label::before { content: "[ MEM ] "; color: #9b59b6; }
+        .summary-card.throughput .label::before { content: "[ OPS ] "; color: #2ecc71; }
+        .summary-card.nodes .label::before { content: "[ NOD ] "; color: #f39c12; }
+
+        /* Charts section */
+        .charts-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .chart-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+        }
+
+        .chart-card h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 12px;
+        }
+
+        .chart-wrapper {
+            position: relative;
+            height: 280px;
+        }
+
+        /* Alerts panel */
+        .alerts-panel {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            margin-bottom: 24px;
+        }
+
+        .alerts-panel h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .alert-count {
+            background: #e74c3c;
+            color: #fff;
+            font-size: 0.75rem;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-weight: 700;
+        }
+
+        .alert-count.zero {
+            background: #2ecc71;
+        }
+
+        .alerts-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        .alerts-table th {
+            text-align: left;
+            padding: 10px 12px;
+            background: #f8f9fa;
+            color: #666;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.5px;
+            border-bottom: 2px solid #e9ecef;
+        }
+
+        .alerts-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .alerts-table tr.warning-row {
+            background: #fff8e1;
+        }
+
+        .alerts-table tr.critical-row {
+            background: #ffebee;
+        }
+
+        .level-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+        }
+
+        .level-badge.warning {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .level-badge.critical {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .no-alerts {
+            text-align: center;
+            padding: 24px;
+            color: #aaa;
+            font-size: 0.9rem;
+        }
+
+        /* Node detail cards */
+        .node-cards-section h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 12px;
+        }
+
+        .node-cards {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .node-card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            border-left: 4px solid #3498db;
+        }
+
+        .node-card.primary {
+            border-left-color: #f39c12;
+        }
+
+        .node-card.replica {
+            border-left-color: #3498db;
+        }
+
+        .node-card-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 14px;
+        }
+
+        .node-id {
+            font-size: 1rem;
+            font-weight: 700;
+            color: #1a1a2e;
+        }
+
+        .role-badge {
+            font-size: 0.7rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            padding: 3px 10px;
+            border-radius: 10px;
+        }
+
+        .role-badge.primary {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .role-badge.replica {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+
+        .node-metrics {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .node-metric {
+            padding: 6px 0;
+        }
+
+        .node-metric .nm-label {
+            font-size: 0.7rem;
+            color: #999;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+
+        .node-metric .nm-value {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #333;
+        }
+
+        /* Simulation controls */
+        .sim-controls {
+            background: #fff;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+            margin-bottom: 24px;
+        }
+
+        .sim-controls h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 12px;
+        }
+
+        .sim-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .sim-btn {
+            padding: 8px 18px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        .sim-btn:active {
+            transform: scale(0.97);
+        }
+
+        .sim-btn.degrade {
+            background: #e74c3c;
+            color: #fff;
+        }
+
+        .sim-btn.degrade:hover {
+            background: #c0392b;
+        }
+
+        .sim-btn.slow-disk {
+            background: #f39c12;
+            color: #fff;
+        }
+
+        .sim-btn.slow-disk:hover {
+            background: #d68910;
+        }
+
+        .sim-btn.network {
+            background: #8e44ad;
+            color: #fff;
+        }
+
+        .sim-btn.network:hover {
+            background: #6c3483;
+        }
+
+        .sim-btn.recover {
+            background: #2ecc71;
+            color: #fff;
+        }
+
+        .sim-btn.recover:hover {
+            background: #27ae60;
+        }
+
+        .sim-status {
+            margin-top: 10px;
+            font-size: 0.8rem;
+            color: #888;
+            min-height: 20px;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .summary-cards {
+                grid-template-columns: repeat(2, 1fr);
+            }
+            .charts-section {
+                grid-template-columns: 1fr;
+            }
+            .node-cards {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .summary-cards {
+                grid-template-columns: 1fr;
+            }
+            .header {
+                flex-direction: column;
+                gap: 10px;
+                text-align: center;
+            }
+            .header-left, .header-right {
+                flex-direction: column;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="header-left">
+        <h1>Cluster Performance Monitor</h1>
+        <div id="healthBadge" class="health-badge health-{{ health.status }}">
+            <span class="dot"></span>
+            <span id="healthStatus">{{ health.status }}</span>
+        </div>
+    </div>
+    <div class="header-right">
+        <div class="score-badge">
+            Score: <span id="scoreValue" class="score-value">{{ "%.0f"|format(health.performance_score) }}</span>
+        </div>
+        <div class="ws-status">
+            <span id="wsDot" class="ws-dot"></span>
+            <span id="wsLabel">Disconnected</span>
+        </div>
+    </div>
+</div>
+
+<!-- Main Content -->
+<div class="container">
+
+    <!-- Summary Cards -->
+    <div class="summary-cards">
+        <div class="summary-card cpu">
+            <div class="label">Avg CPU Usage</div>
+            <div><span id="avgCpu" class="value">{{ "%.1f"|format(metrics.avg_cpu_usage) }}</span><span class="unit">%</span></div>
+        </div>
+        <div class="summary-card memory">
+            <div class="label">Avg Memory Usage</div>
+            <div><span id="avgMemory" class="value">{{ "%.1f"|format(metrics.avg_memory_usage) }}</span><span class="unit">%</span></div>
+        </div>
+        <div class="summary-card throughput">
+            <div class="label">Total Throughput</div>
+            <div><span id="totalThroughput" class="value">{{ "%.0f"|format(metrics.total_throughput) }}</span><span class="unit">ops/s</span></div>
+        </div>
+        <div class="summary-card nodes">
+            <div class="label">Active Nodes</div>
+            <div><span id="activeNodes" class="value">{{ metrics.active_nodes }}</span></div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="charts-section">
+        <div class="chart-card">
+            <h3>CPU &amp; Memory Usage Per Node</h3>
+            <div class="chart-wrapper">
+                <canvas id="cpuMemChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <h3>Throughput Over Time</h3>
+            <div class="chart-wrapper">
+                <canvas id="throughputChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alerts Panel -->
+    <div class="alerts-panel">
+        <h3>Active Alerts <span id="alertCount" class="alert-count {{ 'zero' if alerts|length == 0 else '' }}">{{ alerts|length }}</span></h3>
+        <table class="alerts-table">
+            <thead>
+                <tr>
+                    <th>Level</th>
+                    <th>Node</th>
+                    <th>Metric</th>
+                    <th>Value</th>
+                    <th>Threshold</th>
+                    <th>Time</th>
+                </tr>
+            </thead>
+            <tbody id="alertsBody">
+                {% if alerts %}
+                    {% for a in alerts %}
+                    <tr class="{{ a.level }}-row">
+                        <td><span class="level-badge {{ a.level }}">{{ a.level }}</span></td>
+                        <td>{{ a.node_id }}</td>
+                        <td>{{ a.metric_name }}</td>
+                        <td>{{ "%.2f"|format(a.current_value) }}</td>
+                        <td>{{ a.threshold }}</td>
+                        <td>{{ a.timestamp[:19] if a.timestamp is string else a.timestamp }}</td>
+                    </tr>
+                    {% endfor %}
+                {% else %}
+                    <tr><td colspan="6" class="no-alerts">No active alerts</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Node Detail Cards -->
+    <div class="node-cards-section">
+        <h3>Node Details</h3>
+        <div class="node-cards" id="nodeCards">
+            {% for node in nodes %}
+            <div class="node-card {{ node.role }}" id="node-card-{{ node.node_id }}">
+                <div class="node-card-header">
+                    <span class="node-id">{{ node.node_id }}</span>
+                    <span class="role-badge {{ node.role }}">{{ node.role }}</span>
+                </div>
+                <div class="node-metrics">
+                    <div class="node-metric">
+                        <div class="nm-label">CPU</div>
+                        <div class="nm-value" id="{{ node.node_id }}-cpu">--</div>
+                    </div>
+                    <div class="node-metric">
+                        <div class="nm-label">Memory</div>
+                        <div class="nm-value" id="{{ node.node_id }}-memory">--</div>
+                    </div>
+                    <div class="node-metric">
+                        <div class="nm-label">Throughput</div>
+                        <div class="nm-value" id="{{ node.node_id }}-throughput">--</div>
+                    </div>
+                    <div class="node-metric">
+                        <div class="nm-label">Latency</div>
+                        <div class="nm-value" id="{{ node.node_id }}-latency">--</div>
+                    </div>
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Simulation Controls -->
+    <div class="sim-controls">
+        <h3>Simulation Controls</h3>
+        <div class="sim-buttons">
+            <button class="sim-btn degrade" onclick="simulateDegrade('high_load')">Inject High Load</button>
+            <button class="sim-btn slow-disk" onclick="simulateDegrade('slow_disk')">Inject Slow Disk</button>
+            <button class="sim-btn network" onclick="simulateDegrade('network_issue')">Inject Network Issue</button>
+            <button class="sim-btn recover" onclick="simulateRecover()">Recover All</button>
+        </div>
+        <div class="sim-status" id="simStatus"></div>
+    </div>
+
+</div>
+
+<script>
+    // =========================================================
+    // Chart.js Setup
+    // =========================================================
+
+    const MAX_POINTS = 60;
+    const NODE_COLORS = {
+        'node-1': { cpu: '#e74c3c', mem: '#c0392b' },
+        'node-2': { cpu: '#3498db', mem: '#2980b9' },
+        'node-3': { cpu: '#2ecc71', mem: '#27ae60' },
+    };
+    const THROUGHPUT_COLORS = {
+        'node-1': '#e74c3c',
+        'node-2': '#3498db',
+        'node-3': '#2ecc71',
+    };
+
+    // Initialise empty time labels
+    const timeLabels = [];
+
+    // Build datasets for CPU/Memory chart
+    const cpuMemDatasets = [];
+    const nodeIds = {{ nodes | tojson }};
+    const cpuMemData = {};   // { 'node-1': { cpu: [], mem: [] }, ... }
+    const throughputData = {};  // { 'node-1': [], ... }
+
+    nodeIds.forEach(function(n) {
+        const nid = n.node_id;
+        cpuMemData[nid] = { cpu: [], mem: [] };
+        throughputData[nid] = [];
+
+        const colors = NODE_COLORS[nid] || { cpu: '#95a5a6', mem: '#7f8c8d' };
+        cpuMemDatasets.push({
+            label: nid + ' CPU',
+            data: cpuMemData[nid].cpu,
+            borderColor: colors.cpu,
+            backgroundColor: 'transparent',
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0.3,
+        });
+        cpuMemDatasets.push({
+            label: nid + ' Mem',
+            data: cpuMemData[nid].mem,
+            borderColor: colors.mem,
+            backgroundColor: 'transparent',
+            borderWidth: 2,
+            borderDash: [5, 3],
+            pointRadius: 0,
+            tension: 0.3,
+        });
+    });
+
+    const throughputDatasets = [];
+    nodeIds.forEach(function(n) {
+        const nid = n.node_id;
+        const color = THROUGHPUT_COLORS[nid] || '#95a5a6';
+        throughputDatasets.push({
+            label: nid,
+            data: throughputData[nid],
+            borderColor: color,
+            backgroundColor: 'transparent',
+            borderWidth: 2,
+            pointRadius: 0,
+            tension: 0.3,
+            fill: false,
+        });
+    });
+
+    const cpuMemCtx = document.getElementById('cpuMemChart').getContext('2d');
+    const cpuMemChart = new Chart(cpuMemCtx, {
+        type: 'line',
+        data: { labels: timeLabels, datasets: cpuMemDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 300 },
+            scales: {
+                x: {
+                    display: true,
+                    ticks: { maxTicksLimit: 10, font: { size: 10 }, color: '#aaa' },
+                    grid: { color: 'rgba(0,0,0,0.04)' },
+                },
+                y: {
+                    min: 0,
+                    max: 100,
+                    ticks: { font: { size: 10 }, color: '#aaa', callback: function(v) { return v + '%'; } },
+                    grid: { color: 'rgba(0,0,0,0.04)' },
+                },
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { font: { size: 11 }, boxWidth: 20, padding: 12 },
+                },
+            },
+        },
+    });
+
+    const throughputCtx = document.getElementById('throughputChart').getContext('2d');
+    const throughputChart = new Chart(throughputCtx, {
+        type: 'line',
+        data: { labels: timeLabels, datasets: throughputDatasets },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: { duration: 300 },
+            scales: {
+                x: {
+                    display: true,
+                    ticks: { maxTicksLimit: 10, font: { size: 10 }, color: '#aaa' },
+                    grid: { color: 'rgba(0,0,0,0.04)' },
+                },
+                y: {
+                    min: 0,
+                    ticks: { font: { size: 10 }, color: '#aaa', callback: function(v) { return v + ' ops'; } },
+                    grid: { color: 'rgba(0,0,0,0.04)' },
+                },
+            },
+            plugins: {
+                legend: {
+                    position: 'bottom',
+                    labels: { font: { size: 11 }, boxWidth: 20, padding: 12 },
+                },
+            },
+        },
+    });
+
+    // =========================================================
+    // WebSocket Client
+    // =========================================================
+
+    let ws = null;
+    let reconnectTimer = null;
+
+    function connectWebSocket() {
+        const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+        ws = new WebSocket(protocol + '://' + window.location.host + '/ws');
+
+        ws.onopen = function() {
+            document.getElementById('wsDot').classList.add('connected');
+            document.getElementById('wsLabel').textContent = 'Connected';
+            if (reconnectTimer) {
+                clearInterval(reconnectTimer);
+                reconnectTimer = null;
+            }
+        };
+
+        ws.onclose = function() {
+            document.getElementById('wsDot').classList.remove('connected');
+            document.getElementById('wsLabel').textContent = 'Disconnected';
+            scheduleReconnect();
+        };
+
+        ws.onerror = function() {
+            ws.close();
+        };
+
+        ws.onmessage = function(event) {
+            try {
+                const msg = JSON.parse(event.data);
+                if (msg.type === 'metrics_update') {
+                    handleMetricsUpdate(msg);
+                }
+            } catch (e) {
+                console.error('Failed to parse WebSocket message:', e);
+            }
+        };
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectTimer = setInterval(function() {
+            if (!ws || ws.readyState === WebSocket.CLOSED) {
+                connectWebSocket();
+            }
+        }, 3000);
+    }
+
+    // =========================================================
+    // Handle incoming metric updates
+    // =========================================================
+
+    // Track latest values per node for summary computation
+    const latestNodeMetrics = {};
+
+    function handleMetricsUpdate(msg) {
+        const nodeId = msg.node_id;
+        const metrics = msg.metrics;
+        const ts = msg.timestamp;
+
+        if (!latestNodeMetrics[nodeId]) {
+            latestNodeMetrics[nodeId] = {};
+        }
+        Object.assign(latestNodeMetrics[nodeId], metrics);
+
+        // Time label (HH:MM:SS)
+        const timeStr = ts ? ts.substring(11, 19) : new Date().toISOString().substring(11, 19);
+
+        // Only add a new time label once per batch (first node to report)
+        // We use a simple heuristic: add time label if it differs from the last one
+        const lastLabel = timeLabels.length > 0 ? timeLabels[timeLabels.length - 1] : null;
+        let addedLabel = false;
+        if (lastLabel !== timeStr) {
+            timeLabels.push(timeStr);
+            if (timeLabels.length > MAX_POINTS) timeLabels.shift();
+            addedLabel = true;
+
+            // Pad other node data if they didn't report yet this tick
+            nodeIds.forEach(function(n) {
+                const nid = n.node_id;
+                if (nid !== nodeId) {
+                    const lastCpu = cpuMemData[nid].cpu.length > 0 ? cpuMemData[nid].cpu[cpuMemData[nid].cpu.length - 1] : null;
+                    const lastMem = cpuMemData[nid].mem.length > 0 ? cpuMemData[nid].mem[cpuMemData[nid].mem.length - 1] : null;
+                    const lastTp = throughputData[nid].length > 0 ? throughputData[nid][throughputData[nid].length - 1] : null;
+                    cpuMemData[nid].cpu.push(lastCpu);
+                    cpuMemData[nid].mem.push(lastMem);
+                    throughputData[nid].push(lastTp);
+                    if (cpuMemData[nid].cpu.length > MAX_POINTS) cpuMemData[nid].cpu.shift();
+                    if (cpuMemData[nid].mem.length > MAX_POINTS) cpuMemData[nid].mem.shift();
+                    if (throughputData[nid].length > MAX_POINTS) throughputData[nid].shift();
+                }
+            });
+        }
+
+        // Push data for this node
+        const cpuVal = metrics.cpu_usage !== undefined ? parseFloat(metrics.cpu_usage) : null;
+        const memVal = metrics.memory_usage !== undefined ? parseFloat(metrics.memory_usage) : null;
+        const tpVal = metrics.throughput !== undefined ? parseFloat(metrics.throughput) : null;
+
+        if (addedLabel) {
+            cpuMemData[nodeId].cpu.push(cpuVal);
+            cpuMemData[nodeId].mem.push(memVal);
+            throughputData[nodeId].push(tpVal);
+        } else {
+            // Update the last point for this node
+            if (cpuMemData[nodeId].cpu.length > 0) {
+                cpuMemData[nodeId].cpu[cpuMemData[nodeId].cpu.length - 1] = cpuVal;
+                cpuMemData[nodeId].mem[cpuMemData[nodeId].mem.length - 1] = memVal;
+                throughputData[nodeId][throughputData[nodeId].length - 1] = tpVal;
+            } else {
+                cpuMemData[nodeId].cpu.push(cpuVal);
+                cpuMemData[nodeId].mem.push(memVal);
+                throughputData[nodeId].push(tpVal);
+            }
+        }
+
+        // Trim
+        if (cpuMemData[nodeId].cpu.length > MAX_POINTS) cpuMemData[nodeId].cpu.shift();
+        if (cpuMemData[nodeId].mem.length > MAX_POINTS) cpuMemData[nodeId].mem.shift();
+        if (throughputData[nodeId].length > MAX_POINTS) throughputData[nodeId].shift();
+
+        // Update charts
+        cpuMemChart.update('none');
+        throughputChart.update('none');
+
+        // Update node detail cards
+        updateNodeCard(nodeId, metrics);
+
+        // Update summary cards
+        updateSummaryCards();
+    }
+
+    function updateNodeCard(nodeId, metrics) {
+        const cpuEl = document.getElementById(nodeId + '-cpu');
+        const memEl = document.getElementById(nodeId + '-memory');
+        const tpEl = document.getElementById(nodeId + '-throughput');
+        const latEl = document.getElementById(nodeId + '-latency');
+
+        if (cpuEl && metrics.cpu_usage !== undefined) {
+            cpuEl.textContent = parseFloat(metrics.cpu_usage).toFixed(1) + '%';
+            cpuEl.style.color = metrics.cpu_usage > 85 ? '#e74c3c' : metrics.cpu_usage > 70 ? '#f39c12' : '#333';
+        }
+        if (memEl && metrics.memory_usage !== undefined) {
+            memEl.textContent = parseFloat(metrics.memory_usage).toFixed(1) + '%';
+            memEl.style.color = metrics.memory_usage > 90 ? '#e74c3c' : metrics.memory_usage > 80 ? '#f39c12' : '#333';
+        }
+        if (tpEl && metrics.throughput !== undefined) {
+            tpEl.textContent = parseFloat(metrics.throughput).toFixed(0) + ' ops';
+        }
+        if (latEl && metrics.write_latency !== undefined) {
+            latEl.textContent = parseFloat(metrics.write_latency).toFixed(1) + ' ms';
+            latEl.style.color = metrics.write_latency > 200 ? '#e74c3c' : metrics.write_latency > 100 ? '#f39c12' : '#333';
+        }
+    }
+
+    function updateSummaryCards() {
+        let totalCpu = 0, totalMem = 0, totalTp = 0, nodeCount = 0;
+
+        for (const nid in latestNodeMetrics) {
+            const m = latestNodeMetrics[nid];
+            if (m.cpu_usage !== undefined) totalCpu += parseFloat(m.cpu_usage);
+            if (m.memory_usage !== undefined) totalMem += parseFloat(m.memory_usage);
+            if (m.throughput !== undefined) totalTp += parseFloat(m.throughput);
+            nodeCount++;
+        }
+
+        if (nodeCount > 0) {
+            document.getElementById('avgCpu').textContent = (totalCpu / nodeCount).toFixed(1);
+            document.getElementById('avgMemory').textContent = (totalMem / nodeCount).toFixed(1);
+            document.getElementById('totalThroughput').textContent = totalTp.toFixed(0);
+            document.getElementById('activeNodes').textContent = nodeCount;
+        }
+    }
+
+    // =========================================================
+    // Alerts refresh (every 10s)
+    // =========================================================
+
+    function refreshAlerts() {
+        fetch('/api/alerts')
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                const alerts = data.alerts || [];
+                const countEl = document.getElementById('alertCount');
+                countEl.textContent = alerts.length;
+                countEl.className = 'alert-count' + (alerts.length === 0 ? ' zero' : '');
+
+                const tbody = document.getElementById('alertsBody');
+                if (alerts.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="no-alerts">No active alerts</td></tr>';
+                } else {
+                    let html = '';
+                    alerts.forEach(function(a) {
+                        const ts = a.timestamp ? a.timestamp.substring(0, 19) : '';
+                        html += '<tr class="' + a.level + '-row">'
+                            + '<td><span class="level-badge ' + a.level + '">' + a.level + '</span></td>'
+                            + '<td>' + a.node_id + '</td>'
+                            + '<td>' + a.metric_name + '</td>'
+                            + '<td>' + parseFloat(a.current_value).toFixed(2) + '</td>'
+                            + '<td>' + a.threshold + '</td>'
+                            + '<td>' + ts + '</td>'
+                            + '</tr>';
+                    });
+                    tbody.innerHTML = html;
+                }
+
+                // Also update health badge
+                updateHealthFromAlerts(alerts);
+            })
+            .catch(function(err) {
+                console.error('Failed to fetch alerts:', err);
+            });
+    }
+
+    function updateHealthFromAlerts(alerts) {
+        const badge = document.getElementById('healthBadge');
+        const statusEl = document.getElementById('healthStatus');
+
+        let status = 'healthy';
+        if (alerts.some(function(a) { return a.level === 'critical'; })) {
+            status = 'critical';
+        } else if (alerts.some(function(a) { return a.level === 'warning'; })) {
+            status = 'warning';
+        }
+
+        badge.className = 'health-badge health-' + status;
+        statusEl.textContent = status;
+
+        // Update score estimate (simple client-side approximation)
+        let score = 100;
+        alerts.forEach(function(a) {
+            if (a.level === 'critical') score -= 25;
+            else if (a.level === 'warning') score -= 10;
+        });
+        score = Math.max(0, score);
+        document.getElementById('scoreValue').textContent = score;
+    }
+
+    setInterval(refreshAlerts, 10000);
+
+    // =========================================================
+    // Simulation Controls
+    // =========================================================
+
+    function simulateDegrade(scenario) {
+        const statusEl = document.getElementById('simStatus');
+        statusEl.textContent = 'Injecting ' + scenario + '...';
+        fetch('/api/simulate/degrade?scenario=' + encodeURIComponent(scenario), { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                statusEl.textContent = 'Degradation active: ' + data.scenario;
+                statusEl.style.color = '#e74c3c';
+            })
+            .catch(function(err) {
+                statusEl.textContent = 'Error: ' + err.message;
+            });
+    }
+
+    function simulateRecover() {
+        const statusEl = document.getElementById('simStatus');
+        statusEl.textContent = 'Recovering...';
+        fetch('/api/simulate/recover', { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                statusEl.textContent = 'All nodes recovered';
+                statusEl.style.color = '#2ecc71';
+            })
+            .catch(function(err) {
+                statusEl.textContent = 'Error: ' + err.message;
+            });
+    }
+
+    // =========================================================
+    // Init
+    // =========================================================
+
+    connectWebSocket();
+</script>
+
+</body>
+</html>

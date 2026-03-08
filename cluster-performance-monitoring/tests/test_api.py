@@ -113,3 +113,27 @@ async def test_generate_report(client: httpx.AsyncClient):
     data = response.json()
     assert "report_id" in data
     assert data["report_id"].startswith("perf_report_")
+
+
+async def test_dashboard(client: httpx.AsyncClient):
+    """GET /dashboard returns 200 with HTML content."""
+    response = await client.get("/dashboard")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "Chart.js" in response.text or "chart.js" in response.text
+
+
+async def test_simulate_degrade(client: httpx.AsyncClient):
+    """POST /api/simulate/degrade returns 200."""
+    response = await client.post("/api/simulate/degrade?scenario=high_load")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "degradation_injected"
+
+
+async def test_simulate_recover(client: httpx.AsyncClient):
+    """POST /api/simulate/recover returns 200."""
+    response = await client.post("/api/simulate/recover")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "recovered"

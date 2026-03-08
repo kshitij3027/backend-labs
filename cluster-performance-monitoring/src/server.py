@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from pathlib import Path
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from src.config import Config
 from src.models import MetricPoint, NodeInfo
@@ -26,6 +29,7 @@ aggregator: MetricAggregator = None  # type: ignore[assignment]
 analyzer: PerformanceAnalyzer = None  # type: ignore[assignment]
 reporter: ReportGenerator = None  # type: ignore[assignment]
 ws_manager: ConnectionManager = ConnectionManager()
+templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 NODE_DEFINITIONS = [
     NodeInfo(node_id="node-1", role="primary", host="localhost", port=8001),
@@ -156,6 +160,49 @@ async def generate_report():
     """Generate a new performance report."""
     report = reporter.generate()
     return report.model_dump()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Serve the web dashboard."""
+    health = analyzer.evaluate()
+    metrics = aggregator.get_cluster_totals()
+    nodes_info = [
+        {
+            "node_id": sim.node_info.node_id,
+            "role": sim.node_info.role,
+            "host": sim.node_info.host,
+            "port": sim.node_info.port,
+        }
+        for sim in simulators
+    ]
+    alerts = analyzer.get_alerts()
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "health": health.model_dump(),
+            "metrics": metrics,
+            "nodes": nodes_info,
+            "alerts": [a.model_dump() for a in alerts],
+        },
+    )
+
+
+@app.post("/api/simulate/degrade")
+async def simulate_degrade(scenario: str = "high_load"):
+    """Inject degradation into all simulators for testing."""
+    for sim in simulators:
+        sim.inject_degradation(scenario)
+    return {"status": "degradation_injected", "scenario": scenario}
+
+
+@app.post("/api/simulate/recover")
+async def simulate_recover():
+    """Clear degradation from all simulators."""
+    for sim in simulators:
+        sim.clear_degradation()
+    return {"status": "recovered"}
 
 
 @app.websocket("/ws")
