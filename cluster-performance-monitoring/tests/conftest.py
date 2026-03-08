@@ -8,6 +8,7 @@ import pytest
 
 from src.config import Config
 from src.models import MetricPoint, NodeInfo
+from src.simulator import NodeSimulator
 from src.storage import MetricStore
 
 
@@ -62,3 +63,21 @@ def sample_points() -> list[MetricPoint]:
 def node_info() -> NodeInfo:
     """Return a sample NodeInfo for node-1."""
     return NodeInfo(node_id="node-1", role="primary", host="localhost", port=8001)
+
+
+@pytest.fixture
+def primary_node_info() -> NodeInfo:
+    """Return a NodeInfo for a primary node."""
+    return NodeInfo(node_id="node-1", role="primary", host="localhost", port=8001)
+
+
+@pytest.fixture
+def replica_node_info() -> NodeInfo:
+    """Return a NodeInfo for a replica node."""
+    return NodeInfo(node_id="node-2", role="replica", host="localhost", port=8002)
+
+
+@pytest.fixture
+def simulator(primary_node_info: NodeInfo) -> NodeSimulator:
+    """Return a NodeSimulator backed by a primary node."""
+    return NodeSimulator(primary_node_info, seed=42)
