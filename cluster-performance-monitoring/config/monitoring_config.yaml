@@ -1,0 +1,33 @@
+monitoring:
+  collection_interval: 5
+  retention_period: 86400
+  aggregation_window: 300
+
+cluster:
+  nodes:
+    - id: node-1
+      host: localhost
+      port: 8001
+      role: primary
+    - id: node-2
+      host: localhost
+      port: 8002
+      role: replica
+    - id: node-3
+      host: localhost
+      port: 8003
+      role: replica
+
+metrics:
+  thresholds:
+    cpu_warning: 70
+    cpu_critical: 90
+    memory_warning: 80
+    memory_critical: 95
+    latency_warning: 100
+    latency_critical: 500
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+  refresh_interval: 10

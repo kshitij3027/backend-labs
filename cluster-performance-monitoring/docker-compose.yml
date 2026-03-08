@@ -1,0 +1,32 @@
+services:
+  monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8080
+      - NUM_NODES=3
+      - COLLECTION_INTERVAL=5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - cpm-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+    networks:
+      - cpm-net
+
+networks:
+  cpm-net:
+    driver: bridge

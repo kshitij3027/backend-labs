@@ -1,0 +1,28 @@
+# Web framework + WebSocket support
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Templating for dashboard
+jinja2==3.1.5
+
+# Async HTTP client (for inter-node communication if needed)
+httpx==0.28.1
+
+# Data validation
+pydantic==2.10.4
+
+# Statistics and metrics computation
+numpy==2.2.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+
+# HTTP test client
+httpx  # also used as async test client for FastAPI
+
+# YAML config parsing
+pyyaml==6.0.2
+
+# SQLite is stdlib, no extra dependency needed
