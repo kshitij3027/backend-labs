@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from src.config import Config
-from src.models import NodeInfo
+from src.models import MetricPoint, NodeInfo
 from src.storage import MetricStore
 from src.simulator import NodeSimulator
 from src.collector import MetricCollector
 from src.aggregator import MetricAggregator
 from src.analyzer import PerformanceAnalyzer
 from src.reporter import ReportGenerator
+from src.websocket import ConnectionManager
 
 # Module-level globals (set during lifespan)
 config: Config = None  # type: ignore[assignment]
@@ -24,6 +25,7 @@ collectors: list[MetricCollector] = []
 aggregator: MetricAggregator = None  # type: ignore[assignment]
 analyzer: PerformanceAnalyzer = None  # type: ignore[assignment]
 reporter: ReportGenerator = None  # type: ignore[assignment]
+ws_manager: ConnectionManager = ConnectionManager()
 
 NODE_DEFINITIONS = [
     NodeInfo(node_id="node-1", role="primary", host="localhost", port=8001),
@@ -32,12 +34,28 @@ NODE_DEFINITIONS = [
 ]
 
 
+async def _broadcast_metrics(points: list[MetricPoint]) -> None:
+    """Broadcast new metrics to all WebSocket clients."""
+    if ws_manager.active_count == 0:
+        return
+    # Build a summary of the latest metrics
+    data = {
+        "type": "metrics_update",
+        "node_id": points[0].node_id if points else "unknown",
+        "metrics": {p.metric_name: p.value for p in points},
+        "timestamp": points[0].timestamp.isoformat() if points else None,
+    }
+    await ws_manager.broadcast(data)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown."""
     global config, store, simulators, collectors, aggregator, analyzer, reporter
+    global ws_manager
 
     # Startup
+    ws_manager = ConnectionManager()
     config = Config.load()
     store = MetricStore(
         max_points_per_series=int(config.retention_seconds / config.collection_interval)
@@ -46,7 +64,10 @@ async def lifespan(app: FastAPI):
     for node_def in NODE_DEFINITIONS[: config.num_nodes]:
         sim = NodeSimulator(node_def)
         simulators.append(sim)
-        collector = MetricCollector(sim, store, interval=config.collection_interval)
+        collector = MetricCollector(
+            sim, store, interval=config.collection_interval,
+            on_new_metrics=_broadcast_metrics,
+        )
         collectors.append(collector)
         await collector.start()
 
@@ -135,3 +156,15 @@ async def generate_report():
     """Generate a new performance report."""
     report = reporter.generate()
     return report.model_dump()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time metric streaming."""
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, wait for client messages (or disconnect)
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
