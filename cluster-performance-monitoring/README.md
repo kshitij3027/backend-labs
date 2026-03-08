@@ -4,100 +4,119 @@ A multi-node performance monitoring system that collects, aggregates, and analyz
 
 ## What It Does
 
-- **Metric Collection**: Gathers CPU, memory, disk I/O, network, throughput, and latency metrics from simulated cluster nodes via background async loops
-- **Aggregation & Analysis**: Computes cluster-wide aggregates (min/max/avg/p95/p99), detects anomalies, and tracks trends over configurable time windows
-- **Alerting**: Threshold-based and anomaly-based alerts with configurable rules, cooldowns, and notification channels
-- **Web Dashboard**: Real-time WebSocket-powered dashboard showing per-node and cluster-wide metrics, historical charts, and alert status
-- **REST API**: Query current and historical metrics, manage alert rules, trigger one-shot performance reports
-- **CLI/API Reports**: Generate point-in-time performance reports summarizing cluster health, bottlenecks, and recommendations
-
-## How It Runs
-
-Long-lived server process with a REST API + WebSocket dashboard, backed by background async metric collection loops. Can also generate one-shot performance reports via CLI/API call.
+- **Metric Collection**: Gathers CPU, memory, disk I/O, network, throughput, and latency metrics from 3 simulated cluster nodes (1 primary, 2 replicas) via async background loops
+- **Aggregation**: Computes per-node stats (min/max/avg/p95/p99) and cluster-wide totals over a configurable time window
+- **Analysis & Alerting**: Evaluates metrics against configurable thresholds, generates warning/critical alerts, computes a 0-100 performance score
+- **JSON Reports**: Generates and persists comprehensive performance reports to disk
+- **Web Dashboard**: Real-time Chart.js dashboard with WebSocket updates, health badges, per-node detail cards, and alert panels
+- **REST API**: Query metrics, nodes, alerts, and reports via JSON endpoints
 
 ## Tech Stack
 
-- **Language**: Python 3.11+
-- **Async Framework**: asyncio
-- **Web Framework**: FastAPI (REST API + WebSocket support)
-- **Dashboard**: Jinja2 templates + Chart.js (served by FastAPI)
-- **Metric Storage**: In-memory time-series ring buffers (with optional SQLite persistence)
-- **Alerting**: Custom rule engine with configurable thresholds
-- **Simulated Nodes**: Async tasks generating realistic metric streams
-- **Testing**: pytest + pytest-asyncio
-- **Containerization**: Docker + docker-compose
+- **Language**: Python 3.12
+- **Web Framework**: FastAPI (REST + WebSocket + Jinja2 templates)
+- **Dashboard**: Chart.js (CDN) + vanilla JavaScript
+- **Metric Storage**: In-memory ring buffers (`collections.deque`)
+- **Testing**: pytest + pytest-asyncio + httpx
+- **Containerization**: Docker + Docker Compose
 
 ## How to Run
 
-> Docker instructions will be added once the project is built.
+### Docker (Recommended)
+
+```bash
+# Build images
+make build
+
+# Start the monitoring server
+make run
+
+# View logs
+make logs
+
+# Open dashboard
+open http://localhost:8080/dashboard
+
+# Stop
+make stop
+```
+
+### Run Tests
+
+```bash
+# Unit tests (60 tests)
+make test
+
+# End-to-end verification
+make e2e
+
+# Load/performance test
+make load-test
+```
 
 ### Local Development
 
 ```bash
-cd cluster-performance-monitoring
 pip install -r requirements.txt
-python -m monitor.main
+python -m uvicorn src.server:app --host 0.0.0.0 --port 8080
 ```
 
-The server starts on `http://localhost:8080` by default.
-
-### Environment Variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Server bind address |
-| `PORT` | `8080` | Server port |
-| `NUM_NODES` | `5` | Number of simulated cluster nodes |
-| `COLLECTION_INTERVAL` | `2` | Metric collection interval (seconds) |
-| `RETENTION_SECONDS` | `3600` | How long to keep metric history |
-| `ALERT_COOLDOWN` | `60` | Minimum seconds between repeated alerts |
-| `DB_PATH` | `:memory:` | SQLite path (`:memory:` for in-memory only) |
-
-### API Endpoints (Planned)
+## API Endpoints
 
 | Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/nodes` | List all monitored nodes |
-| `GET` | `/api/nodes/{id}/metrics` | Current metrics for a node |
-| `GET` | `/api/cluster/metrics` | Aggregated cluster metrics |
-| `GET` | `/api/metrics/history` | Historical metrics with time range |
-| `GET` | `/api/alerts` | List active and recent alerts |
-| `POST` | `/api/alerts/rules` | Create/update alert rules |
-| `POST` | `/api/reports/generate` | Generate a one-shot performance report |
-| `WS` | `/ws/metrics` | Real-time metric stream |
+|--------|------|-------------|
+| `GET` | `/health` | Health check |
+| `GET` | `/api/metrics` | Cluster-wide metric totals |
+| `GET` | `/api/nodes` | List monitored nodes |
+| `GET` | `/api/nodes/{id}/metrics` | Per-node aggregated metrics |
+| `GET` | `/api/alerts` | Current threshold-breach alerts |
+| `GET` | `/api/report` | Latest performance report |
+| `POST` | `/api/report/generate` | Generate a new report |
+| `POST` | `/api/simulate/degrade` | Inject degradation scenario |
+| `POST` | `/api/simulate/recover` | Clear degradation |
+| `WS` | `/ws` | Real-time metric stream |
 | `GET` | `/dashboard` | Web dashboard UI |
 
-## Architecture (Planned)
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | `0.0.0.0` | Server bind address |
+| `PORT` | `8080` | Server port |
+| `NUM_NODES` | `3` | Number of simulated nodes |
+| `COLLECTION_INTERVAL` | `5` | Metric collection interval (seconds) |
+| `RETENTION_SECONDS` | `86400` | Metric retention period |
+| `CPU_WARNING` | `70` | CPU warning threshold (%) |
+| `CPU_CRITICAL` | `90` | CPU critical threshold (%) |
+| `MEMORY_WARNING` | `80` | Memory warning threshold (%) |
+| `MEMORY_CRITICAL` | `95` | Memory critical threshold (%) |
+| `LATENCY_WARNING` | `100` | Latency warning threshold (ms) |
+| `LATENCY_CRITICAL` | `500` | Latency critical threshold (ms) |
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    FastAPI Server                     │
-│                                                       │
-│  ┌─────────┐  ┌──────────┐  ┌───────────────────┐   │
-│  │ REST API │  │WebSocket │  │ Dashboard (Jinja2)│   │
-│  └────┬─────┘  └────┬─────┘  └────────┬──────────┘   │
-│       │              │                 │               │
-│  ┌────▼──────────────▼─────────────────▼──────────┐   │
-│  │              Metric Aggregator                  │   │
-│  │  (cluster stats, percentiles, trend detection)  │   │
-│  └────────────────────┬───────────────────────────┘   │
-│                       │                               │
-│  ┌────────────────────▼───────────────────────────┐   │
-│  │           Time-Series Storage                   │   │
-│  │    (ring buffers + optional SQLite persist)     │   │
-│  └────────────────────┬───────────────────────────┘   │
-│                       │                               │
-│  ┌────────────────────▼───────────────────────────┐   │
-│  │         Alert Engine (rule evaluation)          │   │
-│  └────────────────────────────────────────────────┘   │
-│                                                       │
-│  ┌────────────────────────────────────────────────┐   │
-│  │       Async Metric Collectors (per node)        │   │
-│  │  [Node-1] [Node-2] [Node-3] [Node-4] [Node-5]  │   │
-│  └────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────┘
+NodeSimulator -> MetricCollector -> MetricStore (ring buffer)
+                                       |
+                          +------------++-----------+
+                          v             v            v
+                   MetricAggregator  WebSocket    REST API
+                          |          broadcast   /api/metrics
+                          v                        |
+                  PerformanceAnalyzer              |
+                     |        |                    |
+                  Alerts   Reporter -> data/*.json |
+                     |                             |
+                     +----------+------------------+
+                                v
+                          Dashboard (Chart.js + WS)
 ```
 
 ## What I Learned
 
-> To be filled in as the project progresses.
+- **FastAPI lifespan pattern** for managing startup/shutdown of async background tasks
+- **In-memory ring buffers** using `collections.deque(maxlen=N)` for time-series data -- simple, fast, and memory-bounded
+- **WebSocket broadcasting** from async background tasks to update dashboards in real-time
+- **Percentile computation** with NumPy for p95/p99 metrics aggregation
+- **Threshold-based alerting** with score computation and actionable recommendations
+- **Chart.js + WebSocket integration** for real-time browser charts without any build step

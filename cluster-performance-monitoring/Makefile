@@ -14,9 +14,7 @@ stop:
 
 e2e:
 	docker compose up -d monitor
-	sleep 15
-	python scripts/verify_e2e.py
-	docker compose down
+	@python3 scripts/verify_e2e.py; EXIT_CODE=$$?; docker compose down; exit $$EXIT_CODE
 
 load-test:
 	docker compose run --rm test python scripts/load_test.py
