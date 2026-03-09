@@ -1,0 +1,33 @@
+rabbitmq:
+  host: localhost
+  port: 5672
+  management_port: 15672
+  credentials:
+    username: guest
+    password: guest
+  heartbeat: 600
+  blocked_connection_timeout: 300
+  connection:
+    retry_max: 5
+    retry_delay: 1
+
+exchange:
+  name: logs
+  type: topic
+  durable: true
+
+queues:
+  - name: log_messages
+    routing_key: "logs.info.*"
+    durable: true
+  - name: error_messages
+    routing_key: "logs.error.*"
+    durable: true
+  - name: debug_messages
+    routing_key: "logs.debug.*"
+    durable: true
+
+dead_letter:
+  exchange: logs_dlx
+  queue: dead_letter_queue
+  routing_key: failed
