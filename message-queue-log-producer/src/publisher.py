@@ -85,6 +85,9 @@ class PublisherThread:
         exchange_name = self._config.exchange["name"]
         try:
             for entry in batch:
+                # Strip internal timing field before publishing
+                received_at = entry.pop("_received_at", None)
+
                 routing_key = "log.{}.{}".format(
                     entry.get("level", "unknown"),
                     entry.get("source", "unknown"),
@@ -99,6 +102,11 @@ class PublisherThread:
                         content_type="application/json",
                     ),
                 )
+
+                # Record latency
+                if received_at is not None:
+                    latency = (time.monotonic() - received_at) * 1000
+                    self._metrics.record_latency(latency)
             self._cb.record_success()
             self._metrics.record_published(len(batch))
             self._metrics.record_batch_flushed()
@@ -123,6 +131,9 @@ class PublisherThread:
         def publish_chunk(chunk):
             exchange_name = self._config.exchange["name"]
             for entry in chunk:
+                # Strip internal timing field (no latency tracking for fallback)
+                entry.pop("_received_at", None)
+
                 routing_key = "log.{}.{}".format(
                     entry.get("level", "unknown"),
                     entry.get("source", "unknown"),
