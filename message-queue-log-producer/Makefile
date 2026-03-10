@@ -16,7 +16,9 @@ e2e:
 	docker compose down
 
 throughput:
-	docker compose run --rm app python scripts/throughput_test.py
+	docker compose up -d rabbitmq app
+	docker compose run --rm e2e python scripts/throughput_test.py
+	docker compose down
 
 clean:
 	docker compose down -v --remove-orphans
