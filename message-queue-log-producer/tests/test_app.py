@@ -81,8 +81,10 @@ class TestHealthAndMetrics:
         assert "status" in body
 
     def test_metrics(self, client):
-        """GET /metrics returns 200 with status key."""
+        """GET /metrics returns 200 with pipeline metrics."""
         response = client.get("/metrics")
         assert response.status_code == 200
         body = response.get_json()
-        assert "status" in body
+        assert "messages_received" in body
+        assert "messages_published" in body
+        assert "circuit_breaker_state" in body

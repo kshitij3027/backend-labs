@@ -11,7 +11,9 @@ test:
 	docker compose run --rm test
 
 e2e:
-	docker compose run --rm app python scripts/verify_e2e.py
+	docker compose up -d rabbitmq app
+	docker compose run --rm e2e
+	docker compose down
 
 throughput:
 	docker compose run --rm app python scripts/throughput_test.py

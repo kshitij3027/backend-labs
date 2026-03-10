@@ -40,5 +40,19 @@ services:
       RABBITMQ_HOST: rabbitmq
     network_mode: "service:rabbitmq"
 
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      app:
+        condition: service_started
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      APP_HOST: app
+    command: python scripts/verify_e2e.py
+
 volumes:
   rabbitmq_data:
