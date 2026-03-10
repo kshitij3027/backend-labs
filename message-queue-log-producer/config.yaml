@@ -1,0 +1,32 @@
+rabbitmq:
+  host: localhost
+  port: 5672
+  user: guest
+  password: guest
+  heartbeat: 600
+  blocked_connection_timeout: 300
+
+exchange:
+  name: logs
+  type: topic
+  durable: true
+
+queue:
+  name: log_queue
+  durable: true
+  routing_key: "log.#"
+
+dead_letter:
+  exchange: logs_dlx
+  queue: log_queue_dlq
+
+batch:
+  max_size: 100
+  flush_interval: 2.0
+
+circuit_breaker:
+  failure_threshold: 5
+  recovery_timeout: 30
+
+queue_maxsize: 10000
+http_port: 8080
