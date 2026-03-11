@@ -102,4 +102,5 @@ async def get_errors():
 
 
 if __name__ == "__main__":
-    uvicorn.run("src.app:app", host="0.0.0.0", port=config.dashboard_port, reload=False)
+    _startup_config = Config.load()
+    uvicorn.run("src.app:app", host="0.0.0.0", port=_startup_config.dashboard_port, reload=False)

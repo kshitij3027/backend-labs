@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from datetime import datetime, timezone
 
 from src.config import Config
@@ -36,6 +37,7 @@ class LogConsumer:
         self.error_count = 0
         self.last_active: datetime | None = None
         self._stop_event = asyncio.Event()
+        self._retry_counts: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -106,21 +108,70 @@ class LogConsumer:
                 await asyncio.sleep(1)  # Back off on errors
 
     async def _process_message(self, msg_id: str, msg_data: dict) -> None:
-        """Process a single message and ACK it."""
+        """Process a single message with retry and DLQ on exhaustion."""
+        max_retries = self.config.max_retries
+        base_delay = self.config.retry_base_delay
+        max_delay = self.config.retry_max_delay
+
+        while True:
+            try:
+                entry = self.processor.process_message(msg_data)
+                if entry:
+                    await self.metrics.record(entry)
+                self.processed_count += 1
+                self.last_active = datetime.now(timezone.utc)
+                await self.redis.xack(
+                    self.config.stream_key,
+                    self.config.consumer_group,
+                    msg_id,
+                )
+                # Success — clean up any retry state
+                self._retry_counts.pop(msg_id, None)
+                return
+            except Exception as e:
+                attempt = self._retry_counts.get(msg_id, 0) + 1
+                self._retry_counts[msg_id] = attempt
+
+                if attempt < max_retries:
+                    delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 0.5))
+                    logger.warning(
+                        "Retry %d/%d for %s (delay=%.2fs): %s",
+                        attempt, max_retries, msg_id, delay, e,
+                    )
+                    await asyncio.sleep(delay)
+                    continue  # retry
+                else:
+                    # Exhausted retries — send to DLQ
+                    self.error_count += 1
+                    logger.error(
+                        "Max retries (%d) exceeded for %s: %s",
+                        max_retries, msg_id, e,
+                    )
+                    await self._send_to_dlq(msg_id, msg_data, e)
+                    await self.redis.xack(
+                        self.config.stream_key,
+                        self.config.consumer_group,
+                        msg_id,
+                    )
+                    return
+
+    async def _send_to_dlq(self, msg_id: str, msg_data: dict, error: Exception) -> None:
+        """Send a failed message to the dead letter queue stream."""
+        attempt_count = self._retry_counts.pop(msg_id, 0)
         try:
-            entry = self.processor.process_message(msg_data)
-            if entry:
-                await self.metrics.record(entry)
-            self.processed_count += 1
-            self.last_active = datetime.now(timezone.utc)
-            await self.redis.xack(
-                self.config.stream_key,
-                self.config.consumer_group,
-                msg_id,
+            await self.redis.xadd(
+                self.config.dlq_stream_key,
+                {
+                    "original_id": msg_id,
+                    "original_data": str(msg_data),
+                    "error": str(error),
+                    "attempt_count": str(attempt_count),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
             )
-        except Exception as e:
-            self.error_count += 1
-            logger.error("Error processing %s: %s", msg_id, e)
+            logger.info("Sent %s to DLQ after %d attempts", msg_id, attempt_count)
+        except Exception as dlq_err:
+            logger.error("Failed to send %s to DLQ: %s", msg_id, dlq_err)
 
     async def _recover_pending(self) -> None:
         """Read pending messages (ID '0') on startup."""
