@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from datetime import datetime
 
+import structlog
+
 from src.models import LogEntry
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Apache/Nginx combined log format regex
 # Example: 192.168.1.1 - - [10/Mar/2026:13:55:36 +0000] "GET /api/users HTTP/1.1" 200 1234 "-" "curl/7.68" 45.2
@@ -43,7 +44,7 @@ class LogProcessor:
 
         match = _LOG_PATTERN.match(raw.strip())
         if not match:
-            logger.debug("Failed to parse log line: %.100s", raw)
+            logger.debug("failed to parse log line", raw=raw[:100])
             return None
 
         groups = match.groupdict()
@@ -53,7 +54,7 @@ class LogProcessor:
         try:
             ts = datetime.strptime(groups["timestamp"], _TIMESTAMP_FMT)
         except (ValueError, TypeError):
-            logger.debug("Failed to parse timestamp: %s", groups.get("timestamp"))
+            logger.debug("failed to parse timestamp", timestamp=groups.get("timestamp"))
 
         # Parse optional response time
         response_time: float | None = None
@@ -75,7 +76,7 @@ class LogProcessor:
                 raw=raw.strip(),
             )
         except Exception:
-            logger.exception("Failed to construct LogEntry from parsed groups")
+            logger.exception("failed to construct LogEntry from parsed groups")
             return None
 
     def process_message(self, msg_data: dict) -> LogEntry | None:
@@ -85,6 +86,6 @@ class LogProcessor:
         """
         log_line = msg_data.get("log")
         if log_line is None:
-            logger.debug("Message dict missing 'log' key: %s", msg_data)
+            logger.debug("message dict missing 'log' key", msg_data=msg_data)
             return None
         return self.parse_log_line(log_line)

@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import random
 from datetime import datetime, timezone
+
+import structlog
 
 from src.config import Config
 from src.metrics import MetricsAggregator
 from src.models import ConsumerStats
 from src.processor import LogProcessor
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class LogConsumer:
@@ -104,7 +105,7 @@ class LogConsumer:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Consumer %s error: %s", self.consumer_id, e)
+                logger.error("consumer loop error", consumer_id=self.consumer_id, error=str(e))
                 await asyncio.sleep(1)  # Back off on errors
 
     async def _process_message(self, msg_id: str, msg_data: dict) -> None:
@@ -135,8 +136,13 @@ class LogConsumer:
                 if attempt < max_retries:
                     delay = min(max_delay, base_delay * (2 ** attempt) + random.uniform(0, 0.5))
                     logger.warning(
-                        "Retry %d/%d for %s (delay=%.2fs): %s",
-                        attempt, max_retries, msg_id, delay, e,
+                        "retrying message",
+                        consumer_id=self.consumer_id,
+                        attempt=attempt,
+                        max_retries=max_retries,
+                        msg_id=msg_id,
+                        delay=round(delay, 2),
+                        error=str(e),
                     )
                     await asyncio.sleep(delay)
                     continue  # retry
@@ -144,8 +150,11 @@ class LogConsumer:
                     # Exhausted retries — send to DLQ
                     self.error_count += 1
                     logger.error(
-                        "Max retries (%d) exceeded for %s: %s",
-                        max_retries, msg_id, e,
+                        "max retries exceeded",
+                        consumer_id=self.consumer_id,
+                        max_retries=max_retries,
+                        msg_id=msg_id,
+                        error=str(e),
                     )
                     await self._send_to_dlq(msg_id, msg_data, e)
                     await self.redis.xack(
@@ -169,9 +178,9 @@ class LogConsumer:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
-            logger.info("Sent %s to DLQ after %d attempts", msg_id, attempt_count)
+            logger.info("sent to DLQ", consumer_id=self.consumer_id, msg_id=msg_id, attempt_count=attempt_count)
         except Exception as dlq_err:
-            logger.error("Failed to send %s to DLQ: %s", msg_id, dlq_err)
+            logger.error("failed to send to DLQ", consumer_id=self.consumer_id, msg_id=msg_id, error=str(dlq_err))
 
     async def _recover_pending(self) -> None:
         """Read pending messages (ID '0') on startup."""
@@ -188,7 +197,7 @@ class LogConsumer:
                         if msg_data:  # Skip empty pending entries
                             await self._process_message(msg_id, msg_data)
         except Exception as e:
-            logger.error("Pending recovery error: %s", e)
+            logger.error("pending recovery error", consumer_id=self.consumer_id, error=str(e))
 
 
 class ConsumerManager:

@@ -67,6 +67,17 @@ async def client(setup_app):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_endpoint(client):
+    resp = await client.get("/")
+    assert resp.status_code == 200
+    assert "text/html" in resp.headers["content-type"]
+    body = resp.text
+    assert "Log Consumer Dashboard" in body
+    assert "total-processed" in body
+    assert "fetch('/api/stats')" in body
+
+
+@pytest.mark.asyncio
 async def test_health_endpoint(client):
     resp = await client.get("/health")
     assert resp.status_code == 200

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 
+import structlog
+
 from src.models import DashboardStats, EndpointMetrics, LogEntry
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass

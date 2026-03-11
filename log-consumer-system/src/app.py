@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import redis.asyncio as aioredis
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from src.config import Config
 from src.consumer import ConsumerManager
 from src.health import HealthMonitor
+from src.logging_config import configure_logging
 from src.metrics import MetricsAggregator
 from src.processor import LogProcessor
+
+templates = Jinja2Templates(directory=str(Path(__file__).parent.parent / "templates"))
 
 # Module-level globals (set during lifespan)
 config: Config = None  # type: ignore[assignment]
@@ -27,6 +33,8 @@ health_monitor: HealthMonitor = None  # type: ignore[assignment]
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown."""
     global config, redis_client, metrics, processor, consumer_manager, health_monitor
+
+    configure_logging()
 
     config = Config.load()
     redis_client = aioredis.from_url(config.redis_url, decode_responses=True)
@@ -44,6 +52,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Log Consumer System", lifespan=lifespan)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    snapshot = await metrics.snapshot()
+    snapshot.consumers = consumer_manager.get_consumer_stats()
+    return templates.TemplateResponse(request, "dashboard.html", {"stats": snapshot.model_dump()})
 
 
 @app.get("/health")

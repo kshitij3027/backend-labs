@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Consumer Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f1117;
+            color: #e1e4e8;
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        /* Header */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 0;
+            border-bottom: 1px solid #21262d;
+            margin-bottom: 24px;
+        }
+
+        header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #f0f6fc;
+        }
+
+        .header-meta {
+            text-align: right;
+            font-size: 0.85rem;
+            color: #8b949e;
+        }
+
+        .header-meta .uptime {
+            color: #58a6ff;
+            font-weight: 500;
+        }
+
+        .header-meta .last-updated {
+            margin-top: 2px;
+        }
+
+        .update-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3fb950;
+            margin-right: 6px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* Stats cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            padding: 20px;
+            transition: border-color 0.2s;
+        }
+
+        .stat-card:hover {
+            border-color: #30363d;
+        }
+
+        .stat-card .label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #8b949e;
+            margin-bottom: 8px;
+        }
+
+        .stat-card .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #f0f6fc;
+        }
+
+        .stat-card .value.error {
+            color: #f85149;
+        }
+
+        .stat-card .value.success {
+            color: #3fb950;
+        }
+
+        .stat-card .value.info {
+            color: #58a6ff;
+        }
+
+        /* Section titles */
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #f0f6fc;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid #21262d;
+        }
+
+        /* Tables */
+        .table-section {
+            background: #161b22;
+            border: 1px solid #21262d;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 24px;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead th {
+            text-align: left;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #8b949e;
+            padding: 8px 12px;
+            border-bottom: 1px solid #21262d;
+        }
+
+        tbody td {
+            padding: 10px 12px;
+            font-size: 0.9rem;
+            border-bottom: 1px solid #21262d;
+        }
+
+        tbody tr:last-child td {
+            border-bottom: none;
+        }
+
+        tbody tr:hover {
+            background: #1c2128;
+        }
+
+        .mono {
+            font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+            font-size: 0.85rem;
+        }
+
+        /* Status badges */
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .badge-active {
+            background: rgba(63, 185, 80, 0.15);
+            color: #3fb950;
+        }
+
+        .badge-starting {
+            background: rgba(88, 166, 255, 0.15);
+            color: #58a6ff;
+        }
+
+        .badge-stale {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+        }
+
+        .badge-unhealthy {
+            background: rgba(248, 81, 73, 0.15);
+            color: #f85149;
+        }
+
+        .badge-degraded {
+            background: rgba(210, 153, 34, 0.15);
+            color: #d29922;
+        }
+
+        /* Two-column layout for smaller tables */
+        .two-col {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 24px;
+            margin-bottom: 24px;
+        }
+
+        .two-col .table-section {
+            margin-bottom: 0;
+        }
+
+        /* Latency section */
+        .latency-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+        }
+
+        .latency-card {
+            text-align: center;
+            padding: 16px;
+            background: #0d1117;
+            border-radius: 6px;
+            border: 1px solid #21262d;
+        }
+
+        .latency-card .percentile-label {
+            font-size: 0.8rem;
+            color: #8b949e;
+            margin-bottom: 6px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .latency-card .percentile-value {
+            font-size: 1.4rem;
+            font-weight: 700;
+            color: #58a6ff;
+        }
+
+        .latency-card .percentile-unit {
+            font-size: 0.75rem;
+            color: #8b949e;
+            margin-left: 2px;
+        }
+
+        /* Empty state */
+        .empty-state {
+            text-align: center;
+            padding: 24px;
+            color: #8b949e;
+            font-style: italic;
+        }
+
+        /* Status code coloring */
+        .status-2xx { color: #3fb950; }
+        .status-3xx { color: #58a6ff; }
+        .status-4xx { color: #d29922; }
+        .status-5xx { color: #f85149; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>Log Consumer Dashboard</h1>
+            <div class="header-meta">
+                <div><span class="update-indicator"></span>Uptime: <span class="uptime" id="uptime">{{ "%.1f"|format(stats.uptime_seconds) }}s</span></div>
+                <div class="last-updated">Last updated: <span id="last-updated">just now</span></div>
+            </div>
+        </header>
+
+        <!-- Stats Cards -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="label">Total Processed</div>
+                <div class="value success" id="total-processed">{{ "{:,}".format(stats.total_processed) }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Total Errors</div>
+                <div class="value error" id="total-errors">{{ "{:,}".format(stats.total_errors) }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Requests / sec</div>
+                <div class="value info" id="requests-per-second">{{ "%.2f"|format(stats.requests_per_second) }}</div>
+            </div>
+            <div class="stat-card">
+                <div class="label">Error Rate</div>
+                <div class="value error" id="error-rate">
+                    {% if stats.total_processed > 0 %}
+                        {{ "%.2f"|format(stats.total_errors / stats.total_processed * 100) }}%
+                    {% else %}
+                        0.00%
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Latency Percentiles -->
+        <div class="table-section">
+            <div class="section-title">Latency Percentiles</div>
+            <div class="latency-grid">
+                <div class="latency-card">
+                    <div class="percentile-label">P50</div>
+                    <div>
+                        <span class="percentile-value" id="latency-p50">{{ "%.2f"|format(stats.latency_percentiles.get('p50', 0)) }}</span>
+                        <span class="percentile-unit">ms</span>
+                    </div>
+                </div>
+                <div class="latency-card">
+                    <div class="percentile-label">P95</div>
+                    <div>
+                        <span class="percentile-value" id="latency-p95">{{ "%.2f"|format(stats.latency_percentiles.get('p95', 0)) }}</span>
+                        <span class="percentile-unit">ms</span>
+                    </div>
+                </div>
+                <div class="latency-card">
+                    <div class="percentile-label">P99</div>
+                    <div>
+                        <span class="percentile-value" id="latency-p99">{{ "%.2f"|format(stats.latency_percentiles.get('p99', 0)) }}</span>
+                        <span class="percentile-unit">ms</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Status Code Distribution + Top IPs -->
+        <div class="two-col">
+            <div class="table-section">
+                <div class="section-title">Status Code Distribution</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Status Code</th>
+                            <th>Count</th>
+                        </tr>
+                    </thead>
+                    <tbody id="status-codes-body">
+                        {% for code, count in stats.status_code_distribution.items()|sort %}
+                        <tr>
+                            <td class="mono {% if code.startswith('2') %}status-2xx{% elif code.startswith('3') %}status-3xx{% elif code.startswith('4') %}status-4xx{% elif code.startswith('5') %}status-5xx{% endif %}">{{ code }}</td>
+                            <td>{{ "{:,}".format(count) }}</td>
+                        </tr>
+                        {% endfor %}
+                        {% if not stats.status_code_distribution %}
+                        <tr><td colspan="2" class="empty-state">No data yet</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="table-section">
+                <div class="section-title">Top IPs</div>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP Address</th>
+                            <th>Count</th>
+                        </tr>
+                    </thead>
+                    <tbody id="top-ips-body">
+                        {% for item in stats.top_ips %}
+                        <tr>
+                            <td class="mono">{{ item.ip }}</td>
+                            <td>{{ "{:,}".format(item.count) }}</td>
+                        </tr>
+                        {% endfor %}
+                        {% if not stats.top_ips %}
+                        <tr><td colspan="2" class="empty-state">No data yet</td></tr>
+                        {% endif %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Top Paths -->
+        <div class="table-section">
+            <div class="section-title">Top Paths</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Path</th>
+                        <th>Count</th>
+                        <th>Avg Response Time</th>
+                    </tr>
+                </thead>
+                <tbody id="top-paths-body">
+                    {% for item in stats.top_paths %}
+                    <tr>
+                        <td class="mono">{{ item.path }}</td>
+                        <td>{{ "{:,}".format(item.count) }}</td>
+                        <td>
+                            {% if item.avg_response_time is defined %}
+                                {{ "%.2f"|format(item.avg_response_time) }} ms
+                            {% else %}
+                                -
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    {% if not stats.top_paths %}
+                    <tr><td colspan="3" class="empty-state">No data yet</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Consumer Health -->
+        <div class="table-section">
+            <div class="section-title">Consumer Health</div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Consumer ID</th>
+                        <th>Processed</th>
+                        <th>Errors</th>
+                        <th>Success Rate</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody id="consumers-body">
+                    {% for c in stats.consumers %}
+                    <tr>
+                        <td class="mono">{{ c.consumer_id }}</td>
+                        <td>{{ "{:,}".format(c.processed_count) }}</td>
+                        <td>{{ "{:,}".format(c.error_count) }}</td>
+                        <td>{{ "%.2f"|format(c.success_rate * 100) }}%</td>
+                        <td><span class="badge badge-active">active</span></td>
+                    </tr>
+                    {% endfor %}
+                    {% if not stats.consumers %}
+                    <tr><td colspan="5" class="empty-state">No consumers running</td></tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Number formatting helpers
+        function fmtInt(n) {
+            return Number(n).toLocaleString('en-US');
+        }
+
+        function fmtFloat(n, decimals) {
+            decimals = decimals !== undefined ? decimals : 2;
+            return Number(n).toLocaleString('en-US', {
+                minimumFractionDigits: decimals,
+                maximumFractionDigits: decimals,
+            });
+        }
+
+        function fmtUptime(seconds) {
+            var s = Math.floor(seconds);
+            var d = Math.floor(s / 86400);
+            s %= 86400;
+            var h = Math.floor(s / 3600);
+            s %= 3600;
+            var m = Math.floor(s / 60);
+            s %= 60;
+            var parts = [];
+            if (d > 0) parts.push(d + 'd');
+            if (h > 0) parts.push(h + 'h');
+            if (m > 0) parts.push(m + 'm');
+            parts.push(s + 's');
+            return parts.join(' ');
+        }
+
+        function statusCodeClass(code) {
+            code = String(code);
+            if (code.startsWith('2')) return 'status-2xx';
+            if (code.startsWith('3')) return 'status-3xx';
+            if (code.startsWith('4')) return 'status-4xx';
+            if (code.startsWith('5')) return 'status-5xx';
+            return '';
+        }
+
+        function consumerBadge(consumer) {
+            // Determine status from success rate and activity
+            var errorRate = 1.0 - consumer.success_rate;
+            var status = 'active';
+            var badgeClass = 'badge-active';
+
+            if (consumer.processed_count === 0 && consumer.error_count === 0) {
+                status = 'starting';
+                badgeClass = 'badge-starting';
+            } else if (errorRate >= 0.5) {
+                status = 'unhealthy';
+                badgeClass = 'badge-unhealthy';
+            } else if (errorRate >= 0.1) {
+                status = 'degraded';
+                badgeClass = 'badge-degraded';
+            }
+
+            return '<span class="badge ' + badgeClass + '">' + status + '</span>';
+        }
+
+        function updateDashboard(data) {
+            // Stats cards
+            document.getElementById('total-processed').textContent = fmtInt(data.total_processed);
+            document.getElementById('total-errors').textContent = fmtInt(data.total_errors);
+            document.getElementById('requests-per-second').textContent = fmtFloat(data.requests_per_second);
+
+            var errorRate = data.total_processed > 0
+                ? (data.total_errors / data.total_processed * 100)
+                : 0;
+            document.getElementById('error-rate').textContent = fmtFloat(errorRate) + '%';
+
+            // Uptime
+            document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds);
+
+            // Latency percentiles
+            var lp = data.latency_percentiles || {};
+            document.getElementById('latency-p50').textContent = fmtFloat(lp.p50 || 0);
+            document.getElementById('latency-p95').textContent = fmtFloat(lp.p95 || 0);
+            document.getElementById('latency-p99').textContent = fmtFloat(lp.p99 || 0);
+
+            // Status code distribution
+            var scBody = document.getElementById('status-codes-body');
+            var scEntries = Object.entries(data.status_code_distribution || {}).sort(function(a, b) {
+                return a[0].localeCompare(b[0]);
+            });
+            if (scEntries.length === 0) {
+                scBody.innerHTML = '<tr><td colspan="2" class="empty-state">No data yet</td></tr>';
+            } else {
+                var scHtml = '';
+                for (var i = 0; i < scEntries.length; i++) {
+                    var code = scEntries[i][0];
+                    var count = scEntries[i][1];
+                    scHtml += '<tr><td class="mono ' + statusCodeClass(code) + '">' + code + '</td>';
+                    scHtml += '<td>' + fmtInt(count) + '</td></tr>';
+                }
+                scBody.innerHTML = scHtml;
+            }
+
+            // Top IPs
+            var ipsBody = document.getElementById('top-ips-body');
+            var ips = data.top_ips || [];
+            if (ips.length === 0) {
+                ipsBody.innerHTML = '<tr><td colspan="2" class="empty-state">No data yet</td></tr>';
+            } else {
+                var ipsHtml = '';
+                for (var j = 0; j < ips.length; j++) {
+                    ipsHtml += '<tr><td class="mono">' + ips[j].ip + '</td>';
+                    ipsHtml += '<td>' + fmtInt(ips[j].count) + '</td></tr>';
+                }
+                ipsBody.innerHTML = ipsHtml;
+            }
+
+            // Top Paths
+            var pathsBody = document.getElementById('top-paths-body');
+            var paths = data.top_paths || [];
+            if (paths.length === 0) {
+                pathsBody.innerHTML = '<tr><td colspan="3" class="empty-state">No data yet</td></tr>';
+            } else {
+                var pathsHtml = '';
+                for (var k = 0; k < paths.length; k++) {
+                    var p = paths[k];
+                    var avgRt = p.avg_response_time !== undefined && p.avg_response_time !== null
+                        ? fmtFloat(p.avg_response_time) + ' ms'
+                        : '-';
+                    pathsHtml += '<tr><td class="mono">' + p.path + '</td>';
+                    pathsHtml += '<td>' + fmtInt(p.count) + '</td>';
+                    pathsHtml += '<td>' + avgRt + '</td></tr>';
+                }
+                pathsBody.innerHTML = pathsHtml;
+            }
+
+            // Consumer Health
+            var consBody = document.getElementById('consumers-body');
+            var consumers = data.consumers || [];
+            if (consumers.length === 0) {
+                consBody.innerHTML = '<tr><td colspan="5" class="empty-state">No consumers running</td></tr>';
+            } else {
+                var consHtml = '';
+                for (var m = 0; m < consumers.length; m++) {
+                    var c = consumers[m];
+                    consHtml += '<tr>';
+                    consHtml += '<td class="mono">' + c.consumer_id + '</td>';
+                    consHtml += '<td>' + fmtInt(c.processed_count) + '</td>';
+                    consHtml += '<td>' + fmtInt(c.error_count) + '</td>';
+                    consHtml += '<td>' + fmtFloat(c.success_rate * 100) + '%</td>';
+                    consHtml += '<td>' + consumerBadge(c) + '</td>';
+                    consHtml += '</tr>';
+                }
+                consBody.innerHTML = consHtml;
+            }
+
+            // Last updated timestamp
+            var now = new Date();
+            var timeStr = now.toLocaleTimeString();
+            document.getElementById('last-updated').textContent = timeStr;
+        }
+
+        // Auto-refresh every 5 seconds
+        setInterval(function() {
+            fetch('/api/stats')
+                .then(function(response) { return response.json(); })
+                .then(function(data) { updateDashboard(data); })
+                .catch(function(err) { console.error('Failed to fetch stats:', err); });
+        }, 5000);
+    </script>
+</body>
+</html>
