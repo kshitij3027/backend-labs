@@ -1,0 +1,14 @@
+redis_url: "redis://localhost:6379"
+stream_key: "logs:access"
+consumer_group: "log-processors"
+consumer_name: null  # auto-generated from hostname
+num_workers: 4
+batch_size: 100
+block_ms: 2000
+dashboard_port: 8000
+metrics_window_sec: 300
+max_retries: 3
+retry_base_delay: 1.0
+retry_max_delay: 30.0
+dlq_stream_key: "logs:dlq"
+idempotency_ttl: 3600
