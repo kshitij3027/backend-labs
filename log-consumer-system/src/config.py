@@ -28,13 +28,17 @@ class Config:
         "RETRY_MAX_DELAY": "retry_max_delay",
         "DLQ_STREAM_KEY": "dlq_stream_key",
         "IDEMPOTENCY_TTL": "idempotency_ttl",
+        "ENABLE_ORDERING": "enable_ordering",
+        "CLAIM_IDLE_MS": "claim_idle_ms",
     }
 
     INT_FIELDS = {
         "num_workers", "batch_size", "block_ms", "dashboard_port",
         "metrics_window_sec", "max_retries", "idempotency_ttl",
+        "claim_idle_ms",
     }
     FLOAT_FIELDS = {"retry_base_delay", "retry_max_delay"}
+    BOOL_FIELDS = {"enable_ordering"}
 
     def __init__(self, **kwargs):
         self.redis_url: str = kwargs.get("redis_url", "redis://localhost:6379")
@@ -51,6 +55,8 @@ class Config:
         self.retry_max_delay: float = kwargs.get("retry_max_delay", 30.0)
         self.dlq_stream_key: str = kwargs.get("dlq_stream_key", "logs:dlq")
         self.idempotency_ttl: int = kwargs.get("idempotency_ttl", 3600)
+        self.enable_ordering: bool = kwargs.get("enable_ordering", False)
+        self.claim_idle_ms: int = kwargs.get("claim_idle_ms", 30000)
 
     @classmethod
     def load(cls, config_path: str | None = None) -> Config:
@@ -71,6 +77,8 @@ class Config:
                     data[attr_name] = int(value)
                 elif attr_name in cls.FLOAT_FIELDS:
                     data[attr_name] = float(value)
+                elif attr_name in cls.BOOL_FIELDS:
+                    data[attr_name] = value.lower() in ("true", "1", "yes")
                 else:
                     data[attr_name] = value
 

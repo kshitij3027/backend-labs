@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import fakeredis.aioredis
 import pytest
@@ -27,11 +27,15 @@ def _make_consumer(
     fake_redis,
     config: Config,
     consumer_id: str = "test-consumer-0",
+    worker_index: int = 0,
 ) -> LogConsumer:
     """Build a LogConsumer wired to fakeredis."""
     processor = LogProcessor()
     metrics = MetricsAggregator(window_sec=config.metrics_window_sec)
-    return LogConsumer(consumer_id, fake_redis, config, processor, metrics)
+    return LogConsumer(
+        consumer_id, fake_redis, config, processor, metrics,
+        worker_index=worker_index,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +226,166 @@ async def test_manager_starts_n_consumers(fake_redis, config):
     ids = {c.consumer_id for c in manager.consumers}
     assert len(ids) == config.num_workers
 
+    # Each consumer should have a distinct worker_index
+    indices = {c._worker_index for c in manager.consumers}
+    assert indices == set(range(config.num_workers))
+
     # All stats should be returned
     stats = manager.get_consumer_stats()
     assert len(stats) == config.num_workers
 
     await manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# Tests — Idempotency
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_idempotency_skips_duplicate(fake_redis, config):
+    """Processing the same msg_id twice: second call is skipped (duplicate)."""
+    consumer = _make_consumer(fake_redis, config)
+    await consumer._ensure_group()
+
+    msg_id = await fake_redis.xadd(config.stream_key, {"log": SAMPLE_LOG})
+
+    # First processing — should succeed
+    await consumer._process_message(msg_id, {"log": SAMPLE_LOG})
+    assert consumer.processed_count == 1
+
+    # Second processing of the same msg_id — should be skipped
+    await consumer._process_message(msg_id, {"log": SAMPLE_LOG})
+    assert consumer.processed_count == 1  # Still 1, not 2
+
+    # Verify the idempotency key exists in Redis
+    idempotency_val = await fake_redis.get(f"processed:{msg_id}")
+    assert idempotency_val == "1"
+
+
+# ---------------------------------------------------------------------------
+# Tests — Ordering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ordering_routes_correctly(fake_redis, config):
+    """With ordering enabled, consumer only processes messages whose
+    ordering_key hashes to its worker_index."""
+    # Enable ordering for this test
+    config.enable_ordering = True
+    config.num_workers = 2
+
+    consumer_0 = _make_consumer(fake_redis, config, consumer_id="worker-0", worker_index=0)
+    consumer_1 = _make_consumer(fake_redis, config, consumer_id="worker-1", worker_index=1)
+
+    await consumer_0._ensure_group()
+
+    # Pick an ordering_key and figure out which worker it routes to
+    ordering_key = "user-42"
+    target_worker = hash(ordering_key) % config.num_workers
+
+    msg_id = await fake_redis.xadd(
+        config.stream_key, {"log": SAMPLE_LOG, "ordering_key": ordering_key}
+    )
+
+    # Process on both consumers
+    await consumer_0._process_message(msg_id, {"log": SAMPLE_LOG, "ordering_key": ordering_key})
+
+    # The idempotency key was set by consumer_0 if it was the target, or deleted if not.
+    # Reset idempotency for the second consumer attempt.
+    await fake_redis.delete(f"processed:{msg_id}")
+
+    await consumer_1._process_message(msg_id, {"log": SAMPLE_LOG, "ordering_key": ordering_key})
+
+    # Only the target worker should have processed the message
+    if target_worker == 0:
+        assert consumer_0.processed_count == 1
+        assert consumer_1.processed_count == 0
+    else:
+        assert consumer_0.processed_count == 0
+        assert consumer_1.processed_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — XCLAIM abandoned messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_claim_abandoned(fake_redis, config):
+    """_claim_abandoned uses XPENDING + XCLAIM to reclaim idle messages.
+
+    fakeredis may not fully support xpending_range/xclaim, so we mock
+    the Redis methods to verify the consumer logic.
+    """
+    consumer = _make_consumer(fake_redis, config)
+    await consumer._ensure_group()
+
+    msg_id = "1234567890-0"
+    msg_data = {"log": SAMPLE_LOG}
+
+    # Mock xpending_range to return one entry that exceeds claim_idle_ms
+    fake_redis.xpending_range = AsyncMock(return_value=[
+        {
+            "message_id": msg_id,
+            "consumer": "dead-consumer",
+            "time_since_delivered": config.claim_idle_ms + 1000,
+            "times_delivered": 1,
+        }
+    ])
+
+    # Mock xclaim to return the claimed message
+    fake_redis.xclaim = AsyncMock(return_value=[
+        (msg_id, msg_data),
+    ])
+
+    # Seed the stream and add the idempotency-friendly msg_id
+    await fake_redis.xadd(config.stream_key, msg_data)
+
+    await consumer._claim_abandoned()
+
+    # Verify xpending_range was called correctly
+    fake_redis.xpending_range.assert_awaited_once_with(
+        config.stream_key,
+        config.consumer_group,
+        min="-",
+        max="+",
+        count=config.batch_size,
+    )
+
+    # Verify xclaim was called for the idle message
+    fake_redis.xclaim.assert_awaited_once_with(
+        config.stream_key,
+        config.consumer_group,
+        consumer.consumer_id,
+        min_idle_time=config.claim_idle_ms,
+        message_ids=[msg_id],
+    )
+
+    # The claimed message should have been processed
+    assert consumer.processed_count == 1
+
+
+@pytest.mark.asyncio
+async def test_claim_abandoned_skips_non_idle(fake_redis, config):
+    """Messages with idle time below claim_idle_ms are not claimed."""
+    consumer = _make_consumer(fake_redis, config)
+    await consumer._ensure_group()
+
+    # Mock xpending_range with entry below threshold
+    fake_redis.xpending_range = AsyncMock(return_value=[
+        {
+            "message_id": "999-0",
+            "consumer": "other-consumer",
+            "time_since_delivered": config.claim_idle_ms - 1000,  # Below threshold
+            "times_delivered": 1,
+        }
+    ])
+    fake_redis.xclaim = AsyncMock()
+
+    await consumer._claim_abandoned()
+
+    # xclaim should NOT have been called
+    fake_redis.xclaim.assert_not_awaited()
+    assert consumer.processed_count == 0

@@ -12,3 +12,5 @@ retry_base_delay: 1.0
 retry_max_delay: 30.0
 dlq_stream_key: "logs:dlq"
 idempotency_ttl: 3600
+enable_ordering: false
+claim_idle_ms: 30000

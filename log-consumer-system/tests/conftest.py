@@ -27,6 +27,8 @@ def config(tmp_path):
         "retry_max_delay: 1.0\n"
         "dlq_stream_key: logs:test:dlq\n"
         "idempotency_ttl: 60\n"
+        "enable_ordering: false\n"
+        "claim_idle_ms: 30000\n"
     )
     return Config.load(str(config_yaml))
 

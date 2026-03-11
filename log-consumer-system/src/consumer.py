@@ -27,12 +27,14 @@ class LogConsumer:
         config: Config,
         processor: LogProcessor,
         metrics: MetricsAggregator,
+        worker_index: int = 0,
     ) -> None:
         self.consumer_id = consumer_id
         self.redis = redis
         self.config = config
         self.processor = processor
         self.metrics = metrics
+        self._worker_index = worker_index
         self._running = False
         self.processed_count = 0
         self.error_count = 0
@@ -109,7 +111,27 @@ class LogConsumer:
                 await asyncio.sleep(1)  # Back off on errors
 
     async def _process_message(self, msg_id: str, msg_data: dict) -> None:
-        """Process a single message with retry and DLQ on exhaustion."""
+        """Process a single message with idempotency, ordering, retry, and DLQ."""
+        # --- Idempotency: skip if already processed ---
+        is_new = await self.redis.set(
+            f"processed:{msg_id}", "1", nx=True, ex=self.config.idempotency_ttl
+        )
+        if not is_new:
+            await self.redis.xack(
+                self.config.stream_key, self.config.consumer_group, msg_id
+            )
+            logger.info("Skipping duplicate", msg_id=msg_id, consumer_id=self.consumer_id)
+            return
+
+        # --- Ordering: only process if ordering_key hashes to this worker ---
+        if self.config.enable_ordering and "ordering_key" in msg_data:
+            target_worker = hash(msg_data["ordering_key"]) % self.config.num_workers
+            if target_worker != self._worker_index:
+                # Not our message for ordered processing — skip, don't ACK
+                # Remove the idempotency key so the correct worker can process it
+                await self.redis.delete(f"processed:{msg_id}")
+                return
+
         max_retries = self.config.max_retries
         base_delay = self.config.retry_base_delay
         max_delay = self.config.retry_max_delay
@@ -183,8 +205,9 @@ class LogConsumer:
             logger.error("failed to send to DLQ", consumer_id=self.consumer_id, msg_id=msg_id, error=str(dlq_err))
 
     async def _recover_pending(self) -> None:
-        """Read pending messages (ID '0') on startup."""
+        """Recover pending messages and claim abandoned ones."""
         try:
+            # First, try to recover our own pending messages
             messages = await self.redis.xreadgroup(
                 self.config.consumer_group,
                 self.consumer_id,
@@ -196,8 +219,43 @@ class LogConsumer:
                     for msg_id, msg_data in stream_messages:
                         if msg_data:  # Skip empty pending entries
                             await self._process_message(msg_id, msg_data)
+
+            # Then, claim messages that have been idle too long from other consumers
+            await self._claim_abandoned()
         except Exception as e:
-            logger.error("pending recovery error", consumer_id=self.consumer_id, error=str(e))
+            logger.error("Pending recovery error", error=str(e), consumer_id=self.consumer_id)
+
+    async def _claim_abandoned(self) -> None:
+        """Use XPENDING + XCLAIM to take over messages idle longer than claim_idle_ms."""
+        try:
+            pending = await self.redis.xpending_range(
+                self.config.stream_key,
+                self.config.consumer_group,
+                min="-",
+                max="+",
+                count=self.config.batch_size,
+            )
+            for entry in pending:
+                idle_ms = entry.get("time_since_delivered", 0)
+                if idle_ms > self.config.claim_idle_ms:
+                    msg_id = entry["message_id"]
+                    claimed = await self.redis.xclaim(
+                        self.config.stream_key,
+                        self.config.consumer_group,
+                        self.consumer_id,
+                        min_idle_time=self.config.claim_idle_ms,
+                        message_ids=[msg_id],
+                    )
+                    for claimed_id, claimed_data in claimed:
+                        if claimed_data:
+                            logger.info(
+                                "Claimed abandoned message",
+                                msg_id=claimed_id,
+                                consumer_id=self.consumer_id,
+                            )
+                            await self._process_message(claimed_id, claimed_data)
+        except Exception as e:
+            logger.warning("XCLAIM error (non-fatal)", error=str(e), consumer_id=self.consumer_id)
 
 
 class ConsumerManager:
@@ -220,7 +278,8 @@ class ConsumerManager:
         for i in range(self.config.num_workers):
             consumer_id = f"{self.config.consumer_name}-worker-{i}"
             consumer = LogConsumer(
-                consumer_id, redis, self.config, self.processor, self.metrics
+                consumer_id, redis, self.config, self.processor, self.metrics,
+                worker_index=i,
             )
             self.consumers.append(consumer)
             task = asyncio.create_task(consumer.start())
