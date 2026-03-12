@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Consumer Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background-color: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 2rem;
+        }
+
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 2rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .header h1 {
+            font-size: 1.8rem;
+            color: #ffffff;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.95rem;
+            padding: 0.5rem 1rem;
+            border-radius: 8px;
+            background-color: #16213e;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+
+        .status-dot.connected {
+            background-color: #00e676;
+            box-shadow: 0 0 8px #00e676;
+        }
+
+        .status-dot.disconnected {
+            background-color: #ff1744;
+            box-shadow: 0 0 8px #ff1744;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1.2rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background-color: #16213e;
+            border-radius: 12px;
+            padding: 1.5rem;
+            text-align: center;
+            border-left: 4px solid transparent;
+            transition: transform 0.2s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-2px);
+        }
+
+        .stat-card .label {
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #a0a0b0;
+            margin-bottom: 0.5rem;
+        }
+
+        .stat-card .value {
+            font-size: 2.2rem;
+            font-weight: 700;
+        }
+
+        .stat-card.received {
+            border-left-color: #448aff;
+        }
+        .stat-card.received .value {
+            color: #448aff;
+        }
+
+        .stat-card.acked {
+            border-left-color: #00e676;
+        }
+        .stat-card.acked .value {
+            color: #00e676;
+        }
+
+        .stat-card.failed {
+            border-left-color: #ff1744;
+        }
+        .stat-card.failed .value {
+            color: #ff1744;
+        }
+
+        .stat-card.retried {
+            border-left-color: #ff9100;
+        }
+        .stat-card.retried .value {
+            color: #ff9100;
+        }
+
+        .stat-card.dead-lettered {
+            border-left-color: #d500f9;
+        }
+        .stat-card.dead-lettered .value {
+            color: #d500f9;
+        }
+
+        .bottom-section {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1.2rem;
+        }
+
+        @media (max-width: 640px) {
+            .bottom-section {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .success-rate-card {
+            background-color: #16213e;
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+        }
+
+        .success-rate-card .label {
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #a0a0b0;
+            margin-bottom: 0.75rem;
+        }
+
+        .success-rate-card .rate {
+            font-size: 3.5rem;
+            font-weight: 700;
+        }
+
+        .rate.green { color: #00e676; }
+        .rate.yellow { color: #ff9100; }
+        .rate.red { color: #ff1744; }
+
+        .state-card {
+            background-color: #16213e;
+            border-radius: 12px;
+            padding: 2rem;
+        }
+
+        .state-card h3 {
+            font-size: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #a0a0b0;
+            margin-bottom: 1.2rem;
+        }
+
+        .state-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 0.75rem 0;
+            border-bottom: 1px solid #2a2a4a;
+        }
+
+        .state-row:last-child {
+            border-bottom: none;
+        }
+
+        .state-row .state-label {
+            font-size: 0.95rem;
+        }
+
+        .state-row .state-value {
+            font-size: 1.3rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+
+        .footer {
+            margin-top: 2rem;
+            text-align: center;
+            color: #555;
+            font-size: 0.8rem;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Log Consumer Dashboard</h1>
+        <div class="connection-status">
+            <span id="status-dot" class="status-dot {{ 'connected' if is_connected else 'disconnected' }}"></span>
+            <span id="status-text">{{ 'Connected' if is_connected else 'Disconnected' }}</span>
+        </div>
+    </div>
+
+    <div class="stats-grid">
+        <div class="stat-card received">
+            <div class="label">Total Received</div>
+            <div id="total-received" class="value">{{ stats.total_received if stats else 0 }}</div>
+        </div>
+        <div class="stat-card acked">
+            <div class="label">Acknowledged</div>
+            <div id="total-acked" class="value">{{ stats.total_acked if stats else 0 }}</div>
+        </div>
+        <div class="stat-card failed">
+            <div class="label">Failed</div>
+            <div id="total-failed" class="value">{{ stats.total_failed if stats else 0 }}</div>
+        </div>
+        <div class="stat-card retried">
+            <div class="label">Retried</div>
+            <div id="total-retried" class="value">{{ stats.total_retried if stats else 0 }}</div>
+        </div>
+        <div class="stat-card dead-lettered">
+            <div class="label">Dead-Lettered</div>
+            <div id="total-dead-lettered" class="value">{{ stats.total_dead_lettered if stats else 0 }}</div>
+        </div>
+    </div>
+
+    <div class="bottom-section">
+        <div class="success-rate-card">
+            <div class="label">Success Rate</div>
+            {% set rate = stats.success_rate if stats else 0 %}
+            <div id="success-rate" class="rate {{ 'green' if rate >= 80 else ('yellow' if rate >= 50 else 'red') }}">
+                {{ "%.1f"|format(rate) }}%
+            </div>
+        </div>
+
+        <div class="state-card">
+            <h3>Current State</h3>
+            <div class="state-row">
+                <span class="state-label">Pending</span>
+                <span id="pending-count" class="state-value">{{ stats.pending_count if stats else 0 }}</span>
+            </div>
+            <div class="state-row">
+                <span class="state-label">Processing</span>
+                <span id="processing-count" class="state-value">{{ stats.processing_count if stats else 0 }}</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="footer">
+        Auto-refreshes every 3 seconds
+    </div>
+
+    <script>
+        function updateDashboard(data) {
+            document.getElementById('total-received').textContent = data.total_received;
+            document.getElementById('total-acked').textContent = data.total_acked;
+            document.getElementById('total-failed').textContent = data.total_failed;
+            document.getElementById('total-retried').textContent = data.total_retried;
+            document.getElementById('total-dead-lettered').textContent = data.total_dead_lettered;
+            document.getElementById('pending-count').textContent = data.pending_count;
+            document.getElementById('processing-count').textContent = data.processing_count;
+
+            var rate = data.success_rate;
+            var rateEl = document.getElementById('success-rate');
+            rateEl.textContent = rate.toFixed(1) + '%';
+            rateEl.className = 'rate ' + (rate >= 80 ? 'green' : (rate >= 50 ? 'yellow' : 'red'));
+
+            var dot = document.getElementById('status-dot');
+            var text = document.getElementById('status-text');
+            if (data.is_connected) {
+                dot.className = 'status-dot connected';
+                text.textContent = 'Connected';
+            } else {
+                dot.className = 'status-dot disconnected';
+                text.textContent = 'Disconnected';
+            }
+        }
+
+        setInterval(function() {
+            fetch('/api/stats')
+                .then(function(r) { return r.json(); })
+                .then(updateDashboard)
+                .catch(function(err) { console.error('Dashboard update failed:', err); });
+        }, 3000);
+    </script>
+</body>
+</html>

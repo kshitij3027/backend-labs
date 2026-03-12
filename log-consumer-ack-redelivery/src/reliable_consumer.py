@@ -59,8 +59,9 @@ class ReliableConsumer:
 
     def start(self) -> None:
         """Main entry point.  Outer reconnection loop with signal handlers."""
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
 
         logger.info("consumer_starting")
 
