@@ -1,0 +1,57 @@
+rabbitmq:
+  host: localhost
+  port: 5672
+  management_port: 15672
+  credentials:
+    username: guest
+    password: guest
+  heartbeat: 600
+  blocked_connection_timeout: 300
+  connection:
+    retry_max: 5
+    retry_delay: 2
+
+exchanges:
+  - name: logs_direct
+    type: direct
+    durable: true
+  - name: logs_topic
+    type: topic
+    durable: true
+  - name: logs_fanout
+    type: fanout
+    durable: true
+
+queues:
+  - name: error_logs
+    exchange: logs_direct
+    routing_key: "error"
+    durable: true
+  - name: warning_logs
+    exchange: logs_direct
+    routing_key: "warning"
+    durable: true
+  - name: critical_logs
+    exchange: logs_direct
+    routing_key: "critical"
+    durable: true
+  - name: database_logs
+    exchange: logs_topic
+    routing_key: "database.#"
+    durable: true
+  - name: security_logs
+    exchange: logs_topic
+    routing_key: "security.#"
+    durable: true
+  - name: api_logs
+    exchange: logs_topic
+    routing_key: "api.*.error"
+    durable: true
+  - name: audit_logs
+    exchange: logs_fanout
+    routing_key: ""
+    durable: true
+  - name: all_logs
+    exchange: logs_fanout
+    routing_key: ""
+    durable: true
