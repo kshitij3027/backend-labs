@@ -15,10 +15,11 @@ init(autoreset=True)
 class LogProducer:
     """Publishes log messages to direct, topic, and fanout exchanges."""
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, quiet=False):
         self._config = config or Config()
         self._conn_manager = RabbitMQConnection(self._config)
         self._channel = None
+        self._quiet = quiet
         self.message_count = 0
 
     def connect(self):
@@ -40,9 +41,10 @@ class LogProducer:
             properties=pika.BasicProperties(delivery_mode=2),
         )
         self.message_count += 1
-        print(
-            f"  {Fore.GREEN}\U0001f3af Direct: {routing_key}{Style.RESET_ALL}"
-        )
+        if not self._quiet:
+            print(
+                f"  {Fore.GREEN}\U0001f3af Direct: {routing_key}{Style.RESET_ALL}"
+            )
 
     def publish_to_topic(self, message: LogMessage):
         """Publish to logs_topic exchange using the full hierarchical routing key.
@@ -58,9 +60,10 @@ class LogProducer:
             properties=pika.BasicProperties(delivery_mode=2),
         )
         self.message_count += 1
-        print(
-            f"  {Fore.CYAN}\U0001f3f7\ufe0f  Topic: {routing_key}{Style.RESET_ALL}"
-        )
+        if not self._quiet:
+            print(
+                f"  {Fore.CYAN}\U0001f3f7\ufe0f  Topic: {routing_key}{Style.RESET_ALL}"
+            )
 
     def publish_to_fanout(self, message: LogMessage):
         """Publish to logs_fanout exchange (routing key is ignored).
@@ -75,9 +78,10 @@ class LogProducer:
             properties=pika.BasicProperties(delivery_mode=2),
         )
         self.message_count += 1
-        print(
-            f"  {Fore.YELLOW}\U0001f4e2 Fanout: {message.message[:50]}{Style.RESET_ALL}"
-        )
+        if not self._quiet:
+            print(
+                f"  {Fore.YELLOW}\U0001f4e2 Fanout: {message.message[:50]}{Style.RESET_ALL}"
+            )
 
     def publish_to_all(self, message: LogMessage):
         """Publish the message to all three exchanges."""
