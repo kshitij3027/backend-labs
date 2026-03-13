@@ -5,6 +5,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
 COPY scripts/ scripts/
 COPY config/ config/
+COPY web/ web/
 COPY tests/ tests/
 COPY pytest.ini .
 ENV PYTHONPATH=/app

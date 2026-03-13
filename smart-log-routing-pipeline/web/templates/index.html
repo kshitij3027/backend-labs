@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Log Routing Dashboard</title>
+    <style>
+        :root {
+            --bg: #1a1a2e;
+            --surface: #16213e;
+            --accent: #0f3460;
+            --text: #e0e0e0;
+            --green: #4ecca3;
+            --yellow: #f9ed69;
+            --red: #f38181;
+            --blue: #6c63ff;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: "Courier New", monospace;
+            background: var(--bg);
+            color: var(--text);
+            min-height: 100vh;
+            padding: 1rem;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 1.5rem;
+            background: var(--surface);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        header h1 { font-size: 1.4rem; color: var(--green); }
+        #throughput-counter {
+            font-size: 1.2rem;
+            color: var(--yellow);
+            font-weight: bold;
+        }
+        #connection-status {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--red);
+            margin-right: 0.5rem;
+            vertical-align: middle;
+        }
+        #connection-status.connected { background: var(--green); }
+        .panel {
+            background: var(--surface);
+            border-radius: 8px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .panel h2 {
+            font-size: 1rem;
+            margin-bottom: 0.75rem;
+            color: var(--blue);
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 0.5rem 0.75rem;
+            border-bottom: 1px solid var(--accent);
+        }
+        th { color: var(--green); font-size: 0.85rem; }
+        td { font-size: 0.9rem; }
+        tr:hover td { background: var(--accent); }
+        tr.has-messages td { color: var(--yellow); }
+        #log-stream {
+            height: 250px;
+            overflow-y: auto;
+            background: #0d0d1a;
+            border-radius: 6px;
+            padding: 0.75rem;
+            font-size: 0.8rem;
+            line-height: 1.5;
+        }
+        #log-stream .entry {
+            border-bottom: 1px solid var(--accent);
+            padding: 2px 0;
+        }
+        @media (max-width: 640px) {
+            header { flex-direction: column; gap: 0.5rem; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Smart Log Routing Dashboard</h1>
+        <div>
+            <span id="connection-status"></span>
+            <span id="throughput-counter">0 msg/s</span>
+        </div>
+    </header>
+
+    <div class="panel">
+        <h2>Queue Statistics</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Messages</th>
+                    <th>Ready</th>
+                    <th>Consumers</th>
+                    <th>Rate</th>
+                </tr>
+            </thead>
+            <tbody id="queue-stats-table"></tbody>
+        </table>
+    </div>
+
+    <div class="panel">
+        <h2>Live Activity</h2>
+        <div id="log-stream"></div>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        const queueTable = document.getElementById("queue-stats-table");
+        const logStream  = document.getElementById("log-stream");
+        const throughput = document.getElementById("throughput-counter");
+        const statusDot  = document.getElementById("connection-status");
+
+        socket.on("connect", function () {
+            statusDot.classList.add("connected");
+        });
+
+        socket.on("disconnect", function () {
+            statusDot.classList.remove("connected");
+        });
+
+        socket.on("stats_update", function (data) {
+            const queues = data.queues || [];
+            let totalRate = 0;
+
+            // Rebuild table body
+            queueTable.innerHTML = "";
+            queues.forEach(function (q) {
+                const rate = (q.message_stats && q.message_stats.publish_rate) || 0;
+                totalRate += rate;
+
+                const tr = document.createElement("tr");
+                if (q.messages > 0) tr.classList.add("has-messages");
+                tr.innerHTML =
+                    "<td>" + q.name + "</td>" +
+                    "<td>" + q.messages + "</td>" +
+                    "<td>" + q.messages_ready + "</td>" +
+                    "<td>" + q.consumers + "</td>" +
+                    "<td>" + rate.toFixed(1) + "/s</td>";
+                queueTable.appendChild(tr);
+            });
+
+            throughput.textContent = totalRate.toFixed(1) + " msg/s";
+
+            // Append log-stream entry
+            const ts = new Date(data.timestamp * 1000).toLocaleTimeString();
+            const entry = document.createElement("div");
+            entry.className = "entry";
+            entry.textContent = "[" + ts + "] queues=" + queues.length + "  rate=" + totalRate.toFixed(1) + " msg/s";
+            logStream.appendChild(entry);
+
+            // Auto-scroll
+            logStream.scrollTop = logStream.scrollHeight;
+
+            // Keep last 200 entries
+            while (logStream.children.length > 200) {
+                logStream.removeChild(logStream.firstChild);
+            }
+        });
+    </script>
+</body>
+</html>
