@@ -53,6 +53,61 @@ services:
       - "5555:5555"
     command: python -m src.dashboard.app
 
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    command: python -c "from src.setup import RabbitMQSetup; RabbitMQSetup().setup_all(); from src.producer import LogProducer; p = LogProducer(); p.connect(); p.run_continuous(rate=10)"
+
+  error-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    command: python -c "from src.consumers.error_consumer import ErrorConsumer; c = ErrorConsumer(); c.connect(); c.start_consuming()"
+
+  security-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    command: python -c "from src.consumers.security_consumer import SecurityConsumer; c = SecurityConsumer(); c.connect(); c.start_consuming()"
+
+  database-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    command: python -c "from src.consumers.database_consumer import DatabaseConsumer; c = DatabaseConsumer(); c.connect(); c.start_consuming()"
+
+  audit-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+    command: python -c "from src.consumers.audit_consumer import AuditConsumer; c = AuditConsumer(); c.connect(); c.start_consuming()"
+
   e2e:
     build:
       context: .
