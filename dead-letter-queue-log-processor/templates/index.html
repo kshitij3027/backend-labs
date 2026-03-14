@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DLQ Log Processor Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+  }
+
+  header {
+    background: #16213e;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 2px solid #0f3460;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+  }
+
+  header h1 {
+    font-size: 20px;
+    font-weight: 600;
+    color: #e94560;
+  }
+
+  .connection-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: #aaa;
+  }
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #e94560;
+    transition: background 0.3s;
+  }
+
+  .status-dot.connected { background: #00d26a; }
+
+  .container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+
+  /* ---- Stats Cards ---- */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 20px;
+  }
+
+  .stat-card {
+    background: #16213e;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+    text-align: center;
+    border-top: 3px solid #0f3460;
+    transition: transform 0.15s;
+  }
+
+  .stat-card:hover { transform: translateY(-2px); }
+  .stat-card .label { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #888; margin-bottom: 8px; }
+  .stat-card .value { font-size: 32px; font-weight: 700; }
+  .stat-card.processed .value { color: #00d26a; }
+  .stat-card.processed { border-top-color: #00d26a; }
+  .stat-card.failed .value { color: #e94560; }
+  .stat-card.failed { border-top-color: #e94560; }
+  .stat-card.retried .value { color: #f5c518; }
+  .stat-card.retried { border-top-color: #f5c518; }
+  .stat-card.dlq .value { color: #a855f7; }
+  .stat-card.dlq { border-top-color: #a855f7; }
+  .stat-card.queue .value { color: #3b82f6; }
+  .stat-card.queue { border-top-color: #3b82f6; }
+
+  /* ---- Alerts ---- */
+  .alerts-section { margin-bottom: 20px; }
+
+  .alert-banner {
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .alert-banner.high {
+    background: rgba(233, 69, 96, 0.15);
+    border-left: 4px solid #e94560;
+    color: #ff7b93;
+  }
+
+  .alert-banner.medium {
+    background: rgba(245, 197, 24, 0.15);
+    border-left: 4px solid #f5c518;
+    color: #f5d76e;
+  }
+
+  .alert-banner .alert-icon { font-weight: 700; font-size: 16px; }
+  .alert-banner.high .alert-icon::before { content: "!"; }
+  .alert-banner.medium .alert-icon::before { content: "~"; }
+
+  /* ---- Panels ---- */
+  .panels-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+  }
+
+  @media (max-width: 900px) { .panels-grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: #16213e;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+  }
+
+  .panel h2 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ccc;
+    margin-bottom: 16px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* ---- Bar Chart ---- */
+  .bar-chart { display: flex; flex-direction: column; gap: 10px; }
+
+  .bar-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .bar-label {
+    width: 90px;
+    font-size: 13px;
+    text-align: right;
+    color: #aaa;
+    flex-shrink: 0;
+  }
+
+  .bar-track {
+    flex: 1;
+    height: 24px;
+    background: #0f1b30;
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.5s ease;
+    min-width: 2px;
+  }
+
+  .bar-fill.parsing { background: #e94560; }
+  .bar-fill.network { background: #f5c518; }
+  .bar-fill.resource { background: #3b82f6; }
+  .bar-fill.unknown  { background: #a855f7; }
+
+  .bar-count {
+    width: 40px;
+    font-size: 13px;
+    color: #ccc;
+    text-align: left;
+    flex-shrink: 0;
+  }
+
+  /* ---- Source List ---- */
+  .source-list { list-style: none; }
+  .source-list li {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    border-bottom: 1px solid #0f3460;
+    font-size: 13px;
+  }
+  .source-list li:last-child { border-bottom: none; }
+  .source-name { color: #aaa; }
+  .source-count { color: #e0e0e0; font-weight: 600; }
+
+  /* ---- Trends Panel ---- */
+  .trend-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 0;
+    font-size: 13px;
+    border-bottom: 1px solid #0f3460;
+  }
+  .trend-row:last-child { border-bottom: none; }
+  .trend-label { color: #aaa; }
+  .trend-value { color: #e0e0e0; font-weight: 600; }
+
+  /* ---- Actions ---- */
+  .actions-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 20px;
+  }
+
+  .btn {
+    padding: 10px 20px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: opacity 0.2s, transform 0.1s;
+    color: #fff;
+  }
+
+  .btn:hover { opacity: 0.85; }
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .btn-reprocess { background: #3b82f6; }
+  .btn-purge { background: #e94560; }
+  .btn-type { background: #0f3460; border: 1px solid #3b82f6; color: #93c5fd; }
+
+  .btn-feedback {
+    font-size: 12px;
+    margin-left: 8px;
+    color: #aaa;
+  }
+
+  /* ---- DLQ Table ---- */
+  .dlq-table-wrapper {
+    background: #16213e;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.25);
+    margin-bottom: 20px;
+  }
+
+  .dlq-table-wrapper h2 {
+    font-size: 15px;
+    font-weight: 600;
+    color: #ccc;
+    margin-bottom: 16px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .table-scroll {
+    overflow-x: auto;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+
+  thead th {
+    text-align: left;
+    padding: 10px 12px;
+    background: #0f1b30;
+    color: #aaa;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    font-size: 11px;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  tbody td {
+    padding: 10px 12px;
+    border-bottom: 1px solid #0f3460;
+    color: #ccc;
+    max-width: 250px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  tbody tr:hover { background: rgba(255,255,255,0.03); }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+
+  .badge-parsing  { background: rgba(233,69,96,0.2); color: #ff7b93; }
+  .badge-network  { background: rgba(245,197,24,0.2); color: #f5d76e; }
+  .badge-resource { background: rgba(59,130,246,0.2); color: #93c5fd; }
+  .badge-unknown  { background: rgba(168,85,247,0.2); color: #c084fc; }
+
+  .empty-state {
+    text-align: center;
+    padding: 40px;
+    color: #666;
+    font-size: 14px;
+  }
+
+  /* ---- Responsive ---- */
+  @media (max-width: 600px) {
+    header h1 { font-size: 16px; }
+    .stat-card .value { font-size: 24px; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Dead Letter Queue Log Processor</h1>
+  <div class="connection-status">
+    <div class="status-dot" id="statusDot"></div>
+    <span id="statusText">Disconnected</span>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- Alerts -->
+  <div class="alerts-section" id="alertsSection"></div>
+
+  <!-- Stats Cards -->
+  <div class="stats-grid">
+    <div class="stat-card processed">
+      <div class="label">Processed</div>
+      <div class="value" id="statProcessed">0</div>
+    </div>
+    <div class="stat-card failed">
+      <div class="label">Failed</div>
+      <div class="value" id="statFailed">0</div>
+    </div>
+    <div class="stat-card retried">
+      <div class="label">Retried</div>
+      <div class="value" id="statRetried">0</div>
+    </div>
+    <div class="stat-card dlq">
+      <div class="label">DLQ Size</div>
+      <div class="value" id="statDlq">0</div>
+    </div>
+    <div class="stat-card queue">
+      <div class="label">Queue Length</div>
+      <div class="value" id="statQueue">0</div>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="actions-bar">
+    <button class="btn btn-reprocess" onclick="reprocessAll()">Reprocess All</button>
+    <button class="btn btn-purge" onclick="purgeDLQ()">Purge DLQ</button>
+    <button class="btn btn-type" onclick="reprocessByType('PARSING')">Reprocess PARSING</button>
+    <button class="btn btn-type" onclick="reprocessByType('NETWORK')">Reprocess NETWORK</button>
+    <button class="btn btn-type" onclick="reprocessByType('RESOURCE')">Reprocess RESOURCE</button>
+    <button class="btn btn-type" onclick="reprocessByType('UNKNOWN')">Reprocess UNKNOWN</button>
+    <span class="btn-feedback" id="actionFeedback"></span>
+  </div>
+
+  <!-- Panels Row -->
+  <div class="panels-grid">
+
+    <!-- Failure Analysis by Type -->
+    <div class="panel">
+      <h2>Failure Breakdown by Type</h2>
+      <div class="bar-chart" id="failureTypeChart">
+        <div class="empty-state">No data</div>
+      </div>
+    </div>
+
+    <!-- Failure Analysis by Source -->
+    <div class="panel">
+      <h2>Failure Breakdown by Source</h2>
+      <ul class="source-list" id="failureSourceList">
+        <li class="empty-state">No data</li>
+      </ul>
+    </div>
+
+    <!-- Trends -->
+    <div class="panel">
+      <h2>Failure Trends (5 min window)</h2>
+      <div id="trendsPanel">
+        <div class="empty-state">No data</div>
+      </div>
+    </div>
+
+    <!-- Top Errors -->
+    <div class="panel">
+      <h2>Top Errors</h2>
+      <ul class="source-list" id="topErrorsList">
+        <li class="empty-state">No data</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- DLQ Messages Table -->
+  <div class="dlq-table-wrapper">
+    <h2>Dead Letter Queue Messages</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Failure Type</th>
+            <th>Source</th>
+            <th>Error</th>
+            <th>Retries</th>
+            <th>Level</th>
+            <th>First Failure</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody id="dlqTableBody">
+          <tr><td colspan="7" class="empty-state">No messages in DLQ</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  var ws = null;
+  var refreshTimer = null;
+
+  // ---- WebSocket with auto-reconnect ----
+  function connectWS() {
+    var protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(protocol + "//" + location.host + "/ws");
+
+    ws.onopen = function() {
+      document.getElementById("statusDot").className = "status-dot connected";
+      document.getElementById("statusText").textContent = "Connected";
+    };
+
+    ws.onclose = function() {
+      document.getElementById("statusDot").className = "status-dot";
+      document.getElementById("statusText").textContent = "Disconnected";
+      setTimeout(connectWS, 3000);
+    };
+
+    ws.onerror = function() {
+      ws.close();
+    };
+
+    ws.onmessage = function(event) {
+      var parsed = JSON.parse(event.data);
+      if (parsed.type === "stats_update") {
+        updateStats(parsed.data);
+        updateAlerts(parsed.data.alerts || []);
+      }
+    };
+  }
+
+  // ---- Update Stats Cards ----
+  function updateStats(data) {
+    setText("statProcessed", data.processed || 0);
+    setText("statFailed", data.failed || 0);
+    setText("statRetried", data.retried || 0);
+    setText("statDlq", data.dlq_size || 0);
+    setText("statQueue", data.queue_length || 0);
+  }
+
+  function setText(id, val) {
+    var el = document.getElementById(id);
+    if (el) el.textContent = val;
+  }
+
+  // ---- Alerts ----
+  function updateAlerts(alerts) {
+    var section = document.getElementById("alertsSection");
+    if (!alerts || alerts.length === 0) {
+      section.innerHTML = "";
+      return;
+    }
+    var html = "";
+    for (var i = 0; i < alerts.length; i++) {
+      var a = alerts[i];
+      var sev = a.severity === "high" ? "high" : "medium";
+      html += '<div class="alert-banner ' + sev + '">';
+      html += '<span class="alert-icon"></span>';
+      html += '<span>' + escapeHtml(a.message) + '</span>';
+      html += '</div>';
+    }
+    section.innerHTML = html;
+  }
+
+  // ---- Failure Analysis Chart (CSS bars) ----
+  function renderFailureTypeChart(byType) {
+    var container = document.getElementById("failureTypeChart");
+    if (!byType || Object.keys(byType).length === 0) {
+      container.innerHTML = '<div class="empty-state">No data</div>';
+      return;
+    }
+    var maxVal = 0;
+    var types = Object.keys(byType);
+    for (var i = 0; i < types.length; i++) {
+      if (byType[types[i]] > maxVal) maxVal = byType[types[i]];
+    }
+    if (maxVal === 0) maxVal = 1;
+
+    var html = "";
+    var colors = { PARSING: "parsing", NETWORK: "network", RESOURCE: "resource", UNKNOWN: "unknown" };
+    for (var j = 0; j < types.length; j++) {
+      var t = types[j];
+      var pct = (byType[t] / maxVal * 100).toFixed(1);
+      var cls = colors[t] || "unknown";
+      html += '<div class="bar-row">';
+      html += '<span class="bar-label">' + escapeHtml(t) + '</span>';
+      html += '<div class="bar-track"><div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div></div>';
+      html += '<span class="bar-count">' + byType[t] + '</span>';
+      html += '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ---- Source Breakdown ----
+  function renderSourceBreakdown(bySource) {
+    var container = document.getElementById("failureSourceList");
+    if (!bySource || Object.keys(bySource).length === 0) {
+      container.innerHTML = '<li class="empty-state">No data</li>';
+      return;
+    }
+    var html = "";
+    var sources = Object.keys(bySource);
+    // Sort descending by count
+    sources.sort(function(a, b) { return bySource[b] - bySource[a]; });
+    for (var i = 0; i < sources.length; i++) {
+      html += '<li><span class="source-name">' + escapeHtml(sources[i]) + '</span>';
+      html += '<span class="source-count">' + bySource[sources[i]] + '</span></li>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ---- Trends ----
+  function renderTrends(trends) {
+    var container = document.getElementById("trendsPanel");
+    if (!trends || trends.total_failures === 0) {
+      container.innerHTML = '<div class="empty-state">No failures in window</div>';
+      return;
+    }
+    var html = "";
+    html += '<div class="trend-row"><span class="trend-label">Window</span><span class="trend-value">' + trends.window_seconds + 's</span></div>';
+    html += '<div class="trend-row"><span class="trend-label">Total Failures</span><span class="trend-value">' + trends.total_failures + '</span></div>';
+    var types = Object.keys(trends.by_type || {});
+    for (var i = 0; i < types.length; i++) {
+      html += '<div class="trend-row"><span class="trend-label">' + escapeHtml(types[i]) + '</span><span class="trend-value">' + trends.by_type[types[i]] + '</span></div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ---- Top Errors ----
+  function renderTopErrors(topErrors) {
+    var container = document.getElementById("topErrorsList");
+    if (!topErrors || topErrors.length === 0) {
+      container.innerHTML = '<li class="empty-state">No errors</li>';
+      return;
+    }
+    var html = "";
+    for (var i = 0; i < topErrors.length; i++) {
+      var e = topErrors[i];
+      html += '<li><span class="source-name" title="' + escapeHtml(e.error) + '">' + escapeHtml(truncate(e.error, 50)) + '</span>';
+      html += '<span class="source-count">' + e.count + '</span></li>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ---- DLQ Messages Table ----
+  function renderDLQTable(messages) {
+    var tbody = document.getElementById("dlqTableBody");
+    if (!messages || messages.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-state">No messages in DLQ</td></tr>';
+      return;
+    }
+    var html = "";
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      var ft = (m.failure_type || "UNKNOWN").toUpperCase();
+      var badgeCls = "badge-" + ft.toLowerCase();
+      var src = m.original_message ? m.original_message.source : "";
+      var lvl = m.original_message ? m.original_message.level : "";
+      var msg = m.original_message ? m.original_message.message : "";
+      html += "<tr>";
+      html += '<td><span class="badge ' + badgeCls + '">' + escapeHtml(ft) + '</span></td>';
+      html += "<td>" + escapeHtml(src) + "</td>";
+      html += '<td title="' + escapeHtml(m.error_details || "") + '">' + escapeHtml(truncate(m.error_details || "", 40)) + "</td>";
+      html += "<td>" + (m.retry_count || 0) + " / " + (m.max_retries || 3) + "</td>";
+      html += "<td>" + escapeHtml(lvl) + "</td>";
+      html += "<td>" + escapeHtml(formatTime(m.first_failure)) + "</td>";
+      html += '<td title="' + escapeHtml(msg) + '">' + escapeHtml(truncate(msg, 40)) + "</td>";
+      html += "</tr>";
+    }
+    tbody.innerHTML = html;
+  }
+
+  // ---- REST Actions ----
+  window.reprocessAll = function() {
+    if (!confirm("Reprocess all DLQ messages?")) return;
+    postAction("/api/dlq/reprocess", function(data) {
+      showFeedback("Reprocessed " + data.reprocessed + " messages");
+      refreshData();
+    });
+  };
+
+  window.purgeDLQ = function() {
+    if (!confirm("Permanently delete all DLQ messages? This cannot be undone.")) return;
+    postAction("/api/dlq/purge", function(data) {
+      showFeedback("Purged " + data.purged + " messages");
+      refreshData();
+    });
+  };
+
+  window.reprocessByType = function(type) {
+    postAction("/api/dlq/reprocess/" + type, function(data) {
+      showFeedback("Reprocessed " + data.reprocessed + " " + type + " messages");
+      refreshData();
+    });
+  };
+
+  function postAction(url, callback) {
+    fetch(url, { method: "POST" })
+      .then(function(r) { return r.json(); })
+      .then(callback)
+      .catch(function(err) { showFeedback("Error: " + err.message); });
+  }
+
+  function showFeedback(msg) {
+    var el = document.getElementById("actionFeedback");
+    el.textContent = msg;
+    setTimeout(function() { el.textContent = ""; }, 4000);
+  }
+
+  // ---- Data Loading ----
+  function refreshData() {
+    loadDLQTable();
+    loadAnalysis();
+    loadTrends();
+  }
+
+  function loadStats() {
+    fetch("/api/stats")
+      .then(function(r) { return r.json(); })
+      .then(updateStats)
+      .catch(function() {});
+  }
+
+  function loadDLQTable() {
+    fetch("/api/dlq")
+      .then(function(r) { return r.json(); })
+      .then(renderDLQTable)
+      .catch(function() {});
+  }
+
+  function loadAnalysis() {
+    fetch("/api/dlq/analysis")
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        renderFailureTypeChart(data.by_failure_type);
+        renderSourceBreakdown(data.by_source);
+      })
+      .catch(function() {});
+  }
+
+  function loadTrends() {
+    fetch("/api/trends")
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        renderTrends(data);
+        renderTopErrors(data.top_errors || []);
+      })
+      .catch(function() {});
+  }
+
+  function loadAlerts() {
+    fetch("/api/alerts")
+      .then(function(r) { return r.json(); })
+      .then(updateAlerts)
+      .catch(function() {});
+  }
+
+  // ---- Helpers ----
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  function truncate(str, len) {
+    if (!str) return "";
+    return str.length > len ? str.substring(0, len) + "..." : str;
+  }
+
+  function formatTime(iso) {
+    if (!iso) return "";
+    try {
+      var d = new Date(iso);
+      return d.toLocaleTimeString();
+    } catch(e) { return iso; }
+  }
+
+  // ---- Init ----
+  function init() {
+    connectWS();
+    loadStats();
+    loadDLQTable();
+    loadAnalysis();
+    loadTrends();
+    loadAlerts();
+
+    // Periodic refresh for panels (every 10s)
+    refreshTimer = setInterval(function() {
+      loadDLQTable();
+      loadAnalysis();
+      loadTrends();
+      loadAlerts();
+    }, 10000);
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+
+})();
+</script>
+</body>
+</html>
