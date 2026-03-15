@@ -127,6 +127,55 @@ class TestDashboard:
         assert "recent_messages" in data
 
 
+class TestAlerts:
+    def test_alerts_in_status(self):
+        """Verify alerts key appears in /api/status metrics response."""
+        settings = Settings(
+            max_queue_size=10,
+            num_workers=1,
+            generator_rate=0,
+            alert_queue_depth_threshold=5,
+        )
+        queue = ThreadSafePriorityQueue(max_size=settings.max_queue_size, settings=settings)
+        metrics = MetricsTracker()
+        classifier = MessageClassifier()
+        worker_pool = WorkerPool(queue, metrics, settings)
+        aging_monitor = PriorityAgingMonitor(queue, settings)
+        generator = SyntheticLogGenerator()
+
+        app = create_app(
+            settings=settings,
+            queue=queue,
+            metrics=metrics,
+            classifier=classifier,
+            worker_pool=worker_pool,
+            aging_monitor=aging_monitor,
+            generator=generator,
+            start_background=False,
+        )
+        app.config["TESTING"] = True
+        client = app.test_client()
+
+        # Fill queue past alert threshold
+        from src.models import LogMessage, Priority
+
+        for _ in range(7):
+            msg = LogMessage(source="test", message="test alert", priority=Priority.LOW)
+            queue.push(msg)
+
+        # Trigger alert check
+        metrics.check_alert(queue.size, settings.alert_queue_depth_threshold)
+
+        resp = client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "alerts" in data["metrics"]
+        assert "firing" in data["metrics"]["alerts"]
+        assert "recent" in data["metrics"]["alerts"]
+        assert data["metrics"]["alerts"]["firing"] is True
+        assert len(data["metrics"]["alerts"]["recent"]) > 0
+
+
 class TestMetricsEndpoint:
     def test_metrics_endpoint(self, app_client):
         resp = app_client.get("/metrics")

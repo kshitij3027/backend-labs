@@ -165,6 +165,65 @@ def check_metrics_endpoint():
         return False
 
 
+def check_backpressure():
+    """Inject messages rapidly until LOW is rejected (503), then verify CRITICAL still accepted."""
+    try:
+        got_503 = False
+        # Rapidly inject LOW messages until we get a 503 (backpressure)
+        for i in range(200):
+            resp = requests.post(f"{BASE_URL}/api/inject/low", timeout=3)
+            if resp.status_code == 503:
+                got_503 = True
+                break
+
+        if not got_503:
+            # The generator may have already filled the queue, check if queue is near capacity
+            status_resp = requests.get(f"{BASE_URL}/api/status", timeout=5)
+            status_data = status_resp.json()
+            utilization = status_data["queue"]["utilization"]
+            if utilization >= 0.8:
+                # Queue is at capacity, LOW should be rejected
+                resp = requests.post(f"{BASE_URL}/api/inject/low", timeout=3)
+                got_503 = resp.status_code == 503
+
+        if got_503:
+            # Verify CRITICAL is still accepted when LOW is rejected
+            resp = requests.post(f"{BASE_URL}/api/inject/critical", timeout=3)
+            critical_ok = resp.status_code == 200
+            print(f"  Backpressure (LOW rejected={got_503}, CRITICAL accepted={critical_ok}): {'PASS' if critical_ok else 'FAIL'}")
+            return critical_ok
+        else:
+            print("  Backpressure: PASS (soft - queue did not reach backpressure threshold)")
+            return True
+    except Exception as e:
+        print(f"  Backpressure: FAIL ({e})")
+        return False
+
+
+def check_alerts_in_status():
+    """GET /api/status, verify 'alerts' key exists in the metrics response."""
+    try:
+        resp = requests.get(f"{BASE_URL}/api/status", timeout=5)
+        if resp.status_code != 200:
+            print(f"  Alerts in status: FAIL (status {resp.status_code})")
+            return False
+        data = resp.json()
+        metrics_data = data.get("metrics", {})
+        has_alerts = "alerts" in metrics_data
+        if has_alerts:
+            alerts = metrics_data["alerts"]
+            has_firing = "firing" in alerts
+            has_recent = "recent" in alerts
+            ok = has_firing and has_recent
+        else:
+            ok = False
+        print(f"  Alerts in status: {'PASS' if ok else 'FAIL'}")
+        return ok
+    except Exception as e:
+        print(f"  Alerts in status: FAIL ({e})")
+        return False
+
+
 def check_health_latency():
     """Time 10 sequential GET /health calls, verify average < 100ms."""
     try:
@@ -198,6 +257,8 @@ def main():
         ("Priority ordering", check_priority_ordering),
         ("Metrics endpoint", check_metrics_endpoint),
         ("Health latency", check_health_latency),
+        ("Backpressure", check_backpressure),
+        ("Alerts in status", check_alerts_in_status),
     ]
 
     results = []

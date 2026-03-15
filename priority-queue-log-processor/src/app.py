@@ -76,6 +76,15 @@ def create_app(
         aging_monitor.start()
         generator.start(queue, classifier, metrics, settings, stop_event)
 
+        def _alert_loop():
+            while not stop_event.is_set():
+                stop_event.wait(10)
+                if not stop_event.is_set():
+                    metrics.check_alert(queue.size, settings.alert_queue_depth_threshold)
+
+        alert_thread = threading.Thread(target=_alert_loop, daemon=True, name="alert-monitor")
+        alert_thread.start()
+
         def _shutdown():
             stop_event.set()
             worker_pool.stop()

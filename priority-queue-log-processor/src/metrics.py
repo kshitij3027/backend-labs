@@ -1,11 +1,15 @@
 """Metrics tracking with internal counters and Prometheus instrumentation."""
 
+import logging
 import threading
+import time
 from collections import deque
 
 from prometheus_client import Counter, Gauge, Histogram
 
 from src.models import LogMessage, Priority
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Prometheus instruments (module-level singletons to avoid duplicate
@@ -63,6 +67,10 @@ class MetricsTracker:
 
         self._recent_messages: deque[dict] = deque(maxlen=50)
 
+        # Alert state
+        self._alert_firing: bool = False
+        self._alerts: list[dict] = []
+
     # ------------------------------------------------------------------
     # Recording helpers
     # ------------------------------------------------------------------
@@ -106,6 +114,27 @@ class MetricsTracker:
         with self._lock:
             self._dropped[priority] += 1
         LOGS_DROPPED.labels(priority=priority.name).inc()
+
+    # ------------------------------------------------------------------
+    # Alerting
+    # ------------------------------------------------------------------
+
+    def check_alert(self, queue_size: int, threshold: int) -> None:
+        """Check queue depth against threshold and manage alert state."""
+        with self._lock:
+            if queue_size > threshold and not self._alert_firing:
+                msg = f"ALERT: Queue depth {queue_size} exceeds threshold {threshold}"
+                logger.warning(msg)
+                self._alert_firing = True
+                self._alerts.append({"timestamp": time.time(), "message": msg})
+                # Keep only the last 10 alerts
+                self._alerts = self._alerts[-10:]
+            elif queue_size <= threshold and self._alert_firing:
+                msg = f"RESOLVED: Queue depth {queue_size} below threshold {threshold}"
+                logger.info(msg)
+                self._alert_firing = False
+                self._alerts.append({"timestamp": time.time(), "message": msg})
+                self._alerts = self._alerts[-10:]
 
     # ------------------------------------------------------------------
     # Gauge updates
@@ -161,6 +190,10 @@ class MetricsTracker:
                 "dropped": sum(dropped.values()),
             },
             "processing_times": processing_times,
+            "alerts": {
+                "firing": self._alert_firing,
+                "recent": list(self._alerts[-10:]),
+            },
         }
 
     def get_recent_messages(self) -> list[dict]:
