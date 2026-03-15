@@ -230,9 +230,57 @@ services:
       BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
       DASHBOARD_HOST: dashboard
       DASHBOARD_PORT: "8000"
+      KAFKA_UI_HOST: kafka-ui
+      KAFKA_UI_PORT: "8080"
     command: python scripts/verify_e2e.py
     profiles:
       - e2e
+    networks:
+      - kafka-net
+
+  fault-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      USE_INTERNAL_LISTENERS: "true"
+      BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      PYTHONPATH: /app
+    command: python scripts/fault_tolerance_test.py
+    profiles:
+      - fault-test
+    networks:
+      - kafka-net
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-2:
+        condition: service_healthy
+      kafka-3:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      USE_INTERNAL_LISTENERS: "true"
+      BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      PYTHONPATH: /app
+    command: python scripts/benchmark.py
+    profiles:
+      - benchmark
     networks:
       - kafka-net
 
