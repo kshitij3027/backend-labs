@@ -160,7 +160,7 @@ services:
     networks:
       - kafka-net
 
-  app:
+  dashboard:
     build:
       context: .
       dockerfile: Dockerfile
@@ -170,11 +170,17 @@ services:
     depends_on:
       kafka-1:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       USE_INTERNAL_LISTENERS: "true"
       BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
-    profiles:
-      - app
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     networks:
       - kafka-net
 
@@ -184,16 +190,14 @@ services:
       dockerfile: Dockerfile
     container_name: producer
     depends_on:
-      kafka-1:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
     environment:
       USE_INTERNAL_LISTENERS: "true"
       BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
       PRODUCER_DURATION_SECONDS: "60"
       PRODUCER_RATE_PER_SECOND: "50"
     command: python -m src.producer
-    profiles:
-      - app
     networks:
       - kafka-net
 
@@ -218,6 +222,8 @@ services:
       dockerfile: Dockerfile.test
     depends_on:
       kafka-1:
+        condition: service_healthy
+      dashboard:
         condition: service_healthy
     environment:
       USE_INTERNAL_LISTENERS: "true"

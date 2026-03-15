@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Log Streaming Dashboard</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            background: #0f0f1a;
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            min-height: 100vh;
+        }
+
+        /* --- Header --- */
+        header {
+            background: #161625;
+            border-bottom: 1px solid #30363d;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        header h1 {
+            font-size: 1.25rem;
+            color: #e6edf3;
+            font-weight: 600;
+        }
+        .connection-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #f85149;
+            transition: background 0.3s;
+        }
+        .status-dot.connected { background: #3fb950; }
+
+        /* --- Stat Cards --- */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            padding: 20px 24px;
+        }
+        .stat-card {
+            background: #161625;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 16px 20px;
+        }
+        .stat-card .label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #8b949e;
+            margin-bottom: 6px;
+        }
+        .stat-card .value {
+            font-size: 1.75rem;
+            font-weight: 700;
+            color: #e6edf3;
+            font-variant-numeric: tabular-nums;
+        }
+        .stat-card.error .value { color: #f85149; }
+        .stat-card.rate .value  { color: #d29922; }
+        .stat-card.speed .value { color: #58a6ff; }
+
+        /* --- Main Layout --- */
+        .main-grid {
+            display: grid;
+            grid-template-columns: 3fr 2fr;
+            gap: 16px;
+            padding: 0 24px 24px;
+            height: calc(100vh - 200px);
+            min-height: 400px;
+        }
+
+        .panel {
+            background: #161625;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        .panel-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid #30363d;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #e6edf3;
+            flex-shrink: 0;
+        }
+        .panel-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+        }
+
+        /* --- Log Stream --- */
+        .log-entry {
+            padding: 6px 16px;
+            font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+            font-size: 0.78rem;
+            line-height: 1.5;
+            border-left: 3px solid transparent;
+            animation: fadeIn 0.3s ease;
+        }
+        .log-entry:hover { background: #1c1c2e; }
+        .log-entry.level-INFO  { border-left-color: #3fb950; }
+        .log-entry.level-WARN  { border-left-color: #d29922; }
+        .log-entry.level-ERROR { border-left-color: #f85149; }
+
+        .log-header {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .log-ts    { color: #8b949e; }
+        .log-svc   { color: #58a6ff; }
+        .log-level { font-weight: 700; }
+        .log-level.INFO  { color: #3fb950; }
+        .log-level.WARN  { color: #d29922; }
+        .log-level.ERROR { color: #f85149; }
+        .log-ep    { color: #bc8cff; }
+        .log-sc    { color: #8b949e; }
+
+        .log-body {
+            padding-left: 12px;
+            color: #8b949e;
+        }
+        .log-meta {
+            padding-left: 12px;
+            font-size: 0.7rem;
+            color: #484f58;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-4px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+
+        /* --- Right Column --- */
+        .right-column {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .right-column .panel { flex: 1; min-height: 0; }
+
+        /* --- Statistics Panel --- */
+        .stat-section { padding: 10px 16px; }
+        .stat-section h3 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: #8b949e;
+            margin-bottom: 6px;
+            letter-spacing: 0.04em;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+            font-size: 0.82rem;
+        }
+        .stat-row .key   { color: #c9d1d9; }
+        .stat-row .val   { color: #e6edf3; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+        /* --- Error Panel --- */
+        .panel.errors { border-color: #3d1f1f; }
+        .panel.errors .panel-header { color: #f85149; }
+
+        .error-entry {
+            padding: 8px 16px;
+            font-family: "SF Mono", "Fira Code", monospace;
+            font-size: 0.78rem;
+            line-height: 1.4;
+            border-left: 3px solid #f85149;
+            animation: fadeIn 0.3s ease;
+        }
+        .error-entry:hover { background: #1c1c2e; }
+        .error-entry .err-svc { color: #f85149; font-weight: 600; }
+        .error-entry .err-ep  { color: #bc8cff; }
+        .error-entry .err-msg { color: #f0883e; }
+        .error-entry .err-ts  { color: #484f58; font-size: 0.7rem; }
+
+        /* --- Scrollbar --- */
+        .panel-body::-webkit-scrollbar { width: 6px; }
+        .panel-body::-webkit-scrollbar-track { background: transparent; }
+        .panel-body::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+        /* --- Responsive --- */
+        @media (max-width: 900px) {
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+            .main-grid { grid-template-columns: 1fr; height: auto; }
+            .main-grid .panel { min-height: 300px; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+    <h1>Kafka Log Streaming Dashboard</h1>
+    <div class="connection-status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Connecting...</span>
+    </div>
+</header>
+
+<!-- Stat Cards -->
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="label">Total Messages</div>
+        <div class="value" id="totalMessages">0</div>
+    </div>
+    <div class="stat-card speed">
+        <div class="label">Messages / sec</div>
+        <div class="value" id="messagesPerSec">0</div>
+    </div>
+    <div class="stat-card error">
+        <div class="label">Error Count</div>
+        <div class="value" id="errorCount">0</div>
+    </div>
+    <div class="stat-card rate">
+        <div class="label">Error Rate (/ sec)</div>
+        <div class="value" id="errorRate">0</div>
+    </div>
+</div>
+
+<!-- Main Grid -->
+<div class="main-grid">
+
+    <!-- Live Log Stream -->
+    <div class="panel">
+        <div class="panel-header">Live Log Stream</div>
+        <div class="panel-body" id="logStream"></div>
+    </div>
+
+    <!-- Right Column -->
+    <div class="right-column">
+
+        <!-- Statistics -->
+        <div class="panel">
+            <div class="panel-header">Statistics</div>
+            <div class="panel-body">
+                <div class="stat-section">
+                    <h3>By Service</h3>
+                    <div id="statsByService"></div>
+                </div>
+                <div class="stat-section">
+                    <h3>By Level</h3>
+                    <div id="statsByLevel"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Recent Errors -->
+        <div class="panel errors">
+            <div class="panel-header">Recent Errors</div>
+            <div class="panel-body" id="errorPanel"></div>
+        </div>
+
+    </div>
+</div>
+
+<script>
+(function () {
+    "use strict";
+
+    var MAX_LOG_ENTRIES = 200;
+    var STATS_INTERVAL = 2000;
+    var ERRORS_INTERVAL = 5000;
+    var RECONNECT_DELAY = 3000;
+
+    var logStream = document.getElementById("logStream");
+    var statusDot = document.getElementById("statusDot");
+    var statusText = document.getElementById("statusText");
+
+    // --- Helpers -----------------------------------------------------------
+
+    function formatTimestamp(ts) {
+        if (!ts) return "";
+        // Show HH:MM:SS from ISO string
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) return ts.substring(11, 19) || ts;
+        return d.toISOString().substring(11, 19);
+    }
+
+    function escapeHtml(str) {
+        var div = document.createElement("div");
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    function renderStatRows(container, obj) {
+        var html = "";
+        var keys = Object.keys(obj).sort();
+        for (var i = 0; i < keys.length; i++) {
+            html += '<div class="stat-row"><span class="key">' +
+                escapeHtml(keys[i]) +
+                '</span><span class="val">' +
+                escapeHtml(String(obj[keys[i]])) +
+                "</span></div>";
+        }
+        container.innerHTML = html;
+    }
+
+    // --- Log Entry Rendering -----------------------------------------------
+
+    function createLogEntry(msg) {
+        var data = msg.data || {};
+        var level = data.level || "INFO";
+
+        var el = document.createElement("div");
+        el.className = "log-entry level-" + level;
+
+        el.innerHTML =
+            '<div class="log-header">' +
+            '<span class="log-ts">[' + escapeHtml(formatTimestamp(data.timestamp)) + ']</span>' +
+            '<span class="log-svc">[' + escapeHtml(data.service || "") + ']</span>' +
+            '<span class="log-level ' + level + '">[' + escapeHtml(level) + ']</span>' +
+            '<span class="log-ep">' + escapeHtml(data.endpoint || "") + '</span>' +
+            '<span class="log-sc">' + escapeHtml(String(data.status_code || "")) + '</span>' +
+            "</div>" +
+            '<div class="log-body">' + escapeHtml(data.message || "") + "</div>" +
+            '<div class="log-meta">' +
+            escapeHtml(data.user_id || "") +
+            " | " +
+            "partition:" + (msg.partition !== undefined ? msg.partition : "?") +
+            " offset:" + (msg.offset !== undefined ? msg.offset : "?") +
+            "</div>";
+
+        return el;
+    }
+
+    function addLogEntry(msg) {
+        var el = createLogEntry(msg);
+        // Newest at top
+        logStream.insertBefore(el, logStream.firstChild);
+
+        // Cap entries
+        while (logStream.children.length > MAX_LOG_ENTRIES) {
+            logStream.removeChild(logStream.lastChild);
+        }
+    }
+
+    // --- SSE ---------------------------------------------------------------
+
+    var evtSource = null;
+
+    function connectSSE() {
+        if (evtSource) {
+            evtSource.close();
+        }
+
+        evtSource = new EventSource("/api/stream");
+
+        evtSource.onopen = function () {
+            statusDot.classList.add("connected");
+            statusText.textContent = "Connected";
+        };
+
+        evtSource.onmessage = function (event) {
+            try {
+                var msg = JSON.parse(event.data);
+                addLogEntry(msg);
+            } catch (e) {
+                // ignore parse errors (e.g. heartbeat)
+            }
+        };
+
+        evtSource.onerror = function () {
+            statusDot.classList.remove("connected");
+            statusText.textContent = "Disconnected - reconnecting...";
+            evtSource.close();
+            evtSource = null;
+            setTimeout(connectSSE, RECONNECT_DELAY);
+        };
+    }
+
+    // --- Stats Polling -----------------------------------------------------
+
+    function fetchStats() {
+        fetch("/api/stats")
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                document.getElementById("totalMessages").textContent =
+                    data.total !== undefined ? data.total.toLocaleString() : "0";
+                document.getElementById("messagesPerSec").textContent =
+                    data.messages_per_second !== undefined ? data.messages_per_second : "0";
+                renderStatRows(document.getElementById("statsByService"), data.by_service || {});
+                renderStatRows(document.getElementById("statsByLevel"), data.by_level || {});
+            })
+            .catch(function () { /* silently retry next cycle */ });
+    }
+
+    // --- Errors Polling ----------------------------------------------------
+
+    function fetchErrors() {
+        fetch("/api/errors")
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                // Update header cards
+                var totalErrors = 0;
+                var counts = data.error_counts || {};
+                var keys = Object.keys(counts);
+                for (var i = 0; i < keys.length; i++) {
+                    totalErrors += counts[keys[i]];
+                }
+                document.getElementById("errorCount").textContent = totalErrors.toLocaleString();
+                document.getElementById("errorRate").textContent =
+                    data.error_rate !== undefined ? data.error_rate : "0";
+
+                // Render recent errors (newest first)
+                var panel = document.getElementById("errorPanel");
+                var errors = data.recent_errors || [];
+                var html = "";
+                var end = Math.max(0, errors.length - 20);
+                for (var j = errors.length - 1; j >= end; j--) {
+                    var e = errors[j];
+                    var ed = e.data || {};
+                    html +=
+                        '<div class="error-entry">' +
+                        '<span class="err-svc">[' + escapeHtml(ed.service || "") + ']</span> ' +
+                        '<span class="err-ep">' + escapeHtml(ed.endpoint || "") + '</span> ' +
+                        '<span class="err-msg">' + escapeHtml(ed.message || "") + '</span><br>' +
+                        '<span class="err-ts">' + escapeHtml(formatTimestamp(ed.timestamp)) +
+                        " | partition:" + (e.partition !== undefined ? e.partition : "?") +
+                        " offset:" + (e.offset !== undefined ? e.offset : "?") +
+                        "</span></div>";
+                }
+                panel.innerHTML = html;
+            })
+            .catch(function () { /* silently retry next cycle */ });
+    }
+
+    // --- Bootstrap ---------------------------------------------------------
+
+    connectSSE();
+    fetchStats();
+    fetchErrors();
+    setInterval(fetchStats, STATS_INTERVAL);
+    setInterval(fetchErrors, ERRORS_INTERVAL);
+})();
+</script>
+
+</body>
+</html>
