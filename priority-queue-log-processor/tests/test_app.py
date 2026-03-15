@@ -108,6 +108,24 @@ class TestDashboard:
         assert resp.status_code == 200
         assert b"Priority Queue" in resp.data
 
+    def test_dashboard_has_chart_canvas(self, app_client):
+        resp = app_client.get("/")
+        assert resp.status_code == 200
+        assert b'id="processing-chart"' in resp.data or b"<canvas" in resp.data
+
+    def test_dashboard_has_injection_buttons(self, app_client):
+        resp = app_client.get("/")
+        assert resp.status_code == 200
+        assert b"Inject CRITICAL" in resp.data
+        assert b"Inject LOW" in resp.data
+
+    def test_status_has_recent_messages_key(self, app_client):
+        app_client.post("/api/inject/critical")
+        resp = app_client.get("/api/status")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "recent_messages" in data
+
 
 class TestMetricsEndpoint:
     def test_metrics_endpoint(self, app_client):

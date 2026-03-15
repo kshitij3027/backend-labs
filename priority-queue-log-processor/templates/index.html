@@ -1,70 +1,249 @@
 <!DOCTYPE html>
-<html><head><title>Priority Queue Log Processor</title>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Priority Queue Log Processor</title>
 <style>
-body { font-family: sans-serif; background: #1a1a2e; color: #eee; margin: 2rem; }
-.cards { display: flex; gap: 1rem; margin: 1rem 0; }
-.card { padding: 1rem 2rem; border-radius: 8px; text-align: center; min-width: 120px; }
-.critical { background: #e74c3c; } .high { background: #e67e22; }
-.medium { background: #f39c12; } .low { background: #27ae60; }
-.card h2 { margin: 0; font-size: 2rem; } .card p { margin: 0.5rem 0 0; }
-button { padding: 0.5rem 1rem; margin: 0.25rem; border: none; border-radius: 4px; cursor: pointer; color: #fff; }
-.btn-critical { background: #e74c3c; } .btn-high { background: #e67e22; }
-.btn-medium { background: #f39c12; } .btn-low { background: #27ae60; }
-table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
-th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #333; }
-.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; }
-#status { color: #27ae60; }
-</style></head>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#1a1a2e;color:#eee;padding:1rem}
+.header{display:flex;align-items:center;justify-content:space-between;padding:0.75rem 1rem;background:#16213e;border-radius:8px;margin-bottom:1rem}
+.header h1{font-size:1.3rem}
+.conn-status{display:flex;align-items:center;gap:0.5rem;font-size:0.85rem}
+.conn-dot{width:10px;height:10px;border-radius:50%;display:inline-block}
+.conn-dot.ok{background:#27ae60}.conn-dot.err{background:#e74c3c}
+.grid{display:grid;grid-template-columns:1fr;gap:1rem}
+@media(min-width:900px){.grid{grid-template-columns:1fr 1fr}}
+.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:0.75rem;grid-column:1/-1}
+.card{padding:0.75rem;border-radius:8px;text-align:center}
+.card h2{font-size:1.8rem;margin:0}.card p{margin:0.25rem 0 0;font-size:0.8rem;text-transform:uppercase;opacity:0.9}
+.c-critical{background:#e74c3c}.c-high{background:#e67e22}.c-medium{background:#f39c12;color:#222}.c-low{background:#27ae60}
+.summary{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:1rem;padding:0.75rem 1rem;background:#16213e;border-radius:8px;align-items:center;font-size:0.9rem}
+.summary .item{display:flex;flex-direction:column;align-items:center;min-width:80px}
+.summary .item .val{font-size:1.3rem;font-weight:700}.summary .item .lbl{font-size:0.7rem;opacity:0.7;text-transform:uppercase}
+.util-bar{flex:1;min-width:150px;max-width:300px;height:20px;background:#333;border-radius:10px;overflow:hidden}
+.util-fill{height:100%;background:#3498db;border-radius:10px;transition:width 0.3s}
+.section{background:#16213e;border-radius:8px;padding:1rem}
+.section h3{font-size:1rem;margin-bottom:0.75rem;opacity:0.8}
+.inject-btns{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center}
+.inject-btns span{font-size:0.85rem;opacity:0.7}
+button{padding:0.4rem 1rem;border:none;border-radius:4px;cursor:pointer;color:#fff;font-size:0.85rem;font-weight:600}
+button:hover{opacity:0.85}
+.btn-critical{background:#e74c3c}.btn-high{background:#e67e22}.btn-medium{background:#f39c12;color:#222}.btn-low{background:#27ae60}
+table{width:100%;border-collapse:collapse;font-size:0.85rem}
+th{text-align:left;padding:0.4rem 0.5rem;border-bottom:2px solid #333;opacity:0.7;font-size:0.75rem;text-transform:uppercase}
+td{padding:0.35rem 0.5rem;border-bottom:1px solid #262640}
+.badge{padding:2px 8px;border-radius:4px;font-size:0.75rem;font-weight:600;display:inline-block}
+.b-critical{background:#e74c3c}.b-high{background:#e67e22}.b-medium{background:#f39c12;color:#222}.b-low{background:#27ae60}
+#chart-wrap{position:relative;width:100%;height:250px}
+#chart-fallback{display:none;padding:2rem;text-align:center;opacity:0.6}
+.toast{position:fixed;bottom:1.5rem;right:1.5rem;background:#27ae60;color:#fff;padding:0.6rem 1.2rem;border-radius:6px;font-size:0.85rem;opacity:0;transition:opacity 0.3s;pointer-events:none;z-index:999}
+.toast.show{opacity:1}
+</style>
+</head>
 <body>
-<h1>Priority Queue Log Processor <span id="status">&#9679;</span></h1>
-<div class="cards">
-  <div class="card critical"><h2 id="cnt-critical">0</h2><p>CRITICAL</p></div>
-  <div class="card high"><h2 id="cnt-high">0</h2><p>HIGH</p></div>
-  <div class="card medium"><h2 id="cnt-medium">0</h2><p>MEDIUM</p></div>
-  <div class="card low"><h2 id="cnt-low">0</h2><p>LOW</p></div>
+<div class="header">
+  <h1>Priority Queue Log Processor</h1>
+  <div class="conn-status"><span class="conn-dot ok" id="conn-dot"></span><span id="conn-text">Connected</span></div>
 </div>
-<p>Total: <span id="total-size">0</span> | Processed: <span id="total-processed">0</span> | Dropped: <span id="total-dropped">0</span> | Workers: <span id="worker-count">0</span></p>
-<div>
-  <button class="btn-critical" onclick="inject('critical')">Inject CRITICAL</button>
-  <button class="btn-high" onclick="inject('high')">Inject HIGH</button>
-  <button class="btn-medium" onclick="inject('medium')">Inject MEDIUM</button>
-  <button class="btn-low" onclick="inject('low')">Inject LOW</button>
+
+<div class="grid">
+  <div class="cards">
+    <div class="card c-critical"><h2 id="cnt-critical">0</h2><p>Critical</p></div>
+    <div class="card c-high"><h2 id="cnt-high">0</h2><p>High</p></div>
+    <div class="card c-medium"><h2 id="cnt-medium">0</h2><p>Medium</p></div>
+    <div class="card c-low"><h2 id="cnt-low">0</h2><p>Low</p></div>
+  </div>
+
+  <div class="summary">
+    <div class="item"><span class="val" id="total-enqueued">0</span><span class="lbl">Enqueued</span></div>
+    <div class="item"><span class="val" id="total-processed">0</span><span class="lbl">Processed</span></div>
+    <div class="item"><span class="val" id="total-dropped">0</span><span class="lbl">Dropped</span></div>
+    <div class="item"><span class="val" id="throughput">0</span><span class="lbl">msg/s</span></div>
+    <div class="item"><span class="val" id="worker-count">0</span><span class="lbl">Workers</span></div>
+    <div class="item"><span class="val" id="worker-status">--</span><span class="lbl">Status</span></div>
+    <div class="item" style="flex-direction:row;gap:0.5rem;min-width:200px">
+      <span class="lbl" style="white-space:nowrap">Queue</span>
+      <div class="util-bar"><div class="util-fill" id="util-fill" style="width:0%"></div></div>
+      <span id="util-pct" style="font-size:0.8rem">0%</span>
+    </div>
+  </div>
+
+  <div class="inject-btns">
+    <span>Inject:</span>
+    <button class="btn-critical" onclick="inject('critical')">Inject CRITICAL</button>
+    <button class="btn-high" onclick="inject('high')">Inject HIGH</button>
+    <button class="btn-medium" onclick="inject('medium')">Inject MEDIUM</button>
+    <button class="btn-low" onclick="inject('low')">Inject LOW</button>
+  </div>
+
+  <div class="section">
+    <h3>Processing Rate</h3>
+    <div id="chart-wrap"><canvas id="processing-chart"></canvas></div>
+    <div id="chart-fallback">Chart.js could not be loaded. Processing data is still available via the API.</div>
+  </div>
+
+  <div class="section">
+    <h3>Recent Messages</h3>
+    <table>
+      <thead><tr><th>Time</th><th>Priority</th><th>Message</th><th>Duration</th></tr></thead>
+      <tbody id="msg-table"></tbody>
+    </table>
+  </div>
 </div>
-<div id="chart-placeholder" style="margin:1rem 0;padding:1rem;background:#16213e;border-radius:8px;">
-  <p>Chart will be added in the next update</p>
-</div>
-<h3>Recent Messages</h3>
-<table>
-  <thead><tr><th>Time</th><th>Priority</th><th>Message</th><th>Duration</th></tr></thead>
-  <tbody id="msg-table"></tbody>
-</table>
+
+<div class="toast" id="toast"></div>
+
 <script>
+var chartReady = false;
+var chart = null;
+var prevProcessed = null;
+var chartLabels = [];
+var chartData = {CRITICAL:[],HIGH:[],MEDIUM:[],LOW:[]};
+var MAX_POINTS = 30;
+
+function showToast(msg) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show';
+  setTimeout(function(){ el.className = 'toast'; }, 2000);
+}
+
 function inject(priority) {
-  fetch('/api/inject/' + priority, {method: 'POST'})
-    .then(r => r.json()).then(d => console.log('Injected:', d));
+  fetch('/api/inject/' + priority, {method:'POST'})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if (d.injected) showToast('Injected ' + priority.toUpperCase() + ' message');
+      else showToast('Failed: ' + (d.error || 'unknown'));
+    })
+    .catch(function(){ showToast('Inject failed'); });
 }
-function update() {
-  fetch('/api/status').then(r => r.json()).then(data => {
-    var q = data.queue.priority_counts;
-    document.getElementById('cnt-critical').textContent = q.CRITICAL || 0;
-    document.getElementById('cnt-high').textContent = q.HIGH || 0;
-    document.getElementById('cnt-medium').textContent = q.MEDIUM || 0;
-    document.getElementById('cnt-low').textContent = q.LOW || 0;
-    document.getElementById('total-size').textContent = data.queue.size;
-    document.getElementById('total-processed').textContent = data.metrics.totals.processed;
-    document.getElementById('total-dropped').textContent = data.metrics.totals.dropped;
-    document.getElementById('worker-count').textContent = data.workers.count;
-    var tbody = document.getElementById('msg-table');
-    tbody.innerHTML = '';
-    (data.recent_messages || []).slice(-20).reverse().forEach(function(m) {
-      var row = document.createElement('tr');
-      var t = new Date(m.timestamp * 1000).toLocaleTimeString();
-      row.innerHTML = '<td>' + t + '</td><td><span class="badge ' + m.priority.toLowerCase() + '">' + m.priority + '</span></td><td>' + (m.message||'').substring(0,80) + '</td><td>' + (m.processing_time_ms||0).toFixed(1) + 'ms</td>';
-      tbody.appendChild(row);
+
+function initChart() {
+  try {
+    var ctx = document.getElementById('processing-chart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: chartLabels,
+        datasets: [
+          {label:'CRITICAL',data:chartData.CRITICAL,borderColor:'#e74c3c',backgroundColor:'rgba(231,76,60,0.1)',tension:0.3,pointRadius:0,borderWidth:2},
+          {label:'HIGH',data:chartData.HIGH,borderColor:'#e67e22',backgroundColor:'rgba(230,126,34,0.1)',tension:0.3,pointRadius:0,borderWidth:2},
+          {label:'MEDIUM',data:chartData.MEDIUM,borderColor:'#f39c12',backgroundColor:'rgba(243,156,18,0.1)',tension:0.3,pointRadius:0,borderWidth:2},
+          {label:'LOW',data:chartData.LOW,borderColor:'#27ae60',backgroundColor:'rgba(39,174,96,0.1)',tension:0.3,pointRadius:0,borderWidth:2}
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: {duration:300},
+        scales: {
+          x: {ticks:{color:'#aaa',maxTicksLimit:10},grid:{color:'#262640'}},
+          y: {beginAtZero:true,ticks:{color:'#aaa',precision:0},grid:{color:'#262640'}}
+        },
+        plugins: {legend:{labels:{color:'#ccc',boxWidth:12,padding:8}}}
+      }
     });
-    document.getElementById('status').style.color = '#27ae60';
-  }).catch(function() { document.getElementById('status').style.color = '#e74c3c'; });
+    chartReady = true;
+  } catch(e) {
+    document.getElementById('processing-chart').style.display = 'none';
+    document.getElementById('chart-fallback').style.display = 'block';
+  }
 }
+
+function updateChart(processed) {
+  if (!chartReady) return;
+  var now = new Date();
+  var label = ('0'+now.getHours()).slice(-2)+':'+('0'+now.getMinutes()).slice(-2)+':'+('0'+now.getSeconds()).slice(-2);
+  chartLabels.push(label);
+  var keys = ['CRITICAL','HIGH','MEDIUM','LOW'];
+  for (var i=0; i<keys.length; i++) {
+    var k = keys[i];
+    var delta = 0;
+    if (prevProcessed !== null) {
+      delta = (processed[k]||0) - (prevProcessed[k]||0);
+      if (delta < 0) delta = 0;
+    }
+    chartData[k].push(delta);
+    if (chartData[k].length > MAX_POINTS) chartData[k].shift();
+  }
+  if (chartLabels.length > MAX_POINTS) chartLabels.shift();
+  prevProcessed = {};
+  for (var j=0; j<keys.length; j++) prevProcessed[keys[j]] = processed[keys[j]]||0;
+  chart.update();
+}
+
+var lastTotalProcessed = null;
+var lastPollTime = null;
+
+function update() {
+  fetch('/api/status')
+    .then(function(r){ return r.json(); })
+    .then(function(data) {
+      var q = data.queue.priority_counts;
+      document.getElementById('cnt-critical').textContent = q.CRITICAL||0;
+      document.getElementById('cnt-high').textContent = q.HIGH||0;
+      document.getElementById('cnt-medium').textContent = q.MEDIUM||0;
+      document.getElementById('cnt-low').textContent = q.LOW||0;
+
+      var m = data.metrics;
+      document.getElementById('total-enqueued').textContent = m.totals.enqueued;
+      document.getElementById('total-processed').textContent = m.totals.processed;
+      document.getElementById('total-dropped').textContent = m.totals.dropped;
+
+      var now = Date.now()/1000;
+      if (lastTotalProcessed !== null && lastPollTime !== null) {
+        var dt = now - lastPollTime;
+        if (dt > 0) {
+          var rate = (m.totals.processed - lastTotalProcessed)/dt;
+          document.getElementById('throughput').textContent = rate.toFixed(1);
+        }
+      }
+      lastTotalProcessed = m.totals.processed;
+      lastPollTime = now;
+
+      document.getElementById('worker-count').textContent = data.workers.count;
+      document.getElementById('worker-status').textContent = data.workers.is_running ? 'Running' : 'Stopped';
+
+      var pct = Math.round(data.queue.utilization * 100);
+      document.getElementById('util-fill').style.width = pct + '%';
+      document.getElementById('util-pct').textContent = pct + '%';
+
+      updateChart(m.processed);
+
+      var tbody = document.getElementById('msg-table');
+      tbody.innerHTML = '';
+      var msgs = (data.recent_messages||[]).slice(-20).reverse();
+      for (var i=0; i<msgs.length; i++) {
+        var msg = msgs[i];
+        var row = document.createElement('tr');
+        var t = new Date(msg.timestamp*1000).toLocaleTimeString();
+        var pl = msg.priority.toLowerCase();
+        var txt = (msg.message||'').length > 80 ? (msg.message||'').substring(0,80)+'...' : (msg.message||'');
+        row.innerHTML = '<td>'+t+'</td><td><span class="badge b-'+pl+'">'+msg.priority+'</span></td><td>'+txt+'</td><td>'+(msg.processing_time_ms||0).toFixed(1)+'ms</td>';
+        tbody.appendChild(row);
+      }
+
+      document.getElementById('conn-dot').className = 'conn-dot ok';
+      document.getElementById('conn-text').textContent = 'Connected';
+    })
+    .catch(function(){
+      document.getElementById('conn-dot').className = 'conn-dot err';
+      document.getElementById('conn-text').textContent = 'Disconnected';
+    });
+}
+
+(function loadChart() {
+  var s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';
+  s.onload = function(){ initChart(); };
+  s.onerror = function(){
+    document.getElementById('processing-chart').style.display = 'none';
+    document.getElementById('chart-fallback').style.display = 'block';
+  };
+  document.head.appendChild(s);
+})();
+
 setInterval(update, 2000);
 update();
-</script></body></html>
+</script>
+</body></html>
