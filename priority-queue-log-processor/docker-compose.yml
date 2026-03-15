@@ -1,0 +1,36 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - MAX_QUEUE_SIZE=10000
+      - NUM_WORKERS=4
+      - GENERATOR_RATE=50
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - e2e
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+    environment:
+      - APP_URL=http://app:8080

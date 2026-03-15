@@ -3,8 +3,10 @@
 import pytest
 
 from src.aging import PriorityAgingMonitor
+from src.app import create_app
 from src.classifier import MessageClassifier
 from src.config import Settings
+from src.generator import SyntheticLogGenerator
 from src.metrics import MetricsTracker
 from src.models import LogMessage, Priority
 from src.priority_queue import ThreadSafePriorityQueue
@@ -77,3 +79,28 @@ def aging_monitor(priority_queue, fast_settings):
     monitor = PriorityAgingMonitor(priority_queue, fast_settings)
     yield monitor
     monitor.stop()
+
+
+@pytest.fixture
+def app_client():
+    """Create a Flask test client with background services disabled."""
+    settings = Settings(max_queue_size=100, num_workers=1, generator_rate=0)
+    queue = ThreadSafePriorityQueue(max_size=settings.max_queue_size, settings=settings)
+    metrics_tracker = MetricsTracker()
+    msg_classifier = MessageClassifier()
+    pool = WorkerPool(queue, metrics_tracker, settings)
+    aging = PriorityAgingMonitor(queue, settings)
+    gen = SyntheticLogGenerator()
+
+    app = create_app(
+        settings=settings,
+        queue=queue,
+        metrics=metrics_tracker,
+        classifier=msg_classifier,
+        worker_pool=pool,
+        aging_monitor=aging,
+        generator=gen,
+        start_background=False,
+    )
+    app.config["TESTING"] = True
+    return app.test_client()

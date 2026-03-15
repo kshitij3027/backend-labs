@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ src/
+COPY templates/ templates/
 COPY tests/ tests/
 COPY pytest.ini .
 CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]

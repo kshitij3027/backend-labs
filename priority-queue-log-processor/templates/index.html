@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html><head><title>Priority Queue Log Processor</title>
+<style>
+body { font-family: sans-serif; background: #1a1a2e; color: #eee; margin: 2rem; }
+.cards { display: flex; gap: 1rem; margin: 1rem 0; }
+.card { padding: 1rem 2rem; border-radius: 8px; text-align: center; min-width: 120px; }
+.critical { background: #e74c3c; } .high { background: #e67e22; }
+.medium { background: #f39c12; } .low { background: #27ae60; }
+.card h2 { margin: 0; font-size: 2rem; } .card p { margin: 0.5rem 0 0; }
+button { padding: 0.5rem 1rem; margin: 0.25rem; border: none; border-radius: 4px; cursor: pointer; color: #fff; }
+.btn-critical { background: #e74c3c; } .btn-high { background: #e67e22; }
+.btn-medium { background: #f39c12; } .btn-low { background: #27ae60; }
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+th, td { padding: 0.5rem; text-align: left; border-bottom: 1px solid #333; }
+.badge { padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; }
+#status { color: #27ae60; }
+</style></head>
+<body>
+<h1>Priority Queue Log Processor <span id="status">&#9679;</span></h1>
+<div class="cards">
+  <div class="card critical"><h2 id="cnt-critical">0</h2><p>CRITICAL</p></div>
+  <div class="card high"><h2 id="cnt-high">0</h2><p>HIGH</p></div>
+  <div class="card medium"><h2 id="cnt-medium">0</h2><p>MEDIUM</p></div>
+  <div class="card low"><h2 id="cnt-low">0</h2><p>LOW</p></div>
+</div>
+<p>Total: <span id="total-size">0</span> | Processed: <span id="total-processed">0</span> | Dropped: <span id="total-dropped">0</span> | Workers: <span id="worker-count">0</span></p>
+<div>
+  <button class="btn-critical" onclick="inject('critical')">Inject CRITICAL</button>
+  <button class="btn-high" onclick="inject('high')">Inject HIGH</button>
+  <button class="btn-medium" onclick="inject('medium')">Inject MEDIUM</button>
+  <button class="btn-low" onclick="inject('low')">Inject LOW</button>
+</div>
+<div id="chart-placeholder" style="margin:1rem 0;padding:1rem;background:#16213e;border-radius:8px;">
+  <p>Chart will be added in the next update</p>
+</div>
+<h3>Recent Messages</h3>
+<table>
+  <thead><tr><th>Time</th><th>Priority</th><th>Message</th><th>Duration</th></tr></thead>
+  <tbody id="msg-table"></tbody>
+</table>
+<script>
+function inject(priority) {
+  fetch('/api/inject/' + priority, {method: 'POST'})
+    .then(r => r.json()).then(d => console.log('Injected:', d));
+}
+function update() {
+  fetch('/api/status').then(r => r.json()).then(data => {
+    var q = data.queue.priority_counts;
+    document.getElementById('cnt-critical').textContent = q.CRITICAL || 0;
+    document.getElementById('cnt-high').textContent = q.HIGH || 0;
+    document.getElementById('cnt-medium').textContent = q.MEDIUM || 0;
+    document.getElementById('cnt-low').textContent = q.LOW || 0;
+    document.getElementById('total-size').textContent = data.queue.size;
+    document.getElementById('total-processed').textContent = data.metrics.totals.processed;
+    document.getElementById('total-dropped').textContent = data.metrics.totals.dropped;
+    document.getElementById('worker-count').textContent = data.workers.count;
+    var tbody = document.getElementById('msg-table');
+    tbody.innerHTML = '';
+    (data.recent_messages || []).slice(-20).reverse().forEach(function(m) {
+      var row = document.createElement('tr');
+      var t = new Date(m.timestamp * 1000).toLocaleTimeString();
+      row.innerHTML = '<td>' + t + '</td><td><span class="badge ' + m.priority.toLowerCase() + '">' + m.priority + '</span></td><td>' + (m.message||'').substring(0,80) + '</td><td>' + (m.processing_time_ms||0).toFixed(1) + 'ms</td>';
+      tbody.appendChild(row);
+    });
+    document.getElementById('status').style.color = '#27ae60';
+  }).catch(function() { document.getElementById('status').style.color = '#e74c3c'; });
+}
+setInterval(update, 2000);
+update();
+</script></body></html>
