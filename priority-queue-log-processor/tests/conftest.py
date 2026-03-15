@@ -2,7 +2,9 @@
 
 import pytest
 
+from src.classifier import MessageClassifier
 from src.config import Settings
+from src.metrics import MetricsTracker
 from src.models import LogMessage, Priority
 from src.priority_queue import ThreadSafePriorityQueue
 
@@ -33,3 +35,13 @@ def sample_messages() -> list[LogMessage]:
         LogMessage(priority=Priority.MEDIUM, source="web", message="User validation failed"),
         LogMessage(priority=Priority.LOW, source="cron", message="Scheduled cleanup finished"),
     ]
+
+
+@pytest.fixture
+def classifier() -> MessageClassifier:
+    return MessageClassifier()
+
+
+@pytest.fixture
+def metrics() -> MetricsTracker:
+    return MetricsTracker()
