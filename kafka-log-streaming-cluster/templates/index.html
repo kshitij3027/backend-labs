@@ -197,6 +197,19 @@
         .panel-body::-webkit-scrollbar-track { background: transparent; }
         .panel-body::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
 
+        /* --- Ordering Badge --- */
+        .ordering-ok    { color: #3fb950; }
+        .ordering-fail  { color: #f85149; }
+
+        /* --- Throughput Bar Chart --- */
+        .tp-bar {
+            flex: 1;
+            min-width: 2px;
+            background: #58a6ff;
+            border-radius: 1px 1px 0 0;
+            transition: height 0.3s ease;
+        }
+
         /* --- Responsive --- */
         @media (max-width: 900px) {
             .stats-row { grid-template-columns: repeat(2, 1fr); }
@@ -236,6 +249,26 @@
     </div>
 </div>
 
+<!-- Second Stats Row: Latency + Lag + Ordering -->
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="label">Latency p50 (ms)</div>
+        <div class="value" id="latencyP50">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Latency p95 (ms)</div>
+        <div class="value" id="latencyP95">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Latency p99 (ms)</div>
+        <div class="value" id="latencyP99">0</div>
+    </div>
+    <div class="stat-card" id="orderingCard">
+        <div class="label">Message Ordering</div>
+        <div class="value" id="orderingStatus">--</div>
+    </div>
+</div>
+
 <!-- Main Grid -->
 <div class="main-grid">
 
@@ -259,6 +292,24 @@
                 <div class="stat-section">
                     <h3>By Level</h3>
                     <div id="statsByLevel"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Throughput Chart -->
+        <div class="panel">
+            <div class="panel-header">Throughput (msg/s - last 60s)</div>
+            <div class="panel-body" style="padding: 8px 16px;">
+                <div id="throughputChart" style="display:flex;align-items:flex-end;gap:1px;height:80px;"></div>
+            </div>
+        </div>
+
+        <!-- Consumer Lag -->
+        <div class="panel">
+            <div class="panel-header">Consumer Lag</div>
+            <div class="panel-body">
+                <div class="stat-section">
+                    <div id="consumerLag"><div class="stat-row"><span class="key">No data</span></div></div>
                 </div>
             </div>
         </div>
@@ -443,13 +494,95 @@
             .catch(function () { /* silently retry next cycle */ });
     }
 
+    // --- Metrics Polling ---------------------------------------------------
+
+    var METRICS_INTERVAL = 3000;
+    var ORDERING_INTERVAL = 10000;
+
+    function renderThroughputChart(history) {
+        var container = document.getElementById("throughputChart");
+        if (!container) return;
+        if (!history || history.length === 0) {
+            container.innerHTML = '<span style="color:#484f58;font-size:0.75rem;">Waiting for data...</span>';
+            return;
+        }
+        var maxMps = 1;
+        for (var i = 0; i < history.length; i++) {
+            if (history[i].mps > maxMps) maxMps = history[i].mps;
+        }
+        var html = "";
+        for (var j = 0; j < history.length; j++) {
+            var pct = Math.round((history[j].mps / maxMps) * 100);
+            html += '<div class="tp-bar" style="height:' + Math.max(pct, 2) + '%" title="' + history[j].mps + ' msg/s"></div>';
+        }
+        container.innerHTML = html;
+    }
+
+    function fetchMetrics() {
+        fetch("/api/metrics")
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                // Latency stats
+                var lat = data.latency || {};
+                document.getElementById("latencyP50").textContent =
+                    lat.p50 !== undefined ? Math.round(lat.p50) : "0";
+                document.getElementById("latencyP95").textContent =
+                    lat.p95 !== undefined ? Math.round(lat.p95) : "0";
+                document.getElementById("latencyP99").textContent =
+                    lat.p99 !== undefined ? Math.round(lat.p99) : "0";
+
+                // Throughput chart
+                renderThroughputChart(data.throughput_history || []);
+
+                // Consumer lag
+                var lagContainer = document.getElementById("consumerLag");
+                var lag = data.consumer_lag || {};
+                var lagKeys = Object.keys(lag);
+                if (lagKeys.length === 0) {
+                    lagContainer.innerHTML = '<div class="stat-row"><span class="key" style="color:#484f58;">No lag data</span></div>';
+                } else {
+                    var lagHtml = "";
+                    for (var k = 0; k < lagKeys.length; k++) {
+                        lagHtml += '<div class="stat-row"><span class="key">' +
+                            escapeHtml(lagKeys[k]) +
+                            '</span><span class="val">' +
+                            escapeHtml(String(lag[lagKeys[k]])) +
+                            '</span></div>';
+                    }
+                    lagContainer.innerHTML = lagHtml;
+                }
+            })
+            .catch(function () { /* silently retry next cycle */ });
+    }
+
+    function fetchOrdering() {
+        fetch("/api/ordering")
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                var el = document.getElementById("orderingStatus");
+                var card = document.getElementById("orderingCard");
+                if (data.ordered) {
+                    el.textContent = "OK";
+                    el.className = "value ordering-ok";
+                } else {
+                    el.textContent = data.violations ? data.violations.length + " violations" : "FAIL";
+                    el.className = "value ordering-fail";
+                }
+            })
+            .catch(function () { /* silently retry next cycle */ });
+    }
+
     // --- Bootstrap ---------------------------------------------------------
 
     connectSSE();
     fetchStats();
     fetchErrors();
+    fetchMetrics();
+    fetchOrdering();
     setInterval(fetchStats, STATS_INTERVAL);
     setInterval(fetchErrors, ERRORS_INTERVAL);
+    setInterval(fetchMetrics, METRICS_INTERVAL);
+    setInterval(fetchOrdering, ORDERING_INTERVAL);
 })();
 </script>
 

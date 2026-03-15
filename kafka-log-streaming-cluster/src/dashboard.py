@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -31,7 +32,9 @@ def _create_lifespan(settings: Settings):
         # --- startup ---
         dashboard_consumer = DashboardConsumer(settings)
         error_aggregator = ErrorAggregator(settings)
-        metrics_tracker = MetricsTracker()
+        metrics_tracker = MetricsTracker(
+            bootstrap_servers=settings.active_bootstrap_servers,
+        )
 
         dashboard_consumer.start()
         error_aggregator.start()
@@ -58,17 +61,36 @@ def _create_lifespan(settings: Settings):
 
         sampling_task = asyncio.create_task(_sample_throughput())
 
+        async def _update_lag():
+            """Periodically update consumer lag from the dashboard consumer."""
+            while not stop_event.is_set():
+                await asyncio.sleep(5.0)
+                # The consumer's internal _consumer is a confluent_kafka Consumer
+                if hasattr(dashboard_consumer, "_consumer") and dashboard_consumer._consumer:
+                    try:
+                        metrics_tracker.update_consumer_lag(dashboard_consumer._consumer)
+                    except Exception:
+                        pass
+
+        lag_task = asyncio.create_task(_update_lag())
+
         logger.info("dashboard_startup_complete")
         yield
 
         # --- shutdown ---
         stop_event.set()
         sampling_task.cancel()
+        lag_task.cancel()
         try:
             await sampling_task
         except asyncio.CancelledError:
             pass
+        try:
+            await lag_task
+        except asyncio.CancelledError:
+            pass
 
+        metrics_tracker.stop()
         dashboard_consumer.stop()
         error_aggregator.stop()
         logger.info("dashboard_shutdown_complete")
@@ -123,6 +145,59 @@ def create_app(settings: Settings) -> FastAPI:
             "recent_errors": aggregator.recent_errors,
             "error_counts": aggregator.error_counts,
             "error_rate": aggregator.error_rate,
+        })
+
+    @app.get("/api/metrics")
+    async def api_metrics():
+        """Detailed metrics: throughput history, consumer lag, latency stats."""
+        tracker: MetricsTracker = app.state.metrics_tracker
+        return JSONResponse(content={
+            "throughput": tracker.throughput,
+            "throughput_history": tracker.throughput_history,
+            "consumer_lag": tracker.consumer_lag,
+            "latency": tracker.latency_stats,
+        })
+
+    @app.get("/api/ordering")
+    async def api_ordering():
+        """Verify message ordering within partitions.
+
+        Check that sequence_numbers within each (topic, key)
+        combination are monotonically increasing in the recent messages.
+        """
+        consumer: DashboardConsumer = app.state.dashboard_consumer
+        messages = consumer.recent_messages
+
+        # Group by (topic, key) -- messages with same key go to same partition
+        sequences: dict[tuple, list] = defaultdict(list)
+        for msg in messages:
+            key = (msg.get("topic", ""), msg.get("key", ""))
+            seq = msg.get("data", {}).get("sequence_number", 0)
+            sequences[key].append(seq)
+
+        # Check ordering for each group
+        violations = []
+        ordered_count = 0
+        total_groups = 0
+
+        for key, seqs in sequences.items():
+            total_groups += 1
+            is_ordered = all(seqs[i] <= seqs[i + 1] for i in range(len(seqs) - 1))
+            if is_ordered:
+                ordered_count += 1
+            else:
+                violations.append({
+                    "topic": key[0],
+                    "key": key[1][:8] + "..." if key[1] and len(key[1]) > 8 else key[1],
+                    "sequences_sample": seqs[:10],
+                })
+
+        return JSONResponse(content={
+            "ordered": len(violations) == 0,
+            "total_groups": total_groups,
+            "ordered_groups": ordered_count,
+            "violations": violations[:10],
+            "message_count": len(messages),
         })
 
     @app.get("/api/stream")

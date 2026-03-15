@@ -266,3 +266,105 @@ async def test_health_reports_consumer_status(app, mock_dc):
     body = resp.json()
     assert body["consumers"]["dashboard"] is False
     assert body["consumers"]["error_aggregator"] is True
+
+
+@pytest.mark.asyncio
+async def test_api_metrics_endpoint(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/metrics")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "throughput" in body
+    assert "throughput_history" in body
+    assert "consumer_lag" in body
+    assert "latency" in body
+    # Latency should have expected keys
+    lat = body["latency"]
+    assert "p50" in lat
+    assert "p95" in lat
+    assert "p99" in lat
+    assert "samples" in lat
+    # Consumer lag should be a dict (empty without Kafka)
+    assert isinstance(body["consumer_lag"], dict)
+    # Throughput history should be a list
+    assert isinstance(body["throughput_history"], list)
+
+
+@pytest.mark.asyncio
+async def test_api_ordering_endpoint(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/ordering")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "ordered" in body
+    assert "total_groups" in body
+    assert "ordered_groups" in body
+    assert "violations" in body
+    assert "message_count" in body
+    # With the sample data, both messages have different keys so 2 groups
+    assert body["total_groups"] == 2
+    # Both have single messages in their group, so they are ordered
+    assert body["ordered"] is True
+    assert body["violations"] == []
+
+
+@pytest.mark.asyncio
+async def test_api_ordering_detects_violations(app, mock_dc):
+    """Ordering endpoint should detect out-of-order sequences."""
+    # Create messages with the same key but out-of-order sequence numbers
+    mock_dc.recent_messages = [
+        {
+            "topic": "web-api-logs",
+            "key": "user-001",
+            "data": {"sequence_number": 5},
+        },
+        {
+            "topic": "web-api-logs",
+            "key": "user-001",
+            "data": {"sequence_number": 3},
+        },
+        {
+            "topic": "web-api-logs",
+            "key": "user-001",
+            "data": {"sequence_number": 7},
+        },
+    ]
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/ordering")
+    body = resp.json()
+    assert body["ordered"] is False
+    assert body["total_groups"] == 1
+    assert body["ordered_groups"] == 0
+    assert len(body["violations"]) == 1
+    assert body["violations"][0]["topic"] == "web-api-logs"
+
+
+@pytest.mark.asyncio
+async def test_api_ordering_empty_messages(app, mock_dc):
+    """Ordering endpoint works with no messages."""
+    mock_dc.recent_messages = []
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/ordering")
+    body = resp.json()
+    assert body["ordered"] is True
+    assert body["total_groups"] == 0
+    assert body["message_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_api_metrics_latency_with_data(app):
+    """Metrics endpoint returns real latency data when samples exist."""
+    tracker: MetricsTracker = app.state.metrics_tracker
+    for i in range(1, 51):
+        tracker.record_consumed("test", latency_ms=float(i))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/api/metrics")
+    body = resp.json()
+    assert body["latency"]["samples"] == 50
+    assert body["latency"]["p50"] > 0
