@@ -189,6 +189,8 @@ services:
     environment:
       USE_INTERNAL_LISTENERS: "true"
       BOOTSTRAP_SERVERS: kafka-1:29092,kafka-2:29092,kafka-3:29092
+      PRODUCER_DURATION_SECONDS: "60"
+      PRODUCER_RATE_PER_SECOND: "50"
     command: python -m src.producer
     profiles:
       - app
