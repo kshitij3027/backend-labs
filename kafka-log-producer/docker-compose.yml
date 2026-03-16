@@ -47,6 +47,21 @@ services:
     networks:
       - kafka-net
 
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+      - "8000:8000"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+    networks:
+      - kafka-net
+
   test:
     build:
       context: .

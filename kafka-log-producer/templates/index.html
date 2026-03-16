@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Log Producer Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: #0f3460;
+            padding: 20px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #e94560;
+        }
+
+        .ws-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+
+        .ws-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e74c3c;
+            transition: background 0.3s;
+        }
+
+        .ws-dot.connected {
+            background: #2ecc71;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        .stat-cards {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #1a3a5c;
+        }
+
+        .stat-card .label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: #8899aa;
+            margin-bottom: 8px;
+        }
+
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+
+        .stat-card.sent .value { color: #2ecc71; }
+        .stat-card.throughput .value { color: #3498db; }
+        .stat-card.error .value { color: #e74c3c; }
+        .stat-card.buffer .value { color: #f39c12; }
+
+        .panels {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .panel {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #1a3a5c;
+        }
+
+        .panel h2 {
+            font-size: 1rem;
+            margin-bottom: 16px;
+            color: #e94560;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        thead th {
+            text-align: left;
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            color: #8899aa;
+            padding: 8px 12px;
+            border-bottom: 1px solid #1a3a5c;
+        }
+
+        tbody td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #0f1a2e;
+            font-size: 0.9rem;
+        }
+
+        tbody tr:hover {
+            background: #1a3050;
+        }
+
+        canvas {
+            width: 100%;
+            height: 200px;
+        }
+
+        .actions {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .btn {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+
+        .btn:hover {
+            opacity: 0.9;
+        }
+
+        .btn:active {
+            transform: scale(0.97);
+        }
+
+        .btn-sample {
+            background: #2ecc71;
+            color: #1a1a2e;
+        }
+
+        .btn-error {
+            background: #e74c3c;
+            color: #fff;
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            background: #16213e;
+            border: 1px solid #1a3a5c;
+            border-radius: 8px;
+            padding: 12px 20px;
+            font-size: 0.85rem;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: all 0.3s;
+            pointer-events: none;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        @media (max-width: 768px) {
+            .stat-cards { grid-template-columns: repeat(2, 1fr); }
+            .panels { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Kafka Log Producer Dashboard</h1>
+        <div class="ws-status">
+            <div class="ws-dot" id="wsDot"></div>
+            <span id="wsLabel">Disconnected</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="actions">
+            <button class="btn btn-sample" id="btnSample" onclick="sendSample()">Send Sample Logs</button>
+            <button class="btn btn-error" id="btnError" onclick="sendErrorBurst()">Send Error Burst</button>
+        </div>
+
+        <div class="stat-cards">
+            <div class="stat-card sent">
+                <div class="label">Messages Sent</div>
+                <div class="value" id="statSent">0</div>
+            </div>
+            <div class="stat-card throughput">
+                <div class="label">Throughput (msg/s)</div>
+                <div class="value" id="statThroughput">0.0</div>
+            </div>
+            <div class="stat-card error">
+                <div class="label">Error Rate (%)</div>
+                <div class="value" id="statErrorRate">0.0</div>
+            </div>
+            <div class="stat-card buffer">
+                <div class="label">Success Rate (%)</div>
+                <div class="value" id="statSuccessRate">0.0</div>
+            </div>
+        </div>
+
+        <div class="panels">
+            <div class="panel">
+                <h2>Per-Topic Stats</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Topic</th>
+                            <th>Messages</th>
+                        </tr>
+                    </thead>
+                    <tbody id="topicTable">
+                        <tr><td colspan="2" style="color:#556;">No data yet</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="panel">
+                <h2>Throughput Over Time</h2>
+                <canvas id="chartCanvas" width="540" height="200"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // --- State ---
+        const throughputHistory = [];
+        const MAX_POINTS = 60;
+        let ws = null;
+        let reconnectTimer = null;
+
+        // --- WebSocket ---
+        function connectWebSocket() {
+            const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${proto}://${window.location.host}/ws`);
+
+            ws.onopen = function() {
+                document.getElementById('wsDot').classList.add('connected');
+                document.getElementById('wsLabel').textContent = 'Connected';
+                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+            };
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+
+            ws.onclose = function() {
+                document.getElementById('wsDot').classList.remove('connected');
+                document.getElementById('wsLabel').textContent = 'Disconnected';
+                scheduleReconnect();
+            };
+
+            ws.onerror = function() {
+                document.getElementById('wsDot').classList.remove('connected');
+                document.getElementById('wsLabel').textContent = 'Disconnected';
+                ws.close();
+            };
+        }
+
+        function scheduleReconnect() {
+            if (!reconnectTimer) {
+                reconnectTimer = setTimeout(function() {
+                    reconnectTimer = null;
+                    connectWebSocket();
+                }, 3000);
+            }
+        }
+
+        // --- Dashboard Updates ---
+        function updateDashboard(data) {
+            document.getElementById('statSent').textContent = data.total_sent || 0;
+
+            const metrics = data.metrics || {};
+            const throughput = metrics.throughput || 0;
+            const errorRate = metrics.error_rate || 0;
+            const successRate = data.success_rate || 0;
+
+            document.getElementById('statThroughput').textContent = throughput.toFixed(1);
+            document.getElementById('statErrorRate').textContent = errorRate.toFixed(1);
+            document.getElementById('statSuccessRate').textContent = successRate.toFixed(1);
+
+            // Update topic table
+            const topicCounts = data.topic_counts || {};
+            const tbody = document.getElementById('topicTable');
+            const topics = Object.keys(topicCounts);
+            if (topics.length > 0) {
+                tbody.innerHTML = topics.map(function(topic) {
+                    return '<tr><td>' + escapeHtml(topic) + '</td><td>' + topicCounts[topic] + '</td></tr>';
+                }).join('');
+            }
+
+            // Push to throughput chart
+            throughputHistory.push(throughput);
+            if (throughputHistory.length > MAX_POINTS) {
+                throughputHistory.shift();
+            }
+            drawChart();
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // --- Chart ---
+        function drawChart() {
+            const canvas = document.getElementById('chartCanvas');
+            const ctx = canvas.getContext('2d');
+            const W = canvas.width;
+            const H = canvas.height;
+
+            ctx.clearRect(0, 0, W, H);
+
+            if (throughputHistory.length < 2) return;
+
+            const maxVal = Math.max(...throughputHistory, 1);
+            const padding = { top: 10, right: 10, bottom: 25, left: 45 };
+            const plotW = W - padding.left - padding.right;
+            const plotH = H - padding.top - padding.bottom;
+
+            // Grid lines
+            ctx.strokeStyle = '#1a3a5c';
+            ctx.lineWidth = 1;
+            for (let i = 0; i <= 4; i++) {
+                const y = padding.top + (plotH / 4) * i;
+                ctx.beginPath();
+                ctx.moveTo(padding.left, y);
+                ctx.lineTo(W - padding.right, y);
+                ctx.stroke();
+
+                ctx.fillStyle = '#556677';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'right';
+                const label = (maxVal * (1 - i / 4)).toFixed(1);
+                ctx.fillText(label, padding.left - 6, y + 3);
+            }
+
+            // Data line
+            ctx.beginPath();
+            ctx.strokeStyle = '#3498db';
+            ctx.lineWidth = 2;
+
+            const step = plotW / (MAX_POINTS - 1);
+            for (let i = 0; i < throughputHistory.length; i++) {
+                const x = padding.left + i * step;
+                const y = padding.top + plotH - (throughputHistory[i] / maxVal) * plotH;
+                if (i === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+            ctx.stroke();
+
+            // Fill under line
+            const lastX = padding.left + (throughputHistory.length - 1) * step;
+            ctx.lineTo(lastX, padding.top + plotH);
+            ctx.lineTo(padding.left, padding.top + plotH);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(52, 152, 219, 0.1)';
+            ctx.fill();
+
+            // X-axis label
+            ctx.fillStyle = '#556677';
+            ctx.font = '10px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('Time (last ' + throughputHistory.length + ' samples)', W / 2, H - 4);
+        }
+
+        // --- Button Handlers ---
+        async function sendSample() {
+            const btn = document.getElementById('btnSample');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/send-sample', { method: 'POST' });
+                const data = await res.json();
+                showToast('Sent ' + (data.logs_sent || 0) + ' sample logs');
+            } catch (err) {
+                showToast('Failed to send: ' + err.message);
+            }
+            btn.disabled = false;
+        }
+
+        async function sendErrorBurst() {
+            const btn = document.getElementById('btnError');
+            btn.disabled = true;
+            try {
+                const res = await fetch('/api/send-error-burst', { method: 'POST' });
+                const data = await res.json();
+                showToast('Sent ' + (data.logs_sent || 0) + ' error logs');
+            } catch (err) {
+                showToast('Failed to send: ' + err.message);
+            }
+            btn.disabled = false;
+        }
+
+        function showToast(msg) {
+            const toast = document.getElementById('toast');
+            toast.textContent = msg;
+            toast.classList.add('show');
+            setTimeout(function() { toast.classList.remove('show'); }, 2500);
+        }
+
+        // --- Init ---
+        connectWebSocket();
+    </script>
+</body>
+</html>
