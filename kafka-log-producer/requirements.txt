@@ -1,0 +1,33 @@
+# Kafka
+confluent-kafka==2.6.1
+
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.4
+python-multipart==0.0.18
+
+# WebSocket (included via uvicorn[standard] / fastapi)
+websockets==14.1
+
+# Prometheus metrics
+prometheus-client==0.21.1
+
+# Data models / validation
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# CLI
+typer==0.15.1
+rich==13.9.4
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1
+testcontainers[kafka]==4.9.1
+
+# Utilities
+python-json-logger==3.2.1
+orjson==3.10.13
+pyyaml==6.0.2

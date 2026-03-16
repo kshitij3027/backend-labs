@@ -1,0 +1,18 @@
+kafka:
+  bootstrap_servers: "localhost:9092"
+  acks: "all"
+  retries: 2147483647
+  batch_size: 16384
+  linger_ms: 5
+  compression_type: "gzip"
+  enable_idempotence: true
+
+prometheus:
+  port: 8000
+
+dashboard:
+  port: 8080
+  ws_interval: 2
+
+fallback:
+  storage_path: "/tmp/kafka_fallback.jsonl"
