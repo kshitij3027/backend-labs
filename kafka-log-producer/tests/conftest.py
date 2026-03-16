@@ -25,8 +25,19 @@ def sample_log_entry() -> LogEntry:
 
 
 @pytest.fixture
-def config(tmp_path: Path) -> Config:
-    """Create a Config backed by a temporary YAML file."""
+def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Config:
+    """Create a Config backed by a temporary YAML file.
+
+    Clears env vars that would override YAML defaults so assertions
+    against known values work regardless of the Docker environment.
+    """
+    for env_var in (
+        "BOOTSTRAP_SERVERS", "KAFKA_ACKS", "KAFKA_BATCH_SIZE",
+        "KAFKA_LINGER_MS", "KAFKA_COMPRESSION", "PROMETHEUS_PORT",
+        "DASHBOARD_PORT",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
     yaml_content = textwrap.dedent("""\
         kafka:
           bootstrap_servers: "localhost:9092"
