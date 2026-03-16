@@ -76,6 +76,38 @@ services:
     profiles:
       - test
 
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8080
+      METRICS_URL: http://app:8000
+      BOOTSTRAP_SERVERS: kafka:29092
+    entrypoint: ["python", "scripts/verify_e2e.py"]
+    networks:
+      - kafka-net
+    profiles:
+      - e2e
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+    entrypoint: ["python", "scripts/benchmark.py"]
+    networks:
+      - kafka-net
+    profiles:
+      - benchmark
+
 networks:
   kafka-net:
     driver: bridge

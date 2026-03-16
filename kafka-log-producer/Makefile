@@ -1,4 +1,4 @@
-.PHONY: build up down test clean logs
+.PHONY: build up down test clean logs e2e benchmark
 
 build:
 	docker compose build
@@ -19,3 +19,9 @@ clean:
 
 logs:
 	docker compose logs -f
+
+e2e:
+	docker compose --profile e2e up --build --abort-on-container-exit e2e
+
+benchmark:
+	docker compose --profile benchmark up --build --abort-on-container-exit benchmark
