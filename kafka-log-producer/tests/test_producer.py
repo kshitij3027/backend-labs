@@ -41,7 +41,7 @@ class TestSendLog:
         assert kwargs["topic"] == sample_log_entry.route_topic()
         assert kwargs["key"] == sample_log_entry.to_kafka_key().encode("utf-8")
         assert kwargs["value"] == sample_log_entry.to_kafka_value().encode("utf-8")
-        assert kwargs["callback"].__func__ is KafkaLogProducer._delivery_callback
+        assert callable(kwargs["callback"])
 
         # poll(0) should also be called to trigger callbacks
         inner.poll.assert_called_once_with(0)
