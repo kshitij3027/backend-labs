@@ -76,6 +76,21 @@ services:
     networks:
       - kafka-net
 
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    entrypoint: ["python", "-m", "src.producer", "--count", "500", "--rate", "50"]
+    profiles:
+      - producer
+    networks:
+      - kafka-net
+
   test:
     build:
       context: .
