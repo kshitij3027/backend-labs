@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Log Consumer Analytics</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0f1117;
+            color: #e1e4e8;
+            padding: 20px;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 8px;
+            font-size: 1.8em;
+            color: #58a6ff;
+        }
+        .subtitle {
+            text-align: center;
+            color: #8b949e;
+            margin-bottom: 24px;
+            font-size: 0.9em;
+        }
+        .status-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .status-dot.connected { background: #3fb950; }
+        .status-dot.disconnected { background: #f85149; }
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+        }
+        .card .label {
+            font-size: 0.85em;
+            color: #8b949e;
+            margin-bottom: 4px;
+        }
+        .card .value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #58a6ff;
+        }
+        .card .value.error { color: #f85149; }
+        .card .value.success { color: #3fb950; }
+        .section {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        .section h2 {
+            font-size: 1.2em;
+            margin-bottom: 16px;
+            color: #c9d1d9;
+        }
+        canvas {
+            width: 100%;
+            height: 200px;
+            background: #0d1117;
+            border-radius: 4px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            padding: 10px 12px;
+            text-align: left;
+            border-bottom: 1px solid #21262d;
+        }
+        th {
+            color: #8b949e;
+            font-weight: 600;
+            font-size: 0.85em;
+            text-transform: uppercase;
+        }
+        td { font-size: 0.9em; }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        @media (max-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+        .geo-bar {
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+        .geo-bar .name {
+            width: 100px;
+            font-size: 0.85em;
+        }
+        .geo-bar .bar {
+            flex: 1;
+            height: 20px;
+            background: #21262d;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 0 10px;
+        }
+        .geo-bar .bar-fill {
+            height: 100%;
+            background: #58a6ff;
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+        .geo-bar .count {
+            width: 50px;
+            text-align: right;
+            font-size: 0.85em;
+            color: #8b949e;
+        }
+    </style>
+</head>
+<body>
+    <h1>Kafka Log Consumer Analytics</h1>
+    <p class="subtitle">
+        <span class="status-dot disconnected" id="ws-status"></span>
+        <span id="ws-label">Connecting...</span>
+    </p>
+
+    <div class="cards">
+        <div class="card">
+            <div class="label">Total Messages</div>
+            <div class="value" id="total-messages">0</div>
+        </div>
+        <div class="card">
+            <div class="label">Throughput (msg/s)</div>
+            <div class="value" id="throughput">0</div>
+        </div>
+        <div class="card">
+            <div class="label">Error Rate</div>
+            <div class="value error" id="error-rate">0%</div>
+        </div>
+        <div class="card">
+            <div class="label">P95 Response Time</div>
+            <div class="value" id="p95">0ms</div>
+        </div>
+        <div class="card">
+            <div class="label">Success Rate</div>
+            <div class="value success" id="success-rate">100%</div>
+        </div>
+        <div class="card">
+            <div class="label">Batches Processed</div>
+            <div class="value" id="batches">0</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Throughput Over Time</h2>
+        <canvas id="throughput-chart"></canvas>
+    </div>
+
+    <div class="grid-2">
+        <div class="section">
+            <h2>Per-Endpoint Stats</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Endpoint</th>
+                        <th>Requests</th>
+                        <th>Errors</th>
+                        <th>Error Rate</th>
+                        <th>Avg RT</th>
+                    </tr>
+                </thead>
+                <tbody id="endpoint-table"></tbody>
+            </table>
+        </div>
+        <div class="section">
+            <h2>Geographic Distribution</h2>
+            <div id="geo-distribution"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let throughputData = [];
+        const MAX_POINTS = 60;
+
+        function connectWebSocket() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+            ws.onopen = () => {
+                document.getElementById('ws-status').className = 'status-dot connected';
+                document.getElementById('ws-label').textContent = 'Live';
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                updateDashboard(data);
+            };
+
+            ws.onclose = () => {
+                document.getElementById('ws-status').className = 'status-dot disconnected';
+                document.getElementById('ws-label').textContent = 'Reconnecting...';
+                setTimeout(connectWebSocket, 3000);
+            };
+
+            ws.onerror = () => ws.close();
+        }
+
+        function updateDashboard(data) {
+            const stats = data.stats || {};
+            const consumer = data.consumer || {};
+            const processor = data.processor || {};
+
+            document.getElementById('total-messages').textContent =
+                (stats.total_messages || 0).toLocaleString();
+            document.getElementById('throughput').textContent =
+                (stats.throughput_per_sec || 0).toFixed(1);
+            document.getElementById('error-rate').textContent =
+                (stats.error_rate || 0).toFixed(1) + '%';
+            document.getElementById('success-rate').textContent =
+                (processor.success_rate || 100).toFixed(1) + '%';
+            document.getElementById('batches').textContent =
+                consumer.batches_processed || 0;
+
+            // Update throughput chart data
+            throughputData.push(stats.throughput_per_sec || 0);
+            if (throughputData.length > MAX_POINTS) throughputData.shift();
+            drawChart();
+
+            // Fetch detailed analytics
+            fetchAnalytics();
+        }
+
+        async function fetchAnalytics() {
+            try {
+                const resp = await fetch('/api/analytics');
+                const data = await resp.json();
+                updateEndpoints(data.endpoints || {});
+                updateGeo(data.geo_distribution || {});
+                const p95 = data.percentiles?.p95 || 0;
+                document.getElementById('p95').textContent = p95.toFixed(1) + 'ms';
+            } catch (e) {}
+        }
+
+        function updateEndpoints(endpoints) {
+            const tbody = document.getElementById('endpoint-table');
+            tbody.innerHTML = '';
+            const sorted = Object.entries(endpoints).sort((a, b) =>
+                b[1].request_count - a[1].request_count
+            );
+            for (const [name, ep] of sorted) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${name}</td>
+                    <td>${ep.request_count}</td>
+                    <td>${ep.error_count}</td>
+                    <td>${ep.error_rate.toFixed(1)}%</td>
+                    <td>${ep.avg_response_time_ms.toFixed(1)}ms</td>
+                `;
+                tbody.appendChild(tr);
+            }
+        }
+
+        function updateGeo(geo) {
+            const container = document.getElementById('geo-distribution');
+            container.innerHTML = '';
+            const entries = Object.entries(geo).sort((a, b) => b[1] - a[1]);
+            const max = entries.length > 0 ? entries[0][1] : 1;
+            for (const [name, count] of entries) {
+                const pct = (count / max * 100).toFixed(0);
+                container.innerHTML += `
+                    <div class="geo-bar">
+                        <span class="name">${name}</span>
+                        <div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>
+                        <span class="count">${count}</span>
+                    </div>
+                `;
+            }
+        }
+
+        function drawChart() {
+            const canvas = document.getElementById('throughput-chart');
+            const ctx = canvas.getContext('2d');
+            canvas.width = canvas.offsetWidth * 2;
+            canvas.height = canvas.offsetHeight * 2;
+            ctx.scale(2, 2);
+            const w = canvas.offsetWidth;
+            const h = canvas.offsetHeight;
+            ctx.clearRect(0, 0, w, h);
+
+            if (throughputData.length < 2) return;
+
+            const max = Math.max(...throughputData, 1);
+            const step = w / (MAX_POINTS - 1);
+
+            // Grid lines
+            ctx.strokeStyle = '#21262d';
+            ctx.lineWidth = 0.5;
+            for (let i = 0; i < 5; i++) {
+                const y = h * i / 4;
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+
+            // Line
+            ctx.strokeStyle = '#58a6ff';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            const offset = (MAX_POINTS - throughputData.length) * step;
+            for (let i = 0; i < throughputData.length; i++) {
+                const x = offset + i * step;
+                const y = h - (throughputData[i] / max) * (h - 20) - 10;
+                if (i === 0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+
+            // Fill area
+            ctx.lineTo(offset + (throughputData.length - 1) * step, h);
+            ctx.lineTo(offset, h);
+            ctx.closePath();
+            ctx.fillStyle = 'rgba(88, 166, 255, 0.1)';
+            ctx.fill();
+        }
+
+        // Initial data fetch
+        fetch('/api/stats').then(r => r.json()).then(data => {
+            const stats = data.analytics || {};
+            document.getElementById('total-messages').textContent =
+                (stats.total_messages || 0).toLocaleString();
+        }).catch(() => {});
+
+        connectWebSocket();
+        window.addEventListener('resize', drawChart);
+    </script>
+</body>
+</html>
