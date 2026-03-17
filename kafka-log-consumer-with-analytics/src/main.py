@@ -4,6 +4,7 @@ import signal
 import sys
 import time
 
+from src.analytics import AnalyticsEngine
 from src.config import load_config
 from src.consumer import LogConsumer
 from src.batch_processor import BatchProcessor
@@ -21,7 +22,8 @@ def main() -> None:
     logger.info("Configuration loaded — bootstrap=%s, topics=%s",
                 settings.bootstrap_servers, settings.topics)
 
-    processor = BatchProcessor()
+    analytics = AnalyticsEngine(window_seconds=settings.sliding_window_seconds)
+    processor = BatchProcessor(analytics=analytics)
     consumer = LogConsumer(settings, on_batch=processor.process_batch)
 
     # Graceful shutdown handler

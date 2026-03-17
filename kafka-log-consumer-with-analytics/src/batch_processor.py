@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 class BatchProcessor:
     """Deserializes Kafka messages, routes by log type, tracks stats."""
 
-    def __init__(self) -> None:
+    def __init__(self, analytics=None) -> None:
+        self._analytics = analytics
         self._lock = threading.Lock()
         self._total_processed = 0
         self._total_failed = 0
@@ -42,6 +43,9 @@ class BatchProcessor:
                     continue
 
                 parsed.append(log)
+
+                if self._analytics is not None:
+                    self._analytics.record_message(log)
 
                 with self._lock:
                     self._total_processed += 1
