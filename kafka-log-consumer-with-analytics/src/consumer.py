@@ -27,6 +27,7 @@ class LogConsumer:
         self._assigned_partitions: list[TopicPartition] = []
         self._batch: list = []
         self._batch_start: float = 0.0
+        self._last_batch_duration: float = 0.0
 
         # Stats
         self._total_consumed = 0
@@ -101,7 +102,11 @@ class LogConsumer:
         """Called when partitions are revoked — flush partial batch."""
         if self._batch:
             logger.info("Flushing %d messages before revoke", len(self._batch))
-            self._process_batch()
+            try:
+                self._process_batch()
+            except Exception as exc:
+                logger.error("Failed to flush batch during revoke: %s", exc)
+                self._batch = []
         self._assigned_partitions = []
         logger.info("Partitions revoked: %s", [str(p) for p in partitions])
 
@@ -120,7 +125,12 @@ class LogConsumer:
                 if msg is None:
                     # Check batch timeout
                     if self._batch and (time.time() - self._batch_start) >= self._settings.batch_timeout_s:
-                        self._process_batch()
+                        self._process_with_retry()
+                        # Dynamic throttling
+                        if self._last_batch_duration > 0.5:
+                            throttle = min(self._last_batch_duration * 0.5, 2.0)
+                            logger.debug("Throttling: sleeping %.2fs (batch took %.3fs)", throttle, self._last_batch_duration)
+                            time.sleep(throttle)
                     continue
 
                 if msg.error():
@@ -135,7 +145,12 @@ class LogConsumer:
 
                 # Process when batch is full
                 if len(self._batch) >= self._settings.batch_size:
-                    self._process_batch()
+                    self._process_with_retry()
+                    # Dynamic throttling
+                    if self._last_batch_duration > 0.5:
+                        throttle = min(self._last_batch_duration * 0.5, 2.0)
+                        logger.debug("Throttling: sleeping %.2fs (batch took %.3fs)", throttle, self._last_batch_duration)
+                        time.sleep(throttle)
 
             except KafkaException as exc:
                 logger.error("Kafka exception: %s", exc)
@@ -148,7 +163,30 @@ class LogConsumer:
 
         # Final flush on shutdown
         if self._batch:
-            self._process_batch()
+            self._process_with_retry()
+
+    def _process_with_retry(self) -> None:
+        """Process batch with exponential backoff retry."""
+        max_retries = 3
+        delays = [1, 2, 4]  # seconds
+
+        for attempt in range(max_retries + 1):
+            try:
+                self._process_batch()
+                return
+            except Exception as exc:
+                if attempt < max_retries:
+                    delay = delays[attempt]
+                    logger.warning(
+                        "Batch processing failed (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1, max_retries, delay, exc,
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error("Batch processing failed after %d retries: %s", max_retries, exc)
+                    self._send_to_dead_letter(self._batch)
+                    self._batch = []
+                    self._batch_start = time.time()
 
     def _process_batch(self) -> None:
         """Process the current batch and commit offsets."""
@@ -158,6 +196,7 @@ class LogConsumer:
         batch = self._batch
         self._batch = []
         batch_size = len(batch)
+        batch_start = time.time()
 
         try:
             if self._on_batch:
@@ -178,10 +217,36 @@ class LogConsumer:
             )
         except Exception as exc:
             logger.error("Batch processing failed: %s", exc)
-            with self._lock:
-                self._total_errors += batch_size
+            # Restore the batch so _process_with_retry can retry or send to DLQ
+            self._batch = batch
+            # Re-raise so _process_with_retry can handle retries / DLQ
+            raise
 
+        self._last_batch_duration = time.time() - batch_start
         self._batch_start = time.time()
+
+    def _send_to_dead_letter(self, messages: list) -> None:
+        """Send failed messages to dead-letter-logs topic."""
+        try:
+            from confluent_kafka import Producer
+            producer = Producer({"bootstrap.servers": self._settings.bootstrap_servers})
+            for msg in messages:
+                try:
+                    value = msg.value() if hasattr(msg, "value") else str(msg).encode()
+                    producer.produce(
+                        topic="dead-letter-logs",
+                        value=value,
+                        headers={
+                            "error": "processing_failed",
+                            "original_topic": msg.topic() if hasattr(msg, "topic") else "unknown",
+                        },
+                    )
+                except Exception:
+                    pass
+            producer.flush(timeout=5)
+            logger.info("Sent %d messages to dead-letter-logs", len(messages))
+        except Exception as exc:
+            logger.error("Failed to send to dead letter topic: %s", exc)
 
     # ------------------------------------------------------------------
     # Stats

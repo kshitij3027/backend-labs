@@ -40,6 +40,11 @@ class AnalyticsEngine:
         # Geographic distribution
         self._geo_distribution: dict[str, int] = defaultdict(int)
 
+        # Consumer lag tracking
+        self._consumer_lag: dict[str, int] = {}  # partition -> lag
+        self._high_lag_threshold = 10000
+        self._high_lag_alert = False
+
         # Totals
         self._total_messages = 0
         self._total_errors = 0
@@ -100,6 +105,13 @@ class AnalyticsEngine:
         endpoint = log.endpoint or "unknown"
         self._endpoint_stats[endpoint]["error_count"] += 1
 
+    def update_consumer_lag(self, lag_by_partition: dict[str, int]) -> None:
+        """Update consumer lag per partition."""
+        with self._lock:
+            self._consumer_lag = dict(lag_by_partition)
+            total_lag = sum(lag_by_partition.values())
+            self._high_lag_alert = total_lag > self._high_lag_threshold
+
     def _expire_buckets(self, now: int) -> None:
         """Remove throughput buckets outside the sliding window."""
         cutoff = now - self._window
@@ -122,6 +134,9 @@ class AnalyticsEngine:
                 "error_rate": round(errors / total * 100, 2) if total > 0 else 0.0,
                 "throughput_per_sec": throughput,
                 "window_seconds": self._window,
+                "consumer_lag": dict(self._consumer_lag),
+                "total_lag": sum(self._consumer_lag.values()),
+                "high_lag_alert": self._high_lag_alert,
             }
 
     def get_analytics(self) -> dict:

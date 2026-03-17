@@ -5,7 +5,7 @@ echo "Waiting for Kafka to be ready..."
 cub kafka-ready -b kafka:29092 1 60
 
 echo "Creating topics..."
-for topic in web-logs app-logs error-logs; do
+for topic in web-logs app-logs error-logs dead-letter-logs; do
   kafka-topics --create \
     --bootstrap-server kafka:29092 \
     --topic "$topic" \
