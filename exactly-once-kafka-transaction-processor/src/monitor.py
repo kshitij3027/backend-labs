@@ -8,7 +8,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from src.config import Settings
-from src.db.models import Account, Transaction
+from src.db.models import Account, ExchangeRate, Transaction
 from src.db.session import get_engine, get_session_factory
 
 logger = structlog.get_logger(__name__)
@@ -95,6 +95,56 @@ class TransactionMonitor:
             for t in recent_rows
         ]
 
+        # Breakdown by account type (based on from_account)
+        acct_type_map = {a.account_number: (a.account_type or "CHECKING") for a in account_rows}
+        all_txns_for_acct_type = session.query(Transaction).filter(
+            Transaction.status == "completed"
+        ).all()
+        by_account_type: dict[str, int] = {}
+        for t in all_txns_for_acct_type:
+            acct_num = t.from_account or t.to_account
+            acct_type = acct_type_map.get(acct_num, "UNKNOWN")
+            by_account_type[acct_type] = by_account_type.get(acct_type, 0) + 1
+
+        # Large transactions (amount > 5000) for compliance
+        large_txn_rows = (
+            session.query(Transaction)
+            .filter(Transaction.amount > 5000)
+            .order_by(Transaction.created_at.desc())
+            .all()
+        )
+        large_transactions = [
+            {
+                "transaction_id": t.transaction_id,
+                "type": t.type,
+                "amount": float(t.amount),
+                "status": t.status,
+                "from_account": t.from_account,
+                "to_account": t.to_account,
+                "created_at": t.created_at.isoformat() if t.created_at else None,
+            }
+            for t in large_txn_rows
+        ]
+
+        # Cross-currency transfer count: transfers where from/to accounts have different currencies
+        cross_currency_count = 0
+        transfer_txns = session.query(Transaction).filter(
+            Transaction.type == "TRANSFER",
+            Transaction.status == "completed",
+        ).all()
+        acct_currency_map = {a.account_number: (a.currency or "USD") for a in account_rows}
+        for t in transfer_txns:
+            from_cur = acct_currency_map.get(t.from_account, "USD")
+            to_cur = acct_currency_map.get(t.to_account, "USD")
+            if from_cur != to_cur:
+                cross_currency_count += 1
+
+        compliance_summary = {
+            "total_large_txns": len(large_transactions),
+            "total_cross_currency": cross_currency_count,
+            "flagged_count": len(large_transactions) + cross_currency_count,
+        }
+
         return {
             "total_transactions": total_transactions,
             "processed_count": processed_count,
@@ -104,6 +154,9 @@ class TransactionMonitor:
             "success_rate": success_rate,
             "accounts": accounts,
             "recent_transactions": recent_transactions,
+            "by_account_type": by_account_type,
+            "large_transactions": large_transactions,
+            "compliance_summary": compliance_summary,
         }
 
     # ------------------------------------------------------------------

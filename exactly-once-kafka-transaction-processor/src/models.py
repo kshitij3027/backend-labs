@@ -27,6 +27,7 @@ class TransactionMessage(BaseModel):
     from_account: Optional[str] = None
     to_account: Optional[str] = None
     amount: Decimal
+    currency: Optional[str] = None
     timestamp: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )

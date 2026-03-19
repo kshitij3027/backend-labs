@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from src.config import Settings
 from src.dashboard.app import create_app
-from src.db.models import Account, Base, Transaction
+from src.db.models import Account, Base, ExchangeRate, Transaction
 
 
 @pytest.fixture()
@@ -128,6 +128,9 @@ class TestStatsEndpoint:
             "accounts",
             "recent_transactions",
             "guarantee_status",
+            "by_account_type",
+            "large_transactions",
+            "compliance_summary",
         }
         assert expected_keys.issubset(set(data.keys()))
 
@@ -166,6 +169,27 @@ class TestVerifyEosEndpoint:
         assert data["guarantee_status"] == "MAINTAINED"
 
 
+class TestComplianceEndpoint:
+    def test_returns_200(self, client):
+        resp = client.get("/api/compliance")
+        assert resp.status_code == 200
+
+    def test_has_expected_keys(self, client):
+        data = resp_json(client.get("/api/compliance"))
+        expected_keys = {"large_transactions", "cross_currency_count", "total_flagged", "by_account_type"}
+        assert expected_keys.issubset(set(data.keys()))
+
+    def test_no_large_transactions_in_seed(self, client):
+        data = resp_json(client.get("/api/compliance"))
+        # All seeded transactions are <= 5000
+        assert len(data["large_transactions"]) == 0
+
+    def test_cross_currency_zero_for_same_currency(self, client):
+        data = resp_json(client.get("/api/compliance"))
+        # All test accounts default to USD, so no cross-currency transfers
+        assert data["cross_currency_count"] == 0
+
+
 class TestAppFactory:
     def test_creates_valid_flask_app(self):
         config = Settings(db_url="sqlite:///:memory:")
@@ -181,6 +205,7 @@ class TestAppFactory:
         assert "/health" in rules
         assert "/api/stats" in rules
         assert "/api/verify-eos" in rules
+        assert "/api/compliance" in rules
 
 
 # ---------------------------------------------------------------------------

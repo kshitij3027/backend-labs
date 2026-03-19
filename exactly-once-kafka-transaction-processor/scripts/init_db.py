@@ -23,16 +23,22 @@ def main() -> None:
     # Verify
     session = session_factory()
     try:
-        from src.db.models import Account
+        from src.db.models import Account, ExchangeRate
 
         accounts = session.query(Account).all()
         print(f"\nAccounts in database ({len(accounts)}):")
         for acct in accounts:
             print(
                 f"  {acct.account_number}: type={acct.account_type}, "
-                f"balance={acct.balance}, daily_limit={acct.daily_limit}, "
-                f"credit_limit={acct.credit_limit}"
+                f"currency={acct.currency}, balance={acct.balance}, "
+                f"daily_limit={acct.daily_limit}, credit_limit={acct.credit_limit}"
             )
+
+        rates = session.query(ExchangeRate).all()
+        print(f"\nExchange rates in database ({len(rates)}):")
+        for r in rates:
+            print(f"  {r.from_currency} -> {r.to_currency}: {r.rate}")
+
         print("\nDatabase initialization complete.")
     finally:
         session.close()

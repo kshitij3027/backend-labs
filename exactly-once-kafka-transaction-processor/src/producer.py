@@ -17,6 +17,15 @@ logger = structlog.get_logger(__name__)
 
 ACCOUNT_POOL = ["ACC001", "ACC002", "ACC003", "ACC004", "ACC005"]
 
+# Account currency mapping for cross-currency transfer generation
+ACCOUNT_CURRENCIES = {
+    "ACC001": "USD",
+    "ACC002": "EUR",
+    "ACC003": "GBP",
+    "ACC004": "USD",
+    "ACC005": "USD",
+}
+
 
 class TransactionalProducer:
     """Idempotent, transactional Kafka producer for financial transactions."""
@@ -42,10 +51,26 @@ class TransactionalProducer:
         txn_type = random.choice(list(TransactionType))
 
         if txn_type == TransactionType.TRANSFER:
-            from_account = random.choice(ACCOUNT_POOL)
-            to_account = random.choice(
-                [acc for acc in ACCOUNT_POOL if acc != from_account]
-            )
+            # 30% chance of cross-currency transfer
+            if random.random() < 0.3:
+                # Pick accounts with different currencies
+                from_account = random.choice(ACCOUNT_POOL)
+                from_currency = ACCOUNT_CURRENCIES[from_account]
+                cross_candidates = [
+                    acc for acc in ACCOUNT_POOL
+                    if acc != from_account and ACCOUNT_CURRENCIES[acc] != from_currency
+                ]
+                if cross_candidates:
+                    to_account = random.choice(cross_candidates)
+                else:
+                    to_account = random.choice(
+                        [acc for acc in ACCOUNT_POOL if acc != from_account]
+                    )
+            else:
+                from_account = random.choice(ACCOUNT_POOL)
+                to_account = random.choice(
+                    [acc for acc in ACCOUNT_POOL if acc != from_account]
+                )
             amount = Decimal(str(round(random.uniform(10, 5000), 2)))
             return TransactionMessage(
                 transaction_id=str(uuid.uuid4()),

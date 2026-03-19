@@ -9,7 +9,7 @@ import structlog
 from confluent_kafka import Consumer, Producer, TopicPartition
 
 from src.config import Settings
-from src.db.models import Account, AccountType, Transaction
+from src.db.models import Account, AccountType, ExchangeRate, Transaction
 from src.db.session import get_engine, get_session_factory
 from src.models import TransactionMessage, TransactionType
 
@@ -185,8 +185,37 @@ class ExactlyOnceConsumer:
                 if not self._check_daily_limit(from_acct, msg.amount):
                     return self._fail_transaction(session, msg, "daily limit exceeded")
 
-                from_acct.balance -= msg.amount
-                to_acct.balance += msg.amount
+                from_currency = from_acct.currency or "USD"
+                to_currency = to_acct.currency or "USD"
+
+                if from_currency != to_currency:
+                    # Cross-currency transfer: look up exchange rate
+                    rate_row = (
+                        session.query(ExchangeRate)
+                        .filter_by(from_currency=from_currency, to_currency=to_currency)
+                        .first()
+                    )
+                    if rate_row is None:
+                        return self._fail_transaction(
+                            session, msg,
+                            f"no exchange rate found for {from_currency}->{to_currency}",
+                        )
+                    converted = msg.amount * Decimal(str(rate_row.rate))
+                    logger.info(
+                        "cross_currency_conversion",
+                        transaction_id=msg.transaction_id,
+                        from_currency=from_currency,
+                        to_currency=to_currency,
+                        original_amount=str(msg.amount),
+                        rate=str(rate_row.rate),
+                        converted_amount=str(converted),
+                    )
+                    from_acct.balance -= msg.amount
+                    to_acct.balance += converted
+                else:
+                    from_acct.balance -= msg.amount
+                    to_acct.balance += msg.amount
+
                 self._record_daily_spent(from_acct, msg.amount)
 
             elif msg.type == TransactionType.DEPOSIT:

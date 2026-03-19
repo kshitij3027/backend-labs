@@ -36,6 +36,9 @@ STAT_KEYS = {
     "success_rate",
     "accounts",
     "recent_transactions",
+    "by_account_type",
+    "large_transactions",
+    "compliance_summary",
 }
 
 
