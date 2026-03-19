@@ -70,6 +70,9 @@ class TransactionMonitor:
             {
                 "account_number": a.account_number,
                 "balance": float(a.balance),
+                "account_type": getattr(a, "account_type", "CHECKING") or "CHECKING",
+                "daily_limit": float(a.daily_limit) if getattr(a, "daily_limit", None) is not None else None,
+                "credit_limit": float(a.credit_limit) if getattr(a, "credit_limit", None) is not None else None,
             }
             for a in account_rows
         ]

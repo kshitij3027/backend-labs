@@ -9,11 +9,11 @@ from src.db.models import Account, Base
 logger = structlog.get_logger(__name__)
 
 SEED_ACCOUNTS = [
-    {"account_number": "ACC001", "balance": 10000.00},
-    {"account_number": "ACC002", "balance": 10000.00},
-    {"account_number": "ACC003", "balance": 10000.00},
-    {"account_number": "ACC004", "balance": 10000.00},
-    {"account_number": "ACC005", "balance": 10000.00},
+    {"account_number": "ACC001", "balance": 10000.00, "account_type": "CHECKING", "daily_limit": 5000.00},
+    {"account_number": "ACC002", "balance": 10000.00, "account_type": "SAVINGS", "daily_limit": None},
+    {"account_number": "ACC003", "balance": 10000.00, "account_type": "CHECKING", "daily_limit": 3000.00},
+    {"account_number": "ACC004", "balance": 0.00, "account_type": "CREDIT_CARD", "credit_limit": 5000.00, "daily_limit": 2000.00},
+    {"account_number": "ACC005", "balance": 10000.00, "account_type": "SAVINGS", "daily_limit": 10000.00},
 ]
 
 
@@ -49,6 +49,9 @@ def init_db(engine, session_factory: sessionmaker) -> None:
             account = Account(
                 account_number=acct_data["account_number"],
                 balance=acct_data["balance"],
+                account_type=acct_data.get("account_type", "CHECKING"),
+                daily_limit=acct_data.get("daily_limit"),
+                credit_limit=acct_data.get("credit_limit"),
             )
             session.add(account)
 

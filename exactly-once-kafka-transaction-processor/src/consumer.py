@@ -2,17 +2,21 @@
 
 import json
 import threading
+from datetime import date
 from decimal import Decimal
 
 import structlog
 from confluent_kafka import Consumer, Producer, TopicPartition
 
 from src.config import Settings
-from src.db.models import Account, Transaction
+from src.db.models import Account, AccountType, Transaction
 from src.db.session import get_engine, get_session_factory
 from src.models import TransactionMessage, TransactionType
 
 logger = structlog.get_logger(__name__)
+
+# Overdraft allowance for CHECKING accounts
+CHECKING_OVERDRAFT_LIMIT = Decimal("500.00")
 
 
 class ExactlyOnceConsumer:
@@ -53,6 +57,86 @@ class ExactlyOnceConsumer:
             group_id=config.consumer_group_id,
             topic=config.topic_pending,
         )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_sufficient_funds(account: Account, amount: Decimal) -> bool:
+        """Return True if *account* can support a debit of *amount*.
+
+        Rules by account type:
+        - CHECKING: balance can go down to -500 (overdraft protection)
+        - SAVINGS:  balance must stay >= 0
+        - CREDIT_CARD: balance can go negative down to -credit_limit
+        - Default (unknown type): treated as CHECKING for backwards compat
+        """
+        acct_type = account.account_type or AccountType.CHECKING.value
+
+        if acct_type == AccountType.SAVINGS.value:
+            return account.balance - amount >= 0
+
+        if acct_type == AccountType.CREDIT_CARD.value:
+            limit = account.credit_limit or Decimal("0")
+            return account.balance - amount >= -limit
+
+        # CHECKING (or legacy accounts without type)
+        return account.balance - amount >= -CHECKING_OVERDRAFT_LIMIT
+
+    @staticmethod
+    def _check_daily_limit(account: Account, amount: Decimal) -> bool:
+        """Return True if the debit does not exceed the daily spending limit.
+
+        If daily_limit is None the account has no daily cap.
+        Resets daily_spent when the date rolls over.
+        """
+        if account.daily_limit is None:
+            return True
+
+        today = date.today()
+
+        # Reset counter on a new day
+        if account.daily_spent_date is None or account.daily_spent_date != today:
+            account.daily_spent = Decimal("0")
+            account.daily_spent_date = today
+
+        return account.daily_spent + amount <= account.daily_limit
+
+    @staticmethod
+    def _record_daily_spent(account: Account, amount: Decimal) -> None:
+        """Increment the daily spending counter after a successful debit."""
+        if account.daily_limit is None:
+            return
+
+        today = date.today()
+        if account.daily_spent_date is None or account.daily_spent_date != today:
+            account.daily_spent = Decimal("0")
+            account.daily_spent_date = today
+
+        account.daily_spent += amount
+
+    def _fail_transaction(
+        self, session, msg: TransactionMessage, error: str
+    ) -> tuple[str, str]:
+        """Record a failed transaction and return the failure tuple."""
+        txn_record = Transaction(
+            transaction_id=msg.transaction_id,
+            type=msg.type.value,
+            from_account=msg.from_account,
+            to_account=msg.to_account,
+            amount=msg.amount,
+            status="failed",
+            processed=True,
+            error_message=error,
+        )
+        session.add(txn_record)
+        session.commit()
+        return ("failed", error)
+
+    # ------------------------------------------------------------------
+    # Main processing
+    # ------------------------------------------------------------------
 
     def process_transaction(
         self, session, msg: TransactionMessage
@@ -95,24 +179,15 @@ class ExactlyOnceConsumer:
                 if from_acct is None or to_acct is None:
                     return ("failed", "account not found")
 
-                if from_acct.balance < msg.amount:
-                    # Record the failed transaction
-                    txn_record = Transaction(
-                        transaction_id=msg.transaction_id,
-                        type=msg.type.value,
-                        from_account=msg.from_account,
-                        to_account=msg.to_account,
-                        amount=msg.amount,
-                        status="failed",
-                        processed=True,
-                        error_message="insufficient funds",
-                    )
-                    session.add(txn_record)
-                    session.commit()
-                    return ("failed", "insufficient funds")
+                if not self._check_sufficient_funds(from_acct, msg.amount):
+                    return self._fail_transaction(session, msg, "insufficient funds")
+
+                if not self._check_daily_limit(from_acct, msg.amount):
+                    return self._fail_transaction(session, msg, "daily limit exceeded")
 
                 from_acct.balance -= msg.amount
                 to_acct.balance += msg.amount
+                self._record_daily_spent(from_acct, msg.amount)
 
             elif msg.type == TransactionType.DEPOSIT:
                 to_acct = (
@@ -126,7 +201,7 @@ class ExactlyOnceConsumer:
 
                 to_acct.balance += msg.amount
 
-            elif msg.type == TransactionType.WITHDRAWAL:
+            elif msg.type in (TransactionType.WITHDRAWAL, TransactionType.PAYMENT):
                 from_acct = (
                     session.query(Account)
                     .filter_by(account_number=msg.from_account)
@@ -136,22 +211,14 @@ class ExactlyOnceConsumer:
                 if from_acct is None:
                     return ("failed", "account not found")
 
-                if from_acct.balance < msg.amount:
-                    txn_record = Transaction(
-                        transaction_id=msg.transaction_id,
-                        type=msg.type.value,
-                        from_account=msg.from_account,
-                        to_account=msg.to_account,
-                        amount=msg.amount,
-                        status="failed",
-                        processed=True,
-                        error_message="insufficient funds",
-                    )
-                    session.add(txn_record)
-                    session.commit()
-                    return ("failed", "insufficient funds")
+                if not self._check_sufficient_funds(from_acct, msg.amount):
+                    return self._fail_transaction(session, msg, "insufficient funds")
+
+                if not self._check_daily_limit(from_acct, msg.amount):
+                    return self._fail_transaction(session, msg, "daily limit exceeded")
 
                 from_acct.balance -= msg.amount
+                self._record_daily_spent(from_acct, msg.amount)
 
             # Record the successful transaction
             txn_record = Transaction(

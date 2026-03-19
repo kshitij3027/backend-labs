@@ -16,6 +16,7 @@ class TransactionType(str, Enum):
     TRANSFER = "TRANSFER"
     DEPOSIT = "DEPOSIT"
     WITHDRAWAL = "WITHDRAWAL"
+    PAYMENT = "PAYMENT"
 
 
 class TransactionMessage(BaseModel):

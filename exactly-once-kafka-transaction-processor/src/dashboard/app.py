@@ -7,7 +7,7 @@ from decimal import Decimal
 from flask import Flask, jsonify, render_template
 
 from src.config import Settings
-from src.db.models import Account, Transaction
+from src.db.models import Account, AccountType, Transaction
 from src.db.session import get_engine, get_session_factory
 from src.monitor import TransactionMonitor
 
@@ -33,7 +33,7 @@ def register_process(name: str, process, target_fn, config_dict: dict) -> None:
 # App factory
 # ---------------------------------------------------------------------------
 
-INITIAL_TOTAL_BALANCE = Decimal("50000.00")
+INITIAL_TOTAL_BALANCE = Decimal("40000.00")
 
 
 def create_app(config: Settings | None = None) -> Flask:
@@ -147,30 +147,47 @@ def create_app(config: Settings | None = None) -> Flask:
                 .scalar()
                 or Decimal("0")
             )
-            expected = INITIAL_TOTAL_BALANCE + deposit_sum - withdrawal_sum
+            payment_sum = (
+                session.query(func.sum(Transaction.amount))
+                .filter(Transaction.type == "PAYMENT", Transaction.status == "completed")
+                .scalar()
+                or Decimal("0")
+            )
+            expected = INITIAL_TOTAL_BALANCE + deposit_sum - withdrawal_sum - payment_sum
             balance_ok = current_total == expected
             checks.append({
                 "name": "balance_conservation",
                 "passed": balance_ok,
                 "details": (
                     f"expected={float(expected)}, actual={float(current_total)}, "
-                    f"deposits={float(deposit_sum)}, withdrawals={float(withdrawal_sum)}"
+                    f"deposits={float(deposit_sum)}, withdrawals={float(withdrawal_sum)}, "
+                    f"payments={float(payment_sum)}"
                 ),
             })
 
-            # Check 3: No negative balances
-            negatives = (
-                session.query(Account.account_number, Account.balance)
-                .filter(Account.balance < 0)
-                .all()
-            )
+            # Check 3: No balances below allowed floor per account type
+            all_accounts = session.query(Account).all()
+            violations = []
+            for acct in all_accounts:
+                acct_type = getattr(acct, "account_type", "CHECKING") or "CHECKING"
+                if acct_type == AccountType.SAVINGS.value:
+                    if acct.balance < 0:
+                        violations.append(acct.account_number)
+                elif acct_type == AccountType.CREDIT_CARD.value:
+                    limit = acct.credit_limit or Decimal("0")
+                    if acct.balance < -limit:
+                        violations.append(acct.account_number)
+                else:
+                    # CHECKING — overdraft up to -500
+                    if acct.balance < Decimal("-500"):
+                        violations.append(acct.account_number)
             checks.append({
-                "name": "no_negative_balances",
-                "passed": len(negatives) == 0,
+                "name": "no_balance_violations",
+                "passed": len(violations) == 0,
                 "details": (
-                    f"negative_accounts={[a[0] for a in negatives]}"
-                    if negatives
-                    else "all accounts non-negative"
+                    f"violation_accounts={violations}"
+                    if violations
+                    else "all accounts within limits"
                 ),
             })
 

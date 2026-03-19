@@ -15,9 +15,10 @@ class TestTransactionType:
         assert TransactionType.TRANSFER.value == "TRANSFER"
         assert TransactionType.DEPOSIT.value == "DEPOSIT"
         assert TransactionType.WITHDRAWAL.value == "WITHDRAWAL"
+        assert TransactionType.PAYMENT.value == "PAYMENT"
 
-    def test_enum_has_exactly_three_members(self):
-        assert len(TransactionType) == 3
+    def test_enum_has_exactly_four_members(self):
+        assert len(TransactionType) == 4
 
 
 class TestTransactionMessageSerialization:

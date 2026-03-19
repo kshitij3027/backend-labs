@@ -23,20 +23,22 @@ def app():
     session = session_factory()
 
     # Seed accounts — balances must be consistent with the seeded transactions.
-    # Initial total was 50000.  Completed deposit of 500 to ACC001 means
-    # ACC001 should be 10500.  Transfer of 200 from ACC001->ACC002 means
-    # ACC001 = 10300, ACC002 = 10200.  Withdrawal of 100 from ACC003 FAILED,
-    # so ACC003 stays at 10000.  Expected total = 50000 + 500 = 50500.
-    for acct_no, balance in [
-        ("ACC001", "10300.00"),
-        ("ACC002", "10200.00"),
-        ("ACC003", "10000.00"),
-        ("ACC004", "10000.00"),
-        ("ACC005", "10000.00"),
+    # Initial total was 40000 (ACC004 is CREDIT_CARD starting at 0).
+    # Completed deposit of 500 to ACC001 means ACC001 should be 10500.
+    # Transfer of 200 from ACC001->ACC002 means ACC001 = 10300, ACC002 = 10200.
+    # Withdrawal of 100 from ACC003 FAILED, so ACC003 stays at 10000.
+    # Expected total = 40000 + 500 = 40500.
+    for acct_no, balance, acct_type in [
+        ("ACC001", "10300.00", "CHECKING"),
+        ("ACC002", "10200.00", "SAVINGS"),
+        ("ACC003", "10000.00", "CHECKING"),
+        ("ACC004", "0.00", "CREDIT_CARD"),
+        ("ACC005", "10000.00", "SAVINGS"),
     ]:
         session.add(Account(
             account_number=acct_no,
             balance=Decimal(balance),
+            account_type=acct_type,
         ))
 
     # Seed transactions

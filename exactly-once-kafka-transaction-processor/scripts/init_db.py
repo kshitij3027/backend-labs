@@ -28,7 +28,11 @@ def main() -> None:
         accounts = session.query(Account).all()
         print(f"\nAccounts in database ({len(accounts)}):")
         for acct in accounts:
-            print(f"  {acct.account_number}: balance={acct.balance}")
+            print(
+                f"  {acct.account_number}: type={acct.account_type}, "
+                f"balance={acct.balance}, daily_limit={acct.daily_limit}, "
+                f"credit_limit={acct.credit_limit}"
+            )
         print("\nDatabase initialization complete.")
     finally:
         session.close()

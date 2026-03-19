@@ -14,10 +14,10 @@ from decimal import Decimal
 from sqlalchemy import func, text
 
 from src.config import load_config
-from src.db.models import Account, Transaction
+from src.db.models import Account, AccountType, Transaction
 from src.db.session import get_engine, get_session_factory
 
-INITIAL_TOTAL_BALANCE = Decimal("50000.00")  # 5 accounts x 10 000
+INITIAL_TOTAL_BALANCE = Decimal("40000.00")  # ACC001-003,005 @ 10000 + ACC004 @ 0
 
 
 def check_no_duplicate_transaction_ids(session) -> bool:
@@ -61,39 +61,57 @@ def check_balance_conservation(session) -> bool:
         or Decimal("0")
     )
 
-    expected = INITIAL_TOTAL_BALANCE + deposit_sum - withdrawal_sum
+    payment_sum = (
+        session.query(func.sum(Transaction.amount))
+        .filter(Transaction.type == "PAYMENT", Transaction.status == "completed")
+        .scalar()
+        or Decimal("0")
+    )
+
+    expected = INITIAL_TOTAL_BALANCE + deposit_sum - withdrawal_sum - payment_sum
 
     if current_total != expected:
         print("FAIL  Balance-conservation")
         print(f"       expected={expected}  actual={current_total}")
         print(
             f"       initial={INITIAL_TOTAL_BALANCE}  "
-            f"deposits={deposit_sum}  withdrawals={withdrawal_sum}"
+            f"deposits={deposit_sum}  withdrawals={withdrawal_sum}  payments={payment_sum}"
         )
         return False
 
     print(
         f"PASS  Balance-conservation  "
-        f"(balance={current_total}, deposits={deposit_sum}, withdrawals={withdrawal_sum})"
+        f"(balance={current_total}, deposits={deposit_sum}, "
+        f"withdrawals={withdrawal_sum}, payments={payment_sum})"
     )
     return True
 
 
-def check_no_negative_balances(session) -> bool:
-    """No account should have a negative balance."""
-    negatives = (
-        session.query(Account.account_number, Account.balance)
-        .filter(Account.balance < 0)
-        .all()
-    )
+def check_no_balance_violations(session) -> bool:
+    """No account should exceed its allowed floor by account type."""
+    accounts = session.query(Account).all()
+    violations = []
 
-    if negatives:
-        print("FAIL  No-negative-balances")
-        for acct, bal in negatives:
-            print(f"       account={acct}  balance={bal}")
+    for acct in accounts:
+        acct_type = acct.account_type or AccountType.CHECKING.value
+        if acct_type == AccountType.SAVINGS.value:
+            if acct.balance < 0:
+                violations.append(f"{acct.account_number}={acct.balance}")
+        elif acct_type == AccountType.CREDIT_CARD.value:
+            limit = acct.credit_limit or Decimal("0")
+            if acct.balance < -limit:
+                violations.append(f"{acct.account_number}={acct.balance} (limit={limit})")
+        else:  # CHECKING
+            if acct.balance < Decimal("-500"):
+                violations.append(f"{acct.account_number}={acct.balance}")
+
+    if violations:
+        print("FAIL  No-balance-violations")
+        for v in violations:
+            print(f"       {v}")
         return False
 
-    print("PASS  No-negative-balances")
+    print("PASS  No-balance-violations")
     return True
 
 
@@ -111,7 +129,7 @@ def main() -> int:
     try:
         results.append(check_no_duplicate_transaction_ids(session))
         results.append(check_balance_conservation(session))
-        results.append(check_no_negative_balances(session))
+        results.append(check_no_balance_violations(session))
     finally:
         session.close()
         engine.dispose()

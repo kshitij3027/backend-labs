@@ -1,8 +1,11 @@
 """SQLAlchemy ORM models for accounts and transactions."""
 
+import enum
+
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     Index,
     Integer,
@@ -15,6 +18,14 @@ from sqlalchemy.orm import declarative_base
 Base = declarative_base()
 
 
+class AccountType(str, enum.Enum):
+    """Types of bank accounts."""
+
+    CHECKING = "CHECKING"
+    SAVINGS = "SAVINGS"
+    CREDIT_CARD = "CREDIT_CARD"
+
+
 class Account(Base):
     """Bank account with a tracked balance."""
 
@@ -22,7 +33,12 @@ class Account(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     account_number = Column(String(32), unique=True, nullable=False)
+    account_type = Column(String(32), nullable=False, default="CHECKING")
     balance = Column(Numeric(15, 2), nullable=False, default=0)
+    daily_limit = Column(Numeric(15, 2), nullable=True)
+    credit_limit = Column(Numeric(15, 2), nullable=True)
+    daily_spent = Column(Numeric(15, 2), nullable=False, default=0)
+    daily_spent_date = Column(Date, nullable=True)
     updated_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -30,7 +46,10 @@ class Account(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<Account(account_number={self.account_number}, balance={self.balance})>"
+        return (
+            f"<Account(account_number={self.account_number}, "
+            f"type={self.account_type}, balance={self.balance})>"
+        )
 
 
 class Transaction(Base):
