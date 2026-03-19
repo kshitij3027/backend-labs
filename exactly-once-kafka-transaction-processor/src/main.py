@@ -16,22 +16,25 @@ from src.producer import TransactionalProducer
 logger = structlog.get_logger(__name__)
 
 
-def run_producer(config_dict: dict, shutdown_event: multiprocessing.Event) -> None:
+def run_producer(config_dict: dict, shutdown_event) -> None:
     """Child process target for the transactional producer."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     config = Settings(**config_dict)
     producer = TransactionalProducer(config)
     producer.run(shutdown_event)
 
 
-def run_consumer(config_dict: dict, shutdown_event: multiprocessing.Event) -> None:
+def run_consumer(config_dict: dict, shutdown_event) -> None:
     """Child process target for the exactly-once consumer."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     config = Settings(**config_dict)
     consumer = ExactlyOnceConsumer(config)
     consumer.run(shutdown_event)
 
 
-def run_monitor(config_dict: dict, shutdown_event: multiprocessing.Event) -> None:
+def run_monitor(config_dict: dict, shutdown_event) -> None:
     """Child process target for the transaction monitor."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     config = Settings(**config_dict)
     monitor = TransactionMonitor(config)
     monitor.run(shutdown_event)
@@ -50,12 +53,17 @@ def main() -> None:
         name="producer",
         daemon=True,
     )
+
+    # Consumer gets its own shutdown event so crash injection can restart it
+    # without affecting other processes
+    consumer_shutdown = multiprocessing.Event()
     consumer_process = multiprocessing.Process(
         target=run_consumer,
-        args=(config_dict, shutdown_event),
+        args=(config_dict, consumer_shutdown),
         name="consumer",
         daemon=True,
     )
+
     monitor_process = multiprocessing.Process(
         target=run_monitor,
         args=(config_dict, shutdown_event),
@@ -70,17 +78,24 @@ def main() -> None:
         sig_name = signal.Signals(signum).name
         logger.info("shutdown_signal_received", signal=sig_name)
         shutdown_event.set()
+        consumer_shutdown.set()
 
         for proc in processes:
-            if proc.is_alive():
-                logger.info("terminating_process", name=proc.name)
-                proc.terminate()
+            try:
+                if proc.is_alive():
+                    logger.info("terminating_process", name=proc.name)
+                    proc.terminate()
+            except Exception:
+                pass
 
         for proc in processes:
-            proc.join(timeout=10)
-            if proc.is_alive():
-                logger.warning("force_killing_process", name=proc.name)
-                proc.kill()
+            try:
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    logger.warning("force_killing_process", name=proc.name)
+                    proc.kill()
+            except Exception:
+                pass
 
         logger.info("all_processes_stopped")
         sys.exit(0)
@@ -94,7 +109,9 @@ def main() -> None:
         logger.info("process_started", name=proc.name, pid=proc.pid)
 
     # Register consumer process for failure injection
-    register_process("consumer", consumer_process, run_consumer, (config_dict, shutdown_event))
+    register_process(
+        "consumer", consumer_process, run_consumer, config_dict
+    )
 
     # Run Flask dashboard in the main process
     app = create_app(config)

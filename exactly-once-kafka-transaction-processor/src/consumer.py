@@ -28,6 +28,8 @@ class ExactlyOnceConsumer:
                 "auto.offset.reset": "earliest",
                 "enable.auto.commit": False,
                 "isolation.level": "read_committed",
+                "session.timeout.ms": 10000,
+                "heartbeat.interval.ms": 3000,
             }
         )
 

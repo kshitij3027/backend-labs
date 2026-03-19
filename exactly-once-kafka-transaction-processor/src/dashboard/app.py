@@ -20,12 +20,12 @@ from sqlalchemy import func
 _process_registry: dict = {}
 
 
-def register_process(name: str, process, target_fn, args: tuple) -> None:
+def register_process(name: str, process, target_fn, config_dict: dict) -> None:
     """Store a process reference and its restart info for failure injection."""
     _process_registry[name] = {
         "process": process,
         "target_fn": target_fn,
-        "args": args,
+        "config_dict": config_dict,
     }
 
 
@@ -190,17 +190,22 @@ def create_app(config: Settings | None = None) -> Flask:
 
         old_process = entry["process"]
         target_fn = entry["target_fn"]
-        args = entry["args"]
+        config_dict = entry["config_dict"]
 
         # Terminate the running consumer
+        old_pid = old_process.pid
         if old_process.is_alive():
             old_process.terminate()
             old_process.join(timeout=5)
+            if old_process.is_alive():
+                old_process.kill()
+                old_process.join(timeout=3)
 
-        # Restart the consumer
+        # Restart the consumer with a fresh shutdown event
+        new_shutdown = multiprocessing.Event()
         new_process = multiprocessing.Process(
             target=target_fn,
-            args=args,
+            args=(config_dict, new_shutdown),
             name="consumer",
             daemon=True,
         )
@@ -212,7 +217,7 @@ def create_app(config: Settings | None = None) -> Flask:
         return jsonify({
             "status": "success",
             "message": "Consumer crashed and restarted",
-            "old_pid": old_process.pid,
+            "old_pid": old_pid,
             "new_pid": new_process.pid,
         })
 
