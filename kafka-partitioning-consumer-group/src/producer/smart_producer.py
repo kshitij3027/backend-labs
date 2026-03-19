@@ -58,13 +58,34 @@ class SmartProducer:
         """Send a log entry to Kafka."""
         partition = self._calculate_partition(entry)
         key = entry.partition_key()
-        self._producer.produce(
-            topic=self._topic,
-            value=entry.to_kafka_value(),
-            key=key.encode() if key else None,
-            partition=partition,
-            callback=self._delivery_callback,
-        )
+        try:
+            self._producer.produce(
+                topic=self._topic,
+                value=entry.to_kafka_value(),
+                key=key.encode() if key else None,
+                partition=partition,
+                callback=self._delivery_callback,
+            )
+        except BufferError:
+            self._producer.poll(1.0)
+            try:
+                self._producer.produce(
+                    topic=self._topic,
+                    value=entry.to_kafka_value(),
+                    key=key.encode() if key else None,
+                    partition=partition,
+                    callback=self._delivery_callback,
+                )
+            except Exception as e:
+                logger.error("Failed to produce after retry: %s", e)
+                with self._lock:
+                    self._stats["errors"] += 1
+                return
+        except KafkaException as e:
+            logger.error("Kafka error producing message: %s", e)
+            with self._lock:
+                self._stats["errors"] += 1
+            return
         self._producer.poll(0)
 
     def flush(self, timeout: float = 10.0) -> int:

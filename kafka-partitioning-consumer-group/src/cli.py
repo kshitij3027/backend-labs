@@ -55,6 +55,9 @@ def run(consumers, rate, duration, mode):
         return
 
     # CLI mode
+    import time as _time
+    from src.monitoring.cli_dashboard import CLIDashboard
+
     metrics = MetricsCollector()
     shutdown = threading.Event()
 
@@ -70,49 +73,40 @@ def run(consumers, rate, duration, mode):
     coordinator.start()
     logger.info("Consumer group started with %d consumers", settings.num_consumers)
 
-    # Start producer
+    # Start producer in background thread
     producer = SmartProducer(settings)
     generator = LogGenerator(settings)
-    logger.info("Producer started at %d msg/s", settings.producer_rate)
 
-    interval = 1.0 / settings.producer_rate if settings.producer_rate > 0 else 1.0
-    start_time = time.time()
-    produced_count = 0
-
-    try:
+    def producer_loop():
+        interval = 1.0 / settings.producer_rate if settings.producer_rate > 0 else 1.0
+        start_time = _time.time()
         while not shutdown.is_set():
-            # Check duration
-            if settings.duration > 0 and (time.time() - start_time) >= settings.duration:
-                logger.info("Duration reached (%ds), stopping...", settings.duration)
+            if settings.duration > 0 and (_time.time() - start_time) >= settings.duration:
+                logger.info("Duration reached (%ds)", settings.duration)
+                shutdown.set()
                 break
-
-            # Produce a message
             entry = generator.generate_one()
             producer.produce(entry)
-            produced_count += 1
-
-            if produced_count % 100 == 0:
-                snap = metrics.snapshot()
-                logger.info(
-                    "Progress: produced=%d, consumed=%d, errors=%d",
-                    produced_count, snap["total_consumed"], snap["total_errors"],
-                )
-
-            # Rate limiting
             shutdown.wait(interval)
+        producer.flush()
 
-    except Exception as e:
-        logger.error("Error in main loop: %s", e)
+    producer_thread = threading.Thread(target=producer_loop, daemon=True)
+    producer_thread.start()
+    logger.info("Producer started at %d msg/s", settings.producer_rate)
+
+    # Run Rich dashboard in main thread
+    dashboard = CLIDashboard(metrics, producer_stats_fn=lambda: producer.stats)
+    try:
+        dashboard.run(shutdown)
+    except KeyboardInterrupt:
+        shutdown.set()
     finally:
         logger.info("Shutting down...")
-        producer.flush()
-        logger.info("Producer flushed. Stats: %s", producer.stats)
+        shutdown.set()
+        producer_thread.join(timeout=5)
         coordinator.stop()
         snap = metrics.snapshot()
-        logger.info(
-            "Final: consumed=%d, errors=%d, partitions=%s",
-            snap["total_consumed"], snap["total_errors"], snap["per_partition"],
-        )
+        logger.info("Final: consumed=%d, errors=%d", snap["total_consumed"], snap["total_errors"])
         logger.info("Shutdown complete.")
 
 

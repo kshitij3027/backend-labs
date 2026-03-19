@@ -2,7 +2,7 @@
 import logging
 import threading
 import time
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, KafkaException
 from src.config import Settings
 from src.consumer.log_processor import LogProcessor
 from src.consumer.rebalance_handler import RebalanceHandler
@@ -89,20 +89,31 @@ class ConsumerGroupCoordinator:
 
         try:
             while not self._shutdown.is_set():
-                msg = consumer.poll(timeout=1.0)
+                try:
+                    msg = consumer.poll(timeout=1.0)
+                except KafkaException as e:
+                    logger.error("Consumer %s poll error: %s", consumer_id, e)
+                    self._metrics.record_error(consumer_id)
+                    time.sleep(0.5)
+                    continue
+
                 if msg is None:
                     continue
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
                     logger.error("Consumer %s error: %s", consumer_id, msg.error())
+                    self._metrics.record_error(consumer_id)
                     continue
 
                 entry = processor.process(msg)
                 if entry:
                     batch_count += 1
                     if batch_count >= commit_interval:
-                        consumer.commit(asynchronous=False)
+                        try:
+                            consumer.commit(asynchronous=False)
+                        except KafkaException as e:
+                            logger.warning("Consumer %s commit failed, will retry: %s", consumer_id, e)
                         batch_count = 0
 
             # Final commit before exiting
