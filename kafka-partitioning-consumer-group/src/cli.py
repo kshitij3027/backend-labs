@@ -48,8 +48,10 @@ def run(consumers, rate, duration, mode):
     )
 
     if mode == "web":
-        # Web mode placeholder — will be implemented in Commit 5
-        logger.info("Web mode not yet implemented. Use --mode cli.")
+        from src.monitoring.web_dashboard import create_app
+        import uvicorn
+        app = create_app(settings, num_consumers=consumers, rate=rate, duration=duration)
+        uvicorn.run(app, host=settings.dashboard_host, port=settings.dashboard_port, log_level="info")
         return
 
     # CLI mode

@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Partitioning & Consumer Group Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            background: #0f172a; color: #e2e8f0;
+            padding: 20px;
+        }
+        h1 { text-align: center; margin-bottom: 20px; color: #38bdf8; }
+        h2 { color: #94a3b8; margin-bottom: 10px; font-size: 1.1em; text-transform: uppercase; letter-spacing: 1px; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+        .card {
+            background: #1e293b; border-radius: 12px; padding: 20px;
+            border: 1px solid #334155;
+        }
+        .full-width { grid-column: 1 / -1; }
+        .stats-row { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-card {
+            flex: 1; background: #1e293b; border-radius: 12px; padding: 20px;
+            text-align: center; border: 1px solid #334155;
+        }
+        .stat-value { font-size: 2em; font-weight: bold; color: #38bdf8; }
+        .stat-label { color: #94a3b8; margin-top: 5px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid #334155; }
+        th { color: #94a3b8; font-weight: 600; }
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+        .status-online { background: #22c55e; }
+        .status-offline { background: #ef4444; }
+        .ws-status { position: fixed; top: 10px; right: 20px; padding: 6px 12px; border-radius: 20px; font-size: 0.85em; }
+        .ws-connected { background: #166534; color: #4ade80; }
+        .ws-disconnected { background: #7f1d1d; color: #fca5a5; }
+        canvas { max-height: 250px; }
+        .rebalance-log { max-height: 200px; overflow-y: auto; }
+    </style>
+</head>
+<body>
+    <div class="ws-status ws-disconnected" id="wsStatus">Disconnected</div>
+    <h1>Kafka Partitioning & Consumer Group Dashboard</h1>
+
+    <div class="stats-row">
+        <div class="stat-card">
+            <div class="stat-value" id="totalConsumed">0</div>
+            <div class="stat-label">Total Messages</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="totalErrors">0</div>
+            <div class="stat-label">Errors</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="uptime">0s</div>
+            <div class="stat-label">Uptime</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="throughput">0</div>
+            <div class="stat-label">Messages/sec</div>
+        </div>
+    </div>
+
+    <div class="grid">
+        <div class="card">
+            <h2>Partition Assignment Map</h2>
+            <table>
+                <thead><tr><th>Partition</th><th>Consumer</th><th>Messages</th><th>Lag</th></tr></thead>
+                <tbody id="partitionTable"></tbody>
+            </table>
+        </div>
+        <div class="card">
+            <h2>Per-Consumer Load</h2>
+            <canvas id="consumerChart"></canvas>
+        </div>
+        <div class="card">
+            <h2>Throughput Over Time</h2>
+            <canvas id="throughputChart"></canvas>
+        </div>
+        <div class="card">
+            <h2>Partition Distribution</h2>
+            <canvas id="partitionChart"></canvas>
+        </div>
+        <div class="card full-width">
+            <h2>Rebalance Events</h2>
+            <div class="rebalance-log">
+                <table>
+                    <thead><tr><th>Time</th><th>Type</th><th>Consumer</th><th>Partitions</th></tr></thead>
+                    <tbody id="rebalanceTable"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Charts
+        const throughputCtx = document.getElementById('throughputChart').getContext('2d');
+        const throughputChart = new Chart(throughputCtx, {
+            type: 'line',
+            data: { labels: [], datasets: [{ label: 'Messages/sec', data: [], borderColor: '#38bdf8', backgroundColor: 'rgba(56,189,248,0.1)', fill: true, tension: 0.3 }] },
+            options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }, x: { ticks: { color: '#94a3b8', maxTicksLimit: 10 }, grid: { color: '#334155' } } }, plugins: { legend: { labels: { color: '#e2e8f0' } } } }
+        });
+
+        const consumerCtx = document.getElementById('consumerChart').getContext('2d');
+        const consumerChart = new Chart(consumerCtx, {
+            type: 'bar',
+            data: { labels: [], datasets: [{ label: 'Messages Consumed', data: [], backgroundColor: '#38bdf8' }] },
+            options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }, x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } } }, plugins: { legend: { labels: { color: '#e2e8f0' } } } }
+        });
+
+        const partitionCtx = document.getElementById('partitionChart').getContext('2d');
+        const partitionChart = new Chart(partitionCtx, {
+            type: 'doughnut',
+            data: { labels: [], datasets: [{ data: [], backgroundColor: ['#38bdf8', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6'] }] },
+            options: { responsive: true, plugins: { legend: { labels: { color: '#e2e8f0' } } } }
+        });
+
+        let prevConsumed = 0;
+        let throughputData = [];
+
+        function updateDashboard(data) {
+            // Stats
+            document.getElementById('totalConsumed').textContent = (data.total_consumed || 0).toLocaleString();
+            document.getElementById('totalErrors').textContent = data.total_errors || 0;
+            document.getElementById('uptime').textContent = Math.round(data.uptime_seconds || 0) + 's';
+
+            // Throughput
+            const currentConsumed = data.total_consumed || 0;
+            const mps = currentConsumed - prevConsumed;
+            prevConsumed = currentConsumed;
+            document.getElementById('throughput').textContent = mps;
+
+            throughputData.push(mps);
+            if (throughputData.length > 60) throughputData.shift();
+            throughputChart.data.labels = throughputData.map((_, i) => i);
+            throughputChart.data.datasets[0].data = throughputData;
+            throughputChart.update('none');
+
+            // Partition table
+            const partTable = document.getElementById('partitionTable');
+            const consumerPartitions = {};
+            if (data.per_consumer) {
+                Object.entries(data.per_consumer).forEach(([cid, info]) => {
+                    (info.partitions || []).forEach(p => { consumerPartitions[p] = cid; });
+                });
+            }
+            let rows = '';
+            for (let i = 0; i < 6; i++) {
+                const count = (data.per_partition && data.per_partition[i]) || 0;
+                const consumer = consumerPartitions[i] || '-';
+                const lag = (data.lag && data.lag[i]) || 0;
+                const dot = consumer !== '-' ? '<span class="status-dot status-online"></span>' : '<span class="status-dot status-offline"></span>';
+                rows += `<tr><td>${dot}Partition ${i}</td><td>${consumer}</td><td>${count.toLocaleString()}</td><td>${lag}</td></tr>`;
+            }
+            partTable.innerHTML = rows;
+
+            // Consumer chart
+            if (data.per_consumer) {
+                const labels = Object.keys(data.per_consumer);
+                const values = labels.map(k => data.per_consumer[k].consumed || 0);
+                consumerChart.data.labels = labels;
+                consumerChart.data.datasets[0].data = values;
+                consumerChart.update('none');
+            }
+
+            // Partition chart
+            if (data.per_partition) {
+                const labels = Object.keys(data.per_partition).map(k => `P${k}`);
+                const values = Object.values(data.per_partition);
+                partitionChart.data.labels = labels;
+                partitionChart.data.datasets[0].data = values;
+                partitionChart.update('none');
+            }
+
+            // Rebalance events
+            if (data.rebalance_events) {
+                const rebalTable = document.getElementById('rebalanceTable');
+                let rebalRows = '';
+                data.rebalance_events.slice(-10).reverse().forEach(evt => {
+                    const time = new Date(evt.timestamp * 1000).toLocaleTimeString();
+                    rebalRows += `<tr><td>${time}</td><td>${evt.type}</td><td>${evt.consumer_id || '-'}</td><td>${(evt.partitions || []).join(', ')}</td></tr>`;
+                });
+                rebalTable.innerHTML = rebalRows;
+            }
+        }
+
+        // WebSocket
+        function connectWS() {
+            const wsEl = document.getElementById('wsStatus');
+            const ws = new WebSocket(`ws://${location.host}/ws`);
+            ws.onopen = () => { wsEl.className = 'ws-status ws-connected'; wsEl.textContent = 'Connected'; };
+            ws.onmessage = (e) => { updateDashboard(JSON.parse(e.data)); };
+            ws.onclose = () => {
+                wsEl.className = 'ws-status ws-disconnected'; wsEl.textContent = 'Disconnected';
+                setTimeout(connectWS, 3000);
+            };
+            ws.onerror = () => { ws.close(); };
+        }
+        connectWS();
+    </script>
+</body>
+</html>

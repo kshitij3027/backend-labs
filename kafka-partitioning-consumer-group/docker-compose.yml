@@ -73,7 +73,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     stdin_open: false
     tty: false
-    command: ["python", "-m", "src.cli", "run", "--mode", "cli", "--duration", "60"]
+    command: ["python", "-m", "src.cli", "run", "--mode", "web", "--duration", "0"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

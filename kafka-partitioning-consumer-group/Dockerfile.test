@@ -8,6 +8,7 @@ ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
 COPY src/ src/
+COPY static/ static/
 COPY tests/ tests/
 COPY pytest.ini .
 
