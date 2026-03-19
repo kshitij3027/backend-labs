@@ -21,6 +21,7 @@ class ConsumerGroupCoordinator:
         self._threads: list[threading.Thread] = []
         self._consumers: list[Consumer] = []
         self._lock = threading.Lock()
+        self._next_id = settings.num_consumers
 
     def start(self) -> None:
         """Start all consumer threads."""
@@ -59,6 +60,47 @@ class ConsumerGroupCoordinator:
     @property
     def active_consumers(self) -> int:
         return len([t for t in self._threads if t.is_alive()])
+
+    def add_consumer(self) -> str | None:
+        """Dynamically add a new consumer thread. Returns consumer_id or None if at max."""
+        with self._lock:
+            current = len([t for t in self._threads if t.is_alive()])
+            if current >= self._settings.max_consumers:
+                logger.warning("Cannot add consumer: at max (%d)", self._settings.max_consumers)
+                return None
+            consumer_id = f"consumer-{self._next_id}"
+            self._next_id += 1
+
+        t = threading.Thread(
+            target=self._consumer_loop,
+            args=(consumer_id,),
+            name=consumer_id,
+            daemon=True,
+        )
+        with self._lock:
+            self._threads.append(t)
+        t.start()
+        logger.info("Dynamically added %s", consumer_id)
+        return consumer_id
+
+    def remove_consumer(self) -> bool:
+        """Remove the last consumer thread. Returns True if successful."""
+        with self._lock:
+            alive_threads = [t for t in self._threads if t.is_alive()]
+            if len(alive_threads) <= 1:
+                logger.warning("Cannot remove consumer: minimum 1 required")
+                return False
+            # Find the last alive consumer and close it
+            for c in reversed(self._consumers):
+                try:
+                    c.close()
+                    self._consumers.remove(c)
+                    logger.info("Removed a consumer")
+                    return True
+                except Exception as e:
+                    logger.error("Error removing consumer: %s", e)
+                    return False
+        return False
 
     def _consumer_loop(self, consumer_id: str) -> None:
         """Main loop for a single consumer thread."""

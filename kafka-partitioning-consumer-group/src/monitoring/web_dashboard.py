@@ -26,6 +26,7 @@ _producer: SmartProducer | None = None
 _manager: ConnectionManager | None = None
 _settings: Settings | None = None
 _shutdown: threading.Event | None = None
+_auto_scaler = None
 
 
 def _producer_loop(settings: Settings, producer: SmartProducer, generator: LogGenerator, shutdown: threading.Event) -> None:
@@ -49,7 +50,7 @@ def create_app(settings: Settings | None = None, num_consumers: int | None = Non
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        global _metrics, _coordinator, _producer, _manager, _settings, _shutdown
+        global _metrics, _coordinator, _producer, _manager, _settings, _shutdown, _auto_scaler
 
         _settings = settings or load_config()
         if num_consumers is not None:
@@ -67,6 +68,18 @@ def create_app(settings: Settings | None = None, num_consumers: int | None = Non
         _coordinator = ConsumerGroupCoordinator(_settings, _metrics)
         _coordinator.start()
         logger.info("Consumer group started with %d consumers", _settings.num_consumers)
+
+        # Start auto-scaler if enabled
+        if auto_scale:
+            from src.consumer.auto_scaler import AutoScaler
+            _auto_scaler = AutoScaler(
+                _settings, _metrics,
+                add_fn=_coordinator.add_consumer,
+                remove_fn=_coordinator.remove_consumer,
+                count_fn=lambda: _coordinator.active_consumers,
+            )
+            _auto_scaler.start()
+            logger.info("Auto-scaler enabled")
 
         # Start producer thread
         _producer = SmartProducer(_settings)
@@ -90,6 +103,8 @@ def create_app(settings: Settings | None = None, num_consumers: int | None = Non
             await broadcast_task
         except asyncio.CancelledError:
             pass
+        if _auto_scaler is not None:
+            _auto_scaler.stop()
         _shutdown.set()
         producer_thread.join(timeout=5)
         _coordinator.stop()
@@ -129,6 +144,19 @@ def create_app(settings: Settings | None = None, num_consumers: int | None = Non
             "num_partitions": _settings.num_partitions if _settings else 6,
         }
 
+    @app.get("/api/scaling-history")
+    async def scaling_history():
+        if _auto_scaler is None:
+            return {"history": [], "enabled": False}
+        return {"history": _auto_scaler.scaling_history, "enabled": True}
+
+    @app.get("/api/lag")
+    async def lag():
+        if _metrics is None:
+            return {}
+        snap = _metrics.snapshot()
+        return {"lag": snap.get("lag", {}), "total_lag": sum(snap.get("lag", {}).values())}
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await _manager.connect(websocket)
@@ -148,4 +176,6 @@ async def _ws_broadcast_loop() -> None:
         if _metrics is not None and _manager is not None:
             snap = _metrics.snapshot()
             snap["producer"] = _producer.stats if _producer else {}
+            if _auto_scaler is not None:
+                snap["scaling_history"] = _auto_scaler.scaling_history
             await _manager.broadcast(snap)

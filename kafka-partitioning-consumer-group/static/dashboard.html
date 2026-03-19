@@ -83,6 +83,19 @@
             <h2>Partition Distribution</h2>
             <canvas id="partitionChart"></canvas>
         </div>
+        <div class="card">
+            <h2>Consumer Lag</h2>
+            <canvas id="lagChart"></canvas>
+        </div>
+        <div class="card">
+            <h2>Scaling History</h2>
+            <div class="rebalance-log">
+                <table>
+                    <thead><tr><th>Time</th><th>Action</th><th>From</th><th>To</th><th>Reason</th></tr></thead>
+                    <tbody id="scalingTable"></tbody>
+                </table>
+            </div>
+        </div>
         <div class="card full-width">
             <h2>Rebalance Events</h2>
             <div class="rebalance-log">
@@ -115,6 +128,13 @@
             type: 'doughnut',
             data: { labels: [], datasets: [{ data: [], backgroundColor: ['#38bdf8', '#818cf8', '#a78bfa', '#c084fc', '#e879f9', '#f472b6'] }] },
             options: { responsive: true, plugins: { legend: { labels: { color: '#e2e8f0' } } } }
+        });
+
+        const lagCtx = document.getElementById('lagChart').getContext('2d');
+        const lagChart = new Chart(lagCtx, {
+            type: 'bar',
+            data: { labels: [], datasets: [{ label: 'Lag', data: [], backgroundColor: '#f472b6' }] },
+            options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }, x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } } }, plugins: { legend: { labels: { color: '#e2e8f0' } } } }
         });
 
         let prevConsumed = 0;
@@ -183,6 +203,26 @@
                     rebalRows += `<tr><td>${time}</td><td>${evt.type}</td><td>${evt.consumer_id || '-'}</td><td>${(evt.partitions || []).join(', ')}</td></tr>`;
                 });
                 rebalTable.innerHTML = rebalRows;
+            }
+
+            // Lag chart
+            if (data.lag) {
+                const lagLabels = Object.keys(data.lag).map(k => `P${k}`);
+                const lagValues = Object.values(data.lag);
+                lagChart.data.labels = lagLabels;
+                lagChart.data.datasets[0].data = lagValues;
+                lagChart.update('none');
+            }
+
+            // Scaling history
+            if (data.scaling_history) {
+                const scalingTable = document.getElementById('scalingTable');
+                let scalingRows = '';
+                data.scaling_history.slice(-10).reverse().forEach(evt => {
+                    const time = new Date(evt.timestamp * 1000).toLocaleTimeString();
+                    scalingRows += `<tr><td>${time}</td><td>${evt.action}</td><td>${evt.from_count}</td><td>${evt.to_count}</td><td>${evt.reason}</td></tr>`;
+                });
+                scalingTable.innerHTML = scalingRows;
             }
         }
 

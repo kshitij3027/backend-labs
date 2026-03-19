@@ -17,6 +17,7 @@ class MetricsCollector:
         self._throughput_window: deque = deque(maxlen=60)
         self._rebalance_events: list[dict] = []
         self._lag: dict[int, int] = {}
+        self._scaling_events: list[dict] = []
 
     def record_consumed(self, consumer_id: str, partition: int, count: int = 1) -> None:
         """Record that a consumer processed messages from a partition."""
@@ -59,6 +60,16 @@ class MetricsCollector:
         with self._lock:
             self._lag[partition] = lag
 
+    def record_scaling_event(self, event: dict) -> None:
+        """Record a scaling event."""
+        with self._lock:
+            self._scaling_events.append(event)
+
+    def get_lag_history(self) -> list[dict]:
+        """Return lag history."""
+        with self._lock:
+            return [{"timestamp": time.time(), "lag": dict(self._lag)}]
+
     def snapshot(self) -> dict:
         """Return a point-in-time snapshot of all metrics."""
         with self._lock:
@@ -79,4 +90,5 @@ class MetricsCollector:
                 "per_partition": dict(self._per_partition),
                 "rebalance_events": list(self._rebalance_events),
                 "lag": dict(self._lag),
+                "scaling_events": list(self._scaling_events),
             }

@@ -39,7 +39,7 @@ class E2EVerifier:
         print(f"{'='*60}\n")
 
         # 1. Health check
-        print("[1/8] Health Check")
+        print("[1/9] Health Check")
         try:
             resp = httpx.get(f"{APP_URL}/health", timeout=10)
             self.check("Health endpoint returns 200", resp.status_code == 200)
@@ -51,7 +51,7 @@ class E2EVerifier:
             self.check("Health endpoint reachable", False, str(e))
 
         # 2. Dashboard page
-        print("\n[2/8] Dashboard Page")
+        print("\n[2/9] Dashboard Page")
         try:
             resp = httpx.get(f"{APP_URL}/", timeout=10)
             self.check("Dashboard returns 200", resp.status_code == 200)
@@ -61,7 +61,7 @@ class E2EVerifier:
             self.check("Dashboard reachable", False, str(e))
 
         # 3. Stats API
-        print("\n[3/8] Stats API")
+        print("\n[3/9] Stats API")
         try:
             resp = httpx.get(f"{APP_URL}/api/stats", timeout=10)
             self.check("Stats returns 200", resp.status_code == 200)
@@ -74,7 +74,7 @@ class E2EVerifier:
             self.check("Stats API reachable", False, str(e))
 
         # 4. Partitions API
-        print("\n[4/8] Partitions API")
+        print("\n[4/9] Partitions API")
         try:
             resp = httpx.get(f"{APP_URL}/api/partitions", timeout=10)
             self.check("Partitions returns 200", resp.status_code == 200)
@@ -85,7 +85,7 @@ class E2EVerifier:
             self.check("Partitions API reachable", False, str(e))
 
         # 5. WebSocket
-        print("\n[5/8] WebSocket")
+        print("\n[5/9] WebSocket")
         try:
             ws_result = asyncio.run(self._test_websocket())
             self.check("WebSocket connects and receives data", ws_result)
@@ -93,7 +93,7 @@ class E2EVerifier:
             self.check("WebSocket test", False, str(e))
 
         # 6. Message flow (wait and check stats increase)
-        print("\n[6/8] Message Flow")
+        print("\n[6/9] Message Flow")
         try:
             resp1 = httpx.get(f"{APP_URL}/api/stats", timeout=10)
             count1 = resp1.json().get("total_consumed", 0)
@@ -107,7 +107,7 @@ class E2EVerifier:
             self.check("Message flow check", False, str(e))
 
         # 7. Partition distribution
-        print("\n[7/8] Partition Distribution")
+        print("\n[7/9] Partition Distribution")
         try:
             resp = httpx.get(f"{APP_URL}/api/stats", timeout=10)
             data = resp.json()
@@ -122,7 +122,7 @@ class E2EVerifier:
             self.check("Partition distribution check", False, str(e))
 
         # 8. Consumer group
-        print("\n[8/8] Consumer Group")
+        print("\n[8/9] Consumer Group")
         try:
             resp = httpx.get(f"{APP_URL}/api/stats", timeout=10)
             data = resp.json()
@@ -134,6 +134,21 @@ class E2EVerifier:
                 self.check(f"{cid} has partitions", len(info.get("partitions", [])) > 0)
         except Exception as e:
             self.check("Consumer group check", False, str(e))
+
+        # 9. Auto-scale API
+        print("\n[9/9] Auto-Scale API")
+        try:
+            resp = httpx.get(f"{APP_URL}/api/scaling-history", timeout=10)
+            self.check("Scaling history endpoint returns 200", resp.status_code == 200)
+            data = resp.json()
+            self.check("Has history key", "history" in data)
+
+            resp = httpx.get(f"{APP_URL}/api/lag", timeout=10)
+            self.check("Lag endpoint returns 200", resp.status_code == 200)
+            data = resp.json()
+            self.check("Has lag key", "lag" in data)
+        except Exception as e:
+            self.check("Auto-scale API check", False, str(e))
 
         # Summary
         print(f"\n{'='*60}")

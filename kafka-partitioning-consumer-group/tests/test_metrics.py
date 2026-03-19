@@ -16,6 +16,7 @@ class TestMetricsCollector:
         assert snap["per_partition"] == {}
         assert snap["rebalance_events"] == []
         assert snap["lag"] == {}
+        assert snap["scaling_events"] == []
 
     def test_record_consumed(self):
         m = MetricsCollector()
