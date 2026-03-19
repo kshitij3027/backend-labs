@@ -95,13 +95,15 @@ class TransactionalProducer:
             )
 
     def send_transaction(self, msg: TransactionMessage) -> None:
-        """Produce a transaction message to the pending topic."""
+        """Produce a transaction message to the pending topic within a transaction."""
+        self.producer.begin_transaction()
         self.producer.produce(
             topic=self.config.topic_pending,
             key=msg.transaction_id.encode("utf-8"),
             value=msg.to_kafka_value(),
             callback=self._delivery_callback,
         )
+        self.producer.commit_transaction()
 
     def run(self, shutdown_event: threading.Event) -> None:
         """Continuously generate and send transactions until shutdown."""
