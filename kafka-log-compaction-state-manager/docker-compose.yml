@@ -95,14 +95,14 @@ services:
       context: .
       dockerfile: Dockerfile.test
     container_name: compaction-e2e
+    command: ["python", "scripts/verify_e2e.py"]
     depends_on:
-      kafka:
+      app:
         condition: service_healthy
-      kafka-init:
-        condition: service_completed_successfully
     environment:
       USE_INTERNAL_LISTENERS: "true"
       BOOTSTRAP_SERVERS: kafka:29092
+      APP_URL: http://app:5555
     profiles:
       - e2e
     networks:

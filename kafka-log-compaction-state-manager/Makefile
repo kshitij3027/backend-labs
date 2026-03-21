@@ -13,7 +13,8 @@ test:
 	docker compose run --rm --build test
 
 e2e:
-	docker compose --profile e2e up --build --abort-on-container-exit
+	docker compose up --build -d zookeeper kafka kafka-init app
+	docker compose --profile e2e run --rm --build e2e
 
 benchmark:
 	docker compose --profile benchmark up --build --abort-on-container-exit
