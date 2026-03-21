@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Kafka Log Compaction State Manager</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: #0f0f23;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        header {
+            text-align: center;
+            padding: 32px 0 24px;
+            border-bottom: 1px solid #2a2a4a;
+            margin-bottom: 32px;
+        }
+
+        header h1 {
+            font-size: 1.8rem;
+            font-weight: 600;
+            color: #ffffff;
+            letter-spacing: -0.02em;
+        }
+
+        header p {
+            color: #8888aa;
+            font-size: 0.95rem;
+            margin-top: 6px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 32px;
+        }
+
+        .stat-card {
+            background: #1a1a3e;
+            border: 1px solid #2a2a5a;
+            border-radius: 12px;
+            padding: 24px;
+            text-align: center;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+            transition: transform 0.15s ease;
+        }
+
+        .stat-card:hover { transform: translateY(-2px); }
+
+        .stat-card .label {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #8888aa;
+            margin-bottom: 8px;
+        }
+
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+
+        .stat-card.green .value  { color: #4ade80; }
+        .stat-card.blue .value   { color: #60a5fa; }
+        .stat-card.purple .value { color: #a78bfa; }
+        .stat-card.orange .value { color: #fb923c; }
+        .stat-card.cyan .value   { color: #22d3ee; }
+        .stat-card.red .value    { color: #f87171; }
+
+        .chart-section {
+            background: #1a1a3e;
+            border: 1px solid #2a2a5a;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 32px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .chart-section h2 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #ffffff;
+        }
+
+        .chart-container { position: relative; height: 280px; }
+
+        .table-section {
+            background: #1a1a3e;
+            border: 1px solid #2a2a5a;
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+        }
+
+        .table-section h2 {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: #ffffff;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85rem;
+        }
+
+        th {
+            text-align: left;
+            padding: 10px 14px;
+            background: #12122e;
+            color: #8888aa;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            font-size: 0.75rem;
+        }
+
+        td {
+            padding: 10px 14px;
+            border-top: 1px solid #2a2a4a;
+        }
+
+        tr:nth-child(even) td { background: #16163a; }
+        tr:hover td { background: #1e1e4a; }
+
+        @media (max-width: 768px) {
+            .stats-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Kafka Log Compaction State Manager</h1>
+            <p>Real-time dashboard &mdash; auto-refreshes every 2 seconds</p>
+        </header>
+
+        <!-- Row 1 -->
+        <div class="stats-grid">
+            <div class="stat-card green">
+                <div class="label">Active Profiles</div>
+                <div class="value" id="active-profiles">0</div>
+            </div>
+            <div class="stat-card blue">
+                <div class="label">Total Messages</div>
+                <div class="value" id="total-messages">0</div>
+            </div>
+            <div class="stat-card purple">
+                <div class="label">Unique Keys</div>
+                <div class="value" id="unique-keys">0</div>
+            </div>
+        </div>
+
+        <!-- Row 2 -->
+        <div class="stats-grid">
+            <div class="stat-card orange">
+                <div class="label">Compaction Ratio</div>
+                <div class="value" id="compaction-ratio">0%</div>
+            </div>
+            <div class="stat-card cyan">
+                <div class="label">Storage Saved</div>
+                <div class="value" id="storage-saved">0 B</div>
+            </div>
+            <div class="stat-card red">
+                <div class="label">Tombstones Processed</div>
+                <div class="value" id="tombstones">0</div>
+            </div>
+        </div>
+
+        <!-- Chart -->
+        <div class="chart-section">
+            <h2>Compaction Ratio Over Time</h2>
+            <div class="chart-container">
+                <canvas id="compaction-chart"></canvas>
+            </div>
+        </div>
+
+        <!-- Profiles Table -->
+        <div class="table-section">
+            <h2>Active Profiles</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>User ID</th>
+                        <th>Name</th>
+                        <th>Email</th>
+                        <th>Age</th>
+                        <th>Version</th>
+                        <th>Last Updated</th>
+                    </tr>
+                </thead>
+                <tbody id="profiles-body">
+                    <tr><td colspan="6" style="text-align:center; color:#8888aa;">Loading&hellip;</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // ------------------------------------------------------------------
+        // Chart.js setup
+        // ------------------------------------------------------------------
+        const ctx = document.getElementById('compaction-chart').getContext('2d');
+        const chartData = { labels: [], datasets: [{
+            label: 'Compaction Ratio',
+            data: [],
+            borderColor: '#fb923c',
+            backgroundColor: 'rgba(251, 146, 60, 0.1)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+        }]};
+
+        const chart = new Chart(ctx, {
+            type: 'line',
+            data: chartData,
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: { ticks: { color: '#8888aa', maxTicksLimit: 10 }, grid: { color: '#2a2a4a' } },
+                    y: { min: 0, max: 1, ticks: { color: '#8888aa', callback: v => (v * 100).toFixed(0) + '%' }, grid: { color: '#2a2a4a' } }
+                },
+                plugins: { legend: { labels: { color: '#e0e0e0' } } }
+            }
+        });
+
+        // ------------------------------------------------------------------
+        // Helpers
+        // ------------------------------------------------------------------
+        function formatBytes(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1048576).toFixed(2) + ' MB';
+        }
+
+        function timeLabel() {
+            const d = new Date();
+            return d.getHours().toString().padStart(2, '0') + ':' +
+                   d.getMinutes().toString().padStart(2, '0') + ':' +
+                   d.getSeconds().toString().padStart(2, '0');
+        }
+
+        // ------------------------------------------------------------------
+        // Data refresh
+        // ------------------------------------------------------------------
+        async function refreshStats() {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                const cm = data.compaction_metrics || {};
+
+                document.getElementById('active-profiles').textContent = data.active_profiles;
+                document.getElementById('total-messages').textContent = cm.total_messages || 0;
+                document.getElementById('unique-keys').textContent = cm.unique_keys || 0;
+                document.getElementById('compaction-ratio').textContent = ((cm.compaction_ratio || 0) * 100).toFixed(1) + '%';
+                document.getElementById('storage-saved').textContent = formatBytes(cm.estimated_storage_saved_bytes || 0);
+                document.getElementById('tombstones').textContent = data.tombstones_processed;
+
+                // Update chart
+                const ratio = cm.compaction_ratio || 0;
+                chartData.labels.push(timeLabel());
+                chartData.datasets[0].data.push(ratio);
+                if (chartData.labels.length > 30) {
+                    chartData.labels.shift();
+                    chartData.datasets[0].data.shift();
+                }
+                chart.update();
+            } catch (e) {
+                console.error('Failed to fetch stats:', e);
+            }
+        }
+
+        async function refreshProfiles() {
+            try {
+                const res = await fetch('/api/profiles');
+                const profiles = await res.json();
+                const tbody = document.getElementById('profiles-body');
+
+                if (profiles.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#8888aa;">No active profiles</td></tr>';
+                    return;
+                }
+
+                tbody.innerHTML = profiles.map(p =>
+                    `<tr>
+                        <td>${p.user_id}</td>
+                        <td>${p.first_name} ${p.last_name}</td>
+                        <td>${p.email}</td>
+                        <td>${p.age}</td>
+                        <td>${p.version}</td>
+                        <td>${p.last_updated}</td>
+                    </tr>`
+                ).join('');
+            } catch (e) {
+                console.error('Failed to fetch profiles:', e);
+            }
+        }
+
+        // Initial fetch + interval
+        refreshStats();
+        refreshProfiles();
+        setInterval(() => { refreshStats(); refreshProfiles(); }, 2000);
+    </script>
+</body>
+</html>

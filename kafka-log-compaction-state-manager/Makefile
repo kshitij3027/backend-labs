@@ -4,7 +4,7 @@ build:
 	docker compose build
 
 up:
-	docker compose up --build -d zookeeper kafka kafka-init
+	docker compose up --build -d zookeeper kafka kafka-init app
 
 down:
 	docker compose down -v

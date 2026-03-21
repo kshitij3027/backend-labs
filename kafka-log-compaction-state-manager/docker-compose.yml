@@ -54,6 +54,32 @@ services:
     networks:
       - kafka-net
 
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: compaction-app
+    ports:
+      - "5555:5555"
+    environment:
+      - USE_INTERNAL_LISTENERS=true
+      - BOOTSTRAP_SERVERS=kafka:29092
+      - DASHBOARD_HOST=0.0.0.0
+      - DASHBOARD_PORT=5555
+      - NUM_USERS=10
+      - UPDATE_INTERVAL_SECONDS=1.0
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    networks:
+      - kafka-net
+
   test:
     build:
       context: .
