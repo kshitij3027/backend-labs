@@ -113,6 +113,7 @@ services:
       context: .
       dockerfile: Dockerfile.test
     container_name: compaction-benchmark
+    command: ["python", "scripts/benchmark.py"]
     depends_on:
       kafka:
         condition: service_healthy

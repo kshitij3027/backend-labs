@@ -54,7 +54,26 @@ Long-lived process — a Docker Compose stack runs:
 ## How to Run
 
 ```bash
-docker-compose up --build
+# Start full stack (Kafka + app + dashboard)
+make up
+
+# View logs
+make logs
+
+# Run unit tests in Docker
+make test
+
+# Run E2E verification
+make e2e
+
+# Run performance benchmarks
+make benchmark
+
+# Stop and clean up
+make down
+
+# Full cleanup (remove images and volumes)
+make clean
 ```
 
 - Dashboard available at `http://localhost:5555`
@@ -62,4 +81,10 @@ docker-compose up --build
 
 ## What I Learned
 
-_(To be filled after implementation)_
+- **Log compaction requires tuning segment.bytes**: Kafka's default 1GB segment size means compaction rarely triggers in a dev environment. Setting segment.bytes to 1MB forces frequent compaction, making the behavior observable.
+- **Tombstones are just null-valued messages**: Producing a message with a key and null value is Kafka's native deletion mechanism. The log compactor retains tombstones for `delete.retention.ms` before removing them.
+- **State rebuild from compacted topics is fast**: Reading a compacted topic from the beginning to reconstruct current state is efficient because compaction has already removed superseded records.
+- **Idempotent producers prevent duplicates without transactions**: Setting `enable.idempotence=True` gives exactly-once semantics for single-partition writes via producer ID + sequence numbers, without the overhead of full transactions.
+- **Consumer assign() vs subscribe()**: For state rebuild, `assign()` to specific partitions at offset 0 gives deterministic reads. For live consumption, `subscribe()` enables consumer group coordination.
+- **Compaction monitoring requires watermark analysis**: The gap between high and low watermarks, combined with unique key count, reveals how effectively compaction is reducing storage.
+- **min.cleanable.dirty.ratio controls compaction frequency**: A low ratio (0.1) makes the log cleaner more aggressive, which is essential for demos but would increase I/O in production.

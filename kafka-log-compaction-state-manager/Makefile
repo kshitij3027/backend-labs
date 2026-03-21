@@ -17,7 +17,11 @@ e2e:
 	docker compose --profile e2e run --rm --build e2e
 
 benchmark:
-	docker compose --profile benchmark up --build --abort-on-container-exit
+	docker compose up --build -d zookeeper kafka kafka-init
+	@echo "Waiting for Kafka to be ready..."
+	@sleep 30
+	docker compose run --rm --build benchmark
+	docker compose down -v
 
 logs:
 	docker compose logs -f
