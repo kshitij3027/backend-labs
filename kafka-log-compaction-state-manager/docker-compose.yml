@@ -1,0 +1,105 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: compaction-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - kafka-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: compaction-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_CLEANER_ENABLE: "true"
+      KAFKA_LOG_CLEANUP_POLICY: compact
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - kafka-net
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: compaction-kafka-init
+    volumes:
+      - ./scripts:/scripts
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - kafka-net
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: compaction-test
+    profiles:
+      - test
+    networks:
+      - kafka-net
+
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: compaction-e2e
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      USE_INTERNAL_LISTENERS: "true"
+      BOOTSTRAP_SERVERS: kafka:29092
+    profiles:
+      - e2e
+    networks:
+      - kafka-net
+
+  benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: compaction-benchmark
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      USE_INTERNAL_LISTENERS: "true"
+      BOOTSTRAP_SERVERS: kafka:29092
+    profiles:
+      - benchmark
+    networks:
+      - kafka-net
+
+networks:
+  kafka-net:
+    driver: bridge
