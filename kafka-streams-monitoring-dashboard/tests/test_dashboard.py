@@ -55,3 +55,14 @@ class TestApiHistoricalEndpoint:
         assert "events" in data
         assert "error_rate" in data
         assert "response_times" in data
+
+
+class TestApiAlertsEndpoint:
+    """Verify the /api/alerts endpoint."""
+
+    def test_api_alerts_returns_json(self, client):
+        response = client.get("/api/alerts")
+        assert response.status_code == 200
+        data = response.get_json()
+        assert "active" in data
+        assert "history" in data

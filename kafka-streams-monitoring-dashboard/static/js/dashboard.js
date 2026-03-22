@@ -175,6 +175,55 @@ function updateTopicChart(perTopic) {
 // Socket.IO event handler
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Alert handling
+// ---------------------------------------------------------------------------
+
+socket.on('alert_update', (data) => {
+    if (data.alerts && data.alerts.length > 0) {
+        data.alerts.forEach(alert => addAlertToList(alert));
+        updateAlertCount();
+    }
+});
+
+function addAlertToList(alert) {
+    const alertsList = document.getElementById('alerts-list');
+    const noAlerts = alertsList.querySelector('.no-alerts');
+    if (noAlerts) noAlerts.remove();
+
+    const alertEl = document.createElement('div');
+    alertEl.className = `alert-item alert-${alert.severity}`;
+    alertEl.innerHTML = `
+        <div class="alert-header">
+            <span class="alert-severity">${alert.severity.toUpperCase()}</span>
+            <span class="alert-time">${new Date(alert.timestamp * 1000).toLocaleTimeString()}</span>
+        </div>
+        <div class="alert-message">${alert.message}</div>
+        <div class="alert-action">${alert.action_required}</div>
+    `;
+
+    // Prepend (newest first)
+    alertsList.insertBefore(alertEl, alertsList.firstChild);
+
+    // Keep max 20 alerts visible
+    while (alertsList.children.length > 20) {
+        alertsList.removeChild(alertsList.lastChild);
+    }
+
+    // Flash animation
+    alertEl.classList.add('alert-flash');
+    setTimeout(() => alertEl.classList.remove('alert-flash'), 1000);
+}
+
+function updateAlertCount() {
+    const count = document.getElementById('alerts-list').querySelectorAll('.alert-item').length;
+    document.getElementById('alert-count').textContent = count;
+}
+
+// ---------------------------------------------------------------------------
+// Metrics event handler
+// ---------------------------------------------------------------------------
+
 socket.on("metrics_update", (data) => {
     if (data.metrics) {
         updateStatCards(data.metrics);

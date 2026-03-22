@@ -5,6 +5,7 @@ import logging
 import signal
 import sys
 
+from src.alerts import AlertManager
 from src.config import load_config
 from src.dashboard import create_app, start_background_tasks
 from src.metrics_store import MetricsStore
@@ -37,9 +38,10 @@ def main() -> None:
     stream_processor = StreamProcessor(metrics_store)
     consumer = KafkaStreamConsumer(config, stream_processor)
     producer = MetricsProducer(config)
+    alert_manager = AlertManager(config)
 
     # Create the Flask + SocketIO app
-    app, socketio = create_app(config, metrics_store=metrics_store)
+    app, socketio = create_app(config, metrics_store=metrics_store, alert_manager=alert_manager)
 
     # Start consuming from Kafka
     consumer.start()

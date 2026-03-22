@@ -49,6 +49,16 @@ def create_app(config: Settings, **components):
             return jsonify({"error": "metrics store not initialized"}), 503
         return jsonify(metrics_store.get_historical())
 
+    @app.route("/api/alerts")
+    def api_alerts():
+        alert_manager = app.config.get("ALERT_MANAGER")
+        if alert_manager is None:
+            return jsonify({"active": [], "history": []})
+        return jsonify({
+            "active": alert_manager.get_active_alerts(),
+            "history": alert_manager.get_alert_history(),
+        })
+
     # ── SocketIO events ──────────────────────────────────────────────
 
     @socketio.on("connect")
@@ -86,6 +96,13 @@ def start_background_tasks(socketio, app, producer=None):
                         "metrics": metrics,
                         "historical": historical,
                     })
+
+                    # Evaluate alerts and push to clients
+                    alert_manager = app.config.get("ALERT_MANAGER")
+                    if alert_manager:
+                        new_alerts = alert_manager.evaluate(metrics)
+                        if new_alerts:
+                            socketio.emit("alert_update", {"alerts": new_alerts})
 
                     # Produce derived metrics to Kafka
                     if producer:
