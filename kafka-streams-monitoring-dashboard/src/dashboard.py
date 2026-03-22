@@ -68,7 +68,7 @@ def create_app(config: Settings, **components):
     return app, socketio
 
 
-def start_background_tasks(socketio, app):
+def start_background_tasks(socketio, app, producer=None):
     """Start the background emitter that pushes metrics to all clients."""
 
     def _metrics_emitter():
@@ -78,10 +78,17 @@ def start_background_tasks(socketio, app):
                 metrics_store = app.config.get("METRICS_STORE")
                 if metrics_store:
                     config = app.config["APP_CONFIG"]
-                    data = {
-                        "metrics": metrics_store.get_windowed_metrics(config.window_seconds),
-                        "historical": metrics_store.get_historical(),
-                    }
-                    socketio.emit("metrics_update", data)
+                    metrics = metrics_store.get_windowed_metrics(config.window_seconds)
+                    historical = metrics_store.get_historical()
+
+                    # Push to WebSocket clients
+                    socketio.emit("metrics_update", {
+                        "metrics": metrics,
+                        "historical": historical,
+                    })
+
+                    # Produce derived metrics to Kafka
+                    if producer:
+                        producer.produce_derived_metrics(metrics)
 
     socketio.start_background_task(_metrics_emitter)

@@ -10,6 +10,7 @@ from src.dashboard import create_app, start_background_tasks
 from src.metrics_store import MetricsStore
 from src.stream_processor import StreamProcessor
 from src.consumer import KafkaStreamConsumer
+from src.producer import MetricsProducer
 from scripts.wait_for_kafka import wait_for_kafka
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ def main() -> None:
     metrics_store = MetricsStore(max_length=config.deque_max_length)
     stream_processor = StreamProcessor(metrics_store)
     consumer = KafkaStreamConsumer(config, stream_processor)
+    producer = MetricsProducer(config)
 
     # Create the Flask + SocketIO app
     app, socketio = create_app(config, metrics_store=metrics_store)
@@ -44,13 +46,14 @@ def main() -> None:
     logger.info("Kafka consumer started.")
 
     # Start WebSocket background emitter
-    start_background_tasks(socketio, app)
+    start_background_tasks(socketio, app, producer=producer)
     logger.info("WebSocket background emitter started.")
 
     # Graceful shutdown
     def _shutdown(signum, frame):
         logger.info("Received signal %s - shutting down...", signum)
         consumer.stop()
+        producer.close()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _shutdown)
