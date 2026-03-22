@@ -127,6 +127,64 @@ const responseTimeChart = new Chart(document.getElementById("response-time-chart
 });
 
 // ---------------------------------------------------------------------------
+// Business Metrics & Geo chart instances
+// ---------------------------------------------------------------------------
+
+const apiVersionChart = new Chart(document.getElementById("api-version-chart"), {
+    type: "pie",
+    data: {
+        labels: [],
+        datasets: [{
+            data: [],
+            backgroundColor: ["#00d4ff", "#00e676", "#ffc107", "#ff5252", "#bb86fc"],
+        }],
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: { labels: { color: TICK_COLOR, font: { size: 11 } } },
+        },
+    },
+});
+
+const geoChart = new Chart(document.getElementById("geo-chart"), {
+    type: "bar",
+    data: {
+        labels: [],
+        datasets: [{ label: "Requests", data: [], backgroundColor: "#00d4ff" }],
+    },
+    options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+            x: { ticks: { color: TICK_COLOR }, grid: { color: GRID_COLOR } },
+            y: { ticks: { color: TICK_COLOR }, grid: { color: GRID_COLOR } },
+        },
+    },
+});
+
+const latencyChart = new Chart(document.getElementById("latency-chart"), {
+    type: "bar",
+    data: {
+        labels: [],
+        datasets: [{ label: "Avg Latency (ms)", data: [], backgroundColor: "#ffc107" }],
+    },
+    options: {
+        indexAxis: "y",
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+            x: { ticks: { color: TICK_COLOR }, grid: { color: GRID_COLOR } },
+            y: { ticks: { color: TICK_COLOR }, grid: { color: GRID_COLOR } },
+        },
+    },
+});
+
+// ---------------------------------------------------------------------------
 // Update functions
 // ---------------------------------------------------------------------------
 
@@ -232,6 +290,38 @@ socket.on("metrics_update", (data) => {
     if (data.historical) {
         updateTimeSeriesCharts(data.historical);
     }
+    if (data.business_metrics) {
+        updateBusinessMetrics(data.business_metrics);
+    }
+    if (data.geo) {
+        updateGeoCharts(data.geo);
+    }
     document.getElementById("last-update").textContent =
         "Updated: " + new Date().toLocaleTimeString();
 });
+
+function updateBusinessMetrics(bm) {
+    // API versions pie
+    const versions = bm.api_versions || {};
+    apiVersionChart.data.labels = Object.keys(versions);
+    apiVersionChart.data.datasets[0].data = Object.values(versions);
+    apiVersionChart.update("none");
+
+    // Auth stats
+    const auth = bm.auth || {};
+    document.getElementById("auth-success").textContent = (auth.success || 0).toLocaleString();
+    document.getElementById("auth-failure").textContent = (auth.failure || 0).toLocaleString();
+    document.getElementById("auth-failure-rate").textContent = (auth.failure_rate || 0) + "%";
+}
+
+function updateGeoCharts(geo) {
+    const traffic = geo.traffic_by_region || {};
+    geoChart.data.labels = Object.keys(traffic);
+    geoChart.data.datasets[0].data = Object.values(traffic);
+    geoChart.update("none");
+
+    const latency = geo.latency_by_region || {};
+    latencyChart.data.labels = Object.keys(latency);
+    latencyChart.data.datasets[0].data = Object.values(latency).map(v => v.avg || 0);
+    latencyChart.update("none");
+}

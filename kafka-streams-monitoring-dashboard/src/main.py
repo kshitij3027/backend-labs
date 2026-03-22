@@ -6,8 +6,10 @@ import signal
 import sys
 
 from src.alerts import AlertManager
+from src.business_metrics import BusinessMetricsTracker
 from src.config import load_config
 from src.dashboard import create_app, start_background_tasks
+from src.geo_analyzer import GeoAnalyzer
 from src.metrics_store import MetricsStore
 from src.stream_processor import StreamProcessor
 from src.consumer import KafkaStreamConsumer
@@ -35,13 +37,23 @@ def main() -> None:
 
     # Create core components
     metrics_store = MetricsStore(max_length=config.deque_max_length)
-    stream_processor = StreamProcessor(metrics_store)
+    business_metrics = BusinessMetricsTracker()
+    geo_analyzer = GeoAnalyzer()
+    stream_processor = StreamProcessor(
+        metrics_store, business_metrics=business_metrics, geo_analyzer=geo_analyzer
+    )
     consumer = KafkaStreamConsumer(config, stream_processor)
     producer = MetricsProducer(config)
     alert_manager = AlertManager(config)
 
     # Create the Flask + SocketIO app
-    app, socketio = create_app(config, metrics_store=metrics_store, alert_manager=alert_manager)
+    app, socketio = create_app(
+        config,
+        metrics_store=metrics_store,
+        alert_manager=alert_manager,
+        business_metrics=business_metrics,
+        geo_analyzer=geo_analyzer,
+    )
 
     # Start consuming from Kafka
     consumer.start()

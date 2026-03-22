@@ -173,6 +173,39 @@ header h1 span {
 @keyframes flash { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 .no-alerts { color: var(--text-secondary); text-align: center; padding: 20px; }
 
+/* ── Business Metrics & Geo Sections ───────────────────────────── */
+
+.section {
+    padding: 20px 0;
+}
+
+.section h3 {
+    color: var(--text-primary);
+    margin-bottom: 15px;
+    font-size: 1.1rem;
+}
+
+.auth-stats-body {
+    display: flex;
+    align-items: center;
+    height: 280px;
+}
+
+.auth-stats {
+    display: flex;
+    gap: 15px;
+    width: 100%;
+}
+
+.stat-card.small {
+    padding: 12px 16px;
+    flex: 1;
+}
+
+.stat-card.small .stat-value {
+    font-size: 24px;
+}
+
 /* ── Responsive ─────────────────────────────────────────────────── */
 
 @media (max-width: 1024px) {

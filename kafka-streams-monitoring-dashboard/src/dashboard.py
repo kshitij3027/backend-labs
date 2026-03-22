@@ -49,6 +49,20 @@ def create_app(config: Settings, **components):
             return jsonify({"error": "metrics store not initialized"}), 503
         return jsonify(metrics_store.get_historical())
 
+    @app.route("/api/business-metrics")
+    def api_business_metrics():
+        bm = app.config.get("BUSINESS_METRICS")
+        if bm is None:
+            return jsonify({"api_versions": {}, "funnel": {}, "auth": {}})
+        return jsonify(bm.get_business_metrics())
+
+    @app.route("/api/geo")
+    def api_geo():
+        geo = app.config.get("GEO_ANALYZER")
+        if geo is None:
+            return jsonify({"traffic_by_region": {}, "latency_by_region": {}})
+        return jsonify(geo.get_geo_metrics())
+
     @app.route("/api/alerts")
     def api_alerts():
         alert_manager = app.config.get("ALERT_MANAGER")
@@ -91,10 +105,16 @@ def start_background_tasks(socketio, app, producer=None):
                     metrics = metrics_store.get_windowed_metrics(config.window_seconds)
                     historical = metrics_store.get_historical()
 
+                    # Gather business metrics and geo data
+                    bm = app.config.get("BUSINESS_METRICS")
+                    geo = app.config.get("GEO_ANALYZER")
+
                     # Push to WebSocket clients
                     socketio.emit("metrics_update", {
                         "metrics": metrics,
                         "historical": historical,
+                        "business_metrics": bm.get_business_metrics() if bm else None,
+                        "geo": geo.get_geo_metrics() if geo else None,
                     })
 
                     # Evaluate alerts and push to clients

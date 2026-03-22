@@ -4,7 +4,9 @@ import time
 
 import pytest
 
+from src.business_metrics import BusinessMetricsTracker
 from src.config import Settings
+from src.geo_analyzer import GeoAnalyzer
 from src.metrics_store import MetricsStore
 from src.stream_processor import StreamProcessor
 
@@ -22,9 +24,21 @@ def metrics_store():
 
 
 @pytest.fixture
-def stream_processor(metrics_store):
-    """Return a StreamProcessor wired to the test metrics_store."""
-    return StreamProcessor(metrics_store)
+def business_metrics():
+    """Return a fresh BusinessMetricsTracker for tests."""
+    return BusinessMetricsTracker(max_users=100)
+
+
+@pytest.fixture
+def geo_analyzer():
+    """Return a fresh GeoAnalyzer for tests."""
+    return GeoAnalyzer()
+
+
+@pytest.fixture
+def stream_processor(metrics_store, business_metrics, geo_analyzer):
+    """Return a StreamProcessor wired to the test metrics_store with business metrics and geo."""
+    return StreamProcessor(metrics_store, business_metrics=business_metrics, geo_analyzer=geo_analyzer)
 
 
 @pytest.fixture
@@ -62,11 +76,16 @@ def sample_user_event():
 
 
 @pytest.fixture
-def flask_app(config, metrics_store):
+def flask_app(config, metrics_store, business_metrics, geo_analyzer):
     """Create a Flask app instance for testing with a metrics_store."""
     from src.dashboard import create_app
 
-    app, socketio = create_app(config, metrics_store=metrics_store)
+    app, socketio = create_app(
+        config,
+        metrics_store=metrics_store,
+        business_metrics=business_metrics,
+        geo_analyzer=geo_analyzer,
+    )
     app.config["TESTING"] = True
     return app
 
