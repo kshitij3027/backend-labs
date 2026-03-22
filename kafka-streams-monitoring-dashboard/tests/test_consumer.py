@@ -2,7 +2,7 @@
 
 import json
 import time
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,6 +42,14 @@ class TestConsumerLifecycle:
         assert consumer._running is True
 
         time.sleep(0.3)
+        consumer.stop()
+        assert consumer._running is False
+
+    @patch("src.consumer.Consumer")
+    def test_stop_without_start(self, mock_consumer_cls, consumer_config, consumer_deps):
+        """Stopping a consumer that was never started should not crash."""
+        _, processor = consumer_deps
+        consumer = KafkaStreamConsumer(consumer_config, processor)
         consumer.stop()
         assert consumer._running is False
 
@@ -176,3 +184,83 @@ class TestConsumeLoop:
         # Should not crash; no events stored
         metrics = store.get_windowed_metrics(window_seconds=60)
         assert metrics["total_events"] == 0
+
+    @patch("src.consumer.Consumer")
+    def test_consume_loop_commits_every_100(self, mock_consumer_cls, consumer_config, consumer_deps):
+        """After 100 messages the consumer should commit offsets."""
+        store, processor = consumer_deps
+        mock_instance = MagicMock()
+        mock_consumer_cls.return_value = mock_instance
+
+        fake_msg = MagicMock()
+        fake_msg.error.return_value = None
+        fake_msg.value.return_value = json.dumps(
+            {"path": "/test", "timestamp": time.time()}
+        ).encode("utf-8")
+        fake_msg.key.return_value = b"key"
+        fake_msg.topic.return_value = "log-events"
+
+        call_count = 0
+
+        def poll_side_effect(timeout=1.0):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 101:
+                return fake_msg
+            return None
+
+        mock_instance.poll.side_effect = poll_side_effect
+
+        consumer = KafkaStreamConsumer(consumer_config, processor)
+        consumer.start()
+        time.sleep(1.0)
+        consumer.stop()
+
+        # commit should have been called at least once (at message 100)
+        mock_instance.commit.assert_called()
+
+    @patch("src.consumer.Consumer")
+    def test_message_with_none_key(self, mock_consumer_cls, consumer_config, consumer_deps):
+        """Messages with None key should be handled gracefully."""
+        store, processor = consumer_deps
+        mock_instance = MagicMock()
+        mock_consumer_cls.return_value = mock_instance
+
+        fake_msg = MagicMock()
+        fake_msg.error.return_value = None
+        fake_msg.value.return_value = json.dumps(
+            {"path": "/test", "timestamp": time.time()}
+        ).encode("utf-8")
+        fake_msg.key.return_value = None
+        fake_msg.topic.return_value = "log-events"
+
+        call_count = 0
+
+        def poll_side_effect(timeout=1.0):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return fake_msg
+            return None
+
+        mock_instance.poll.side_effect = poll_side_effect
+
+        consumer = KafkaStreamConsumer(consumer_config, processor)
+        consumer.start()
+        time.sleep(0.3)
+        consumer.stop()
+
+        metrics = store.get_windowed_metrics(window_seconds=60)
+        assert metrics["total_events"] >= 1
+
+    @patch("src.consumer.Consumer")
+    def test_consumer_handles_create_exception(self, mock_consumer_cls, consumer_config, consumer_deps):
+        """If Consumer constructor raises, the loop should handle it gracefully."""
+        _, processor = consumer_deps
+        mock_consumer_cls.side_effect = Exception("cannot connect")
+
+        consumer = KafkaStreamConsumer(consumer_config, processor)
+        consumer.start()
+        time.sleep(0.3)
+        consumer.stop()
+        # Should not crash the thread

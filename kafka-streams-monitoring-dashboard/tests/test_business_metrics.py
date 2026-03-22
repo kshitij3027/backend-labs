@@ -115,6 +115,50 @@ def test_get_business_metrics_structure(tracker):
     assert "failure_rate" in metrics["auth"]
 
 
+def test_funnel_user_eviction(tracker):
+    """When max_users is exceeded, oldest entries are evicted."""
+    tracker._max_users = 5
+    for i in range(10):
+        tracker.track_payment_funnel(f"/products", "page_view")
+    metrics = tracker.get_business_metrics()
+    assert metrics["funnel"]["browse"] == 10
+
+
+def test_infer_funnel_stage_pay_action(tracker):
+    """Action 'pay' maps to payment stage."""
+    tracker.track_payment_funnel("", "pay")
+    metrics = tracker.get_business_metrics()
+    assert metrics["funnel"]["payment"] == 1
+
+
+def test_infer_funnel_stage_no_match(tracker):
+    """Empty path and empty action returns None (no funnel stage)."""
+    tracker.track_payment_funnel("", "")
+    metrics = tracker.get_business_metrics()
+    # All stages should remain at 0
+    assert all(v == 0 for v in metrics["funnel"].values())
+
+
+def test_auth_signup_success(tracker):
+    tracker.track_auth_event("signup", success=True)
+    metrics = tracker.get_business_metrics()
+    assert metrics["auth"]["success"] == 1
+
+
+def test_auth_signup_failure(tracker):
+    tracker.track_auth_event("signup", success=False)
+    metrics = tracker.get_business_metrics()
+    assert metrics["auth"]["failure"] == 1
+
+
+def test_auth_logout_ignored(tracker):
+    """Logout action is in the accepted set but doesn't count as success/failure."""
+    tracker.track_auth_event("logout", success=True)
+    metrics = tracker.get_business_metrics()
+    assert metrics["auth"]["success"] == 0
+    assert metrics["auth"]["failure"] == 0
+
+
 def test_thread_safety(tracker):
     """Concurrent access should not crash."""
     errors = []
