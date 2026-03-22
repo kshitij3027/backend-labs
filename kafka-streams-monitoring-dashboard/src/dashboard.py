@@ -33,4 +33,18 @@ def create_app(config: Settings, **components):
             "service": "kafka-streams-monitoring-dashboard",
         })
 
+    @app.route("/api/metrics")
+    def api_metrics():
+        metrics_store = app.config.get("METRICS_STORE")
+        if metrics_store is None:
+            return jsonify({"error": "metrics store not initialized"}), 503
+        return jsonify(metrics_store.get_windowed_metrics(config.window_seconds))
+
+    @app.route("/api/historical")
+    def api_historical():
+        metrics_store = app.config.get("METRICS_STORE")
+        if metrics_store is None:
+            return jsonify({"error": "metrics store not initialized"}), 503
+        return jsonify(metrics_store.get_historical())
+
     return app, socketio
