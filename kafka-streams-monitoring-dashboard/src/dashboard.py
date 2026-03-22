@@ -3,7 +3,7 @@
 import logging
 
 from flask import Flask, render_template, jsonify
-from flask_socketio import SocketIO
+from flask_socketio import SocketIO, emit
 
 from src.config import Settings
 
@@ -21,6 +21,8 @@ def create_app(config: Settings, **components):
     app.config["APP_CONFIG"] = config
     for key, value in components.items():
         app.config[key.upper()] = value
+
+    # ── HTTP routes ──────────────────────────────────────────────────
 
     @app.route("/")
     def index():
@@ -47,4 +49,39 @@ def create_app(config: Settings, **components):
             return jsonify({"error": "metrics store not initialized"}), 503
         return jsonify(metrics_store.get_historical())
 
+    # ── SocketIO events ──────────────────────────────────────────────
+
+    @socketio.on("connect")
+    def handle_connect():
+        logger.info("Client connected")
+        metrics_store = app.config.get("METRICS_STORE")
+        if metrics_store:
+            emit("metrics_update", {
+                "metrics": metrics_store.get_windowed_metrics(config.window_seconds),
+                "historical": metrics_store.get_historical(),
+            })
+
+    @socketio.on("disconnect")
+    def handle_disconnect():
+        logger.info("Client disconnected")
+
     return app, socketio
+
+
+def start_background_tasks(socketio, app):
+    """Start the background emitter that pushes metrics to all clients."""
+
+    def _metrics_emitter():
+        with app.app_context():
+            while True:
+                socketio.sleep(app.config["APP_CONFIG"].ws_emit_interval)
+                metrics_store = app.config.get("METRICS_STORE")
+                if metrics_store:
+                    config = app.config["APP_CONFIG"]
+                    data = {
+                        "metrics": metrics_store.get_windowed_metrics(config.window_seconds),
+                        "historical": metrics_store.get_historical(),
+                    }
+                    socketio.emit("metrics_update", data)
+
+    socketio.start_background_task(_metrics_emitter)

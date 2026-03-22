@@ -6,7 +6,7 @@ import signal
 import sys
 
 from src.config import load_config
-from src.dashboard import create_app
+from src.dashboard import create_app, start_background_tasks
 from src.metrics_store import MetricsStore
 from src.stream_processor import StreamProcessor
 from src.consumer import KafkaStreamConsumer
@@ -42,6 +42,10 @@ def main() -> None:
     # Start consuming from Kafka
     consumer.start()
     logger.info("Kafka consumer started.")
+
+    # Start WebSocket background emitter
+    start_background_tasks(socketio, app)
+    logger.info("WebSocket background emitter started.")
 
     # Graceful shutdown
     def _shutdown(signum, frame):

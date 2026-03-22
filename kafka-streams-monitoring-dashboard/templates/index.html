@@ -5,12 +5,74 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kafka Streams Monitoring Dashboard</title>
     <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 </head>
 <body>
-    <div id="app">
-        <h1>Kafka Streams Monitoring Dashboard</h1>
-        <p>Dashboard loading...</p>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1><span>Kafka Streams</span> Monitoring Dashboard</h1>
+            <div class="header-meta">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">Connecting...</span>
+                <span id="last-update"></span>
+            </div>
+        </header>
+
+        <!-- Stats Cards Row -->
+        <div class="stats-row">
+            <div class="stat-card total">
+                <div class="stat-label">Total Events</div>
+                <div class="stat-value" id="total-events">0</div>
+            </div>
+            <div class="stat-card error">
+                <div class="stat-label">Error Rate</div>
+                <div class="stat-value" id="error-rate">0%</div>
+            </div>
+            <div class="stat-card response">
+                <div class="stat-label">Avg Response Time</div>
+                <div class="stat-value" id="avg-response-time">0ms</div>
+            </div>
+            <div class="stat-card throughput">
+                <div class="stat-label">Events/sec</div>
+                <div class="stat-value" id="events-per-sec">0</div>
+            </div>
+        </div>
+
+        <!-- Charts Row 1: Time Series -->
+        <div class="charts-row">
+            <div class="chart-container">
+                <div class="chart-header">Event Throughput</div>
+                <div class="chart-body">
+                    <canvas id="throughput-chart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div class="chart-header">Error Rate Over Time</div>
+                <div class="chart-body">
+                    <canvas id="error-rate-chart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <!-- Charts Row 2: Topic & Response -->
+        <div class="charts-row">
+            <div class="chart-container">
+                <div class="chart-header">Events by Topic</div>
+                <div class="chart-body">
+                    <canvas id="topic-chart"></canvas>
+                </div>
+            </div>
+            <div class="chart-container">
+                <div class="chart-header">Response Time Trend</div>
+                <div class="chart-body">
+                    <canvas id="response-time-chart"></canvas>
+                </div>
+            </div>
+        </div>
     </div>
+
     <script src="/static/js/dashboard.js"></script>
 </body>
 </html>
