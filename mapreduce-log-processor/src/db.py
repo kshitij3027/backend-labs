@@ -30,10 +30,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL DEFAULT 'PENDING',
     worker_id TEXT,
     partition_id INTEGER NOT NULL DEFAULT 0,
+    input_start INTEGER NOT NULL DEFAULT 0,
+    input_end INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS input_start INTEGER DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS input_end INTEGER DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS workers (
     id TEXT PRIMARY KEY,
@@ -214,3 +219,22 @@ async def mark_worker_dead(worker_id: str) -> None:
             worker_id,
         )
     logger.info("worker_marked_dead", worker_id=worker_id)
+
+
+async def get_tasks_for_job(job_id: str) -> list[dict]:
+    """Get all tasks for a job."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM tasks WHERE job_id = $1 ORDER BY partition_id",
+            job_id,
+        )
+    return [dict(r) for r in rows]
+
+
+async def increment_worker_tasks(worker_id: str) -> None:
+    """Increment the tasks_completed counter for a worker."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE workers SET tasks_completed = tasks_completed + 1 WHERE id = $1",
+            worker_id,
+        )

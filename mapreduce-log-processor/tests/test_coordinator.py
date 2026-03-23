@@ -1,4 +1,19 @@
+import json
+import os
+import tempfile
+
 import pytest
+
+
+@pytest.fixture
+def sample_log_path():
+    """Create a temporary log file for coordinator tests."""
+    lines = [json.dumps({"timestamp": "2025-01-15T08:00:00Z", "level": "INFO", "message": f"line {i}"}) for i in range(10)]
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write("\n".join(lines) + "\n")
+        path = f.name
+    yield path
+    os.unlink(path)
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -11,11 +26,11 @@ class TestHealth:
 
 @pytest.mark.asyncio(loop_scope="session")
 class TestJobs:
-    async def test_create_job(self, test_client):
+    async def test_create_job(self, test_client, sample_log_path):
         resp = await test_client.post(
             "/jobs",
             json={
-                "input_path": "/data/sample-logs.jsonl",
+                "input_path": sample_log_path,
                 "map_fn": "word_count",
                 "reduce_fn": "sum",
             },
@@ -23,8 +38,8 @@ class TestJobs:
         assert resp.status_code == 201
         data = resp.json()
         assert "id" in data
-        assert data["status"] == "PENDING"
-        assert data["input_path"] == "/data/sample-logs.jsonl"
+        assert data["status"] == "MAPPING"
+        assert data["input_path"] == sample_log_path
         assert data["map_fn"] == "word_count"
         assert data["reduce_fn"] == "sum"
 

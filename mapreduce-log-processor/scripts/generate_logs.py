@@ -1,6 +1,6 @@
 """
 Generate sample JSONL log data for MapReduce processing.
-Writes 500 log lines to /data/sample-logs.jsonl.
+Writes 1500 log lines to /data/sample-logs.jsonl with deterministic output.
 """
 
 import json
@@ -9,60 +9,84 @@ import random
 from datetime import datetime, timedelta, timezone
 
 LEVELS = ["INFO", "WARN", "ERROR", "FATAL"]
-LEVEL_WEIGHTS = [70, 15, 12, 3]
+LEVEL_WEIGHTS = [60, 20, 15, 5]
 
 URLS = [
     "/api/users",
+    "/api/orders",
+    "/api/products",
+    "/health",
+    "/login",
     "/api/users/login",
     "/api/users/register",
-    "/api/orders",
     "/api/orders/checkout",
-    "/api/products",
     "/api/products/search",
-    "/api/health",
     "/api/payments",
-    "/api/notifications",
 ]
 
-ERROR_CODES = [None, None, None, "400", "401", "403", "404", "500", "502", "503"]
+ERROR_CODES_FOR_ERRORS = ["400", "404", "500", "503"]
+ERROR_CODES_FOR_WARNS = [None, "400", "429"]
 
-MESSAGES = [
+MESSAGES_INFO = [
     "Request processed successfully",
-    "User authenticated",
-    "Cache miss, fetching from database",
+    "User authenticated via token",
+    "Cache miss fetching from database",
+    "Connection established to upstream",
+    "Background job completed successfully",
+    "Session created for user",
+    "Page rendered in time",
+    "Health check passed",
+]
+
+MESSAGES_WARN = [
     "Rate limit approaching threshold",
+    "Slow database query detected",
+    "Cache eviction rate high",
+    "Connection pool near capacity",
+    "Retry attempt for upstream call",
+]
+
+MESSAGES_ERROR = [
     "Connection timeout to upstream service",
-    "Database query slow: exceeded 500ms",
-    "Invalid request payload",
+    "Invalid request payload received",
     "Authentication token expired",
     "Permission denied for resource",
-    "Resource not found",
-    "Internal server error",
-    "Bad gateway from upstream",
-    "Service temporarily unavailable",
-    "Request queued for processing",
-    "Background job completed",
+    "Resource not found on server",
 ]
 
-NUM_LINES = 500
+MESSAGES_FATAL = [
+    "Internal server error encountered",
+    "Bad gateway from upstream service",
+    "Service temporarily unavailable",
+    "Out of memory error triggered",
+    "Database connection pool exhausted",
+]
+
+NUM_LINES = 1500
 OUTPUT_DIR = "/data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "sample-logs.jsonl")
 
 
-def generate_log_line(base_time: datetime, offset_seconds: int) -> dict:
-    level = random.choices(LEVELS, weights=LEVEL_WEIGHTS, k=1)[0]
-    url = random.choice(URLS)
-    user_id = f"user_{random.randint(1, 100):03d}"
+def generate_log_line(rng: random.Random, base_time: datetime, offset_seconds: int) -> dict:
+    level = rng.choices(LEVELS, weights=LEVEL_WEIGHTS, k=1)[0]
+    url = rng.choice(URLS)
+    user_id = f"user_{rng.randint(1, 100):03d}"
     timestamp = base_time + timedelta(seconds=offset_seconds)
 
     error_code = None
     if level in ("ERROR", "FATAL"):
-        error_code = random.choice(["400", "401", "403", "404", "500", "502", "503"])
+        error_code = rng.choice(ERROR_CODES_FOR_ERRORS)
     elif level == "WARN":
-        error_code = random.choice([None, "400", "429"])
+        error_code = rng.choice(ERROR_CODES_FOR_WARNS)
 
-    message_pool = MESSAGES[:8] if level == "INFO" else MESSAGES[4:]
-    message = random.choice(message_pool)
+    if level == "INFO":
+        message = rng.choice(MESSAGES_INFO)
+    elif level == "WARN":
+        message = rng.choice(MESSAGES_WARN)
+    elif level == "ERROR":
+        message = rng.choice(MESSAGES_ERROR)
+    else:
+        message = rng.choice(MESSAGES_FATAL)
 
     return {
         "timestamp": timestamp.isoformat(),
@@ -78,11 +102,11 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     base_time = datetime(2025, 1, 15, 8, 0, 0, tzinfo=timezone.utc)
-    random.seed(42)
+    rng = random.Random(42)
 
     with open(OUTPUT_FILE, "w") as f:
         for i in range(NUM_LINES):
-            line = generate_log_line(base_time, offset_seconds=i * 2)
+            line = generate_log_line(rng, base_time, offset_seconds=i * 2)
             f.write(json.dumps(line) + "\n")
 
     print(f"Generated {NUM_LINES} log lines to {OUTPUT_FILE}")

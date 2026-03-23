@@ -3,10 +3,12 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from src.config import settings
 from src.coordinator.heartbeat import heartbeat_checker
+from src.coordinator.scheduler import assign_task, complete_task, create_map_tasks, fail_task
 from src.db import (
     close_db,
     create_job,
@@ -89,6 +91,20 @@ async def submit_job(job: JobCreate):
         num_mappers=job.num_mappers,
         num_reducers=job.num_reducers,
     )
+
+    job_id = result["id"]
+
+    # Create map tasks for this job
+    try:
+        tasks = await create_map_tasks(job_id, job.input_path, job.num_mappers)
+        await update_job_status(job_id, JobStatus.MAPPING.value)
+        result["status"] = JobStatus.MAPPING.value
+        logger.info("job_map_tasks_created", job_id=job_id, num_tasks=len(tasks))
+    except Exception as e:
+        logger.error("job_map_task_creation_failed", job_id=job_id, error=str(e))
+        await update_job_status(job_id, JobStatus.FAILED.value)
+        result["status"] = JobStatus.FAILED.value
+
     return JobResponse(**result)
 
 
@@ -127,6 +143,47 @@ async def cancel_job(job_id: str):
     await update_job_status(job_id, JobStatus.CANCELLED.value)
     logger.info("job_cancelled", job_id=job_id)
     return {"id": job_id, "status": "CANCELLED"}
+
+
+# ── Task endpoints ──────────────────────────────────────────────
+
+
+@app.get("/tasks/next")
+async def get_next_task(worker_id: str):
+    """Assign the next pending task to the requesting worker."""
+    task = await assign_task(worker_id)
+    if task is None:
+        return Response(status_code=204)
+    return JSONResponse(content={
+        "id": task["id"],
+        "job_id": task["job_id"],
+        "type": task["type"],
+        "status": "RUNNING",
+        "partition_id": task["partition_id"],
+        "input_start": task["input_start"],
+        "input_end": task["input_end"],
+        "input_path": task["input_path"],
+        "map_fn": task["map_fn"],
+        "reduce_fn": task["reduce_fn"],
+        "num_reducers": task["num_reducers"],
+    })
+
+
+@app.post("/tasks/{task_id}/complete")
+async def mark_task_complete(task_id: str):
+    """Mark a task as completed."""
+    await complete_task(task_id)
+    return {"task_id": task_id, "status": "COMPLETED"}
+
+
+@app.post("/tasks/{task_id}/failed")
+async def mark_task_failed(task_id: str):
+    """Mark a task as failed."""
+    await fail_task(task_id)
+    return {"task_id": task_id, "status": "FAILED"}
+
+
+# ── Worker endpoints ────────────────────────────────────────────
 
 
 class WorkerRegisterRequest(BaseModel):
