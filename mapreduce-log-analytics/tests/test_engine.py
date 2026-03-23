@@ -7,7 +7,6 @@ from src.engine import (
     MapReduceEngine,
     _map_worker,
     _reduce_worker,
-    _simple_word_count_map,
 )
 
 

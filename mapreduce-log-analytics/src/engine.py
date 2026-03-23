@@ -9,41 +9,10 @@ from typing import Any, Callable
 from src.chunker import read_chunk, split_file
 from src.parsers import detect_format, parse_line
 
+import src.analyzers  # noqa: F401  — trigger decorator registration
+from src.analyzers.registry import get_map_fn, get_reduce_fn
+
 logger = logging.getLogger(__name__)
-
-
-# Simple built-in functions for testing (will be replaced by registry in commit 4)
-def _simple_word_count_map(record: dict) -> list[tuple[str, int]]:
-    """Simple word count map for testing."""
-    message = record.get("message", "")
-    results = []
-    for word in message.lower().split():
-        word = word.strip(".,!?;:\"'()[]{}").lower()
-        if len(word) > 2:
-            results.append((word, 1))
-    return results
-
-
-def _simple_sum_reduce(key: str, values: list) -> Any:
-    """Simple sum reduce for testing."""
-    return sum(values)
-
-
-# Registry of built-in functions (expanded in commit 4)
-_MAP_FUNCTIONS = {
-    "word_count": _simple_word_count_map,
-}
-_REDUCE_FUNCTIONS = {
-    "word_count": _simple_sum_reduce,
-}
-
-
-def get_map_fn(name: str) -> Callable:
-    return _MAP_FUNCTIONS[name]
-
-
-def get_reduce_fn(name: str) -> Callable:
-    return _REDUCE_FUNCTIONS[name]
 
 
 # --- Worker functions (must be top-level for pickling) ---
