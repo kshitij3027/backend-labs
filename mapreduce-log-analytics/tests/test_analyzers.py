@@ -12,6 +12,7 @@ from src.analyzers.registry import (
 from src.analyzers.word_count import word_count_map, word_count_reduce
 from src.analyzers.pattern_frequency import pattern_frequency_map
 from src.analyzers.service_distribution import service_distribution_map
+from src.analyzers.security import security_map, security_reduce, security_postprocess
 from src.engine import MapReduceEngine
 
 
@@ -127,3 +128,76 @@ class TestServiceDistribution:
         assert len(service_keys) > 0
         level_keys = [k for k in results if k.startswith("level:")]
         assert len(level_keys) > 0
+
+
+class TestSecurity:
+    def test_map_emits_ip(self):
+        record = {"ip": "10.0.0.1", "status_code": 200, "timestamp": "2025-01-15T14:30:00+00:00", "user_agent": "curl/8.4.0"}
+        pairs = security_map(record)
+        keys = [k for k, v in pairs]
+        assert "ip:10.0.0.1" in keys
+
+    def test_map_emits_404(self):
+        record = {"ip": "10.0.0.1", "status_code": 404, "url": "/missing", "timestamp": "2025-01-15T14:30:00+00:00", "user_agent": "curl/8.4.0"}
+        pairs = security_map(record)
+        keys = [k for k, v in pairs]
+        assert "404_error:/missing" in keys
+
+    def test_map_emits_hour(self):
+        record = {"ip": "10.0.0.1", "status_code": 200, "timestamp": "2025-01-15T14:30:00+00:00", "user_agent": "curl/8.4.0"}
+        pairs = security_map(record)
+        keys = [k for k, v in pairs]
+        assert "hour:14" in keys
+
+    def test_map_emits_user_agent(self):
+        record = {"ip": "10.0.0.1", "status_code": 200, "timestamp": "2025-01-15T14:30:00+00:00", "user_agent": "curl/8.4.0"}
+        pairs = security_map(record)
+        keys = [k for k, v in pairs]
+        assert "user_agent:curl/8.4.0" in keys
+
+    def test_map_emits_all_four_categories(self):
+        record = {"ip": "10.0.0.1", "status_code": 404, "url": "/test", "timestamp": "2025-01-15T10:00:00+00:00", "user_agent": "Mozilla/5.0"}
+        pairs = security_map(record)
+        keys = [k for k, v in pairs]
+        has_ip = any(k.startswith("ip:") for k in keys)
+        has_404 = any(k.startswith("404_error:") for k in keys)
+        has_hour = any(k.startswith("hour:") for k in keys)
+        has_ua = any(k.startswith("user_agent:") for k in keys)
+        assert has_ip and has_404 and has_hour and has_ua
+
+    def test_reduce_sums(self):
+        assert security_reduce("ip:10.0.0.1", [1, 1, 1]) == 3
+
+    def test_postprocess_groups_and_sorts(self):
+        raw_results = {
+            "ip:10.0.0.1": 100,
+            "ip:10.0.0.2": 50,
+            "ip:10.0.0.3": 200,
+            "404_error:/missing": 30,
+            "404_error:/gone": 10,
+            "hour:14": 500,
+            "hour:10": 300,
+            "user_agent:curl": 80,
+            "user_agent:firefox": 120,
+        }
+        result = security_postprocess(raw_results)
+        assert "top_ips" in result
+        assert "top_404_paths" in result
+        assert "peak_hours" in result
+        assert "top_user_agents" in result
+        # Top IP should be 10.0.0.3 (200 count)
+        assert result["top_ips"][0]["key"] == "10.0.0.3"
+        assert result["top_ips"][0]["count"] == 200
+        # Only top 10 returned
+        assert len(result["top_ips"]) <= 10
+
+    def test_full_pipeline(self, sample_json_logs):
+        engine = MapReduceEngine(num_workers=2, chunk_size=500)
+        results = engine.run([sample_json_logs], "security", "security")
+        # After postprocess, results should have the 4 category keys
+        assert "top_ips" in results
+        assert "top_404_paths" in results
+        assert "peak_hours" in results
+        assert "top_user_agents" in results
+        assert len(results["top_ips"]) > 0
+        assert len(results["peak_hours"]) > 0

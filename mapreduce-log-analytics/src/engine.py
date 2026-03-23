@@ -10,7 +10,7 @@ from src.chunker import read_chunk, split_file
 from src.parsers import detect_format, parse_line
 
 import src.analyzers  # noqa: F401  — trigger decorator registration
-from src.analyzers.registry import get_map_fn, get_reduce_fn
+from src.analyzers.registry import get_map_fn, get_postprocess_fn, get_reduce_fn
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +195,11 @@ class MapReduceEngine:
                 final_results.update(partial)
                 if progress_callback:
                     progress_callback("reducing", (i + 1) / len(reduce_args), {})
+
+        # 5. Postprocess phase (optional)
+        postprocess_fn = get_postprocess_fn(map_fn_name)
+        if postprocess_fn:
+            final_results = postprocess_fn(final_results)
 
         elapsed = time.time() - start_time
         logger.info(
