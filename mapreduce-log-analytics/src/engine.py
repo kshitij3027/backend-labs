@@ -14,12 +14,17 @@ from src.analyzers.registry import get_map_fn, get_postprocess_fn, get_reduce_fn
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_TIMEOUT = 300  # seconds
+
 
 # --- Worker functions (must be top-level for pickling) ---
 
 
 def _map_worker(args: tuple) -> tuple[list[tuple[str, Any]], int, int]:
     """Map worker: reads a chunk, parses lines, applies map function.
+
+    Uses a combiner step to pre-aggregate map output within each chunk,
+    dramatically reducing the volume of data going through shuffle.
 
     Args: (file_path, start, end, format, map_fn_name)
     Returns: (list of (key, value) pairs, records_processed, records_skipped)
@@ -28,7 +33,7 @@ def _map_worker(args: tuple) -> tuple[list[tuple[str, Any]], int, int]:
     map_fn = get_map_fn(map_fn_name)
 
     lines = read_chunk(file_path, start, end)
-    results = []
+    local_counts: dict[str, Any] = {}  # combiner
     processed = 0
     skipped = 0
 
@@ -39,12 +44,17 @@ def _map_worker(args: tuple) -> tuple[list[tuple[str, Any]], int, int]:
             continue
         try:
             pairs = map_fn(record)
-            results.extend(pairs)
+            for key, value in pairs:
+                if key in local_counts:
+                    local_counts[key] += value
+                else:
+                    local_counts[key] = value
             processed += 1
         except Exception:
             skipped += 1
 
-    return results, processed, skipped
+    # Return pre-aggregated pairs
+    return list(local_counts.items()), processed, skipped
 
 
 def _reduce_worker(args: tuple) -> dict[str, Any]:
@@ -69,9 +79,15 @@ def _reduce_worker(args: tuple) -> dict[str, Any]:
 class MapReduceEngine:
     """Orchestrates the MapReduce pipeline: split -> map -> shuffle -> reduce."""
 
-    def __init__(self, num_workers: int = 4, chunk_size: int = 67_108_864):
+    def __init__(
+        self,
+        num_workers: int = 4,
+        chunk_size: int = 67_108_864,
+        timeout: int = DEFAULT_TIMEOUT,
+    ):
         self.num_workers = num_workers
         self.chunk_size = chunk_size
+        self.timeout = timeout
 
     def run(
         self,
@@ -109,8 +125,9 @@ class MapReduceEngine:
 
         # 2. Map phase - parallel
         logger.info(
-            f"Map phase: {total_chunks} chunks with {self.num_workers} workers"
+            f"Map phase: processing {total_chunks} chunks with {self.num_workers} workers"
         )
+        map_start = time.time()
         all_map_results = []
 
         if total_chunks == 0:
@@ -121,31 +138,37 @@ class MapReduceEngine:
                     "records_processed": 0,
                 })
         else:
-            with Pool(processes=self.num_workers) as pool:
-                for i, result in enumerate(
-                    pool.imap_unordered(_map_worker, all_chunks)
-                ):
-                    pairs, processed, skipped = result
-                    all_map_results.extend(pairs)
-                    total_processed += processed
-                    total_skipped += skipped
-                    if progress_callback:
-                        progress_callback(
-                            "mapping",
-                            (i + 1) / total_chunks,
-                            {
-                                "completed_chunks": i + 1,
-                                "total_chunks": total_chunks,
-                                "records_processed": total_processed,
-                            },
-                        )
+            try:
+                with Pool(processes=self.num_workers) as pool:
+                    for i, result in enumerate(
+                        pool.imap_unordered(_map_worker, all_chunks)
+                    ):
+                        pairs, processed, skipped = result
+                        all_map_results.extend(pairs)
+                        total_processed += processed
+                        total_skipped += skipped
+                        if progress_callback:
+                            progress_callback(
+                                "mapping",
+                                (i + 1) / total_chunks,
+                                {
+                                    "completed_chunks": i + 1,
+                                    "total_chunks": total_chunks,
+                                    "records_processed": total_processed,
+                                },
+                            )
+            except Exception as e:
+                logger.error(f"Map phase failed: {e}")
+                raise
 
+        map_time = time.time() - map_start
         logger.info(
-            f"Map phase complete: {len(all_map_results)} pairs, "
-            f"{total_processed} records, {total_skipped} skipped"
+            f"Map phase complete in {map_time:.2f}s: {len(all_map_results)} combined pairs "
+            f"from {total_processed} records ({total_skipped} skipped)"
         )
 
         # 3. Shuffle phase
+        shuffle_start = time.time()
         if progress_callback:
             progress_callback("shuffling", 0.0, {})
 
@@ -153,7 +176,8 @@ class MapReduceEngine:
         for key, value in all_map_results:
             grouped[key].append(value)
 
-        logger.info(f"Shuffle phase complete: {len(grouped)} unique keys")
+        shuffle_time = time.time() - shuffle_start
+        logger.info(f"Shuffle phase complete in {shuffle_time:.2f}s: {len(grouped)} unique keys")
         if progress_callback:
             progress_callback("shuffling", 1.0, {"unique_keys": len(grouped)})
 
@@ -187,14 +211,22 @@ class MapReduceEngine:
             (partition, reduce_fn_name) for partition in partitions if partition
         ]
 
+        reduce_start = time.time()
         final_results = {}
-        with Pool(processes=num_reducers) as pool:
-            for i, partial in enumerate(
-                pool.imap_unordered(_reduce_worker, reduce_args)
-            ):
-                final_results.update(partial)
-                if progress_callback:
-                    progress_callback("reducing", (i + 1) / len(reduce_args), {})
+        try:
+            with Pool(processes=num_reducers) as pool:
+                for i, partial in enumerate(
+                    pool.imap_unordered(_reduce_worker, reduce_args)
+                ):
+                    final_results.update(partial)
+                    if progress_callback:
+                        progress_callback("reducing", (i + 1) / len(reduce_args), {})
+        except Exception as e:
+            logger.error(f"Reduce phase failed: {e}")
+            raise
+
+        reduce_time = time.time() - reduce_start
+        logger.info(f"Reduce phase complete in {reduce_time:.2f}s")
 
         # 5. Postprocess phase (optional)
         postprocess_fn = get_postprocess_fn(map_fn_name)
@@ -203,7 +235,8 @@ class MapReduceEngine:
 
         elapsed = time.time() - start_time
         logger.info(
-            f"MapReduce complete in {elapsed:.2f}s: {len(final_results)} results"
+            f"Pipeline complete in {elapsed:.2f}s | {total_processed} records | "
+            f"{len(final_results)} result keys"
         )
 
         if progress_callback:
