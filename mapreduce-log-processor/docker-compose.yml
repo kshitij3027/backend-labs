@@ -83,5 +83,19 @@ services:
       - test
     env_file: .env.example
 
+  e2e:
+    build: .
+    command: python scripts/verify_e2e.py
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    environment:
+      COORDINATOR_URL: http://coordinator:8000
+    env_file: .env.example
+    profiles:
+      - e2e
+    volumes:
+      - log-data:/data:ro
+
 volumes:
   log-data:

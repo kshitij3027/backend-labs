@@ -50,10 +50,13 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE TABLE IF NOT EXISTS results (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    partition_id INTEGER NOT NULL DEFAULT 0,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE results ADD COLUMN IF NOT EXISTS partition_id INTEGER DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(job_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);

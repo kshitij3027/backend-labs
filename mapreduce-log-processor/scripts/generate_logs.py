@@ -1,11 +1,13 @@
 """
 Generate sample JSONL log data for MapReduce processing.
-Writes 1500 log lines to /data/sample-logs.jsonl with deterministic output.
+Writes 10,000+ log lines to /data/sample-logs.jsonl with deterministic output (seed=42).
 """
 
 import json
 import os
 import random
+import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 LEVELS = ["INFO", "WARN", "ERROR", "FATAL"]
@@ -17,12 +19,10 @@ URLS = [
     "/api/products",
     "/health",
     "/login",
-    "/api/users/login",
-    "/api/users/register",
-    "/api/orders/checkout",
-    "/api/products/search",
+    "/api/search",
     "/api/payments",
 ]
+URL_WEIGHTS = [25, 20, 15, 10, 10, 12, 8]
 
 ERROR_CODES_FOR_ERRORS = ["400", "404", "500", "503"]
 ERROR_CODES_FOR_WARNS = [None, "400", "429"]
@@ -62,14 +62,14 @@ MESSAGES_FATAL = [
     "Database connection pool exhausted",
 ]
 
-NUM_LINES = 1500
+NUM_LINES = 10_000
 OUTPUT_DIR = "/data"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "sample-logs.jsonl")
 
 
 def generate_log_line(rng: random.Random, base_time: datetime, offset_seconds: int) -> dict:
     level = rng.choices(LEVELS, weights=LEVEL_WEIGHTS, k=1)[0]
-    url = rng.choice(URLS)
+    url = rng.choices(URLS, weights=URL_WEIGHTS, k=1)[0]
     user_id = f"user_{rng.randint(1, 100):03d}"
     timestamp = base_time + timedelta(seconds=offset_seconds)
 
@@ -98,18 +98,36 @@ def generate_log_line(rng: random.Random, base_time: datetime, offset_seconds: i
     }
 
 
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+def generate_logs(output_path: str, num_lines: int = NUM_LINES) -> None:
+    """Generate deterministic log lines and write to output_path."""
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    base_time = datetime(2025, 1, 15, 8, 0, 0, tzinfo=timezone.utc)
+    base_time = datetime(2025, 1, 15, 0, 0, 0, tzinfo=timezone.utc)
     rng = random.Random(42)
 
-    with open(OUTPUT_FILE, "w") as f:
-        for i in range(NUM_LINES):
-            line = generate_log_line(rng, base_time, offset_seconds=i * 2)
+    # Spread 10K lines over 24 hours => ~8.64s between lines
+    seconds_per_line = (24 * 3600) / num_lines
+
+    level_counts: Counter = Counter()
+
+    with open(output_path, "w") as f:
+        for i in range(num_lines):
+            offset = int(i * seconds_per_line)
+            line = generate_log_line(rng, base_time, offset_seconds=offset)
+            level_counts[line["level"]] += 1
             f.write(json.dumps(line) + "\n")
 
-    print(f"Generated {NUM_LINES} log lines to {OUTPUT_FILE}")
+    # Print summary
+    print(f"Generated {num_lines} log lines to {output_path}")
+    print("Level distribution:")
+    for level in LEVELS:
+        count = level_counts[level]
+        pct = count / num_lines * 100
+        print(f"  {level:>5s}: {count:>5d} ({pct:.1f}%)")
+
+
+def main():
+    generate_logs(OUTPUT_FILE)
 
 
 if __name__ == "__main__":

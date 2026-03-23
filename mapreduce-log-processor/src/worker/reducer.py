@@ -48,12 +48,20 @@ async def execute_reduce_task(task: dict) -> None:
     partition_id = task["partition_id"]
     reduce_fn_name = task["reduce_fn"]
 
-    redis_key = f"job:{job_id}:reduce:{partition_id}"
     redis = await _get_binary_redis()
 
-    # Read all items from Redis list, then delete the key
-    raw_items = await redis.lrange(redis_key, 0, -1)
-    await redis.delete(redis_key)
+    # Collect data from all mapper keys for this reducer partition.
+    # Each mapper writes to job:{job_id}:map:{task_id}:reduce:{partition_id}
+    pattern = f"job:{job_id}:map:*:reduce:{partition_id}"
+    mapper_keys = []
+    async for key in redis.scan_iter(match=pattern):
+        mapper_keys.append(key)
+
+    raw_items = []
+    for key in mapper_keys:
+        items = await redis.lrange(key, 0, -1)
+        raw_items.extend(items)
+        await redis.delete(key)
 
     if not raw_items:
         logger.info(
@@ -81,7 +89,7 @@ async def execute_reduce_task(task: dict) -> None:
 
     # Batch insert results into PostgreSQL
     if results:
-        await db.insert_results_batch(job_id, results)
+        await db.insert_results_batch(job_id, results, partition_id=partition_id)
 
     logger.info(
         "reduce_task_executed",

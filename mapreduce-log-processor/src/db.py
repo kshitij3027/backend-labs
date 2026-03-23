@@ -51,10 +51,13 @@ CREATE TABLE IF NOT EXISTS workers (
 CREATE TABLE IF NOT EXISTS results (
     id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    partition_id INTEGER NOT NULL DEFAULT 0,
     key TEXT NOT NULL,
     value TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE results ADD COLUMN IF NOT EXISTS partition_id INTEGER DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_tasks_job_id ON tasks(job_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -151,14 +154,14 @@ async def update_job_status(job_id: str, status: str) -> None:
     logger.info("job_status_updated", job_id=job_id, status=status)
 
 
-async def insert_results_batch(job_id: str, results: list[tuple[str, str]]) -> None:
+async def insert_results_batch(job_id: str, results: list[tuple[str, str]], partition_id: int = 0) -> None:
     """Batch insert reduce results into the results table."""
     async with pool.acquire() as conn:
         await conn.executemany(
-            "INSERT INTO results (id, job_id, key, value) VALUES ($1, $2, $3, $4)",
-            [(str(uuid.uuid4()), job_id, key, value) for key, value in results],
+            "INSERT INTO results (id, job_id, partition_id, key, value) VALUES ($1, $2, $3, $4, $5)",
+            [(str(uuid.uuid4()), job_id, partition_id, key, value) for key, value in results],
         )
-    logger.info("results_inserted", job_id=job_id, count=len(results))
+    logger.info("results_inserted", job_id=job_id, partition_id=partition_id, count=len(results))
 
 
 async def get_job_results(job_id: str) -> list[dict]:
@@ -410,10 +413,10 @@ async def delete_results_for_partition(job_id: str, partition_id: int) -> None:
     # A practical approach: use a sub-table or just delete by job_id.
     # For simplicity, we add partition_id tracking to results or delete by job.
     # Since the schema doesn't have partition_id on results, we'll delete all
-    # results for this job (reduce tasks for the same job all run close together).
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM results WHERE job_id = $1",
+            "DELETE FROM results WHERE job_id = $1 AND partition_id = $2",
             job_id,
+            partition_id,
         )
     logger.info("results_deleted_for_partition", job_id=job_id, partition_id=partition_id)

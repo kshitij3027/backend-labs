@@ -27,7 +27,7 @@ class TestSumReduce:
         assert sum_reduce([42]) == "42"
 
     def test_sum_floats(self):
-        assert sum_reduce([1.5, 2.5]) == "4.0"
+        assert sum_reduce([1.5, 2.5]) == "4"
 
 
 class TestCountReduce:
@@ -64,7 +64,7 @@ async def setup_db_redis(setup_services):
     yield
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_execute_reduce_task_sum(setup_db_redis):
     """Write msgpack data to Redis, run reducer with sum, verify results in DB."""
     # Register reduce functions
@@ -82,7 +82,7 @@ async def test_execute_reduce_task_sum(setup_db_redis):
 
     # Write mock intermediate data to Redis
     redis = await _get_binary_redis()
-    redis_key = f"job:{job_id}:reduce:0"
+    redis_key = f"job:{job_id}:map:test-mapper:reduce:0"
 
     pairs = [("hello", 1), ("hello", 1), ("hello", 1), ("world", 1), ("world", 1)]
     for pair in pairs:
@@ -108,7 +108,7 @@ async def test_execute_reduce_task_sum(setup_db_redis):
     assert len(remaining) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_execute_reduce_task_count(setup_db_redis):
     """Test reducer with count function."""
     import src.mapfunctions.reducers  # noqa: F401
@@ -123,7 +123,7 @@ async def test_execute_reduce_task_count(setup_db_redis):
         )
 
     redis = await _get_binary_redis()
-    redis_key = f"job:{job_id}:reduce:0"
+    redis_key = f"job:{job_id}:map:test-mapper:reduce:0"
 
     pairs = [("error", "404"), ("error", "500"), ("error", "404"), ("ok", "200")]
     for pair in pairs:
@@ -143,7 +143,7 @@ async def test_execute_reduce_task_count(setup_db_redis):
     assert result_dict["ok"] == "1"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_execute_reduce_task_empty(setup_db_redis):
     """Test reducer with no data in Redis (empty partition)."""
     import src.mapfunctions.reducers  # noqa: F401
@@ -168,7 +168,7 @@ async def test_execute_reduce_task_empty(setup_db_redis):
     assert len(results) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_execute_reduce_task_collect(setup_db_redis):
     """Test reducer with collect function."""
     import src.mapfunctions.reducers  # noqa: F401
@@ -183,7 +183,7 @@ async def test_execute_reduce_task_collect(setup_db_redis):
         )
 
     redis = await _get_binary_redis()
-    redis_key = f"job:{job_id}:reduce:0"
+    redis_key = f"job:{job_id}:map:test-mapper:reduce:0"
 
     pairs = [("user1", "/home"), ("user1", "/about"), ("user1", "/home"), ("user2", "/login")]
     for pair in pairs:

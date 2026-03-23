@@ -19,9 +19,12 @@ async def detect_data_skew(job_id: str, num_reducers: int) -> None:
 
     sizes = {}
     for i in range(num_reducers):
-        key = f"job:{job_id}:reduce:{i}"
-        size = await redis.llen(key)
-        sizes[i] = size
+        # Sum sizes across all mapper keys for this reducer partition
+        pattern = f"job:{job_id}:map:*:reduce:{i}"
+        total = 0
+        async for key in redis.scan_iter(match=pattern):
+            total += await redis.llen(key)
+        sizes[i] = total
 
     if not sizes or all(s == 0 for s in sizes.values()):
         return

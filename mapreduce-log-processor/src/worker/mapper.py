@@ -1,5 +1,6 @@
 """Map task execution logic."""
 
+import hashlib
 import json
 
 import msgpack
@@ -38,12 +39,13 @@ async def execute_map_task(task: dict) -> None:
     1. Read log lines from input_path[input_start:input_end]
     2. Apply map function to each line
     3. Hash-partition output into num_reducers buckets
-    4. Write each bucket to Redis
+    4. Write each bucket to Redis (keyed by task_id to avoid cross-mapper collisions)
     """
     input_path = task["input_path"]
     input_start = task["input_start"]
     input_end = task["input_end"]
     job_id = task["job_id"]
+    task_id = task["id"]
     num_reducers = task["num_reducers"]
     map_fn_name = task["map_fn"]
 
@@ -73,8 +75,10 @@ async def execute_map_task(task: dict) -> None:
 
             # Apply map function
             for key, value in map_fn(log_line):
-                # Hash partition: determine which reducer gets this key
-                reducer_id = hash(key) % num_reducers
+                # Deterministic hash partition (Python's built-in hash() is
+                # randomised per-process via PYTHONHASHSEED, which would route
+                # the same key to different reducer partitions across mappers).
+                reducer_id = int(hashlib.md5(key.encode()).hexdigest(), 16) % num_reducers
                 buckets[reducer_id].append((key, value))
                 pairs_emitted += 1
 
@@ -83,11 +87,12 @@ async def execute_map_task(task: dict) -> None:
         if buckets[reducer_id]:
             buckets[reducer_id] = combine(buckets[reducer_id], task["reduce_fn"])
 
-    # Write each bucket to Redis
+    # Write each bucket to Redis, keyed by task_id so multiple mappers
+    # don't overwrite each other's data for the same reducer partition.
     for reducer_id, pairs in buckets.items():
         if not pairs:
             continue
-        redis_key = f"job:{job_id}:reduce:{reducer_id}"
+        redis_key = f"job:{job_id}:map:{task_id}:reduce:{reducer_id}"
         # Delete existing key to ensure clean slate on retry (idempotency)
         await redis.delete(redis_key)
         # Serialize all pairs as msgpack and RPUSH to Redis list
