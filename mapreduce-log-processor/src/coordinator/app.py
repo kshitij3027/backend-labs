@@ -81,6 +81,44 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/stats")
+async def get_stats():
+    """Return current system stats: jobs, tasks, and workers."""
+    async with db.pool.acquire() as conn:
+        total_jobs = await conn.fetchval("SELECT COUNT(*) FROM jobs")
+        active_jobs = await conn.fetchval(
+            "SELECT COUNT(*) FROM jobs WHERE status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')"
+        )
+        pending_tasks = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'PENDING'"
+        )
+        running_tasks = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'RUNNING'"
+        )
+        completed_tasks = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'COMPLETED'"
+        )
+        failed_tasks = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'FAILED'"
+        )
+        workers_alive = await conn.fetchval(
+            "SELECT COUNT(*) FROM workers WHERE status = 'ALIVE'"
+        )
+        workers_dead = await conn.fetchval(
+            "SELECT COUNT(*) FROM workers WHERE status = 'DEAD'"
+        )
+    return {
+        "total_jobs": total_jobs,
+        "active_jobs": active_jobs,
+        "pending_tasks": pending_tasks,
+        "running_tasks": running_tasks,
+        "completed_tasks": completed_tasks,
+        "failed_tasks": failed_tasks,
+        "workers_alive": workers_alive,
+        "workers_dead": workers_dead,
+    }
+
+
 @app.post("/jobs", status_code=201, response_model=JobResponse)
 async def submit_job(job: JobCreate):
     logger.info(

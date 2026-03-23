@@ -8,6 +8,7 @@ import structlog
 
 from src.config import settings
 from src.mapfunctions.registry import get_map_fn
+from src.worker.combiner import combine
 
 logger = structlog.get_logger()
 
@@ -76,6 +77,11 @@ async def execute_map_task(task: dict) -> None:
                 reducer_id = hash(key) % num_reducers
                 buckets[reducer_id].append((key, value))
                 pairs_emitted += 1
+
+    # Apply combiner to each bucket before writing to Redis
+    for reducer_id in buckets:
+        if buckets[reducer_id]:
+            buckets[reducer_id] = combine(buckets[reducer_id], task["reduce_fn"])
 
     # Write each bucket to Redis
     for reducer_id, pairs in buckets.items():

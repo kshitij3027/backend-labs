@@ -1,12 +1,14 @@
-"""Tests for map functions and mapper logic."""
+"""Tests for map functions, mapper logic, and combiner."""
 
 import pytest
 
 # Import map function modules to trigger registration
 import src.mapfunctions.error_code  # noqa: F401
+import src.mapfunctions.reducers  # noqa: F401
 import src.mapfunctions.url_path  # noqa: F401
 import src.mapfunctions.word_count  # noqa: F401
 from src.mapfunctions.registry import get_map_fn
+from src.worker.combiner import combine
 
 
 class TestWordCountMap:
@@ -108,6 +110,48 @@ class TestUrlPathMap:
         log_line = {"url": None}
         result = list(fn(log_line))
         assert result == []
+
+
+class TestCombiner:
+    """Tests for the combiner (local pre-reducer)."""
+
+    def test_sum_combiner_reduces_pairs(self):
+        """Combiner with sum reducer should aggregate values by key."""
+        kv_pairs = [("a", 1), ("a", 1), ("b", 1)]
+        result = combine(kv_pairs, "sum")
+        result_dict = dict(result)
+        assert result_dict["a"] == "2"
+        assert result_dict["b"] == "1"
+        assert len(result) == 2
+
+    def test_count_combiner(self):
+        """Combiner with count reducer should count values per key."""
+        kv_pairs = [("x", 1), ("x", 1), ("x", 1), ("y", 1)]
+        result = combine(kv_pairs, "count")
+        result_dict = dict(result)
+        assert result_dict["x"] == "3"
+        assert result_dict["y"] == "1"
+
+    def test_empty_input_returns_empty(self):
+        """Combiner with empty input should return empty list."""
+        result = combine([], "sum")
+        assert result == []
+
+    def test_single_key_single_value(self):
+        """Combiner with a single pair should return that pair reduced."""
+        kv_pairs = [("only", 5)]
+        result = combine(kv_pairs, "sum")
+        assert len(result) == 1
+        assert result[0] == ("only", "5")
+
+    def test_many_duplicate_keys(self):
+        """Combiner should handle many duplicate keys efficiently."""
+        kv_pairs = [("error_404", 1)] * 100 + [("error_500", 1)] * 50
+        result = combine(kv_pairs, "sum")
+        result_dict = dict(result)
+        assert result_dict["error_404"] == "100"
+        assert result_dict["error_500"] == "50"
+        assert len(result) == 2
 
 
 class TestHashPartitioning:

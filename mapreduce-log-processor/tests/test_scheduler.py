@@ -167,3 +167,77 @@ class TestAssignTask:
     async def test_returns_none_when_no_pending(self, setup_services, clean_db):
         task = await assign_task("some-worker")
         assert task is None
+
+    async def test_backpressure_blocks_when_at_limit(self, setup_services, clean_db, sample_log_file):
+        """When RUNNING tasks >= MAX_CONCURRENT_TASKS, assign_task should return None."""
+        import uuid
+        from src.config import settings
+
+        job_id = str(uuid.uuid4())
+        worker_id = "test-worker-bp"
+
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jobs (id, status, input_path, map_fn, reduce_fn, num_mappers, num_reducers)
+                   VALUES ($1, 'MAPPING', $2, 'word_count', 'sum', 2, 2)""",
+                job_id, sample_log_file,
+            )
+
+            # Create MAX_CONCURRENT_TASKS tasks already in RUNNING state
+            for i in range(settings.MAX_CONCURRENT_TASKS):
+                task_id = str(uuid.uuid4())
+                await conn.execute(
+                    """INSERT INTO tasks (id, job_id, type, status, worker_id, partition_id, input_start, input_end)
+                       VALUES ($1, $2, 'MAP', 'RUNNING', $3, $4, 0, 10)""",
+                    task_id, job_id, f"worker-{i}", i,
+                )
+
+            # Also insert a PENDING task that would normally be assignable
+            pending_task_id = str(uuid.uuid4())
+            await conn.execute(
+                """INSERT INTO tasks (id, job_id, type, status, partition_id, input_start, input_end)
+                   VALUES ($1, $2, 'MAP', 'PENDING', $3, 0, 10)""",
+                pending_task_id, job_id, settings.MAX_CONCURRENT_TASKS,
+            )
+
+        # Should return None due to backpressure even though a PENDING task exists
+        task = await assign_task(worker_id)
+        assert task is None
+
+    async def test_assign_works_under_backpressure_limit(self, setup_services, clean_db, sample_log_file):
+        """When RUNNING tasks < MAX_CONCURRENT_TASKS, assign_task should work normally."""
+        import uuid
+        from src.config import settings
+
+        job_id = str(uuid.uuid4())
+        worker_id = "test-worker-under"
+
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jobs (id, status, input_path, map_fn, reduce_fn, num_mappers, num_reducers)
+                   VALUES ($1, 'MAPPING', $2, 'word_count', 'sum', 2, 2)""",
+                job_id, sample_log_file,
+            )
+            await conn.execute(
+                """INSERT INTO workers (id, status, last_heartbeat, tasks_completed)
+                   VALUES ($1, 'ALIVE', NOW(), 0)""",
+                worker_id,
+            )
+
+            # Create fewer than MAX_CONCURRENT_TASKS running tasks
+            limit = max(settings.MAX_CONCURRENT_TASKS - 2, 0)
+            for i in range(limit):
+                task_id = str(uuid.uuid4())
+                await conn.execute(
+                    """INSERT INTO tasks (id, job_id, type, status, worker_id, partition_id, input_start, input_end)
+                       VALUES ($1, $2, 'MAP', 'RUNNING', $3, $4, 0, 10)""",
+                    task_id, job_id, f"worker-{i}", i,
+                )
+
+        # Create a pending task via the normal API
+        await create_map_tasks(job_id, sample_log_file, num_mappers=1)
+
+        # Should succeed since we're under the limit
+        task = await assign_task(worker_id)
+        assert task is not None
+        assert task["job_id"] == job_id

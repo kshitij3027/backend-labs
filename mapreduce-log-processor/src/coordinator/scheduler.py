@@ -4,6 +4,7 @@ import uuid
 
 import structlog
 
+from src.config import settings
 import src.db as db
 
 logger = structlog.get_logger()
@@ -63,8 +64,22 @@ async def create_reduce_tasks(job_id: str, num_reducers: int) -> list[dict]:
 
 
 async def assign_task(worker_id: str) -> dict | None:
-    """Atomically assign a pending task to a worker using SELECT FOR UPDATE SKIP LOCKED."""
+    """Atomically assign a pending task to a worker using SELECT FOR UPDATE SKIP LOCKED.
+    Returns None if backpressure limit is reached (too many RUNNING tasks)."""
     async with db.pool.acquire() as conn:
+        # Backpressure check
+        running_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'RUNNING'"
+        )
+        if running_count >= settings.MAX_CONCURRENT_TASKS:
+            logger.info(
+                "backpressure_applied",
+                running_tasks=running_count,
+                limit=settings.MAX_CONCURRENT_TASKS,
+                worker_id=worker_id,
+            )
+            return None
+
         async with conn.transaction():
             row = await conn.fetchrow(
                 """SELECT t.*, j.input_path, j.map_fn, j.reduce_fn, j.num_reducers
