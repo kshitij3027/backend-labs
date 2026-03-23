@@ -1,15 +1,22 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
+from src.config import settings
+from src.coordinator.heartbeat import heartbeat_checker
 from src.db import (
     close_db,
     create_job,
     get_job,
     get_job_results,
+    get_workers,
     init_db,
     list_jobs,
+    register_worker,
+    update_heartbeat,
     update_job_status,
 )
 from src.models import (
@@ -30,9 +37,25 @@ async def lifespan(app: FastAPI):
     logger.info("coordinator_starting")
     await init_db()
     await init_redis()
+
+    # Start heartbeat checker background task
+    hb_task = asyncio.create_task(
+        heartbeat_checker(
+            interval=settings.HEARTBEAT_INTERVAL,
+            timeout=settings.HEARTBEAT_TIMEOUT,
+        )
+    )
     logger.info("coordinator_ready")
     yield
     logger.info("coordinator_shutting_down")
+
+    # Cancel heartbeat checker
+    hb_task.cancel()
+    try:
+        await hb_task
+    except asyncio.CancelledError:
+        pass
+
     await close_redis()
     await close_db()
     logger.info("coordinator_stopped")
@@ -106,6 +129,26 @@ async def cancel_job(job_id: str):
     return {"id": job_id, "status": "CANCELLED"}
 
 
+class WorkerRegisterRequest(BaseModel):
+    worker_id: str
+
+
+@app.post("/workers/register")
+async def register_worker_endpoint(body: WorkerRegisterRequest):
+    worker = await register_worker(body.worker_id)
+    logger.info("worker_registered_via_api", worker_id=body.worker_id)
+    return {"worker_id": worker["id"], "status": worker["status"]}
+
+
+@app.post("/workers/{worker_id}/heartbeat")
+async def worker_heartbeat(worker_id: str):
+    updated = await update_heartbeat(worker_id)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return {"worker_id": worker_id, "status": "ok"}
+
+
 @app.get("/workers", response_model=list[WorkerInfo])
-async def get_workers():
-    return []
+async def list_workers():
+    rows = await get_workers()
+    return [WorkerInfo(**r) for r in rows]

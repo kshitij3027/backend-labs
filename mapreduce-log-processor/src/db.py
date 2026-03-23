@@ -152,3 +152,65 @@ async def get_job_results(job_id: str) -> list[dict]:
             job_id,
         )
     return [dict(r) for r in rows]
+
+
+# ── Worker operations ────────────────────────────────────────────
+
+
+async def register_worker(worker_id: str) -> dict:
+    """Upsert a worker: insert or update status to ALIVE with fresh heartbeat."""
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO workers (id, status, last_heartbeat, tasks_completed)
+            VALUES ($1, 'ALIVE', $2, 0)
+            ON CONFLICT (id) DO UPDATE
+                SET status = 'ALIVE', last_heartbeat = $2
+            RETURNING *
+            """,
+            worker_id,
+            now,
+        )
+    logger.info("worker_registered", worker_id=worker_id)
+    return dict(row)
+
+
+async def update_heartbeat(worker_id: str) -> bool:
+    """Update last_heartbeat for a worker. Returns True if the worker exists."""
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE workers SET last_heartbeat = $1 WHERE id = $2",
+            now,
+            worker_id,
+        )
+    # asyncpg returns e.g. "UPDATE 1" or "UPDATE 0"
+    updated = result.split()[-1] != "0"
+    return updated
+
+
+async def get_workers() -> list[dict]:
+    """List all workers."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM workers ORDER BY last_heartbeat DESC")
+    return [dict(r) for r in rows]
+
+
+async def get_alive_workers() -> list[dict]:
+    """List workers with status ALIVE."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM workers WHERE status = 'ALIVE' ORDER BY last_heartbeat DESC"
+        )
+    return [dict(r) for r in rows]
+
+
+async def mark_worker_dead(worker_id: str) -> None:
+    """Update worker status to DEAD."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE workers SET status = 'DEAD' WHERE id = $1",
+            worker_id,
+        )
+    logger.info("worker_marked_dead", worker_id=worker_id)

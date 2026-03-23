@@ -45,6 +45,16 @@ services:
       start_period: 10s
       retries: 3
 
+  worker:
+    build: .
+    command: python -m src.worker.main
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    env_file: .env.example
+    deploy:
+      replicas: 2
+
   test:
     build:
       context: .
