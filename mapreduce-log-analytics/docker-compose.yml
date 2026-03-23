@@ -1,0 +1,59 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - log-data:/data
+    environment:
+      - LOG_LEVEL=INFO
+      - PYTHONPATH=/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  generate-logs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/generate_logs.py --output-dir /data
+    volumes:
+      - log-data:/data
+    environment:
+      - PYTHONPATH=/app
+    restart: "no"
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - log-data:/data
+    environment:
+      - PYTHONPATH=/app
+    profiles:
+      - test
+
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/verify_e2e.py
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - SERVER_URL=http://app:8080
+      - PYTHONPATH=/app
+    profiles:
+      - e2e
+    volumes:
+      - log-data:/data:ro
+
+volumes:
+  log-data:
