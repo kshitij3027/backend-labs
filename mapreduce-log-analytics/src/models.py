@@ -38,3 +38,29 @@ class JobInfo(BaseModel):
     results: dict | None = None
     created_at: str
     completed_at: str | None = None
+
+    def set_phase(self, status: JobStatus, phase_name: str) -> None:
+        self.status = status
+        self.current_phase = phase_name
+
+    def update_progress(
+        self, completed: int, total: int, records: int = 0
+    ) -> None:
+        self.completed_chunks = completed
+        self.total_chunks = total
+        self.progress = completed / total if total > 0 else 0.0
+        if records:
+            self.records_processed = records
+
+    def set_completed(self, results: dict, execution_time: float) -> None:
+        self.status = JobStatus.COMPLETED
+        self.current_phase = "completed"
+        self.progress = 1.0
+        self.results = results
+        self.execution_time = execution_time
+
+    def set_failed(self, error: str, execution_time: float = 0.0) -> None:
+        self.status = JobStatus.FAILED
+        self.current_phase = "failed"
+        self.error_message = error
+        self.execution_time = execution_time
