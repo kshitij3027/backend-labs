@@ -150,6 +150,16 @@ async def update_job_status(job_id: str, status: str) -> None:
     logger.info("job_status_updated", job_id=job_id, status=status)
 
 
+async def insert_results_batch(job_id: str, results: list[tuple[str, str]]) -> None:
+    """Batch insert reduce results into the results table."""
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO results (id, job_id, key, value) VALUES ($1, $2, $3, $4)",
+            [(str(uuid.uuid4()), job_id, key, value) for key, value in results],
+        )
+    logger.info("results_inserted", job_id=job_id, count=len(results))
+
+
 async def get_job_results(job_id: str) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(

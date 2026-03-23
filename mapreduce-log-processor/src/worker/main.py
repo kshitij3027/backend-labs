@@ -7,9 +7,11 @@ import httpx
 import structlog
 
 from src.config import settings
+from src.db import close_db, init_db
 from src.redis_client import close_redis, init_redis
 from src.worker.heartbeat import heartbeat_loop
-from src.worker.mapper import close_binary_redis
+from src.worker.mapper import close_binary_redis as close_mapper_redis
+from src.worker.reducer import close_binary_redis as close_reducer_redis
 
 logger = structlog.get_logger()
 
@@ -57,6 +59,10 @@ async def task_poll_loop(worker_id: str, coordinator_url: str) -> None:
                         from src.worker.mapper import execute_map_task
 
                         await execute_map_task(task)
+                    elif task_type == "REDUCE":
+                        from src.worker.reducer import execute_reduce_task
+
+                        await execute_reduce_task(task)
 
                     # Report completion
                     await client.post(f"{coordinator_url}/tasks/{task_id}/complete")
@@ -89,8 +95,9 @@ async def register_worker(worker_id: str, coordinator_url: str) -> None:
 
 
 def _register_map_functions() -> None:
-    """Import all map function modules to trigger registration."""
+    """Import all map/reduce function modules to trigger registration."""
     import src.mapfunctions.error_code  # noqa: F401
+    import src.mapfunctions.reducers  # noqa: F401
     import src.mapfunctions.url_path  # noqa: F401
     import src.mapfunctions.word_count  # noqa: F401
 
@@ -110,6 +117,9 @@ async def main() -> None:
 
     # Initialize Redis for mapper intermediate data
     await init_redis()
+
+    # Initialize DB pool for reducer result writes
+    await init_db()
 
     # Register with coordinator
     await register_worker(worker_id, coordinator_url)
@@ -145,9 +155,11 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
 
-    # Close Redis connections
-    await close_binary_redis()
+    # Close connections
+    await close_mapper_redis()
+    await close_reducer_redis()
     await close_redis()
+    await close_db()
 
     logger.info("worker_stopped", worker_id=worker_id)
 

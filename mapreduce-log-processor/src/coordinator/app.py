@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 from src.config import settings
 from src.coordinator.heartbeat import heartbeat_checker
-from src.coordinator.scheduler import assign_task, complete_task, create_map_tasks, fail_task
+from src.coordinator.scheduler import assign_task, complete_task, create_map_tasks, create_reduce_tasks, fail_task
 from src.db import (
     close_db,
     create_job,

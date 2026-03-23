@@ -46,6 +46,22 @@ async def create_map_tasks(job_id: str, input_path: str, num_mappers: int) -> li
     return tasks
 
 
+async def create_reduce_tasks(job_id: str, num_reducers: int) -> list[dict]:
+    """Create reduce task records in DB for a job (one per reducer partition)."""
+    tasks = []
+    async with db.pool.acquire() as conn:
+        for i in range(num_reducers):
+            task_id = str(uuid.uuid4())
+            await conn.execute(
+                """INSERT INTO tasks (id, job_id, type, status, partition_id, input_start, input_end)
+                   VALUES ($1, $2, 'REDUCE', 'PENDING', $3, 0, 0)""",
+                task_id, job_id, i,
+            )
+            tasks.append({"id": task_id, "partition_id": i})
+    logger.info("reduce_tasks_created", job_id=job_id, count=len(tasks))
+    return tasks
+
+
 async def assign_task(worker_id: str) -> dict | None:
     """Atomically assign a pending task to a worker using SELECT FOR UPDATE SKIP LOCKED."""
     async with db.pool.acquire() as conn:
@@ -99,12 +115,32 @@ async def complete_task(task_id: str) -> None:
                 job_id,
             )
             if pending == 0:
-                # All map tasks done - transition to SHUFFLE_COMPLETE
-                await conn.execute(
-                    "UPDATE jobs SET status = 'SHUFFLE_COMPLETE', updated_at = NOW() WHERE id = $1",
-                    job_id,
+                # All map tasks done - get num_reducers from job
+                job_row = await conn.fetchrow(
+                    "SELECT num_reducers FROM jobs WHERE id = $1", job_id,
                 )
                 logger.info("all_map_tasks_completed", job_id=job_id)
+
+                # Create reduce tasks and transition to REDUCING
+                await create_reduce_tasks(job_id, job_row["num_reducers"])
+                await conn.execute(
+                    "UPDATE jobs SET status = 'REDUCING', updated_at = NOW() WHERE id = $1",
+                    job_id,
+                )
+                logger.info("job_reducing", job_id=job_id)
+
+        elif task_type == "REDUCE":
+            # Check if all reduce tasks for this job are completed
+            pending = await conn.fetchval(
+                "SELECT COUNT(*) FROM tasks WHERE job_id = $1 AND type = 'REDUCE' AND status != 'COMPLETED'",
+                job_id,
+            )
+            if pending == 0:
+                await conn.execute(
+                    "UPDATE jobs SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1",
+                    job_id,
+                )
+                logger.info("all_reduce_tasks_completed", job_id=job_id)
 
     logger.info("task_completed", task_id=task_id, type=task_type)
 
