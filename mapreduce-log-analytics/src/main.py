@@ -1,5 +1,9 @@
+"""Entry point for MapReduce Log Analytics server."""
+
 import logging
 import os
+
+import uvicorn
 
 
 def setup_logging():
@@ -12,4 +16,5 @@ def setup_logging():
 
 if __name__ == "__main__":
     setup_logging()
-    logging.getLogger(__name__).info("MapReduce Log Analytics starting...")
+    port = int(os.environ.get("PORT", "8080"))
+    uvicorn.run("src.api:app", host="0.0.0.0", port=port, log_level="info")
