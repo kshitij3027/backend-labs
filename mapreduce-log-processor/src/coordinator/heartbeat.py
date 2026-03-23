@@ -3,13 +3,15 @@ from datetime import datetime, timezone
 
 import structlog
 
-from src.db import get_alive_workers, mark_worker_dead
+from src.config import settings
+from src.db import get_alive_workers, mark_worker_dead, reassign_tasks_for_worker, fail_task_and_check_job
 
 logger = structlog.get_logger()
 
 
 async def heartbeat_checker(interval: int, timeout: int) -> None:
-    """Check worker heartbeats. Mark workers as DEAD if they miss heartbeats."""
+    """Check worker heartbeats. Mark workers as DEAD if they miss heartbeats.
+    When a worker is marked DEAD, reassign its running tasks."""
     while True:
         await asyncio.sleep(interval)
         try:
@@ -29,5 +31,29 @@ async def heartbeat_checker(interval: int, timeout: int) -> None:
                         timeout=timeout,
                     )
                     await mark_worker_dead(w["id"])
+
+                    # Reassign tasks that were running on this dead worker
+                    affected = await reassign_tasks_for_worker(
+                        w["id"], settings.MAX_RETRIES
+                    )
+                    for task in affected:
+                        if task["new_status"] == "PENDING":
+                            logger.info(
+                                "task_reassigned",
+                                task_id=task["id"],
+                                worker_id=w["id"],
+                                retry_count=task["retry_count"],
+                            )
+                        elif task["new_status"] == "FAILED":
+                            logger.warning(
+                                "task_exceeded_retries",
+                                task_id=task["id"],
+                                worker_id=w["id"],
+                                retry_count=task["retry_count"],
+                            )
+                            # Check if job should be failed
+                            await fail_task_and_check_job(
+                                task["id"], settings.MAX_RETRIES
+                            )
         except Exception as e:
             logger.error("heartbeat_checker_error", error=str(e))

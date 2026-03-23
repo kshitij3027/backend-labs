@@ -1,8 +1,11 @@
 import json
 import os
 import tempfile
+import uuid
 
 import pytest
+
+from src.config import settings
 
 
 @pytest.fixture
@@ -108,6 +111,97 @@ class TestJobs:
     async def test_get_result_nonexistent_job(self, test_client):
         resp = await test_client.get("/jobs/nonexistent-id-12345/result")
         assert resp.status_code == 404
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestTaskFailedEndpoint:
+    async def test_task_failed_resets_to_pending_on_first_failure(self, test_client):
+        """POST /tasks/{id}/failed resets task to PENDING on first failure."""
+        from src.db import pool
+
+        job_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jobs (id, status, input_path, map_fn, reduce_fn, num_mappers, num_reducers)
+                   VALUES ($1, 'MAPPING', '/data/test.jsonl', 'word_count', 'sum', 2, 2)""",
+                job_id,
+            )
+            await conn.execute(
+                """INSERT INTO tasks (id, job_id, type, status, worker_id, partition_id, input_start, input_end, retry_count)
+                   VALUES ($1, $2, 'MAP', 'RUNNING', 'some-worker', 0, 0, 10, 0)""",
+                task_id, job_id,
+            )
+
+        resp = await test_client.post(f"/tasks/{task_id}/failed")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "PENDING"
+        assert data["retry_count"] == 1
+
+        # Verify in DB
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        assert row["status"] == "PENDING"
+        assert row["worker_id"] is None
+        assert row["retry_count"] == 1
+
+    async def test_task_failed_marks_failed_after_max_retries(self, test_client):
+        """POST /tasks/{id}/failed marks FAILED when retries exhausted."""
+        from src.db import pool
+
+        job_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jobs (id, status, input_path, map_fn, reduce_fn, num_mappers, num_reducers)
+                   VALUES ($1, 'MAPPING', '/data/test.jsonl', 'word_count', 'sum', 2, 2)""",
+                job_id,
+            )
+            await conn.execute(
+                """INSERT INTO tasks (id, job_id, type, status, worker_id, partition_id, input_start, input_end, retry_count)
+                   VALUES ($1, $2, 'MAP', 'RUNNING', 'some-worker', 0, 0, 10, $3)""",
+                task_id, job_id, settings.MAX_RETRIES - 1,
+            )
+
+        resp = await test_client.post(f"/tasks/{task_id}/failed")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "FAILED"
+        assert data["retry_count"] == settings.MAX_RETRIES
+
+
+@pytest.mark.asyncio(loop_scope="session")
+class TestRecovery:
+    async def test_recovery_resets_stale_running_tasks(self, setup_services):
+        """Create a job with stale RUNNING tasks, call recovery, verify tasks reset."""
+        from src.db import pool
+        from src.coordinator.recovery import on_startup_recovery
+
+        job_id = str(uuid.uuid4())
+        task_id = str(uuid.uuid4())
+
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO jobs (id, status, input_path, map_fn, reduce_fn, num_mappers, num_reducers)
+                   VALUES ($1, 'MAPPING', '/data/test.jsonl', 'word_count', 'sum', 2, 2)""",
+                job_id,
+            )
+            await conn.execute(
+                """INSERT INTO tasks (id, job_id, type, status, worker_id, partition_id, input_start, input_end, retry_count)
+                   VALUES ($1, $2, 'MAP', 'RUNNING', 'dead-worker-recovery', 0, 0, 10, 0)""",
+                task_id, job_id,
+            )
+
+        await on_startup_recovery()
+
+        # Verify task was reset to PENDING
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM tasks WHERE id = $1", task_id)
+        assert row["status"] == "PENDING"
+        assert row["worker_id"] is None
 
 
 @pytest.mark.asyncio(loop_scope="session")

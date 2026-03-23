@@ -8,7 +8,9 @@ from pydantic import BaseModel
 
 from src.config import settings
 from src.coordinator.heartbeat import heartbeat_checker
+from src.coordinator.recovery import on_startup_recovery
 from src.coordinator.scheduler import assign_task, complete_task, create_map_tasks, create_reduce_tasks, fail_task
+import src.db as db
 from src.db import (
     close_db,
     create_job,
@@ -39,6 +41,9 @@ async def lifespan(app: FastAPI):
     logger.info("coordinator_starting")
     await init_db()
     await init_redis()
+
+    # Run crash recovery before starting normal operations
+    await on_startup_recovery()
 
     # Start heartbeat checker background task
     hb_task = asyncio.create_task(
@@ -178,9 +183,50 @@ async def mark_task_complete(task_id: str):
 
 @app.post("/tasks/{task_id}/failed")
 async def mark_task_failed(task_id: str):
-    """Mark a task as failed."""
-    await fail_task(task_id)
-    return {"task_id": task_id, "status": "FAILED"}
+    """Mark a task as failed, with retry logic."""
+    async with db.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM tasks WHERE id = $1", task_id,
+        )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = dict(row)
+    new_retry = task["retry_count"] + 1
+
+    if new_retry < settings.MAX_RETRIES:
+        # Reset to PENDING for retry
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'PENDING', worker_id = NULL,
+                       retry_count = $1, updated_at = NOW()
+                   WHERE id = $2""",
+                new_retry, task_id,
+            )
+        logger.info(
+            "task_reset_for_retry",
+            task_id=task_id,
+            retry_count=new_retry,
+        )
+        return {"task_id": task_id, "status": "PENDING", "retry_count": new_retry}
+    else:
+        # Max retries exceeded — mark FAILED and check job
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE tasks
+                   SET status = 'FAILED', retry_count = $1, updated_at = NOW()
+                   WHERE id = $2""",
+                new_retry, task_id,
+            )
+        job_failed = await db.fail_task_and_check_job(task_id, settings.MAX_RETRIES)
+        logger.warning(
+            "task_permanently_failed",
+            task_id=task_id,
+            retry_count=new_retry,
+            job_failed=job_failed,
+        )
+        return {"task_id": task_id, "status": "FAILED", "retry_count": new_retry}
 
 
 # ── Worker endpoints ────────────────────────────────────────────

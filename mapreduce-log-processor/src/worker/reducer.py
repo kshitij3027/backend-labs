@@ -76,6 +76,9 @@ async def execute_reduce_task(task: dict) -> None:
         reduced_value = reduce_fn(values)
         results.append((key, reduced_value))
 
+    # Delete existing results for this partition before inserting (idempotency)
+    await db.delete_results_for_partition(job_id, partition_id)
+
     # Batch insert results into PostgreSQL
     if results:
         await db.insert_results_batch(job_id, results)

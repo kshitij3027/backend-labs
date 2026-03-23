@@ -82,6 +82,8 @@ async def execute_map_task(task: dict) -> None:
         if not pairs:
             continue
         redis_key = f"job:{job_id}:reduce:{reducer_id}"
+        # Delete existing key to ensure clean slate on retry (idempotency)
+        await redis.delete(redis_key)
         # Serialize all pairs as msgpack and RPUSH to Redis list
         pipeline = redis.pipeline()
         for pair in pairs:
