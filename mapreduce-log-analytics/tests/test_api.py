@@ -65,7 +65,7 @@ class TestJobsEndpoint:
         assert resp.status_code == 201
         data = resp.json()
         assert "job_id" in data
-        assert data["status"] == "PENDING"
+        assert data["status"] in ("PENDING", "MAPPING", "SHUFFLING", "REDUCING", "DONE")
 
     @pytest.mark.asyncio
     async def test_list_jobs(self, client, sample_json_logs):

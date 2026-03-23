@@ -1,18 +1,22 @@
 """FastAPI application with REST endpoints for MapReduce job management."""
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from src.analyzers.registry import list_analyzers
 from src.config import Config
 from src.job_manager import JobManager
 from src.models import JobSubmission
+from src.websocket import ConnectionManager
 
 logger = logging.getLogger(__name__)
+
+ws_manager = ConnectionManager()
 
 
 @asynccontextmanager
@@ -34,6 +38,15 @@ async def lifespan(app: FastAPI):
     # Create job manager
     app.state.job_manager = JobManager(config)
     app.state.config = config
+
+    # Wire up sync-to-async WebSocket broadcast bridge
+    loop = asyncio.get_event_loop()
+
+    def sync_broadcast(data: dict):
+        """Bridge sync->async for WebSocket broadcast from background threads."""
+        asyncio.run_coroutine_threadsafe(ws_manager.broadcast(data), loop)
+
+    app.state.job_manager.set_ws_broadcast(sync_broadcast)
 
     logger.info(f"MapReduce Log Analytics started on port {config.port}")
     yield
@@ -87,7 +100,20 @@ async def list_functions():
     return list_analyzers()
 
 
-@app.get("/dashboard")
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time job updates."""
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """Serve the web dashboard."""
-    return HTMLResponse("<html><body><h1>Dashboard coming in Commit 7</h1></body></html>")
+    dashboard_path = os.path.join(os.path.dirname(__file__), "templates", "dashboard.html")
+    with open(dashboard_path) as f:
+        return HTMLResponse(content=f.read())

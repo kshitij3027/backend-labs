@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MapReduce Log Analytics Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; }
+
+        .header { background: #1a1a2e; color: white; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+        .header h1 { font-size: 20px; }
+        .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-dot.connected { background: #4caf50; }
+        .status-dot.disconnected { background: #f44336; }
+
+        .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+        .card h2 { font-size: 16px; margin-bottom: 12px; color: #333; }
+
+        .form-row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+        .form-group { display: flex; flex-direction: column; }
+        .form-group label { font-size: 12px; color: #666; margin-bottom: 4px; }
+        .form-group input, .form-group select { padding: 8px 12px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+
+        button { padding: 8px 20px; background: #1a1a2e; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #16213e; }
+
+        .progress-bar { height: 8px; background: #e0e0e0; border-radius: 4px; overflow: hidden; margin: 8px 0; }
+        .progress-fill { height: 100%; background: #4caf50; transition: width 0.3s; border-radius: 4px; }
+
+        .job-card { border-left: 4px solid #1a1a2e; }
+        .job-card.completed { border-left-color: #4caf50; }
+        .job-card.failed { border-left-color: #f44336; }
+        .job-card.running { border-left-color: #ff9800; }
+
+        .job-meta { display: flex; gap: 16px; font-size: 13px; color: #666; margin-top: 4px; }
+
+        .results-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+        .chart-container { position: relative; height: 300px; }
+
+        .top-list { list-style: none; padding: 0; }
+        .top-list li { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+        .top-list li:last-child { border-bottom: none; }
+        .count-badge { background: #e3f2fd; color: #1565c0; padding: 2px 8px; border-radius: 12px; font-size: 12px; }
+
+        #no-jobs { text-align: center; color: #999; padding: 40px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>MapReduce Log Analytics</h1>
+        <div>
+            <span class="status-dot disconnected" id="ws-status"></span>
+            <span id="ws-text">Disconnected</span>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Job Submission -->
+        <div class="card">
+            <h2>Submit Job</h2>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Analysis Type</label>
+                    <select id="analysis-type">
+                        <option value="WORD_COUNT">Word Count</option>
+                        <option value="PATTERN_FREQUENCY">Pattern Frequency</option>
+                        <option value="SERVICE_DISTRIBUTION">Service Distribution</option>
+                        <option value="SECURITY">Security Analysis</option>
+                    </select>
+                </div>
+                <div class="form-group" style="flex: 1;">
+                    <label>Input File Path</label>
+                    <input type="text" id="input-file" placeholder="/data/sample-logs.jsonl" value="/data/sample-logs.jsonl">
+                </div>
+                <div class="form-group">
+                    <label>Workers</label>
+                    <input type="number" id="num-workers" value="4" min="1" max="16" style="width: 70px;">
+                </div>
+                <button onclick="submitJob()">Submit</button>
+            </div>
+        </div>
+
+        <!-- Jobs List -->
+        <div class="card">
+            <h2>Jobs</h2>
+            <div id="jobs-container">
+                <div id="no-jobs">No jobs submitted yet</div>
+            </div>
+        </div>
+
+        <!-- Results -->
+        <div class="card" id="results-section" style="display: none;">
+            <h2>Results</h2>
+            <div id="results-container" class="results-grid"></div>
+        </div>
+    </div>
+
+    <script>
+    // State
+    const jobs = {};
+    let ws = null;
+    let reconnectDelay = 1000;
+
+    // WebSocket connection
+    function connectWS() {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${protocol}//${location.host}/ws`);
+
+        ws.onopen = () => {
+            document.getElementById('ws-status').className = 'status-dot connected';
+            document.getElementById('ws-text').textContent = 'Connected';
+            reconnectDelay = 1000;
+        };
+
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            handleWSMessage(data);
+        };
+
+        ws.onclose = () => {
+            document.getElementById('ws-status').className = 'status-dot disconnected';
+            document.getElementById('ws-text').textContent = 'Disconnected';
+            setTimeout(connectWS, reconnectDelay);
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        };
+    }
+
+    function handleWSMessage(data) {
+        if (data.type === 'job_update' || data.type === 'job_completed') {
+            if (jobs[data.job_id]) {
+                Object.assign(jobs[data.job_id], data);
+            }
+            renderJobs();
+            if (data.type === 'job_completed' && data.results) {
+                showResults(data.job_id, jobs[data.job_id]?.analysis_type, data.results);
+            }
+        }
+    }
+
+    // API calls
+    async function submitJob() {
+        const analysisType = document.getElementById('analysis-type').value;
+        const inputFile = document.getElementById('input-file').value;
+        const numWorkers = parseInt(document.getElementById('num-workers').value);
+
+        const resp = await fetch('/api/jobs/submit', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                analysis_type: analysisType,
+                input_files: [inputFile],
+                num_workers: numWorkers,
+            }),
+        });
+
+        if (resp.ok) {
+            const job = await resp.json();
+            jobs[job.job_id] = job;
+            renderJobs();
+        } else {
+            const err = await resp.json();
+            alert('Error: ' + JSON.stringify(err.detail));
+        }
+    }
+
+    async function pollJobs() {
+        try {
+            const resp = await fetch('/api/jobs');
+            if (resp.ok) {
+                const jobList = await resp.json();
+                for (const j of jobList) {
+                    jobs[j.job_id] = j;
+                    if (j.status === 'COMPLETED' && j.results) {
+                        showResults(j.job_id, j.analysis_type, j.results);
+                    }
+                }
+                renderJobs();
+            }
+        } catch (e) {}
+    }
+
+    // Rendering
+    function renderJobs() {
+        const container = document.getElementById('jobs-container');
+        const jobIds = Object.keys(jobs);
+
+        if (jobIds.length === 0) {
+            container.innerHTML = '<div id="no-jobs">No jobs submitted yet</div>';
+            return;
+        }
+
+        container.innerHTML = jobIds.map(id => {
+            const j = jobs[id];
+            const status = j.status || 'PENDING';
+            const progress = (j.progress || 0) * 100;
+            const phase = j.current_phase || 'pending';
+            const cardClass = status === 'COMPLETED' ? 'completed' : status === 'FAILED' ? 'failed' :
+                             ['MAPPING','SHUFFLING','REDUCING'].includes(status) ? 'running' : '';
+
+            return `
+                <div class="card job-card ${cardClass}" style="margin-bottom: 8px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <strong>${j.analysis_type || 'Unknown'}</strong>
+                        <span style="font-size: 12px; padding: 2px 10px; border-radius: 12px;
+                              background: ${status === 'COMPLETED' ? '#e8f5e9' : status === 'FAILED' ? '#ffebee' : '#fff3e0'};
+                              color: ${status === 'COMPLETED' ? '#2e7d32' : status === 'FAILED' ? '#c62828' : '#e65100'};">
+                            ${status}
+                        </span>
+                    </div>
+                    <div class="progress-bar"><div class="progress-fill" style="width: ${progress}%"></div></div>
+                    <div class="job-meta">
+                        <span>Phase: ${phase}</span>
+                        <span>Progress: ${progress.toFixed(0)}%</span>
+                        ${j.records_processed ? `<span>Records: ${j.records_processed.toLocaleString()}</span>` : ''}
+                        ${j.execution_time ? `<span>Time: ${j.execution_time.toFixed(2)}s</span>` : ''}
+                    </div>
+                    ${status === 'FAILED' ? `<div style="color: #c62828; font-size: 13px; margin-top: 8px;">${j.error_message || ''}</div>` : ''}
+                    ${status === 'COMPLETED' ? `<button onclick="fetchResults('${id}')" style="margin-top: 8px; font-size: 12px; padding: 4px 12px;">View Results</button>` : ''}
+                </div>
+            `;
+        }).join('');
+    }
+
+    async function fetchResults(jobId) {
+        const resp = await fetch(`/api/jobs/${jobId}`);
+        if (resp.ok) {
+            const job = await resp.json();
+            if (job.results) {
+                showResults(jobId, job.analysis_type, job.results);
+            }
+        }
+    }
+
+    function showResults(jobId, analysisType, results) {
+        const section = document.getElementById('results-section');
+        const container = document.getElementById('results-container');
+        section.style.display = 'block';
+
+        if (analysisType === 'WORD_COUNT') {
+            renderWordCount(container, results);
+        } else if (analysisType === 'PATTERN_FREQUENCY') {
+            renderPatternFrequency(container, results);
+        } else if (analysisType === 'SERVICE_DISTRIBUTION') {
+            renderServiceDistribution(container, results);
+        } else if (analysisType === 'SECURITY') {
+            renderSecurity(container, results);
+        }
+    }
+
+    function renderWordCount(container, results) {
+        const sorted = Object.entries(results).sort((a, b) => b[1] - a[1]).slice(0, 20);
+        container.innerHTML = `
+            <div class="card" style="grid-column: 1 / -1;">
+                <h2>Word Count - Top 20</h2>
+                <div class="chart-container"><canvas id="wc-chart"></canvas></div>
+            </div>
+        `;
+        new Chart(document.getElementById('wc-chart'), {
+            type: 'bar',
+            data: {
+                labels: sorted.map(e => e[0]),
+                datasets: [{
+                    label: 'Count',
+                    data: sorted.map(e => e[1]),
+                    backgroundColor: '#42a5f5',
+                }],
+            },
+            options: { indexAxis: 'y', responsive: true, maintainAspectRatio: false },
+        });
+    }
+
+    function renderPatternFrequency(container, results) {
+        const groups = {};
+        for (const [key, val] of Object.entries(results)) {
+            const [prefix] = key.split(':');
+            if (!groups[prefix]) groups[prefix] = [];
+            groups[prefix].push({key: key.split(':').slice(1).join(':'), count: val});
+        }
+
+        let html = '';
+        for (const [group, items] of Object.entries(groups)) {
+            items.sort((a, b) => b.count - a.count);
+            const top = items.slice(0, 10);
+            html += `
+                <div class="card">
+                    <h2>${group.replace('_', ' ').toUpperCase()}</h2>
+                    <ul class="top-list">
+                        ${top.map(i => `<li><span>${i.key}</span><span class="count-badge">${i.count}</span></li>`).join('')}
+                    </ul>
+                </div>
+            `;
+        }
+        container.innerHTML = html;
+    }
+
+    function renderServiceDistribution(container, results) {
+        const services = {}, levels = {};
+        for (const [key, val] of Object.entries(results)) {
+            if (key.startsWith('service:')) services[key.slice(8)] = val;
+            else if (key.startsWith('level:')) levels[key.slice(6)] = val;
+        }
+
+        container.innerHTML = `
+            <div class="card"><h2>Services</h2><div class="chart-container"><canvas id="svc-chart"></canvas></div></div>
+            <div class="card"><h2>Log Levels</h2><div class="chart-container"><canvas id="lvl-chart"></canvas></div></div>
+        `;
+
+        const colors = ['#42a5f5', '#66bb6a', '#ffa726', '#ef5350', '#ab47bc', '#26c6da', '#8d6e63'];
+
+        new Chart(document.getElementById('svc-chart'), {
+            type: 'pie',
+            data: {
+                labels: Object.keys(services),
+                datasets: [{ data: Object.values(services), backgroundColor: colors }],
+            },
+            options: { responsive: true, maintainAspectRatio: false },
+        });
+
+        new Chart(document.getElementById('lvl-chart'), {
+            type: 'bar',
+            data: {
+                labels: Object.keys(levels),
+                datasets: [{ label: 'Count', data: Object.values(levels), backgroundColor: colors }],
+            },
+            options: { responsive: true, maintainAspectRatio: false },
+        });
+    }
+
+    function renderSecurity(container, results) {
+        const sections = {
+            'top_ips': 'Top IP Addresses',
+            'top_404_paths': 'Top 404 Paths',
+            'peak_hours': 'Peak Hours',
+            'top_user_agents': 'Top User Agents',
+        };
+
+        let html = '';
+        for (const [key, title] of Object.entries(sections)) {
+            const items = results[key] || [];
+            if (key === 'peak_hours') {
+                html += `
+                    <div class="card">
+                        <h2>${title}</h2>
+                        <div class="chart-container"><canvas id="hours-chart"></canvas></div>
+                    </div>
+                `;
+            } else {
+                html += `
+                    <div class="card">
+                        <h2>${title}</h2>
+                        <ul class="top-list">
+                            ${items.map(i => `<li><span>${i.key}</span><span class="count-badge">${i.count}</span></li>`).join('')}
+                        </ul>
+                    </div>
+                `;
+            }
+        }
+        container.innerHTML = html;
+
+        if (results.peak_hours && results.peak_hours.length > 0) {
+            const hours = results.peak_hours.sort((a, b) => a.key.localeCompare(b.key));
+            new Chart(document.getElementById('hours-chart'), {
+                type: 'bar',
+                data: {
+                    labels: hours.map(h => h.key + ':00'),
+                    datasets: [{ label: 'Requests', data: hours.map(h => h.count), backgroundColor: '#ff9800' }],
+                },
+                options: { responsive: true, maintainAspectRatio: false },
+            });
+        }
+    }
+
+    // Init
+    connectWS();
+    setInterval(pollJobs, 5000);
+    pollJobs();
+    </script>
+</body>
+</html>
