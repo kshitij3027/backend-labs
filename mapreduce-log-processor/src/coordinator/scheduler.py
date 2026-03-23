@@ -5,9 +5,37 @@ import uuid
 import structlog
 
 from src.config import settings
+from src.coordinator.metrics import metrics
 import src.db as db
 
 logger = structlog.get_logger()
+
+
+async def detect_data_skew(job_id: str, num_reducers: int) -> None:
+    """Check Redis key sizes per reduce partition. Warn if skewed."""
+    from src.redis_client import get_redis
+
+    redis = get_redis()
+
+    sizes = {}
+    for i in range(num_reducers):
+        key = f"job:{job_id}:reduce:{i}"
+        size = await redis.llen(key)
+        sizes[i] = size
+
+    if not sizes or all(s == 0 for s in sizes.values()):
+        return
+
+    avg_size = sum(sizes.values()) / len(sizes)
+    for partition_id, size in sizes.items():
+        if avg_size > 0 and size > 2 * avg_size:
+            logger.warning(
+                "data_skew_detected",
+                job_id=job_id,
+                partition_id=partition_id,
+                partition_size=size,
+                avg_size=avg_size,
+            )
 
 
 async def partition_input(input_path: str, num_mappers: int) -> list[tuple[int, int]]:
@@ -101,7 +129,7 @@ async def assign_task(worker_id: str) -> dict | None:
 
 
 async def complete_task(task_id: str) -> None:
-    """Mark a task as completed. Check if all map tasks for the job are done."""
+    """Mark a task as completed. Handle speculative tasks. Check phase transitions."""
     async with db.pool.acquire() as conn:
         # Update task status
         row = await conn.fetchrow(
@@ -116,6 +144,9 @@ async def complete_task(task_id: str) -> None:
         task_type = row["type"]
         worker_id = row["worker_id"]
 
+        # Record task completion in metrics
+        metrics.record_task_completed(task_type)
+
         # Increment worker's tasks_completed counter
         if worker_id:
             await conn.execute(
@@ -123,10 +154,17 @@ async def complete_task(task_id: str) -> None:
                 worker_id,
             )
 
+    # Cancel speculative counterparts
+    await db.cancel_speculative_tasks(task_id, job_id)
+
+    async with db.pool.acquire() as conn:
         if task_type == "MAP":
             # Check if all map tasks for this job are completed
+            # Exclude FAILED speculative copies from the count
             pending = await conn.fetchval(
-                "SELECT COUNT(*) FROM tasks WHERE job_id = $1 AND type = 'MAP' AND status != 'COMPLETED'",
+                """SELECT COUNT(*) FROM tasks
+                   WHERE job_id = $1 AND type = 'MAP'
+                   AND status NOT IN ('COMPLETED', 'FAILED')""",
                 job_id,
             )
             if pending == 0:
@@ -135,6 +173,12 @@ async def complete_task(task_id: str) -> None:
                     "SELECT num_reducers FROM jobs WHERE id = $1", job_id,
                 )
                 logger.info("all_map_tasks_completed", job_id=job_id)
+
+                # Check for data skew before creating reduce tasks
+                try:
+                    await detect_data_skew(job_id, job_row["num_reducers"])
+                except Exception as e:
+                    logger.warning("data_skew_detection_failed", job_id=job_id, error=str(e))
 
                 # Create reduce tasks and transition to REDUCING
                 await create_reduce_tasks(job_id, job_row["num_reducers"])
@@ -147,15 +191,31 @@ async def complete_task(task_id: str) -> None:
         elif task_type == "REDUCE":
             # Check if all reduce tasks for this job are completed
             pending = await conn.fetchval(
-                "SELECT COUNT(*) FROM tasks WHERE job_id = $1 AND type = 'REDUCE' AND status != 'COMPLETED'",
+                """SELECT COUNT(*) FROM tasks
+                   WHERE job_id = $1 AND type = 'REDUCE'
+                   AND status NOT IN ('COMPLETED', 'FAILED')""",
                 job_id,
             )
             if pending == 0:
+                # Get job created_at to compute duration
+                job_row = await conn.fetchrow(
+                    "SELECT created_at FROM jobs WHERE id = $1", job_id,
+                )
                 await conn.execute(
                     "UPDATE jobs SET status = 'COMPLETED', updated_at = NOW() WHERE id = $1",
                     job_id,
                 )
                 logger.info("all_reduce_tasks_completed", job_id=job_id)
+
+                # Record job completion with duration
+                if job_row:
+                    created = job_row["created_at"]
+                    from datetime import datetime, timezone
+                    now = datetime.now(timezone.utc)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    duration = (now - created).total_seconds()
+                    metrics.record_job_completed(job_id, duration)
 
     logger.info("task_completed", task_id=task_id, type=task_type)
 

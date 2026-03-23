@@ -55,5 +55,12 @@ async def heartbeat_checker(interval: int, timeout: int) -> None:
                             await fail_task_and_check_job(
                                 task["id"], settings.MAX_RETRIES
                             )
+            # After checking heartbeats, also check for stragglers
+            try:
+                from src.coordinator.straggler import detect_stragglers
+                await detect_stragglers()
+            except Exception as straggler_err:
+                logger.error("straggler_detection_error", error=str(straggler_err))
+
         except Exception as e:
             logger.error("heartbeat_checker_error", error=str(e))

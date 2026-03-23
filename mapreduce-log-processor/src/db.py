@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS input_start INTEGER DEFAULT 0;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS input_end INTEGER DEFAULT 0;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS speculative_of TEXT;
 
 CREATE TABLE IF NOT EXISTS workers (
     id TEXT PRIMARY KEY,
@@ -349,6 +350,52 @@ async def fail_task_and_check_job(task_id: str, max_retries: int) -> bool:
             logger.warning("job_failed_due_to_task_retries", job_id=job_id)
             return True
     return False
+
+
+async def cancel_speculative_tasks(task_id: str, job_id: str) -> None:
+    """Cancel speculative copies of a task, or cancel the original if a spec finished first.
+
+    When a task completes:
+    - If it's a speculative copy (has speculative_of set), cancel the original task
+    - If it's the original, cancel any speculative copies of it
+    """
+    async with pool.acquire() as conn:
+        # Check if this task is a speculative copy
+        row = await conn.fetchrow(
+            "SELECT speculative_of FROM tasks WHERE id = $1", task_id
+        )
+        if row is None:
+            return
+
+        if row["speculative_of"] is not None:
+            # This is a speculative copy that finished — cancel the original
+            original_id = row["speculative_of"]
+            result = await conn.execute(
+                """UPDATE tasks SET status = 'FAILED', updated_at = NOW()
+                   WHERE id = $1 AND status IN ('RUNNING', 'PENDING')""",
+                original_id,
+            )
+            count = int(result.split()[-1])
+            if count > 0:
+                logger.info(
+                    "original_cancelled_by_speculative",
+                    original_task=original_id,
+                    speculative_task=task_id,
+                )
+        else:
+            # This is the original — cancel any speculative copies
+            result = await conn.execute(
+                """UPDATE tasks SET status = 'FAILED', updated_at = NOW()
+                   WHERE speculative_of = $1 AND status IN ('RUNNING', 'PENDING')""",
+                task_id,
+            )
+            count = int(result.split()[-1])
+            if count > 0:
+                logger.info(
+                    "speculative_cancelled_by_original",
+                    original_task=task_id,
+                    cancelled_count=count,
+                )
 
 
 async def delete_results_for_partition(job_id: str, partition_id: int) -> None:

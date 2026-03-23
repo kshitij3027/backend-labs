@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 from src.config import settings
 from src.coordinator.heartbeat import heartbeat_checker
+from src.coordinator.metrics import metrics
 from src.coordinator.recovery import on_startup_recovery
 from src.coordinator.scheduler import assign_task, complete_task, create_map_tasks, create_reduce_tasks, fail_task
 import src.db as db
@@ -119,8 +120,15 @@ async def get_stats():
     }
 
 
+@app.get("/metrics")
+async def get_metrics():
+    """Return in-memory metrics: job/task counts, durations, shuffle volumes."""
+    return metrics.to_dict()
+
+
 @app.post("/jobs", status_code=201, response_model=JobResponse)
 async def submit_job(job: JobCreate):
+    metrics.record_job_submitted()
     logger.info(
         "job_submitted",
         input_path=job.input_path,
@@ -257,7 +265,10 @@ async def mark_task_failed(task_id: str):
                    WHERE id = $2""",
                 new_retry, task_id,
             )
+        metrics.record_task_failed(task["type"])
         job_failed = await db.fail_task_and_check_job(task_id, settings.MAX_RETRIES)
+        if job_failed:
+            metrics.record_job_failed()
         logger.warning(
             "task_permanently_failed",
             task_id=task_id,
