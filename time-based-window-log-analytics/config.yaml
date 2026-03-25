@@ -1,0 +1,28 @@
+window_types:
+  - name: "5m"
+    size_seconds: 300
+    grace_period_seconds: 60
+    retention_seconds: 3600
+  - name: "1h"
+    size_seconds: 3600
+    grace_period_seconds: 300
+    retention_seconds: 86400
+  - name: "1d"
+    size_seconds: 86400
+    grace_period_seconds: 600
+    retention_seconds: 604800
+
+redis:
+  host: "localhost"
+  port: 6379
+
+api:
+  host: "0.0.0.0"
+  port: 8080
+
+dashboard:
+  refresh_interval: 5
+
+lifecycle:
+  check_interval: 10
+  cleanup_interval: 60
