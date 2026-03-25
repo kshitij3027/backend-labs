@@ -93,6 +93,58 @@ def main() -> None:
     assert "chart" in text or "dashboard" in text, "Dashboard HTML missing expected content"
     print("PASS: Dashboard serves HTML with Chart.js")
 
+    # --- E-Commerce: Ingest 10 order events ---
+    for i in range(10):
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "INFO",
+            "source": "order-svc",
+            "message": f"Order event #{i}",
+            "order_id": f"ORD-E2E-{i:04d}",
+            "order_value": 20.0 + i * 5.0,
+            "order_status": ["placed", "confirmed", "cancelled"][i % 3],
+        }
+        r = httpx.post(f"{APP_URL}/api/v1/logs", json=event, timeout=10)
+        assert r.status_code == 200
+        assert r.json()["accepted"] >= 1
+    print("PASS: Ingested 10 order events")
+
+    time.sleep(1)
+
+    # --- E-Commerce: Verify order_5m e-commerce endpoint ---
+    r = httpx.get(f"{APP_URL}/api/v1/windows/order_5m/ecommerce", timeout=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["window_type"] == "order_5m"
+    assert body["count"] >= 1
+    total_orders = sum(w["order_count"] for w in body["windows"])
+    assert total_orders >= 10, f"Expected >= 10 orders, got {total_orders}"
+    total_revenue = sum(w["total_revenue"] for w in body["windows"])
+    assert total_revenue > 0, f"Expected revenue > 0, got {total_revenue}"
+    print(f"PASS: E-commerce order_5m — {total_orders} orders, ${total_revenue:.2f} revenue")
+
+    # --- Replay: POST 5 historical events ---
+    replay_events = [
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "WARN",
+            "source": "replay-test",
+            "message": f"Replay event #{i}",
+        }
+        for i in range(5)
+    ]
+    r = httpx.post(f"{APP_URL}/api/v1/replay", json={
+        "start_time": "2024-01-01T00:00:00Z",
+        "end_time": "2024-01-01T01:00:00Z",
+        "events": replay_events,
+    }, timeout=10)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["events_processed"] == 5, f"Expected 5 processed, got {body['events_processed']}"
+    assert body["windows_created"] >= 1, f"Expected >= 1 windows, got {body['windows_created']}"
+    assert body["errors"] == [], f"Unexpected errors: {body['errors']}"
+    print(f"PASS: Replay — processed={body['events_processed']}, windows={body['windows_created']}")
+
     # --- WebSocket connection and broadcast ---
     ws_url = APP_URL.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = f"{ws_url}/ws/dashboard"

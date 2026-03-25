@@ -52,6 +52,10 @@ class Aggregator:
         await self._json_field_incr(window_key, "levels", event.level.upper())
         await self._json_field_incr(window_key, "services", event.source)
 
+        # E-commerce tracking
+        if event.order_id is not None:
+            await self.record_order_event(window_key, event)
+
     async def get_window_metrics(self, window_key: str, window_size: int) -> WindowMetrics | None:
         """Read and compute derived metrics for a window."""
         data = await self._redis.hgetall(window_key)
@@ -78,6 +82,36 @@ class Aggregator:
             levels=levels,
             services=services,
         )
+
+    async def record_order_event(self, window_key: str, event: LogEvent) -> None:
+        """Track order-specific metrics in a window."""
+        pipe = self._redis.pipeline(transaction=True)
+        pipe.hincrby(window_key, "order_count", 1)
+        if event.order_value is not None:
+            pipe.hincrbyfloat(window_key, "total_revenue", event.order_value)
+        if event.order_status:
+            await pipe.execute()
+            await self._json_field_incr(window_key, "order_statuses", event.order_status)
+        else:
+            await pipe.execute()
+
+    async def get_ecommerce_metrics(self, window_key: str) -> dict | None:
+        """Get e-commerce specific metrics from a window."""
+        data = await self._redis.hgetall(window_key)
+        if not data:
+            return None
+        order_count = int(data.get(b"order_count", 0))
+        if order_count == 0:
+            return None
+        total_revenue = float(data.get(b"total_revenue", 0))
+        statuses = json.loads(data.get(b"order_statuses", b"{}"))
+        avg_order_value = (total_revenue / order_count) if order_count > 0 else 0.0
+        return {
+            "order_count": order_count,
+            "total_revenue": round(total_revenue, 2),
+            "avg_order_value": round(avg_order_value, 2),
+            "order_statuses": statuses,
+        }
 
     async def get_active_windows(self, window_type: str) -> list[str]:
         """Get all tracked window keys for a type from the sorted set."""

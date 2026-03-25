@@ -11,6 +11,14 @@ window_types:
     size_seconds: 86400
     grace_period_seconds: 600
     retention_seconds: 604800
+  - name: "order_5m"
+    size_seconds: 300
+    grace_period_seconds: 60
+    retention_seconds: 3600
+  - name: "revenue_1h"
+    size_seconds: 3600
+    grace_period_seconds: 300
+    retention_seconds: 86400
 
 redis:
   host: "localhost"

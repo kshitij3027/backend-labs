@@ -149,6 +149,37 @@
     </div>
 </div>
 
+<!-- E-Commerce Metrics Section (hidden until data arrives) -->
+<div id="ecomSection" style="display:none;">
+    <div class="header" style="margin-top: 32px; border-top: 1px solid #2a2a4a; padding-top: 20px;">
+        <h1 style="font-size: 1.3rem;">E-Commerce Metrics</h1>
+    </div>
+    <div class="stats-row" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="stat-card">
+            <div class="label">Order Volume (5m)</div>
+            <div class="value" id="statOrders">0</div>
+        </div>
+        <div class="stat-card">
+            <div class="label">Revenue (1h)</div>
+            <div class="value" id="statRevenue">$0.00</div>
+        </div>
+    </div>
+    <div class="charts-grid">
+        <div class="chart-card">
+            <h3>Order Volume (5-min windows)</h3>
+            <div class="chart-container">
+                <canvas id="orderVolumeChart"></canvas>
+            </div>
+        </div>
+        <div class="chart-card">
+            <h3>Revenue Trend (hourly)</h3>
+            <div class="chart-container">
+                <canvas id="revenueTrendChart"></canvas>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
 const MAX_POINTS = 20;
 const CHART_COLORS = ['#6366f1','#22d3ee','#f59e0b','#ef4444','#10b981','#8b5cf6','#ec4899','#f97316'];
@@ -204,6 +235,21 @@ const levelChart = new Chart(levelCtx, {
         indexAxis: 'y',
         plugins: { legend: { display: false } }
     }
+});
+
+/* --- E-Commerce Chart.js instances --- */
+const orderVolumeCtx = document.getElementById('orderVolumeChart').getContext('2d');
+const orderVolumeChart = new Chart(orderVolumeCtx, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Orders', data: [], backgroundColor: 'rgba(34,211,238,0.6)', borderColor: '#22d3ee', borderWidth: 1 }] },
+    options: { ...commonOpts }
+});
+
+const revenueTrendCtx = document.getElementById('revenueTrendChart').getContext('2d');
+const revenueTrendChart = new Chart(revenueTrendCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'Revenue ($)', data: [], borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.15)', fill: true, tension: 0.3, pointRadius: 2 }] },
+    options: { ...commonOpts }
 });
 
 /* --- Update functions --- */
@@ -265,6 +311,35 @@ function handleMetrics(payload) {
     serviceChart.data.datasets[0].backgroundColor = CHART_COLORS.slice(0, Object.keys(mergedServices).length);
     serviceChart.update();
     updateCategoryChart(levelChart, mergedLevels, LEVEL_COLORS);
+
+    /* --- E-Commerce metrics --- */
+    let hasEcom = false;
+    const order5m = payload['order_5m'];
+    const revenue1h = payload['revenue_1h'];
+
+    if (order5m && order5m.windows) {
+        let totalOrders = 0;
+        for (const w of order5m.windows) {
+            if (w.order_count) { totalOrders += w.order_count; hasEcom = true; }
+        }
+        if (hasEcom) {
+            document.getElementById('statOrders').textContent = totalOrders;
+            pushTimeSeries(orderVolumeChart, now, totalOrders);
+        }
+    }
+    if (revenue1h && revenue1h.windows) {
+        let totalRev = 0;
+        for (const w of revenue1h.windows) {
+            if (w.total_revenue) { totalRev += w.total_revenue; hasEcom = true; }
+        }
+        if (hasEcom) {
+            document.getElementById('statRevenue').textContent = '$' + totalRev.toFixed(2);
+            pushTimeSeries(revenueTrendChart, now, totalRev);
+        }
+    }
+    if (hasEcom) {
+        document.getElementById('ecomSection').style.display = 'block';
+    }
 }
 
 /* --- WebSocket client --- */

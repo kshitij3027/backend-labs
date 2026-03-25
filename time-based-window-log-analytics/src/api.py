@@ -23,6 +23,8 @@ from src.models import (
     BatchIngestResponse,
     IngestResponse,
     LogEvent,
+    ReplayRequest,
+    ReplayResponse,
     WindowInfo,
     WindowMetrics,
     WindowState,
@@ -293,6 +295,84 @@ async def get_window_history(window_type: str) -> dict:
             closed.append(info.model_dump())
 
     return {"window_type": window_type, "count": len(closed), "windows": closed}
+
+
+# ---------------------------------------------------------------------------
+# Replay
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/replay", response_model=ReplayResponse)
+async def replay_events(body: ReplayRequest) -> ReplayResponse:
+    """Re-process historical events to reconstruct window aggregations."""
+    ts_parser: TimestampParser = app.state.ts_parser
+    window_manager: WindowManager = app.state.window_manager
+    aggregator: Aggregator = app.state.aggregator
+
+    processed = 0
+    windows_seen: set[str] = set()
+    errors: list[str] = []
+
+    for event in body.events:
+        try:
+            parsed_ts = ts_parser.parse(event.timestamp)
+        except ValueError as e:
+            errors.append(str(e))
+            continue
+
+        # For replay, create windows regardless of current time state
+        for wt in app.state.config.window_types:
+            start_ts = window_manager.align_to_window(parsed_ts, wt.size_seconds)
+            window_key = window_manager.get_window_key(wt.name, wt.size_seconds, start_ts)
+            end_ts = start_ts + wt.size_seconds
+            ttl = wt.size_seconds + wt.grace_period_seconds + wt.retention_seconds
+            await window_manager.ensure_window_exists(window_key, start_ts, end_ts, wt.name, ttl)
+            await aggregator.record_event(window_key, event, parsed_ts)
+            windows_seen.add(window_key)
+
+        processed += 1
+
+    return ReplayResponse(
+        events_processed=processed,
+        windows_created=len(windows_seen),
+        errors=errors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# E-Commerce Windows
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/windows/{window_type}/ecommerce")
+async def get_ecommerce_windows(window_type: str) -> dict:
+    """Get e-commerce specific metrics for a window type."""
+    config: AppConfig = app.state.config
+    aggregator: Aggregator = app.state.aggregator
+
+    wt_config = None
+    for wt in config.window_types:
+        if wt.name == window_type:
+            wt_config = wt
+            break
+
+    if wt_config is None:
+        raise HTTPException(status_code=404, detail=f"Unknown window type: {window_type}")
+
+    window_keys = await aggregator.get_active_windows(window_type)
+    windows: list[dict] = []
+    for wk in window_keys:
+        ecom = await aggregator.get_ecommerce_metrics(wk)
+        if ecom is None:
+            continue
+        redis_client = app.state.redis
+        raw = await redis_client.hgetall(wk)
+        start_ts = int(raw.get(b"start_ts", 0))
+        end_ts = int(raw.get(b"end_ts", 0))
+        windows.append({
+            "window_key": wk,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            **ecom,
+        })
+
+    return {"window_type": window_type, "count": len(windows), "windows": windows}
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,10 @@ class LogEvent(BaseModel):
     message: str
     metadata: dict | None = None
     response_time: float | None = None
+    # E-commerce fields (optional)
+    order_id: str | None = None
+    order_value: float | None = None
+    order_status: str | None = None  # "placed", "confirmed", "cancelled"
 
 
 class WindowState(str, Enum):
@@ -71,4 +75,20 @@ class BatchIngestResponse(BaseModel):
     accepted: int
     rejected: int
     late_accepted: int
+    errors: list[str]
+
+
+class ReplayRequest(BaseModel):
+    """Request body for replaying historical events."""
+
+    start_time: str
+    end_time: str
+    events: list[LogEvent]
+
+
+class ReplayResponse(BaseModel):
+    """Response for a replay operation."""
+
+    events_processed: int
+    windows_created: int
     errors: list[str]

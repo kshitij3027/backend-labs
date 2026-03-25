@@ -30,6 +30,8 @@ async def client():
         window_types=[
             WindowTypeConfig(name="5m", size_seconds=300, grace_period_seconds=60, retention_seconds=3600),
             WindowTypeConfig(name="1h", size_seconds=3600, grace_period_seconds=300, retention_seconds=86400),
+            WindowTypeConfig(name="order_5m", size_seconds=300, grace_period_seconds=60, retention_seconds=3600),
+            WindowTypeConfig(name="revenue_1h", size_seconds=3600, grace_period_seconds=300, retention_seconds=86400),
         ],
     )
 
@@ -151,6 +153,87 @@ async def test_dashboard_serves_html(client: AsyncClient) -> None:
     assert "chart.js" in text or "dashboard" in text
 
 
+@pytest.mark.asyncio
+async def test_ecommerce_order_tracking(client: AsyncClient) -> None:
+    """Ingest events with order_id and order_value, verify e-commerce metrics."""
+    for i in range(5):
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "INFO",
+            "source": "order-svc",
+            "message": f"Order placed #{i}",
+            "order_id": f"ORD-{i:04d}",
+            "order_value": 25.50 + i * 10,
+            "order_status": "placed",
+        }
+        r = await client.post("/api/v1/logs", json=event)
+        assert r.status_code == 200
+        assert r.json()["accepted"] >= 1
+
+    # Check order_5m e-commerce endpoint
+    r = await client.get("/api/v1/windows/order_5m/ecommerce")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["window_type"] == "order_5m"
+    assert body["count"] >= 1
+    total_orders = sum(w["order_count"] for w in body["windows"])
+    assert total_orders >= 5
+    total_revenue = sum(w["total_revenue"] for w in body["windows"])
+    assert total_revenue > 0
+
+
+@pytest.mark.asyncio
+async def test_replay_endpoint(client: AsyncClient) -> None:
+    """POST /api/v1/replay with historical events, verify response."""
+    events = [
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "INFO",
+            "source": "replay-svc",
+            "message": f"Replay event #{i}",
+        }
+        for i in range(5)
+    ]
+    r = await client.post("/api/v1/replay", json={
+        "start_time": "2024-01-01T00:00:00Z",
+        "end_time": "2024-01-01T01:00:00Z",
+        "events": events,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["events_processed"] == 5
+    assert body["windows_created"] >= 1
+    assert body["errors"] == []
+
+
+@pytest.mark.asyncio
+async def test_replay_invalid_event(client: AsyncClient) -> None:
+    """Replay with bad timestamp, verify error in response."""
+    events = [
+        {
+            "timestamp": "not-a-timestamp!!!",
+            "level": "INFO",
+            "source": "replay-svc",
+            "message": "Bad event",
+        },
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": "INFO",
+            "source": "replay-svc",
+            "message": "Good event",
+        },
+    ]
+    r = await client.post("/api/v1/replay", json={
+        "start_time": "2024-01-01T00:00:00Z",
+        "end_time": "2024-01-01T01:00:00Z",
+        "events": events,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["events_processed"] == 1
+    assert len(body["errors"]) == 1
+
+
 def test_websocket_connection() -> None:
     """Test WebSocket connection via Starlette sync TestClient."""
     # Set up app state for sync test client
@@ -161,6 +244,8 @@ def test_websocket_connection() -> None:
         log_level="DEBUG",
         window_types=[
             WindowTypeConfig(name="5m", size_seconds=300, grace_period_seconds=60, retention_seconds=3600),
+            WindowTypeConfig(name="order_5m", size_seconds=300, grace_period_seconds=60, retention_seconds=3600),
+            WindowTypeConfig(name="revenue_1h", size_seconds=3600, grace_period_seconds=300, retention_seconds=86400),
         ],
     )
     app.state.config = config
