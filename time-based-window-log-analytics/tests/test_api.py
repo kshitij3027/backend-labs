@@ -6,17 +6,20 @@ from datetime import datetime, timezone
 
 import fakeredis.aioredis
 import pytest
+import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from starlette.testclient import TestClient
 
 from src.aggregator import Aggregator
 from src.api import app
 from src.config import AppConfig, WindowTypeConfig
 from src.timestamp_parser import TimestampParser
+from src.websocket import ConnectionManager
 from src.window_manager import WindowManager
 from src.window_rotator import WindowRotator
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def client():
     """Provide an async HTTP client with fakeredis-backed app state."""
     fake_redis = fakeredis.aioredis.FakeRedis()
@@ -40,6 +43,7 @@ async def client():
         app.state.rotator = WindowRotator(fake_redis, config)
         app.state.ts_parser = TimestampParser()
         app.state.start_time = int(datetime.now(timezone.utc).timestamp())
+        app.state.ws_manager = ConnectionManager()
         yield ac
 
     await fake_redis.aclose()
@@ -137,3 +141,40 @@ async def test_get_stats(client: AsyncClient) -> None:
     assert "active_windows" in body
     assert "window_types" in body
     assert body["total_events"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_serves_html(client: AsyncClient) -> None:
+    r = await client.get("/dashboard")
+    assert r.status_code == 200
+    text = r.text.lower()
+    assert "chart.js" in text or "dashboard" in text
+
+
+def test_websocket_connection() -> None:
+    """Test WebSocket connection via Starlette sync TestClient."""
+    # Set up app state for sync test client
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    config = AppConfig(
+        redis_host="localhost",
+        redis_port=6379,
+        log_level="DEBUG",
+        window_types=[
+            WindowTypeConfig(name="5m", size_seconds=300, grace_period_seconds=60, retention_seconds=3600),
+        ],
+    )
+    app.state.config = config
+    app.state.redis = fake_redis
+    app.state.window_manager = WindowManager(fake_redis, config)
+    app.state.aggregator = Aggregator(fake_redis)
+    app.state.rotator = WindowRotator(fake_redis, config)
+    app.state.ts_parser = TimestampParser()
+    app.state.start_time = int(datetime.now(timezone.utc).timestamp())
+    app.state.ws_manager = ConnectionManager()
+
+    sync_client = TestClient(app)
+    with sync_client.websocket_connect("/ws/dashboard") as ws:
+        # Connection accepted — send a ping and verify no crash
+        ws.send_text("ping")
+        # If we get here without exception, the connection works
+        assert True

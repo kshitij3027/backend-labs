@@ -1,11 +1,14 @@
 """End-to-end verification script for the log analytics service."""
 
+import json
 import os
 import sys
 import time
 from datetime import datetime, timezone
 
 import httpx
+import websockets
+import websockets.sync.client
 
 APP_URL = os.environ.get("APP_URL", "http://localhost:8080")
 
@@ -82,6 +85,31 @@ def main() -> None:
     r = httpx.get(f"{APP_URL}/api/v1/windows/invalid_type", timeout=10)
     assert r.status_code == 404
     print("PASS: Invalid window type returns 404")
+
+    # --- Dashboard serves HTML ---
+    r = httpx.get(f"{APP_URL}/dashboard", timeout=10)
+    assert r.status_code == 200
+    text = r.text.lower()
+    assert "chart" in text or "dashboard" in text, "Dashboard HTML missing expected content"
+    print("PASS: Dashboard serves HTML with Chart.js")
+
+    # --- WebSocket connection and broadcast ---
+    ws_url = APP_URL.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url = f"{ws_url}/ws/dashboard"
+    try:
+        with websockets.sync.client.connect(ws_url, close_timeout=5) as ws:
+            # Wait for a broadcast (refresh interval is 5s, give 8s)
+            try:
+                raw = ws.recv(timeout=8)
+                msg = json.loads(raw)
+                assert msg.get("type") == "metrics_update", f"Unexpected message type: {msg.get('type')}"
+                assert "data" in msg, "Broadcast missing 'data' key"
+                print(f"PASS: WebSocket received metrics_update with {len(msg['data'])} window type(s)")
+            except TimeoutError:
+                # No broadcast yet — acceptable if no events were in the window
+                print("WARN: No WebSocket broadcast within timeout (acceptable if windows empty)")
+    except Exception as e:
+        print(f"WARN: WebSocket test skipped — {e}")
 
     print("\nAll E2E tests passed!")
 

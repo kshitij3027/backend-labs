@@ -11,7 +11,10 @@ from typing import AsyncIterator
 import redis.asyncio as aioredis
 import structlog
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
 
 from src.aggregator import Aggregator
 from src.config import AppConfig
@@ -25,6 +28,7 @@ from src.models import (
     WindowState,
 )
 from src.timestamp_parser import TimestampParser
+from src.websocket import ConnectionManager
 from src.window_manager import WindowManager
 from src.window_rotator import WindowRotator
 
@@ -57,6 +61,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     rotator = WindowRotator(redis_client, config)
     ts_parser = TimestampParser()
 
+    # WebSocket manager
+    ws_manager = ConnectionManager()
+
     # Store on app state
     app.state.config = config
     app.state.redis = redis_client
@@ -65,6 +72,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.rotator = rotator
     app.state.ts_parser = ts_parser
     app.state.start_time = int(time.time())
+    app.state.ws_manager = ws_manager
 
     # Background scheduler for window rotation / cleanup
     loop = asyncio.get_event_loop()
@@ -87,9 +95,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     scheduler.start()
     app.state.scheduler = scheduler
 
+    # Broadcast loop — sends metrics to all WebSocket clients
+    async def _broadcast_loop() -> None:
+        while True:
+            await asyncio.sleep(config.dashboard_refresh_interval)
+            try:
+                payload: dict = {}
+                for wt in config.window_types:
+                    keys = await aggregator.get_active_windows(wt.name)
+                    windows_data: list[dict] = []
+                    for wk in keys:
+                        m = await aggregator.get_window_metrics(wk, wt.size_seconds)
+                        if m:
+                            windows_data.append(m.model_dump())
+                    payload[wt.name] = {
+                        "window_count": len(windows_data),
+                        "windows": windows_data,
+                    }
+                if ws_manager.active_count > 0:
+                    await ws_manager.broadcast({"type": "metrics_update", "data": payload})
+            except Exception:
+                pass
+
+    broadcast_task = asyncio.create_task(_broadcast_loop())
+
     yield
 
     # Shutdown
+    broadcast_task.cancel()
     scheduler.shutdown(wait=False)
     await redis_client.aclose()
     log.info("shutting_down")
@@ -290,3 +323,27 @@ async def get_stats() -> dict:
         "active_windows": active_counts,
         "window_types": [wt.name for wt in config.window_types],
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard & WebSocket
+# ---------------------------------------------------------------------------
+templates = Jinja2Templates(directory="src/templates")
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    """Serve the live analytics dashboard."""
+    return templates.TemplateResponse("dashboard.html", {"request": request})
+
+
+@app.websocket("/ws/dashboard")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time metric broadcasts."""
+    ws_manager: ConnectionManager = app.state.ws_manager
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)

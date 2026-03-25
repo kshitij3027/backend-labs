@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Analytics Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            padding: 20px;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #ffffff;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ef4444;
+            transition: background 0.3s;
+        }
+        .status-dot.connected { background: #22c55e; }
+
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .stat-card {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+        }
+        .stat-card .label {
+            font-size: 0.8rem;
+            color: #9ca3af;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+        }
+        .stat-card .value {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #ffffff;
+        }
+
+        .charts-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .chart-card {
+            background: #16213e;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        .chart-card h3 {
+            font-size: 0.95rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #d1d5db;
+        }
+        .chart-container {
+            position: relative;
+            height: 260px;
+        }
+
+        @media (max-width: 768px) {
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+            .charts-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>Time-Based Windowed Log Analytics</h1>
+    <div class="status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Disconnected</span>
+    </div>
+</div>
+
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="label">Active Windows</div>
+        <div class="value" id="statWindows">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Total Events (5m)</div>
+        <div class="value" id="statEvents">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Error Rate %</div>
+        <div class="value" id="statErrorRate">0.0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Avg Response Time ms</div>
+        <div class="value" id="statAvgRt">-</div>
+    </div>
+</div>
+
+<div class="charts-grid">
+    <div class="chart-card">
+        <h3>Event Volume Over Time</h3>
+        <div class="chart-container">
+            <canvas id="volumeChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>Error Rate Trend</h3>
+        <div class="chart-container">
+            <canvas id="errorChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>Service Distribution</h3>
+        <div class="chart-container">
+            <canvas id="serviceChart"></canvas>
+        </div>
+    </div>
+    <div class="chart-card">
+        <h3>Log Level Distribution</h3>
+        <div class="chart-container">
+            <canvas id="levelChart"></canvas>
+        </div>
+    </div>
+</div>
+
+<script>
+const MAX_POINTS = 20;
+const CHART_COLORS = ['#6366f1','#22d3ee','#f59e0b','#ef4444','#10b981','#8b5cf6','#ec4899','#f97316'];
+const LEVEL_COLORS = {
+    DEBUG: '#6b7280', INFO: '#3b82f6', WARN: '#f59e0b',
+    WARNING: '#f59e0b', ERROR: '#ef4444', CRITICAL: '#dc2626'
+};
+
+/* --- Chart.js instances --- */
+const commonOpts = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: { duration: 0 },
+    plugins: { legend: { labels: { color: '#9ca3af', font: { size: 11 } } } },
+    scales: {
+        x: { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: '#2a2a4a' } },
+        y: { ticks: { color: '#6b7280' }, grid: { color: '#2a2a4a' }, beginAtZero: true }
+    }
+};
+
+const volumeCtx = document.getElementById('volumeChart').getContext('2d');
+const volumeChart = new Chart(volumeCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'Events', data: [], borderColor: '#6366f1', backgroundColor: 'rgba(99,102,241,0.15)', fill: true, tension: 0.3, pointRadius: 2 }] },
+    options: { ...commonOpts }
+});
+
+const errorCtx = document.getElementById('errorChart').getContext('2d');
+const errorChart = new Chart(errorCtx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label: 'Error Rate %', data: [], borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.15)', fill: true, tension: 0.3, pointRadius: 2 }] },
+    options: { ...commonOpts }
+});
+
+const serviceCtx = document.getElementById('serviceChart').getContext('2d');
+const serviceChart = new Chart(serviceCtx, {
+    type: 'doughnut',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: CHART_COLORS }] },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 0 },
+        plugins: { legend: { position: 'right', labels: { color: '#9ca3af', font: { size: 11 }, padding: 10 } } }
+    }
+});
+
+const levelCtx = document.getElementById('levelChart').getContext('2d');
+const levelChart = new Chart(levelCtx, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ label: 'Count', data: [], backgroundColor: [] }] },
+    options: {
+        ...commonOpts,
+        indexAxis: 'y',
+        plugins: { legend: { display: false } }
+    }
+});
+
+/* --- Update functions --- */
+function pushTimeSeries(chart, label, value) {
+    chart.data.labels.push(label);
+    chart.data.datasets[0].data.push(value);
+    if (chart.data.labels.length > MAX_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+    }
+    chart.update();
+}
+
+function updateCategoryChart(chart, dataMap, colorMap) {
+    const entries = Object.entries(dataMap).sort((a, b) => b[1] - a[1]);
+    chart.data.labels = entries.map(e => e[0]);
+    chart.data.datasets[0].data = entries.map(e => e[1]);
+    if (colorMap) {
+        chart.data.datasets[0].backgroundColor = entries.map(e => colorMap[e[0]] || '#6b7280');
+    }
+    chart.update();
+}
+
+function handleMetrics(payload) {
+    const now = new Date().toLocaleTimeString();
+    let totalEvents = 0, totalErrors = 0, totalWindows = 0;
+    let totalRt = 0, rtCount = 0;
+    let mergedServices = {}, mergedLevels = {};
+
+    for (const [typeName, typeData] of Object.entries(payload)) {
+        totalWindows += typeData.window_count || 0;
+        for (const w of (typeData.windows || [])) {
+            totalEvents += w.count || 0;
+            totalErrors += w.error_count || 0;
+            if (w.avg_response_time != null) {
+                totalRt += w.avg_response_time * w.count;
+                rtCount += w.count;
+            }
+            for (const [svc, cnt] of Object.entries(w.services || {})) {
+                mergedServices[svc] = (mergedServices[svc] || 0) + cnt;
+            }
+            for (const [lv, cnt] of Object.entries(w.levels || {})) {
+                mergedLevels[lv] = (mergedLevels[lv] || 0) + cnt;
+            }
+        }
+    }
+
+    const errorRate = totalEvents > 0 ? (totalErrors / totalEvents * 100).toFixed(1) : '0.0';
+    const avgRt = rtCount > 0 ? (totalRt / rtCount).toFixed(1) : '-';
+
+    document.getElementById('statWindows').textContent = totalWindows;
+    document.getElementById('statEvents').textContent = totalEvents;
+    document.getElementById('statErrorRate').textContent = errorRate;
+    document.getElementById('statAvgRt').textContent = avgRt;
+
+    pushTimeSeries(volumeChart, now, totalEvents);
+    pushTimeSeries(errorChart, now, parseFloat(errorRate) || 0);
+    updateCategoryChart(serviceChart, mergedServices, null);
+    serviceChart.data.datasets[0].backgroundColor = CHART_COLORS.slice(0, Object.keys(mergedServices).length);
+    serviceChart.update();
+    updateCategoryChart(levelChart, mergedLevels, LEVEL_COLORS);
+}
+
+/* --- WebSocket client --- */
+let ws = null;
+let reconnectDelay = 1000;
+let pingInterval = null;
+
+function setStatus(connected) {
+    const dot = document.getElementById('statusDot');
+    const txt = document.getElementById('statusText');
+    if (connected) {
+        dot.classList.add('connected');
+        txt.textContent = 'Connected';
+    } else {
+        dot.classList.remove('connected');
+        txt.textContent = 'Disconnected';
+    }
+}
+
+function connectWs() {
+    const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    ws = new WebSocket(`${proto}://${window.location.host}/ws/dashboard`);
+
+    ws.onopen = function() {
+        setStatus(true);
+        reconnectDelay = 1000;
+        pingInterval = setInterval(function() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('ping');
+            }
+        }, 30000);
+    };
+
+    ws.onmessage = function(event) {
+        try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'metrics_update' && msg.data) {
+                handleMetrics(msg.data);
+            }
+        } catch (e) { /* ignore parse errors */ }
+    };
+
+    ws.onclose = function() {
+        setStatus(false);
+        clearInterval(pingInterval);
+        setTimeout(function() {
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+            connectWs();
+        }, reconnectDelay);
+    };
+
+    ws.onerror = function() {
+        ws.close();
+    };
+}
+
+connectWs();
+</script>
+</body>
+</html>
