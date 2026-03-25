@@ -2,6 +2,7 @@
 
 import json
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -162,6 +163,88 @@ def main() -> None:
                 print("WARN: No WebSocket broadcast within timeout (acceptable if windows empty)")
     except Exception as e:
         print(f"WARN: WebSocket test skipped — {e}")
+
+    # --- Mini load test: 200 events/sec for 5 seconds (1000 events) ---
+    print("\n--- Mini load test: 200 events/sec for 5s ---")
+    MINI_RATE = 200
+    MINI_DURATION = 5
+    MINI_BATCH = 50
+    mini_batches_per_sec = MINI_RATE // MINI_BATCH
+    mini_interval = 1.0 / mini_batches_per_sec
+
+    mini_sent = 0
+    mini_accepted = 0
+    mini_errors = 0
+    levels_load = ["INFO", "WARN", "ERROR", "DEBUG"]
+    sources_load = ["web-api", "auth-svc", "db-proxy", "payment", "orders", "gateway"]
+
+    client = httpx.Client(base_url=APP_URL, timeout=10)
+    mini_start = time.time()
+    while time.time() - mini_start < MINI_DURATION:
+        batch_start = time.time()
+        batch_events = [
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": random.choice(levels_load),
+                "source": random.choice(sources_load),
+                "message": f"Mini load event {random.randint(1, 100000)}",
+                "response_time": random.uniform(10, 500),
+            }
+            for _ in range(MINI_BATCH)
+        ]
+        try:
+            r = client.post("/api/v1/logs/batch", json={"events": batch_events})
+            if r.status_code == 200:
+                body = r.json()
+                mini_sent += len(batch_events)
+                mini_accepted += body.get("accepted", 0)
+            else:
+                mini_errors += 1
+                mini_sent += len(batch_events)
+        except Exception:
+            mini_errors += 1
+            mini_sent += len(batch_events)
+
+        elapsed = time.time() - batch_start
+        if elapsed < mini_interval:
+            time.sleep(mini_interval - elapsed)
+
+    mini_elapsed = time.time() - mini_start
+    client.close()
+
+    mini_rate = mini_sent / mini_elapsed if mini_elapsed > 0 else 0
+    assert mini_sent >= 800, f"Mini load sent only {mini_sent} events (expected >= 800)"
+    assert mini_accepted >= mini_sent * 0.9, (
+        f"Mini load accepted {mini_accepted}/{mini_sent} (expected >= 90%)"
+    )
+    print(
+        f"PASS: Mini load test — sent={mini_sent}, accepted={mini_accepted}, "
+        f"rate={mini_rate:.0f} events/sec, errors={mini_errors}"
+    )
+
+    # --- Persistence / data consistency test ---
+    time.sleep(2)  # let windows settle
+
+    r = httpx.get(f"{APP_URL}/api/v1/windows/5m", timeout=10)
+    assert r.status_code == 200
+    body = r.json()
+    window_total = sum(
+        w["metrics"]["count"] for w in body["windows"] if w.get("metrics")
+    )
+
+    r = httpx.get(f"{APP_URL}/api/v1/stats", timeout=10)
+    assert r.status_code == 200
+    stats_total = r.json()["total_events"]
+
+    # We sent at least: 20 singles + 5 batch + 10 order + 5 replay + mini_sent
+    min_expected = 20 + 5 + 10 + mini_sent
+    assert stats_total >= min_expected, (
+        f"Stats total_events={stats_total} < expected minimum {min_expected}"
+    )
+    print(
+        f"PASS: Data consistency — stats total_events={stats_total} "
+        f"(>= {min_expected} expected), 5m window count={window_total}"
+    )
 
     print("\nAll E2E tests passed!")
 

@@ -46,3 +46,18 @@ services:
     environment:
       - APP_URL=http://app:8080
       - REDIS_HOST=redis
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - loadtest
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py"]
+    environment:
+      - APP_URL=http://app:8080
