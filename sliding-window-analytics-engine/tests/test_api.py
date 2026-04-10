@@ -10,12 +10,19 @@ racing with assertions on window counts.
 TestClient drives the FastAPI lifespan via its context manager, so all
 tests create a fresh client-per-test inside a ``with`` block to ensure
 clean setup and teardown.
+
+Commit 6 note: because POST /api/metric now routes through an async
+queue (drained by a dedicated consumer task) rather than calling
+``window_manager.dispatch`` synchronously, tests that assert on stats
+*immediately* after a POST need a tiny settle window — we poll
+``/api/stats`` for up to a second instead of reading it once.
 """
 
 from __future__ import annotations
 
 import importlib
 import os
+import time
 
 import pytest
 
@@ -29,6 +36,31 @@ import src.main as main_module  # noqa: E402
 
 # Re-import to make sure module-level ``app`` picks up the env var state.
 main_module = importlib.reload(main_module)
+
+
+def _poll_count(
+    client: TestClient,
+    metric: str,
+    resolution: str,
+    expected: int,
+    timeout: float = 2.0,
+) -> int:
+    """Poll ``/api/stats`` until the target count appears (or the timeout elapses).
+
+    The ingest pipeline drains into the window manager on the event
+    loop, so a just-posted event may not be reflected in the very next
+    stats read. This helper retries for a short window to keep the
+    Commit 6 async path green without introducing flakiness.
+    """
+    deadline = time.monotonic() + timeout
+    last = -1
+    while time.monotonic() < deadline:
+        body = client.get("/api/stats").json()
+        last = body["metrics"][metric][resolution]["count"]
+        if last >= expected:
+            return last
+        time.sleep(0.05)
+    return last
 
 
 @pytest.fixture
@@ -113,16 +145,41 @@ def test_stats_reflects_ingested_metric(client: TestClient) -> None:
     before = client.get("/api/stats").json()
     before_count = before["metrics"]["response_time"]["1m"]["count"]
 
-    # Ingest a single event.
+    # Ingest a single event. Because the event now flows through the
+    # async ingest queue, we poll /api/stats instead of reading once.
     ingest = client.post(
         "/api/metric",
         json={"metric": "response_time", "value": 42.0},
     )
     assert ingest.status_code == 200
 
-    after = client.get("/api/stats").json()
-    after_count = after["metrics"]["response_time"]["1m"]["count"]
-    assert after_count == before_count + 1, (
-        f"expected count to increment from {before_count} to {before_count + 1}, "
+    expected = before_count + 1
+    after_count = _poll_count(client, "response_time", "1m", expected)
+    assert after_count == expected, (
+        f"expected count to increment from {before_count} to {expected}, "
         f"got {after_count}"
     )
+
+
+def test_stats_includes_ingest_counters(client: TestClient) -> None:
+    """Commit 6: /api/stats should expose the ingest-pipeline snapshot."""
+    body = client.get("/api/stats").json()
+    assert "ingest" in body, "stats response missing 'ingest' key"
+    ingest = body["ingest"]
+    for key in ("queue_depth", "queue_maxsize", "enqueued", "dropped", "sampled", "processed"):
+        assert key in ingest, f"ingest snapshot missing {key!r}"
+    assert ingest["queue_maxsize"] >= 1
+    assert ingest["queue_depth"] >= 0
+
+    # A fresh POST should bump enqueued and (after the consumer drains)
+    # processed — poll briefly to allow the consumer task to run.
+    before_enqueued = ingest["enqueued"]
+    client.post("/api/metric", json={"metric": "response_time", "value": 1.0})
+    deadline = time.monotonic() + 2.0
+    after_enqueued = before_enqueued
+    while time.monotonic() < deadline:
+        after_enqueued = client.get("/api/stats").json()["ingest"]["enqueued"]
+        if after_enqueued > before_enqueued:
+            break
+        time.sleep(0.05)
+    assert after_enqueued > before_enqueued

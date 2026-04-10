@@ -178,6 +178,24 @@ def main() -> None:
             flush=True,
         )
 
+        # Commit 6: verify the backpressure-aware ingest counters.
+        ingest = stats_body.get("ingest")
+        if not isinstance(ingest, dict):
+            _fail(f"stats body missing 'ingest' dict: {stats_body!r}")
+        queue_maxsize = int(ingest.get("queue_maxsize", 0))
+        processed = int(ingest.get("processed", 0))
+        if queue_maxsize < 1:
+            _fail(f"expected ingest.queue_maxsize >= 1, got {queue_maxsize}")
+        if processed < 1:
+            _fail(f"expected ingest.processed >= 1, got {processed}")
+        print(
+            f"E2E INGEST PASSED (queue_maxsize={queue_maxsize} "
+            f"processed={processed} "
+            f"dropped={ingest.get('dropped')} "
+            f"sampled={ingest.get('sampled')})",
+            flush=True,
+        )
+
     # 6. WebSocket phase — connect and verify live broadcasts.
     ws_url = _ws_url_from_app_url(APP_URL)
     print(f"E2E WS: connecting to {ws_url}", flush=True)

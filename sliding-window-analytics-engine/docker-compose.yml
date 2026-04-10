@@ -64,3 +64,17 @@ services:
       redis:
         condition: service_healthy
     command: ["python", "scripts/verify_e2e.py"]
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - loadtest
+    environment:
+      - APP_URL=http://app:8000
+      - PYTHONPATH=/app
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py", "--rate", "1500", "--duration", "10"]

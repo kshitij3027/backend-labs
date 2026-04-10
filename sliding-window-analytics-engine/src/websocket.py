@@ -87,6 +87,7 @@ async def broadcast_loop(
     window_manager,
     interval: float,
     stop_event: asyncio.Event,
+    ingest_pipeline=None,
 ) -> None:
     """Periodically snapshot ``window_manager`` and broadcast to all clients.
 
@@ -94,9 +95,12 @@ async def broadcast_loop(
     1. Snapshots the :class:`WindowManager` at the current wall clock.
     2. Serialises the nested ``{metric: {resolution: WindowResult}}``
        structure to plain dicts.
-    3. Fans the payload out to every connected client via the
+    3. If an ``ingest_pipeline`` was supplied, includes its counters
+       under the ``ingest`` key so the dashboard can visualise queue
+       depth / drops / sampling in real time.
+    4. Fans the payload out to every connected client via the
        :class:`ConnectionManager`.
-    4. Sleeps up to ``interval`` seconds, waking early on ``stop_event``.
+    5. Sleeps up to ``interval`` seconds, waking early on ``stop_event``.
 
     Any exception is logged and the loop continues — a broken snapshot
     should never take the dashboard down permanently.
@@ -116,6 +120,7 @@ async def broadcast_loop(
                 "timestamp": time.time(),
                 "active_windows": window_manager.active_count,
                 "metrics": metrics,
+                "ingest": ingest_pipeline.snapshot() if ingest_pipeline is not None else None,
             }
             await manager.broadcast_json(payload)
         except Exception:
