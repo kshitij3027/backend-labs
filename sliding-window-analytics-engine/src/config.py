@@ -27,6 +27,13 @@ def _env_str(name: str, default: str) -> str:
     return raw
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Config:
     """Runtime configuration loaded from environment variables."""
@@ -39,6 +46,10 @@ class Config:
     api_port: int = 8000
     ws_update_interval_seconds: float = 5.0
     spike_probability: float = 0.1
+    # When true, the FastAPI lifespan will NOT spawn the background
+    # LogEventGenerator task. This is used by the unit-test suite so
+    # tests don't race against a 600 evt/s producer.
+    disable_generator: bool = False
 
 
 def get_config() -> Config:
@@ -52,4 +63,5 @@ def get_config() -> Config:
         api_port=_env_int("API_PORT", 8000),
         ws_update_interval_seconds=_env_float("WS_UPDATE_INTERVAL_SECONDS", 5.0),
         spike_probability=_env_float("SPIKE_PROBABILITY", 0.1),
+        disable_generator=_env_bool("DISABLE_GENERATOR", False),
     )

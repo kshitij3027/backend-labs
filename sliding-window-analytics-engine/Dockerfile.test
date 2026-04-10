@@ -18,10 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 COPY tests/ tests/
+COPY scripts/ scripts/
 COPY pytest.ini .
-
-# scripts/ is created in later commits; make sure the directory exists so
-# e2e profile commands referencing scripts/*.py don't fail at image build time.
-RUN mkdir -p scripts
 
 CMD ["pytest", "-v"]
