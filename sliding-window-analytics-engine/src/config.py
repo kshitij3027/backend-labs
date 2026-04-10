@@ -50,6 +50,16 @@ class Config:
     # LogEventGenerator task. This is used by the unit-test suite so
     # tests don't race against a 600 evt/s producer.
     disable_generator: bool = False
+    # Commit 7: Redis checkpoint tuning knobs.
+    # ``checkpoint_interval_seconds`` controls how often the background
+    # checkpoint task serialises the window manager into Redis.
+    # ``checkpoint_max_age_seconds`` bounds how old a stored checkpoint
+    # may be before it's considered stale and discarded on restore.
+    # ``disable_checkpoint`` lets the test suite (and anyone running
+    # without a Redis dependency) skip the whole restore/save cycle.
+    checkpoint_interval_seconds: float = 10.0
+    checkpoint_max_age_seconds: float = 3600.0
+    disable_checkpoint: bool = False
 
 
 def get_config() -> Config:
@@ -64,4 +74,7 @@ def get_config() -> Config:
         ws_update_interval_seconds=_env_float("WS_UPDATE_INTERVAL_SECONDS", 5.0),
         spike_probability=_env_float("SPIKE_PROBABILITY", 0.1),
         disable_generator=_env_bool("DISABLE_GENERATOR", False),
+        checkpoint_interval_seconds=_env_float("CHECKPOINT_INTERVAL_SECONDS", 10.0),
+        checkpoint_max_age_seconds=_env_float("CHECKPOINT_MAX_AGE_SECONDS", 3600.0),
+        disable_checkpoint=_env_bool("DISABLE_CHECKPOINT", False),
     )

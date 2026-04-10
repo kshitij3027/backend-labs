@@ -17,11 +17,17 @@ The window expires events in two ways:
 
 Both forms of expiry update ``_stats`` and ``_minmax`` so that snapshots
 always reflect exactly the events currently in the buffer.
+
+Commit 7 adds :meth:`state_dict` / :meth:`load_state` for the Redis
+checkpoint loop (see :mod:`src.checkpoint`). These capture the event
+buffer (not the derived stats) and rebuild the aggregates via ``add``
+on restore — simpler and safer than round-tripping the stats objects.
 """
 
 from __future__ import annotations
 
 from collections import deque
+from typing import Any
 
 from src.models import Event, WindowResult
 from src.stats import IncrementalStats, MonotonicMinMax
@@ -143,3 +149,59 @@ class SlidingWindow:
     def size(self) -> int:
         """Number of events currently buffered."""
         return len(self._buffer)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Serialize the window's current state as a JSON-safe dict.
+
+        Captures:
+          - configuration (name, resolution, window_size, slide_interval, max_size)
+          - the full event buffer as a list of dicts with
+            ``event_id``, ``timestamp``, ``value``, ``metric``, ``metadata``.
+
+        We re-derive stats from the events on restore rather than
+        serializing the :class:`IncrementalStats` / :class:`MonotonicMinMax`
+        directly — that keeps the snapshot much simpler and sidesteps any
+        risk of inconsistency between the buffer and its aggregates.
+        """
+        return {
+            "name": self.name,
+            "resolution": self.resolution,
+            "window_size": self.window_size,
+            "slide_interval": self.slide_interval,
+            "max_size": self.max_size,
+            "events": [
+                {
+                    "event_id": event.event_id,
+                    "timestamp": event.timestamp,
+                    "value": event.value,
+                    "metric": event.metric,
+                    "metadata": dict(event.metadata),
+                }
+                for event in self._buffer
+            ],
+        }
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Rehydrate the window from a previously-serialized state dict.
+
+        Clears any existing buffer/stats and replays each stored event
+        through :meth:`add` so that :class:`IncrementalStats` and
+        :class:`MonotonicMinMax` are rebuilt fresh. Events whose
+        timestamps have since expired (older than ``window_size`` from
+        now) are still replayed and will then be lazy-expired on the
+        next :meth:`snapshot` — the buffer may briefly contain stale
+        entries until the next snapshot runs.
+        """
+        self._buffer.clear()
+        self._stats = IncrementalStats()
+        self._minmax = MonotonicMinMax()
+
+        for raw in state.get("events", []):
+            event = Event(
+                event_id=str(raw.get("event_id", "")),
+                timestamp=float(raw.get("timestamp", 0.0)),
+                value=float(raw.get("value", 0.0)),
+                metric=str(raw.get("metric", "")),
+                metadata=dict(raw.get("metadata", {})),
+            )
+            self.add(event)

@@ -13,6 +13,8 @@ canonical 7-window layout used by the rest of the service (see
 
 from __future__ import annotations
 
+from typing import Any
+
 from src.config import Config
 from src.models import Event, WindowConfig, WindowResult
 from src.sliding_window import SlidingWindow
@@ -79,6 +81,50 @@ class WindowManager:
     def get_window(self, metric: str, resolution: str) -> SlidingWindow | None:
         """Look up a single window by ``(metric, resolution)``."""
         return self._windows.get((metric, resolution))
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return ``{window_key: window_state_dict}`` for every window.
+
+        ``window_key`` is ``f"{metric}__{resolution}"`` — a flat string
+        so the whole thing serialises cleanly as JSON. Consumers should
+        treat the keys as opaque and call :meth:`load_state` to restore.
+        """
+        out: dict[str, Any] = {}
+        for (metric, resolution), window in self._windows.items():
+            key = f"{metric}__{resolution}"
+            out[key] = window.state_dict()
+        return out
+
+    def load_state(self, state: dict[str, Any]) -> int:
+        """Restore all windows from a state dict produced by :meth:`state_dict`.
+
+        Returns the number of windows successfully restored. Any keys
+        that don't match a currently-registered window are silently
+        skipped — this way a schema or layout change (e.g. adding a new
+        resolution) simply drops the stale keys on the floor rather
+        than blowing up startup.
+        """
+        if not isinstance(state, dict):
+            return 0
+
+        restored = 0
+        for key, window_state in state.items():
+            if not isinstance(key, str) or "__" not in key:
+                continue
+            metric, _, resolution = key.partition("__")
+            window = self._windows.get((metric, resolution))
+            if window is None:
+                continue
+            if not isinstance(window_state, dict):
+                continue
+            try:
+                window.load_state(window_state)
+            except Exception:  # pragma: no cover - defensive
+                # A corrupt sub-state shouldn't take down the whole
+                # restore; just skip it and keep going.
+                continue
+            restored += 1
+        return restored
 
 
 # Canonical resolution labels -> window size (seconds).

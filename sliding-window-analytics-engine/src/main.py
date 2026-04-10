@@ -1,8 +1,9 @@
 """FastAPI entrypoint for the sliding-window analytics engine.
 
-Commit 6 scope: on top of the HTTP + WebSocket surface from Commit 5,
-the lifespan now wires a backpressure-aware ingest pipeline between
-the event producers and the :class:`WindowManager`.
+Commit 7 scope: on top of the backpressure-aware ingest pipeline from
+Commit 6, the lifespan now wires a Redis-backed checkpoint store that
+periodically snapshots the :class:`WindowManager` state and restores
+it on startup, so trends survive ``app`` container restarts.
 
 * ``GET /`` — serves the Chart.js dashboard HTML.
 * ``GET /api/health`` — liveness plus the number of active windows.
@@ -13,15 +14,16 @@ the event producers and the :class:`WindowManager`.
 * ``WS /ws`` — pushes a ``metrics_update`` payload (including the
   ingest counters) every ``config.ws_update_interval_seconds`` seconds.
 
-Three background tasks are spawned in the lifespan: the generator
-(unless ``DISABLE_GENERATOR=1``), the ingest consumer, and the
-WebSocket broadcast loop. All three share the same ``stop_event`` so
-shutdown is prompt.
+Four background tasks may be spawned in the lifespan: the generator
+(unless ``DISABLE_GENERATOR=1``), the ingest consumer, the WebSocket
+broadcast loop, and the checkpoint loop (unless ``DISABLE_CHECKPOINT=1``).
+All of them share the same ``stop_event`` so shutdown is prompt.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -32,12 +34,15 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from src.checkpoint import CheckpointStore, checkpoint_loop
 from src.config import get_config
 from src.generator import LogEventGenerator
 from src.ingest import IngestPipeline, MetricRequest
 from src.models import Event
 from src.websocket import ConnectionManager, broadcast_loop
 from src.window_manager import build_default_manager
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -47,6 +52,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     The window manager is always built. The generator task is spawned
     only when ``config.disable_generator`` is false — tests disable it
     via the ``DISABLE_GENERATOR`` env var to keep the event loop idle.
+    The checkpoint task is similarly spawned only when
+    ``config.disable_checkpoint`` is false; unit tests disable it via
+    ``DISABLE_CHECKPOINT`` so the lifespan doesn't try to reach Redis.
     The broadcast task is always spawned so unit tests that drive the
     WebSocket endpoint get live pushes.
     """
@@ -67,6 +75,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.generator_task = None
     app.state.broadcast_task = None
     app.state.ingest_consumer_task = None
+    app.state.checkpoint_store = None
+    app.state.checkpoint_task = None
+
+    # Wire up the checkpoint store first so any previously-saved state
+    # is restored *before* new events start flowing. If Redis is down
+    # we just proceed with empty windows — the store logs a warning.
+    checkpoint_store: CheckpointStore | None = None
+    if not config.disable_checkpoint:
+        checkpoint_store = CheckpointStore(
+            host=config.redis_host,
+            port=config.redis_port,
+            max_age_seconds=config.checkpoint_max_age_seconds,
+        )
+        try:
+            await checkpoint_store.connect()
+            restored = await checkpoint_store.load(window_manager)
+            logger.info("checkpoint restore: %d window(s) restored", restored)
+        except Exception as exc:
+            logger.warning("checkpoint restore failed: %s", exc)
+        app.state.checkpoint_store = checkpoint_store
 
     # Start the ingest consumer first so events produced during startup
     # are drained immediately.
@@ -106,11 +134,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         name="broadcast-loop",
     )
 
+    # Start the checkpoint loop last so the first save is triggered
+    # after the pipeline has had a chance to drain any backlog.
+    if checkpoint_store is not None:
+        app.state.checkpoint_task = asyncio.create_task(
+            checkpoint_loop(
+                checkpoint_store,
+                window_manager,
+                config.checkpoint_interval_seconds,
+                stop_event,
+            ),
+            name="checkpoint-loop",
+        )
+
     try:
         yield
     finally:
         stop_event.set()
-        for task_attr in ("generator_task", "broadcast_task", "ingest_consumer_task"):
+        for task_attr in (
+            "generator_task",
+            "broadcast_task",
+            "ingest_consumer_task",
+            "checkpoint_task",
+        ):
             task = getattr(app.state, task_attr, None)
             if task is None:
                 continue
@@ -126,6 +172,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pass
             except Exception:
                 # Don't let background task shutdown errors mask a clean exit.
+                pass
+
+        # One final save so the most recent state is persisted even
+        # if the periodic loop hadn't fired yet, then release Redis.
+        if checkpoint_store is not None:
+            try:
+                await checkpoint_store.save(window_manager)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("final checkpoint save failed: %s", exc)
+            try:
+                await checkpoint_store.close()
+            except Exception:  # pragma: no cover - defensive
                 pass
 
 

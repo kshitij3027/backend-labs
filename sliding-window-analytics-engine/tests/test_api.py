@@ -27,8 +27,11 @@ import time
 import pytest
 
 # Disable the background generator *before* importing the app so the
-# lifespan skips the asyncio.create_task call entirely.
+# lifespan skips the asyncio.create_task call entirely. Similarly
+# disable the Redis checkpoint loop (Commit 7) so the TestClient
+# lifespan doesn't try to reach Redis during unit tests.
 os.environ["DISABLE_GENERATOR"] = "1"
+os.environ["DISABLE_CHECKPOINT"] = "1"
 
 from fastapi.testclient import TestClient  # noqa: E402
 

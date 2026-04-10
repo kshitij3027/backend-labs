@@ -43,6 +43,7 @@ services:
       - REDIS_HOST=redis
       - PYTHONPATH=/app
       - DISABLE_GENERATOR=1
+      - DISABLE_CHECKPOINT=1
     depends_on:
       redis:
         condition: service_healthy

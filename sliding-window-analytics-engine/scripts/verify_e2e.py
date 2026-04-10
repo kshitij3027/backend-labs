@@ -13,11 +13,18 @@ data path:
 6. Connect to the WebSocket ``/ws`` endpoint and verify that at least
    three consecutive ``metrics_update`` payloads are broadcast, each
    containing a non-empty ``metrics`` dict.
+7. Commit 7: read the Redis checkpoint key directly and verify that
+   the app has persisted window state at least once. Because this
+   container can't issue ``docker compose restart app`` against the
+   host, full restart continuity is asserted by the TEST AGENT via a
+   separate compose flow — the e2e script only validates that the
+   checkpoint key is being written by the background loop.
 
 Prints ``E2E PASSED`` on success and exits 0; prints
 ``E2E FAILED: <reason>`` and exits 1 on any failure. The script uses
 ``httpx`` (already declared in ``requirements.txt``) plus the
-``websockets`` package for the WebSocket phase.
+``websockets`` and ``redis`` packages for the WebSocket and
+checkpoint phases.
 """
 
 from __future__ import annotations
@@ -30,7 +37,11 @@ import time
 from urllib.parse import urlparse
 
 import httpx
+import redis.asyncio as aioredis
 import websockets
+
+CHECKPOINT_KEY = "sliding_window:checkpoint:v1"
+CHECKPOINT_WAIT_SECONDS = 12.0
 
 APP_URL = os.environ.get("APP_URL", "http://app:8000")
 HEALTH_TIMEOUT_SECONDS = 30.0
@@ -51,6 +62,65 @@ def _ws_url_from_app_url(app_url: str) -> str:
     scheme = "wss" if parsed.scheme == "https" else "ws"
     netloc = parsed.netloc or parsed.path  # fall back for scheme-less inputs
     return f"{scheme}://{netloc}/ws"
+
+
+async def _verify_checkpoint_key_in_redis() -> None:
+    """Poll the Redis checkpoint key and assert the save loop is writing it.
+
+    The app-side loop runs every ``CHECKPOINT_INTERVAL_SECONDS`` (10s
+    by default), so after a short wait the key should exist and carry
+    a JSON payload with both ``saved_at`` and ``state`` fields. We
+    can't directly test a full restart continuity here (the e2e
+    container has no way to ``docker compose restart`` the app), but
+    the TEST AGENT covers that via its own compose-level flow and
+    this phase guarantees the underlying state is at least being
+    persisted by the running app.
+    """
+    host = os.environ.get("REDIS_HOST", "redis")
+    port = int(os.environ.get("REDIS_PORT", "6379"))
+    client = aioredis.Redis(host=host, port=port, decode_responses=True)
+
+    try:
+        # Give the background checkpoint loop time to fire at least once.
+        # With the default 10s interval, a 12s wait is a safe lower bound.
+        await asyncio.sleep(CHECKPOINT_WAIT_SECONDS)
+
+        try:
+            raw = await client.get(CHECKPOINT_KEY)
+        except Exception as exc:
+            _fail(f"redis GET failed for checkpoint key: {exc}")
+            return
+
+        if raw is None:
+            _fail(
+                f"expected checkpoint key {CHECKPOINT_KEY!r} to exist in redis "
+                f"after {CHECKPOINT_WAIT_SECONDS:.0f}s, but it was missing"
+            )
+            return
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _fail(f"checkpoint payload was not valid JSON: {exc}")
+            return
+
+        if "saved_at" not in payload:
+            _fail(f"checkpoint payload missing 'saved_at': {payload!r}")
+            return
+        if "state" not in payload or not isinstance(payload["state"], dict):
+            _fail(f"checkpoint payload missing 'state' dict: {payload!r}")
+            return
+
+        print(
+            f"E2E CHECKPOINT: key present, saved_at={payload['saved_at']:.2f}, "
+            f"window_count={len(payload['state'])}",
+            flush=True,
+        )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
 
 
 async def _verify_ws(ws_url: str) -> None:
@@ -196,17 +266,23 @@ def main() -> None:
             flush=True,
         )
 
-    # 6. WebSocket phase — connect and verify live broadcasts.
+    # 6. WebSocket + checkpoint phases share a single event loop.
     ws_url = _ws_url_from_app_url(APP_URL)
     print(f"E2E WS: connecting to {ws_url}", flush=True)
+
+    async def _async_phases() -> None:
+        await _verify_ws(ws_url)
+        print("E2E WS PASSED", flush=True)
+        await _verify_checkpoint_key_in_redis()
+        print("E2E CHECKPOINT PASSED", flush=True)
+
     try:
-        asyncio.run(_verify_ws(ws_url))
+        asyncio.run(_async_phases())
     except SystemExit:
         raise
     except Exception as exc:
-        _fail(f"WS phase raised {type(exc).__name__}: {exc}")
+        _fail(f"async phase raised {type(exc).__name__}: {exc}")
         return
-    print("E2E WS PASSED", flush=True)
 
     print("E2E PASSED", flush=True)
     sys.exit(0)
