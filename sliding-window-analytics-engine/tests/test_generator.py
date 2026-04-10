@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 
 import pytest
 
@@ -115,3 +116,41 @@ async def test_async_run_drives_sink():
     assert len(received) > 10
     for event in received[:5]:
         assert event.metric in KNOWN_METRICS
+
+
+@pytest.mark.asyncio
+async def test_run_emits_wall_clock_timestamps():
+    """Regression test: :meth:`run` must tag events with wall-clock
+    ``time.time()`` rather than ``asyncio.loop.time()`` (monotonic).
+
+    Monotonic timestamps differ from wall-clock time by however long
+    the host / container has been up — in practice hundreds to billions
+    of seconds — which causes every generated event to look "ancient"
+    relative to a ``SlidingWindow.snapshot(time.time())`` cutoff and
+    be expired immediately. Events must be directly comparable with
+    wall-clock ``now`` values used elsewhere in the pipeline.
+    """
+    received: list[Event] = []
+
+    async def sink(event: Event) -> None:
+        received.append(event)
+
+    gen = LogEventGenerator(rate_per_second=500.0, rng_seed=4242)
+    stop_event = asyncio.Event()
+
+    before = time.time()
+    task = asyncio.create_task(gen.run(sink, stop_event))
+    await asyncio.sleep(0.1)
+    stop_event.set()
+    await task
+    after = time.time()
+
+    assert received, "generator produced no events"
+    # Every emitted event's timestamp must be within the wall-clock
+    # window of when the generator ran. A ~5s slack on each side
+    # absorbs scheduler jitter without weakening the regression check.
+    for event in received:
+        assert before - 5.0 <= event.timestamp <= after + 5.0, (
+            f"event.timestamp={event.timestamp} outside wall-clock window "
+            f"[{before}, {after}]; likely using monotonic clock"
+        )

@@ -62,3 +62,6 @@ appendonly.aof
 # Project planning
 plan.md
 project_requirements.md
+
+# Captured UI artifacts (gifs, screenshots)
+artifacts/

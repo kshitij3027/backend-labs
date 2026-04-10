@@ -10,29 +10,87 @@ data path:
    the 1-minute window.
 5. GET ``/api/stats`` and verify the expected metrics + resolutions
    are present with non-zero counts.
+6. Connect to the WebSocket ``/ws`` endpoint and verify that at least
+   three consecutive ``metrics_update`` payloads are broadcast, each
+   containing a non-empty ``metrics`` dict.
 
 Prints ``E2E PASSED`` on success and exits 0; prints
 ``E2E FAILED: <reason>`` and exits 1 on any failure. The script uses
-``httpx`` (already declared in ``requirements.txt``).
+``httpx`` (already declared in ``requirements.txt``) plus the
+``websockets`` package for the WebSocket phase.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
 import time
+from urllib.parse import urlparse
 
 import httpx
+import websockets
 
 APP_URL = os.environ.get("APP_URL", "http://app:8000")
 HEALTH_TIMEOUT_SECONDS = 30.0
 POLL_INTERVAL_SECONDS = 1.0
 EXPECTED_METRICS = ("response_time", "throughput", "error_rate")
+WS_MESSAGES_REQUIRED = 3
+WS_MESSAGE_TIMEOUT_SECONDS = 10.0
 
 
 def _fail(reason: str) -> None:
     print(f"E2E FAILED: {reason}", flush=True)
     sys.exit(1)
+
+
+def _ws_url_from_app_url(app_url: str) -> str:
+    """Derive the ``ws://host:port/ws`` URL from the HTTP ``APP_URL``."""
+    parsed = urlparse(app_url)
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    netloc = parsed.netloc or parsed.path  # fall back for scheme-less inputs
+    return f"{scheme}://{netloc}/ws"
+
+
+async def _verify_ws(ws_url: str) -> None:
+    """Open a WebSocket and assert ``WS_MESSAGES_REQUIRED`` metric updates arrive."""
+    async with websockets.connect(ws_url, open_timeout=10.0) as ws:
+        received = 0
+        while received < WS_MESSAGES_REQUIRED:
+            try:
+                raw = await asyncio.wait_for(
+                    ws.recv(), timeout=WS_MESSAGE_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                _fail(
+                    f"WS timeout after {received}/{WS_MESSAGES_REQUIRED} messages "
+                    f"(limit {WS_MESSAGE_TIMEOUT_SECONDS}s)"
+                )
+                return
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                _fail(f"WS message {received + 1} was not valid JSON: {exc}")
+                return
+            if not isinstance(msg, dict):
+                _fail(f"WS message {received + 1} was not a dict: {msg!r}")
+                return
+            if msg.get("type") != "metrics_update":
+                # Skip any stray non-update frames; they don't count.
+                continue
+            metrics = msg.get("metrics")
+            if not isinstance(metrics, dict) or not metrics:
+                _fail(
+                    f"WS message {received + 1} had empty or missing 'metrics': {msg!r}"
+                )
+                return
+            received += 1
+            print(
+                f"E2E WS: received metrics_update {received}/{WS_MESSAGES_REQUIRED} "
+                f"(metrics={list(metrics.keys())})",
+                flush=True,
+            )
 
 
 def _wait_for_health(client: httpx.Client) -> dict:
@@ -119,6 +177,18 @@ def main() -> None:
             f"active_windows={stats_body.get('active_windows')}",
             flush=True,
         )
+
+    # 6. WebSocket phase — connect and verify live broadcasts.
+    ws_url = _ws_url_from_app_url(APP_URL)
+    print(f"E2E WS: connecting to {ws_url}", flush=True)
+    try:
+        asyncio.run(_verify_ws(ws_url))
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _fail(f"WS phase raised {type(exc).__name__}: {exc}")
+        return
+    print("E2E WS PASSED", flush=True)
 
     print("E2E PASSED", flush=True)
     sys.exit(0)

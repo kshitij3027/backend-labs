@@ -1,17 +1,21 @@
 """FastAPI entrypoint for the sliding-window analytics engine.
 
-Commit 4 scope: wire the window manager + generator into a FastAPI
-lifespan, and expose the initial HTTP surface:
+Commit 5 scope: on top of the Commit 4 HTTP surface, this module now
+also drives the live dashboard:
 
+* ``GET /`` — serves the Chart.js dashboard HTML.
 * ``GET /api/health`` — liveness plus the number of active windows.
 * ``POST /api/metric`` — ingest a single user-supplied metric event.
 * ``GET /api/stats`` — multi-resolution snapshot of all registered
   windows, serialised as JSON.
+* ``WS /ws`` — pushes a ``metrics_update`` payload to every connected
+  client every ``config.ws_update_interval_seconds`` seconds.
 
 The background :class:`LogEventGenerator` task is started in the
 lifespan unless ``DISABLE_GENERATOR=1`` is set in the environment (the
 test suite toggles this so unit tests don't race against a 600 evt/s
-producer).
+producer). A second background task drives the WebSocket broadcast
+loop; both tasks share the same ``stop_event`` so shutdown is prompt.
 """
 
 from __future__ import annotations
@@ -21,33 +25,41 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 
 from src.config import get_config
 from src.generator import LogEventGenerator
 from src.ingest import MetricRequest
 from src.models import Event
+from src.websocket import ConnectionManager, broadcast_loop
 from src.window_manager import build_default_manager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Build singletons and manage the background generator task.
+    """Build singletons and manage background tasks.
 
     The window manager is always built. The generator task is spawned
     only when ``config.disable_generator`` is false — tests disable it
     via the ``DISABLE_GENERATOR`` env var to keep the event loop idle.
+    The broadcast task is always spawned so unit tests that drive the
+    WebSocket endpoint get live pushes.
     """
     config = get_config()
     window_manager = build_default_manager(config)
     stop_event = asyncio.Event()
+    connection_manager = ConnectionManager()
 
     app.state.config = config
     app.state.window_manager = window_manager
     app.state.stop_event = stop_event
+    app.state.connection_manager = connection_manager
     app.state.generator_task = None
+    app.state.broadcast_task = None
 
     if not config.disable_generator:
         generator = LogEventGenerator(
@@ -67,12 +79,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.generator_task = task
 
+    # Always run the broadcast loop so WebSocket clients see pushes
+    # even when the generator is disabled (unit tests rely on this).
+    app.state.broadcast_task = asyncio.create_task(
+        broadcast_loop(
+            connection_manager,
+            window_manager,
+            config.ws_update_interval_seconds,
+            stop_event,
+        ),
+        name="broadcast-loop",
+    )
+
     try:
         yield
     finally:
         stop_event.set()
-        task = app.state.generator_task
-        if task is not None:
+        for task_attr in ("generator_task", "broadcast_task"):
+            task = getattr(app.state, task_attr, None)
+            if task is None:
+                continue
             try:
                 await asyncio.wait_for(task, timeout=2.0)
             except asyncio.TimeoutError:
@@ -84,11 +110,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except asyncio.CancelledError:
                 pass
             except Exception:
-                # Don't let generator shutdown errors mask a clean exit.
+                # Don't let background task shutdown errors mask a clean exit.
                 pass
 
 
 app = FastAPI(title="Sliding Window Analytics Engine", lifespan=lifespan)
+
+_DASHBOARD_PATH = Path(__file__).parent / "templates" / "dashboard.html"
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    """Serve the Chart.js dashboard HTML.
+
+    The template lives next to this module under ``templates/`` so it
+    is picked up by the Dockerfile's ``COPY src/ src/`` line without
+    any extra wiring.
+    """
+    try:
+        html = _DASHBOARD_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail="dashboard template missing")
+    return HTMLResponse(content=html)
 
 
 @app.get("/api/health")
@@ -163,6 +206,31 @@ async def stats() -> dict[str, object]:
         "active_windows": manager.active_count,
         "timestamp": now,
     }
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket) -> None:
+    """Accept a dashboard client and keep it subscribed to broadcasts.
+
+    The broadcast loop owned by the lifespan is doing all the work —
+    this handler just tracks the client lifecycle. We call
+    ``receive_text`` in a loop purely to detect disconnects (the client
+    is expected to ping periodically; any inbound frame is discarded).
+    """
+    manager: ConnectionManager = websocket.app.state.connection_manager
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Discard any inbound frames (keepalive pings, etc).
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # Any other receive-side error is treated as a disconnect — we
+        # never want a single misbehaving client to tear down the loop.
+        pass
+    finally:
+        await manager.disconnect(websocket)
 
 
 if __name__ == "__main__":

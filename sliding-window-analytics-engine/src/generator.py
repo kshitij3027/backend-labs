@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 import uuid
 from typing import Awaitable, Callable
 
@@ -139,11 +140,18 @@ class LogEventGenerator:
         best-effort pacing loop — it does not attempt to catch up if
         the sink itself is slow, which is the desired semantics for a
         backpressure-aware pipeline.
+
+        Event timestamps use ``time.time()`` (wall-clock epoch seconds)
+        so they are directly comparable with the wall-clock ``now``
+        value passed into :meth:`SlidingWindow.snapshot`. Using
+        ``asyncio.get_event_loop().time()`` here would produce
+        monotonic-clock values that are off from epoch by billions of
+        seconds, causing every generated event to be expired
+        immediately on the next snapshot.
         """
         delay = 1.0 / self.rate_per_second if self.rate_per_second > 0 else 0.0
-        loop = asyncio.get_event_loop()
         while not stop_event.is_set():
-            event = self.generate_one(loop.time())
+            event = self.generate_one(time.time())
             await sink(event)
             if delay > 0:
                 await asyncio.sleep(delay)
