@@ -17,7 +17,7 @@ services:
       - "8000:8000"
     environment:
       - REDIS_URL=redis://redis:6379/0
-      - DISABLE_SIMULATOR=1
+      - DISABLE_SIMULATOR=${DISABLE_SIMULATOR:-0}
     depends_on:
       redis:
         condition: service_healthy
@@ -63,3 +63,17 @@ services:
       redis:
         condition: service_healthy
     command: ["python", "scripts/verify_e2e.py"]
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - loadtest
+    environment:
+      - APP_URL=http://engine:8000
+      - PYTHONPATH=/app
+    depends_on:
+      engine:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py", "--url", "http://engine:8000", "--rate", "100", "--duration", "10"]

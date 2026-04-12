@@ -137,6 +137,27 @@ def check_websocket(app_url: str) -> None:
         sys.exit(1)
 
 
+def check_simulator_traffic(app_url: str) -> None:
+    """Wait for simulator traffic and verify it appears in analytics (soft check)."""
+    print("E2E: waiting 5s for simulator traffic ...")
+    time.sleep(5)
+
+    print("E2E: GET /api/analytics (simulator traffic check) ...")
+    try:
+        resp = httpx.get(f"{app_url}/api/analytics", timeout=10.0)
+        if resp.status_code == 200:
+            analytics = resp.json()
+            active = analytics.get("active_sessions", 0)
+            if active > 0:
+                print(f"  Simulator traffic detected: OK (active_sessions={active})")
+            else:
+                print("  No simulator traffic detected (simulator may be disabled on engine)")
+        else:
+            print(f"  Analytics check returned HTTP {resp.status_code} (non-fatal)")
+    except Exception as exc:
+        print(f"  Simulator traffic check failed (non-fatal): {exc}")
+
+
 def main() -> None:
     app_url = os.environ.get("APP_URL", "http://engine:8000")
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -145,6 +166,7 @@ def main() -> None:
     check_redis(redis_url)
     check_api_endpoints(app_url)
     check_websocket(app_url)
+    check_simulator_traffic(app_url)
 
     print("E2E: all checks passed")
 

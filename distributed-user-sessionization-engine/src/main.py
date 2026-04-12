@@ -67,6 +67,25 @@ async def lifespan(app: FastAPI):
         name="ws-broadcast-loop",
     )
 
+    # Start event simulator (if not disabled)
+    simulator_task = None
+    if not config.disable_simulator:
+        from src.simulator.generator import EventSimulator
+        simulator = EventSimulator(config.simulator_users, config.simulator_events_per_second)
+
+        async def _simulator_sink(event):
+            try:
+                await engine.enqueue_event(event)
+            except Exception:
+                logger.exception("Simulator sink error")
+
+        simulator_task = asyncio.create_task(
+            simulator.run(_simulator_sink, stop_event),
+            name="event-simulator",
+        )
+        logger.info("Event simulator started (%d users, %.1f events/sec)",
+                    config.simulator_users, config.simulator_events_per_second)
+
     logger.info("Sessionization engine started (port=%s)", config.port)
     yield
 
@@ -75,6 +94,8 @@ async def lifespan(app: FastAPI):
     stop_event.set()
     cleanup_task.cancel()
     broadcast_task.cancel()
+    if simulator_task is not None:
+        simulator_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
@@ -83,6 +104,11 @@ async def lifespan(app: FastAPI):
         await broadcast_task
     except asyncio.CancelledError:
         pass
+    if simulator_task is not None:
+        try:
+            await simulator_task
+        except asyncio.CancelledError:
+            pass
 
     await engine.stop_workers()
     await engine.flush_to_redis()
