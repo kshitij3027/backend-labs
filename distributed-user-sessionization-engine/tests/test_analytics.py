@@ -84,3 +84,37 @@ async def test_analytics_engagement_distribution(client: AsyncClient):
     assert "low" in eng
     assert "moderate" in eng
     assert "high" in eng
+
+
+@pytest.mark.asyncio
+async def test_analytics_behavioral_fields(client: AsyncClient):
+    """Analytics response includes session_type_breakdown, funnel_conversion_rates, anomaly_distribution."""
+    # Post an event so analytics are non-empty
+    await client.post("/api/events", json={
+        "user_id": "behavioral_user",
+        "event_type": "page_view",
+        "page_url": "/product/1",
+    })
+
+    resp = await client.get("/api/analytics")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # session_type_breakdown
+    assert "session_type_breakdown" in body
+    assert isinstance(body["session_type_breakdown"], dict)
+
+    # funnel_conversion_rates
+    assert "funnel_conversion_rates" in body
+    rates = body["funnel_conversion_rates"]
+    assert "none" in rates
+    assert "viewed" in rates
+    assert "carted" in rates
+    assert "purchased" in rates
+
+    # anomaly_distribution
+    assert "anomaly_distribution" in body
+    anomaly = body["anomaly_distribution"]
+    assert "normal" in anomaly
+    assert "suspicious" in anomaly
+    assert "anomalous" in anomaly

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.config import Config
-from src.models import Event, SessionState
+from src.models import Event, SessionState, FunnelStage
 from src.session_engine import SessionEngine
 
 
@@ -382,3 +382,242 @@ async def test_cleanup_idle_sessions(make_event):
     # s2 was ACTIVE + past half-timeout => now IDLE but still in active_sessions
     assert s2.state == SessionState.IDLE
     assert "u2" in engine.active_sessions
+
+
+# ---------------------------------------------------------------------------
+# Device-transition boundary
+# ---------------------------------------------------------------------------
+
+
+def test_device_transition_creates_new_session(make_event):
+    """With device_change_boundary=True, changing device mid-session creates a new session."""
+    cfg = Config(
+        session_timeout_seconds=3600.0,
+        device_change_boundary=True,
+    )
+    engine = SessionEngine(cfg)
+    e1 = make_event(user_id="u1", device_type="desktop", timestamp=BASE_TIME)
+    e2 = make_event(user_id="u1", device_type="mobile", timestamp=BASE_TIME + timedelta(seconds=10))
+
+    s1, _ = engine.process_event(e1)
+    s2, _ = engine.process_event(e2)
+
+    assert s1.session_id != s2.session_id
+    assert s1.state == SessionState.EXPIRED
+    assert s2.device_type == "mobile"
+
+
+def test_device_transition_disabled_by_default(make_event):
+    """With default config, changing device does NOT create a new session."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    e1 = make_event(user_id="u1", device_type="desktop", timestamp=BASE_TIME)
+    e2 = make_event(user_id="u1", device_type="mobile", timestamp=BASE_TIME + timedelta(seconds=10))
+
+    s1, _ = engine.process_event(e1)
+    s2, _ = engine.process_event(e2)
+
+    assert s1.session_id == s2.session_id
+
+
+# ---------------------------------------------------------------------------
+# Event deduplication
+# ---------------------------------------------------------------------------
+
+
+def test_event_dedup(make_event):
+    """Sending an identical event twice within the dedup window only processes it once."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    e1 = make_event(user_id="u1", event_type="page_view", timestamp=BASE_TIME, page_url="/home")
+    # Exact duplicate
+    e2 = make_event(user_id="u1", event_type="page_view", timestamp=BASE_TIME, page_url="/home")
+
+    s1, _ = engine.process_event(e1)
+    s2, _ = engine.process_event(e2)
+
+    assert s1.session_id == s2.session_id
+    assert s2.event_count == 1  # only one event processed
+
+
+# ---------------------------------------------------------------------------
+# Out-of-order tolerance
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_order_within_tolerance(make_event):
+    """An event with a slightly older timestamp still processes in the same session."""
+    cfg = Config(
+        session_timeout_seconds=3600.0,
+        timestamp_tolerance_seconds=10.0,
+    )
+    engine = SessionEngine(cfg)
+    e1 = make_event(user_id="u1", timestamp=BASE_TIME)
+    # Event arrives with timestamp 3 seconds *before* the previous event
+    e2 = make_event(user_id="u1", timestamp=BASE_TIME - timedelta(seconds=3))
+
+    s1, _ = engine.process_event(e1)
+    s2, _ = engine.process_event(e2)
+
+    assert s1.session_id == s2.session_id
+    assert s2.event_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Anomaly scoring
+# ---------------------------------------------------------------------------
+
+
+def test_anomaly_score_normal(make_event):
+    """A normal session with moderate event rate gets a low anomaly score."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    # Send a few events over several minutes — low velocity
+    for i in range(5):
+        ev = make_event(
+            user_id="u1",
+            event_type="page_view",
+            timestamp=BASE_TIME + timedelta(minutes=i * 2),
+            page_url=f"/page_{i}",
+        )
+        session, _ = engine.process_event(ev)
+
+    assert session.anomaly_score < 30
+
+
+def test_anomaly_score_high_velocity(make_event):
+    """Many rapid events yield a high anomaly score."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    # 50 events in 1 minute = 50/min velocity, well above the 20/min threshold
+    for i in range(50):
+        ev = make_event(
+            user_id="u1",
+            event_type="click",
+            timestamp=BASE_TIME + timedelta(seconds=i),
+            page_url=f"/page_{i}",
+        )
+        session, _ = engine.process_event(ev)
+
+    assert session.anomaly_score > 30
+
+
+# ---------------------------------------------------------------------------
+# Session type classification
+# ---------------------------------------------------------------------------
+
+
+def test_session_type_browsing(make_event):
+    """A session with mostly page_view and click events is classified as browsing."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    for i in range(5):
+        ev = make_event(
+            user_id="u1",
+            event_type="page_view" if i % 2 == 0 else "click",
+            timestamp=BASE_TIME + timedelta(seconds=i * 10),
+            page_url=f"/page_{i}",
+        )
+        session, _ = engine.process_event(ev)
+
+    assert session.session_type == "browsing"
+
+
+def test_session_type_searching(make_event):
+    """A session with search events is classified as searching."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    ev1 = make_event(user_id="u1", event_type="page_view", timestamp=BASE_TIME)
+    ev2 = make_event(user_id="u1", event_type="search", timestamp=BASE_TIME + timedelta(seconds=5))
+
+    engine.process_event(ev1)
+    session, _ = engine.process_event(ev2)
+
+    assert session.session_type == "searching"
+
+
+def test_session_type_purchasing(make_event):
+    """A session with add_to_cart events is classified as purchasing."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+    ev1 = make_event(user_id="u1", event_type="page_view", timestamp=BASE_TIME)
+    ev2 = make_event(user_id="u1", event_type="add_to_cart", timestamp=BASE_TIME + timedelta(seconds=5))
+
+    engine.process_event(ev1)
+    session, _ = engine.process_event(ev2)
+
+    assert session.session_type == "purchasing"
+
+
+# ---------------------------------------------------------------------------
+# Funnel stage progression
+# ---------------------------------------------------------------------------
+
+
+def test_funnel_stage_progression(make_event):
+    """Funnel advances through VIEWED -> CARTED -> PURCHASED and never regresses."""
+    cfg = _config(timeout=3600.0)
+    engine = SessionEngine(cfg)
+
+    ev1 = make_event(user_id="u1", event_type="page_view", timestamp=BASE_TIME, page_url="/product/1")
+    session, _ = engine.process_event(ev1)
+    assert session.funnel_stage == FunnelStage.VIEWED.value
+
+    ev2 = make_event(user_id="u1", event_type="add_to_cart", timestamp=BASE_TIME + timedelta(seconds=10))
+    session, _ = engine.process_event(ev2)
+    assert session.funnel_stage == FunnelStage.CARTED.value
+
+    # Note: purchase is a force-end event, so we check funnel within that new session.
+    # Instead, we verify that an extra page_view does NOT regress from CARTED.
+    ev3 = make_event(user_id="u1", event_type="click", timestamp=BASE_TIME + timedelta(seconds=20))
+    session, _ = engine.process_event(ev3)
+    assert session.funnel_stage == FunnelStage.CARTED.value  # did NOT regress
+
+
+# ---------------------------------------------------------------------------
+# Session merging
+# ---------------------------------------------------------------------------
+
+
+def test_session_merging(make_event):
+    """Probabilistic merging restores a recently expired (merge-eligible) session
+    when a new event for the same user has similar event types."""
+    cfg = Config(
+        session_timeout_seconds=3600.0,
+        merge_threshold=0.5,
+        merge_window_seconds=300.0,
+    )
+    engine = SessionEngine(cfg)
+
+    # Build a session with page_view events
+    for i in range(3):
+        ev = make_event(
+            user_id="u1",
+            event_type="page_view",
+            timestamp=BASE_TIME + timedelta(seconds=i * 5),
+            page_url=f"/page_{i}",
+        )
+        s1, _ = engine.process_event(ev)
+    original_id = s1.session_id
+    assert s1.event_count == 3
+
+    # Manually finalize with allow_merge=True (simulating a force-end boundary)
+    engine._finalize_session(s1, allow_merge=True)
+    assert "u1" not in engine.active_sessions
+    assert "u1" in engine._recently_expired
+
+    # New page_view event — _create_session checks merge and finds the expired session
+    # with high cosine similarity (page_view vs page_view = 1.0 > 0.5 threshold)
+    ev_new = make_event(
+        user_id="u1",
+        event_type="page_view",
+        timestamp=BASE_TIME + timedelta(seconds=30),
+        page_url="/page_new",
+    )
+    s2, _ = engine.process_event(ev_new)
+
+    # The session was merged — same session restored with merged_from tracking
+    assert original_id in s2.merged_from
+    assert s2.state == SessionState.ACTIVE
+    # The restored session should have the original events plus the new one
+    assert s2.event_count == 4

@@ -4,10 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections import Counter
 from datetime import datetime, timezone, timedelta
 
 from src.config import Config
-from src.models import Event, Session, SessionState, SessionAnalysis
+from src.models import Event, Session, SessionState, SessionAnalysis, FunnelStage
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,10 @@ class SessionEngine:
         ]
         self._workers: list[asyncio.Task] = []
         self._redis_store = redis_store
+        # Event deduplication: dedup_key -> insertion timestamp (seconds)
+        self._recent_events: dict[str, float] = {}
+        # Recently expired sessions for probabilistic merging: user_id -> (Session, expiry_time)
+        self._recently_expired: dict[str, tuple[Session, datetime]] = {}
 
     @property
     def active_sessions(self) -> dict[str, Session]:
@@ -138,18 +143,45 @@ class SessionEngine:
 
     def process_event(self, event: Event) -> tuple[Session, SessionAnalysis]:
         """Process a single event and return (session, analysis)."""
+        # --- Event deduplication ---
+        dedup_key = f"{event.user_id}:{event.event_type}:{event.timestamp.isoformat()}:{event.page_url}"
+        now_ts = event.timestamp.timestamp()
+        existing_ts = self._recent_events.get(dedup_key)
+        if existing_ts is not None and (now_ts - existing_ts) < self._config.dedup_window_seconds:
+            # Duplicate event — return current session unchanged
+            current = self._active_sessions.get(event.user_id)
+            if current is not None:
+                analysis = SessionAnalysis(
+                    quality_score=current.quality_score,
+                    engagement=current.engagement,
+                    session_id=current.session_id,
+                )
+                return current, analysis
+        self._recent_events[dedup_key] = now_ts
+        # Periodic cleanup of stale dedup entries
+        self._cleanup_dedup_entries(now_ts)
+
         self._total_events += 1
         session = self._find_or_create_session(event)
         self._update_session(session, event)
         score = self._compute_quality_score(session)
         session.quality_score = score
         session.engagement = self._classify_engagement(score)
+        session.anomaly_score = self._compute_anomaly_score(session)
+        session.session_type = self._classify_session_type(session)
         analysis = SessionAnalysis(
             quality_score=score,
             engagement=session.engagement,
             session_id=session.session_id,
         )
         return session, analysis
+
+    def _cleanup_dedup_entries(self, now_ts: float) -> None:
+        """Remove dedup entries older than 10x the dedup window."""
+        cutoff = now_ts - (self._config.dedup_window_seconds * 10)
+        stale = [k for k, v in self._recent_events.items() if v < cutoff]
+        for k in stale:
+            del self._recent_events[k]
 
     def _find_or_create_session(self, event: Event) -> Session:
         """Find existing session or create new one using hybrid boundary detection."""
@@ -159,19 +191,23 @@ class SessionEngine:
             # No active session — create new
             return self._create_session(event)
 
-        # Priority 1: Force-end event closes current session
+        # Priority 1: Force-end event closes current session (eligible for merge)
         if event.event_type in FORCE_END_EVENTS:
-            self._finalize_session(current)
+            self._finalize_session(current, allow_merge=True)
             return self._create_session(event)
 
-        # Priority 2: Force-new event starts new session
+        # Priority 2: Force-new event starts new session (eligible for merge)
         if event.event_type in FORCE_NEW_EVENTS:
-            self._finalize_session(current)
+            self._finalize_session(current, allow_merge=True)
             return self._create_session(event)
 
-        # Priority 3: Time-gap check
+        # Priority 3: Time-gap check (with out-of-order tolerance)
         gap = (event.timestamp - current.last_event_time).total_seconds()
-        if gap > self._config.session_timeout_seconds:
+        # If event is slightly out-of-order (negative gap) but within tolerance, keep session
+        if gap < 0 and abs(gap) <= self._config.timestamp_tolerance_seconds:
+            # Out-of-order but within tolerance — continue current session
+            pass
+        elif gap > self._config.session_timeout_seconds:
             self._finalize_session(current)
             return self._create_session(event)
 
@@ -181,11 +217,22 @@ class SessionEngine:
             self._finalize_session(current)
             return self._create_session(event)
 
+        # Priority 5: Device-transition boundary
+        if self._config.device_change_boundary and event.device_type != current.device_type:
+            self._finalize_session(current)
+            return self._create_session(event)
+
         # No boundary — continue current session
         return current
 
     def _create_session(self, event: Event) -> Session:
-        """Create a new session for the event."""
+        """Create a new session for the event, or merge with a recently expired one."""
+        # Try probabilistic merge with recently expired session
+        merged = self._try_merge_session(event.user_id, event)
+        if merged is not None:
+            self._active_sessions[event.user_id] = merged
+            return merged
+
         session = Session(
             user_id=event.user_id,
             start_time=event.timestamp,
@@ -199,7 +246,9 @@ class SessionEngine:
 
     def _update_session(self, session: Session, event: Event) -> None:
         """Update session with new event data."""
-        session.last_event_time = event.timestamp
+        # For out-of-order events within tolerance, don't regress last_event_time
+        if event.timestamp > session.last_event_time:
+            session.last_event_time = event.timestamp
         session.event_count += 1
         session.events.append(event)
         # Ensure ACTIVE state
@@ -212,10 +261,16 @@ class SessionEngine:
         # Track event types
         if event.event_type not in session.event_types:
             session.event_types.append(event.event_type)
+        # Funnel detection
+        self._update_funnel_stage(session, event)
 
-    def _finalize_session(self, session: Session) -> None:
+    def _finalize_session(self, session: Session, *, allow_merge: bool = False) -> None:
         """Mark session as expired and remove from active sessions."""
         session.state = SessionState.EXPIRED
+        # Only store for potential merging when the boundary is a force-end/force-new
+        # (not a time-gap, max-duration, or device-change boundary)
+        if allow_merge:
+            self._recently_expired[session.user_id] = (session, session.last_event_time)
         self._active_sessions.pop(session.user_id, None)
         # Persist to Redis if available
         if self._redis_store:
@@ -255,6 +310,127 @@ class SessionEngine:
                     )
 
         return expired
+
+    def _compute_anomaly_score(self, session: Session) -> float:
+        """Compute anomaly score (0-100) based on velocity and duration."""
+        duration_seconds = (session.last_event_time - session.start_time).total_seconds()
+        duration_minutes = max(duration_seconds / 60.0, 0.01)  # avoid division by zero
+
+        # Velocity factor: events per minute; > 20/min is suspicious
+        velocity = session.event_count / duration_minutes
+        if velocity > 20:
+            velocity_score = min(60.0, (velocity - 20) * 3.0)
+        else:
+            velocity_score = 0.0
+
+        # Duration factor: sessions > 2 hours are suspicious
+        if duration_seconds > 7200:
+            duration_score = min(40.0, (duration_seconds - 7200) / 180.0)
+        else:
+            duration_score = 0.0
+
+        return round(min(100.0, velocity_score + duration_score), 1)
+
+    @staticmethod
+    def _classify_session_type(session: Session) -> str:
+        """Classify session type based on event type distribution."""
+        counts: Counter[str] = Counter()
+        for ev in session.events:
+            counts[ev.event_type] += 1
+
+        total = sum(counts.values())
+        if total == 0:
+            return "browsing"
+
+        # Check for purchasing signals
+        purchase_types = {"purchase", "add_to_cart"}
+        purchase_count = sum(counts.get(pt, 0) for pt in purchase_types)
+        if purchase_count > 0:
+            return "purchasing"
+
+        # Check for search signals
+        search_count = counts.get("search", 0)
+        if search_count > 0:
+            return "searching"
+
+        # Default: browsing (page_view, click, etc.)
+        return "browsing"
+
+    @staticmethod
+    def _update_funnel_stage(session: Session, event: Event) -> None:
+        """Advance funnel stage based on event type. Only advances, never regresses."""
+        stage_order = {
+            FunnelStage.NONE: 0,
+            FunnelStage.VIEWED: 1,
+            FunnelStage.CARTED: 2,
+            FunnelStage.PURCHASED: 3,
+        }
+        current_order = stage_order.get(FunnelStage(session.funnel_stage), 0)
+
+        # Determine candidate stage from event
+        candidate = None
+        if event.event_type == "page_view":
+            candidate = FunnelStage.VIEWED
+        elif event.event_type == "add_to_cart":
+            candidate = FunnelStage.CARTED
+        elif event.event_type == "purchase":
+            candidate = FunnelStage.PURCHASED
+
+        if candidate is not None and stage_order[candidate] > current_order:
+            session.funnel_stage = candidate.value
+
+    def _try_merge_session(self, user_id: str, event: Event) -> Session | None:
+        """Attempt to merge with a recently expired session for the same user.
+
+        Uses cosine similarity of event-type frequency vectors to decide.
+        Returns the merged (restored) session or None.
+        """
+        entry = self._recently_expired.get(user_id)
+        if entry is None:
+            return None
+
+        expired_session, expired_last_event_time = entry
+        # Use event timestamp to measure gap from the expired session's last event
+        elapsed = (event.timestamp - expired_last_event_time).total_seconds()
+        if elapsed < 0 or elapsed > self._config.merge_window_seconds:
+            # Negative means new event is before expired session or too old
+            if elapsed > self._config.merge_window_seconds:
+                del self._recently_expired[user_id]
+            return None
+
+        # Build event-type frequency vector for the expired session
+        expired_counts: Counter[str] = Counter()
+        for ev in expired_session.events:
+            expired_counts[ev.event_type] += 1
+
+        # For the new "session" we only have the triggering event so far
+        new_counts: Counter[str] = Counter()
+        new_counts[event.event_type] += 1
+
+        # Compute cosine similarity
+        similarity = self._cosine_similarity(expired_counts, new_counts)
+        if similarity < self._config.merge_threshold:
+            return None
+
+        # Merge: restore expired session
+        expired_session.state = SessionState.ACTIVE
+        expired_session.merged_from.append(expired_session.session_id)
+        # Remove from recently expired
+        del self._recently_expired[user_id]
+        return expired_session
+
+    @staticmethod
+    def _cosine_similarity(a: Counter, b: Counter) -> float:
+        """Compute cosine similarity between two Counter vectors."""
+        all_keys = set(a.keys()) | set(b.keys())
+        if not all_keys:
+            return 0.0
+        dot = sum(a.get(k, 0) * b.get(k, 0) for k in all_keys)
+        mag_a = math.sqrt(sum(v * v for v in a.values()))
+        mag_b = math.sqrt(sum(v * v for v in b.values()))
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        return dot / (mag_a * mag_b)
 
     @staticmethod
     def _compute_quality_score(session: Session) -> float:

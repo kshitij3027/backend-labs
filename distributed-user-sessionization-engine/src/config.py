@@ -47,6 +47,11 @@ class Config:
     simulator_users: int = 50
     simulator_events_per_second: float = 10.0
     disable_simulator: bool = False
+    device_change_boundary: bool = False
+    timestamp_tolerance_seconds: float = 5.0
+    dedup_window_seconds: float = 2.0
+    merge_threshold: float = 0.7
+    merge_window_seconds: float = 300.0
 
 
 def get_config() -> Config:
@@ -64,4 +69,9 @@ def get_config() -> Config:
         simulator_users=_env_int("SIMULATOR_USERS", 50),
         simulator_events_per_second=_env_float("SIMULATOR_EVENTS_PER_SECOND", 10.0),
         disable_simulator=_env_bool("DISABLE_SIMULATOR", False),
+        device_change_boundary=_env_bool("DEVICE_CHANGE_BOUNDARY", False),
+        timestamp_tolerance_seconds=_env_float("TIMESTAMP_TOLERANCE_SECONDS", 5.0),
+        dedup_window_seconds=_env_float("DEDUP_WINDOW_SECONDS", 2.0),
+        merge_threshold=_env_float("MERGE_THRESHOLD", 0.7),
+        merge_window_seconds=_env_float("MERGE_WINDOW_SECONDS", 300.0),
     )

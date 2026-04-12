@@ -17,6 +17,22 @@ class SessionState(str, enum.Enum):
     EXPIRED = "expired"
 
 
+class SessionType(str, enum.Enum):
+    """Classification of session behavior."""
+    BROWSING = "browsing"
+    SEARCHING = "searching"
+    PURCHASING = "purchasing"
+    MIXED = "mixed"
+
+
+class FunnelStage(str, enum.Enum):
+    """E-commerce funnel progression stages."""
+    NONE = "none"
+    VIEWED = "viewed"
+    CARTED = "carted"
+    PURCHASED = "purchased"
+
+
 class Event(BaseModel):
     """A single user event."""
     user_id: str
@@ -41,6 +57,10 @@ class Session(BaseModel):
     event_types: list[str] = Field(default_factory=list)
     quality_score: float = 0.0
     engagement: str = "bounce"
+    anomaly_score: float = 0.0
+    session_type: str = "browsing"
+    funnel_stage: str = "none"
+    merged_from: list[str] = Field(default_factory=list)
 
 
 class SessionAnalysis(BaseModel):
