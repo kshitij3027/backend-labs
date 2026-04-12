@@ -5,10 +5,13 @@ import os
 from datetime import datetime, timezone
 
 import pytest
+from httpx import AsyncClient, ASGITransport
 
 from src.config import Config
 from src.models import Event
 from src.redis_store import RedisStore
+from src.session_engine import SessionEngine
+from src.main import app
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -56,3 +59,26 @@ async def redis_store(config):
     yield store
     await store.redis.flushdb()
     await store.close()
+
+
+@pytest.fixture
+async def client(config):
+    """Async HTTP client with app.state properly initialised (engine + Redis)."""
+    redis_store = RedisStore(config)
+    await redis_store.connect()
+    await redis_store.redis.flushdb()
+
+    engine = SessionEngine(config, redis_store=redis_store)
+    await engine.start_workers()
+
+    app.state.config = config
+    app.state.redis_store = redis_store
+    app.state.session_engine = engine
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+    await engine.stop_workers()
+    await redis_store.redis.flushdb()
+    await redis_store.close()

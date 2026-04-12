@@ -9,6 +9,9 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 
+from src.api.analytics import router as analytics_router
+from src.api.events import router as events_router
+from src.api.sessions import router as sessions_router
 from src.config import get_config
 from src.redis_store import RedisStore
 from src.session_engine import SessionEngine
@@ -71,6 +74,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Distributed User Sessionization Engine", lifespan=lifespan)
+
+app.include_router(events_router)
+app.include_router(sessions_router)
+app.include_router(analytics_router)
 
 
 @app.get("/health")
