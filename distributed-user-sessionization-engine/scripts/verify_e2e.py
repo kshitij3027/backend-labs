@@ -94,7 +94,7 @@ def check_api_endpoints(app_url: str) -> None:
     assert len(sessions) > 0, "Expected non-empty session list for e2e_user_1"
     print(f"  Sessions for e2e_user_1: OK ({len(sessions)} session(s))")
 
-    # --- Analytics ---
+    # --- Analytics (core fields) ---
     print("E2E: GET /api/analytics ...")
     resp = httpx.get(f"{app_url}/api/analytics", timeout=10.0)
     assert resp.status_code == 200, f"Analytics GET failed: {resp.status_code}"
@@ -102,6 +102,27 @@ def check_api_endpoints(app_url: str) -> None:
     assert analytics.get("active_sessions", 0) > 0, f"Expected active_sessions > 0: {analytics}"
     assert analytics.get("total_events", 0) > 0, f"Expected total_events > 0: {analytics}"
     print(f"  Analytics: OK (active={analytics['active_sessions']}, events={analytics['total_events']})")
+
+    # --- Analytics (behavioral fields) ---
+    print("E2E: verifying behavioral analytics fields ...")
+    required_behavioral = ["session_type_breakdown", "funnel_conversion_rates", "anomaly_distribution"]
+    for field in required_behavioral:
+        assert field in analytics, f"Missing behavioral field '{field}' in analytics: {list(analytics.keys())}"
+    st = analytics["session_type_breakdown"]
+    assert isinstance(st, dict), f"session_type_breakdown should be dict, got {type(st)}"
+    print(f"  session_type_breakdown: OK ({st})")
+
+    funnel = analytics["funnel_conversion_rates"]
+    assert isinstance(funnel, dict), f"funnel_conversion_rates should be dict, got {type(funnel)}"
+    for stage in ["none", "viewed", "carted", "purchased"]:
+        assert stage in funnel, f"Missing funnel stage '{stage}'"
+    print(f"  funnel_conversion_rates: OK ({funnel})")
+
+    anomaly = analytics["anomaly_distribution"]
+    assert isinstance(anomaly, dict), f"anomaly_distribution should be dict, got {type(anomaly)}"
+    for level in ["normal", "suspicious", "anomalous"]:
+        assert level in anomaly, f"Missing anomaly level '{level}'"
+    print(f"  anomaly_distribution: OK ({anomaly})")
 
     print("API endpoints: OK")
 

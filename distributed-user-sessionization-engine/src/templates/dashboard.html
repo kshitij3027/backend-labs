@@ -32,13 +32,38 @@
   .stat-card .value{font-size:1.75rem;font-weight:700;color:#f1f5f9}
 
   /* ---- Chart Grid ---- */
-  .charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;padding:0 2rem 1rem}
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:1rem;padding:0 2rem 1rem}
   .chart-card{
     background:#131a33;border:1px solid #1f2a44;border-radius:12px;
     padding:1.25rem;display:flex;flex-direction:column;
   }
   .chart-card h3{font-size:.85rem;font-weight:600;margin-bottom:.75rem;color:#94a3b8}
   .chart-card canvas{flex:1;max-height:260px}
+
+  /* ---- Funnel Section ---- */
+  .funnel-section{padding:0 2rem 1rem}
+  .funnel-card{
+    background:#131a33;border:1px solid #1f2a44;border-radius:12px;padding:1.25rem;
+  }
+  .funnel-card h3{font-size:.85rem;font-weight:600;margin-bottom:.75rem;color:#94a3b8}
+  .funnel-bar-wrap{display:flex;align-items:center;gap:0;height:42px;border-radius:8px;overflow:hidden;background:#1a2240}
+  .funnel-stage{
+    display:flex;align-items:center;justify-content:center;
+    height:100%;min-width:60px;font-size:.72rem;font-weight:600;
+    color:#fff;transition:width .4s ease;position:relative;
+  }
+  .funnel-stage .funnel-label{white-space:nowrap;padding:0 .5rem}
+  .funnel-legend{display:flex;gap:1.5rem;margin-top:.75rem;font-size:.75rem;color:#94a3b8}
+  .funnel-legend-item{display:flex;align-items:center;gap:.35rem}
+  .funnel-legend-dot{width:10px;height:10px;border-radius:3px}
+
+  /* ---- Anomaly Dot ---- */
+  .anomaly-dot{
+    display:inline-block;width:10px;height:10px;border-radius:50%;
+  }
+  .anomaly-normal{background:#10b981}
+  .anomaly-suspicious{background:#f59e0b}
+  .anomaly-anomalous{background:#ef4444}
 
   /* ---- Live Sessions Table ---- */
   .table-section{padding:0 2rem}
@@ -64,7 +89,6 @@
   .badge-expired{background:rgba(239,68,68,.15);color:#ef4444}
 
   /* ---- Responsive ---- */
-  @media(max-width:1100px){.charts{grid-template-columns:1fr 1fr}}
   @media(max-width:768px){
     .stats{grid-template-columns:repeat(2,1fr)}
     .charts{grid-template-columns:1fr}
@@ -116,6 +140,24 @@
     <h3>Engagement Breakdown</h3>
     <canvas id="engagement-chart"></canvas>
   </div>
+  <div class="chart-card">
+    <h3>Session Type Breakdown</h3>
+    <canvas id="session-type-chart"></canvas>
+  </div>
+</div>
+
+<!-- Funnel Visualization -->
+<div class="funnel-section">
+  <div class="funnel-card">
+    <h3>Conversion Funnel</h3>
+    <div class="funnel-bar-wrap" id="funnel-bar"></div>
+    <div class="funnel-legend">
+      <div class="funnel-legend-item"><div class="funnel-legend-dot" style="background:#64748b"></div> None</div>
+      <div class="funnel-legend-item"><div class="funnel-legend-dot" style="background:#3b82f6"></div> Viewed</div>
+      <div class="funnel-legend-item"><div class="funnel-legend-dot" style="background:#f59e0b"></div> Carted</div>
+      <div class="funnel-legend-item"><div class="funnel-legend-dot" style="background:#10b981"></div> Purchased</div>
+    </div>
+  </div>
 </div>
 
 <!-- Live Sessions Table -->
@@ -130,6 +172,7 @@
           <th>Duration</th>
           <th>Events</th>
           <th>Score</th>
+          <th>Anomaly</th>
           <th>Status</th>
           <th>Device</th>
         </tr>
@@ -206,6 +249,24 @@
     }
   });
 
+  /* ---- Session Type Doughnut ---- */
+  const stCtx = document.getElementById('session-type-chart').getContext('2d');
+  const stColors = ['#3b82f6','#8b5cf6','#10b981','#f59e0b'];
+  const stChart = new Chart(stCtx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Browsing','Searching','Purchasing','Mixed'],
+      datasets: [{ data: [0,0,0,0], backgroundColor: stColors, borderWidth: 0 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '60%',
+      plugins: {
+        legend: { position: 'bottom', labels: { padding: 14, usePointStyle: true, pointStyleWidth: 10 } }
+      }
+    }
+  });
+
   /* ---- Helpers ---- */
   function fmtDuration(secs) {
     const m = Math.floor(secs / 60);
@@ -250,21 +311,58 @@
     engChart.update('none');
   }
 
+  function updateSessionTypeChart(breakdown) {
+    var keys = ['browsing','searching','purchasing','mixed'];
+    stChart.data.datasets[0].data = keys.map(function(k){ return breakdown[k] || 0; });
+    stChart.update('none');
+  }
+
+  function updateFunnel(rates) {
+    var stages = [
+      { key: 'none',      label: 'None',      color: '#64748b' },
+      { key: 'viewed',    label: 'Viewed',    color: '#3b82f6' },
+      { key: 'carted',    label: 'Carted',    color: '#f59e0b' },
+      { key: 'purchased', label: 'Purchased', color: '#10b981' }
+    ];
+    var total = 0;
+    for (var i = 0; i < stages.length; i++) { total += (rates[stages[i].key] || 0); }
+    if (total === 0) total = 1;
+    var html = '';
+    for (var i = 0; i < stages.length; i++) {
+      var pct = rates[stages[i].key] || 0;
+      var widthPct = Math.max(pct / total * 100, 0);
+      if (widthPct > 0 && widthPct < 5) widthPct = 5;
+      html += '<div class="funnel-stage" style="width:' + widthPct + '%;background:' + stages[i].color + '">'
+        + '<span class="funnel-label">' + stages[i].label + ' ' + pct.toFixed(1) + '%</span>'
+        + '</div>';
+    }
+    document.getElementById('funnel-bar').innerHTML = html;
+  }
+
+  function anomalyDotHtml(score) {
+    var cls = 'anomaly-normal';
+    if (score > 60) cls = 'anomaly-anomalous';
+    else if (score > 30) cls = 'anomaly-suspicious';
+    return '<span class="anomaly-dot ' + cls + '" title="Score: ' + score.toFixed(1) + '"></span>';
+  }
+
   function updateSessionTable(sessions) {
     const tbody = document.getElementById('session-tbody');
     if (!sessions || sessions.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#64748b;padding:1.5rem">No active sessions</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748b;padding:1.5rem">No active sessions</td></tr>';
       return;
     }
     var html = '';
     for (var i = 0; i < sessions.length; i++) {
       var s = sessions[i];
+      var aScore = s.anomaly_score || 0;
       html += '<tr>'
         + '<td>' + s.user_id + '</td>'
         + '<td style="font-family:monospace;font-size:.78rem">' + s.session_id + '</td>'
         + '<td>' + fmtDuration(s.duration) + '</td>'
         + '<td>' + s.event_count + '</td>'
         + '<td>' + s.quality_score.toFixed(1) + '</td>'
+        + '<td style="text-align:center">' + anomalyDotHtml(aScore) + '</td>'
         + '<td><span class="' + badgeClass(s.state) + '">' + s.state + '</span></td>'
         + '<td>' + s.device_type + '</td>'
         + '</tr>';
@@ -305,6 +403,8 @@
       updateDurationChart(d.duration_distribution);
       updateDeviceChart(d.device_breakdown);
       updateEngagementChart(d.engagement_breakdown);
+      if (d.session_type_breakdown) updateSessionTypeChart(d.session_type_breakdown);
+      if (d.funnel_conversion_rates) updateFunnel(d.funnel_conversion_rates);
       updateSessionTable(d.live_sessions);
     };
   }

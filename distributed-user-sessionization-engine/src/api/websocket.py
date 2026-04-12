@@ -67,6 +67,9 @@ async def broadcast_loop(
         duration_dist = {"0-30s": 0, "30-60s": 0, "1-5m": 0, "5-15m": 0, "15-30m": 0, "30m+": 0}
         device_breakdown = {}
         engagement_breakdown = {"bounce": 0, "low": 0, "moderate": 0, "high": 0}
+        session_type_breakdown: dict[str, int] = {}
+        funnel_counts = {"none": 0, "viewed": 0, "carted": 0, "purchased": 0}
+        anomaly_dist = {"normal": 0, "suspicious": 0, "anomalous": 0}
         live_sessions = []
 
         total_duration = 0.0
@@ -105,11 +108,34 @@ async def broadcast_loop(
                 "quality_score": s.quality_score,
                 "state": s.state.value,
                 "device_type": s.device_type,
+                "anomaly_score": s.anomaly_score,
             })
+
+            # Session type breakdown
+            st = s.session_type
+            session_type_breakdown[st] = session_type_breakdown.get(st, 0) + 1
+
+            # Funnel stage counts
+            fs = s.funnel_stage
+            if fs in funnel_counts:
+                funnel_counts[fs] += 1
+
+            # Anomaly distribution
+            score = s.anomaly_score
+            if score <= 30:
+                anomaly_dist["normal"] += 1
+            elif score <= 60:
+                anomaly_dist["suspicious"] += 1
+            else:
+                anomaly_dist["anomalous"] += 1
 
         # Sort by most recent activity, take top 10
         live_sessions.sort(key=lambda x: x["duration"], reverse=True)
         live_sessions = live_sessions[:10]
+
+        # Compute funnel conversion rates as percentages
+        total = max(len(sessions), 1)
+        funnel_rates = {k: round((v / total) * 100, 1) for k, v in funnel_counts.items()}
 
         payload = {
             "type": "session_update",
@@ -121,6 +147,9 @@ async def broadcast_loop(
             "device_breakdown": device_breakdown,
             "engagement_breakdown": engagement_breakdown,
             "live_sessions": live_sessions,
+            "session_type_breakdown": session_type_breakdown,
+            "funnel_conversion_rates": funnel_rates,
+            "anomaly_distribution": anomaly_dist,
         }
 
         await manager.broadcast_json(payload)
