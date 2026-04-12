@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from src.config import get_config
+from src.session_engine import SessionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     config = get_config()
     app.state.config = config
+    engine = SessionEngine(config)
+    app.state.session_engine = engine
     logger.info("Sessionization engine started (port=%s)", config.port)
     yield
     logger.info("Sessionization engine shutting down")
