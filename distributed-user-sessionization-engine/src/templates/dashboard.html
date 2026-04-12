@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sessionization Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;
+    background:#0b1020;color:#e6e8ef;min-height:100vh;padding:0 0 2rem;
+  }
+
+  /* ---- Header ---- */
+  .header{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:1rem 2rem;border-bottom:1px solid #1f2a44;
+  }
+  .header h1{font-size:1.25rem;font-weight:600;letter-spacing:.02em}
+  .status{display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:#94a3b8}
+  .status-dot{width:10px;height:10px;border-radius:50%;background:#ef4444;transition:background .3s}
+  .status-dot.connected{background:#10b981}
+
+  /* ---- Stat Cards ---- */
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1rem;padding:1.25rem 2rem}
+  .stat-card{
+    background:#131a33;border:1px solid #1f2a44;border-radius:12px;
+    padding:1.25rem 1.5rem;
+  }
+  .stat-card .label{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:.35rem}
+  .stat-card .value{font-size:1.75rem;font-weight:700;color:#f1f5f9}
+
+  /* ---- Chart Grid ---- */
+  .charts{display:grid;grid-template-columns:1fr 1fr 1fr;gap:1rem;padding:0 2rem 1rem}
+  .chart-card{
+    background:#131a33;border:1px solid #1f2a44;border-radius:12px;
+    padding:1.25rem;display:flex;flex-direction:column;
+  }
+  .chart-card h3{font-size:.85rem;font-weight:600;margin-bottom:.75rem;color:#94a3b8}
+  .chart-card canvas{flex:1;max-height:260px}
+
+  /* ---- Live Sessions Table ---- */
+  .table-section{padding:0 2rem}
+  .table-section h3{font-size:.85rem;font-weight:600;color:#94a3b8;margin-bottom:.75rem}
+  .table-wrap{
+    background:#131a33;border:1px solid #1f2a44;border-radius:12px;
+    overflow:hidden;
+  }
+  table{width:100%;border-collapse:collapse;font-size:.82rem}
+  thead th{
+    text-align:left;padding:.75rem 1rem;background:#1a2240;
+    color:#64748b;text-transform:uppercase;letter-spacing:.05em;font-weight:600;font-size:.72rem;
+  }
+  tbody td{padding:.65rem 1rem;border-top:1px solid #1f2a44;color:#cbd5e1}
+  tbody tr:hover{background:#1a2240}
+  .badge{
+    display:inline-block;padding:.15rem .5rem;border-radius:6px;
+    font-size:.72rem;font-weight:600;text-transform:uppercase;
+  }
+  .badge-active{background:rgba(16,185,129,.15);color:#10b981}
+  .badge-created{background:rgba(59,130,246,.15);color:#3b82f6}
+  .badge-idle{background:rgba(245,158,11,.15);color:#f59e0b}
+  .badge-expired{background:rgba(239,68,68,.15);color:#ef4444}
+
+  /* ---- Responsive ---- */
+  @media(max-width:1100px){.charts{grid-template-columns:1fr 1fr}}
+  @media(max-width:768px){
+    .stats{grid-template-columns:repeat(2,1fr)}
+    .charts{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <h1>Distributed User Sessionization Engine</h1>
+  <div class="status">
+    <span class="status-dot" id="status-dot"></span>
+    <span id="status-text">Disconnected</span>
+  </div>
+</div>
+
+<!-- Stat Cards -->
+<div class="stats">
+  <div class="stat-card">
+    <div class="label">Active Sessions</div>
+    <div class="value" id="active-sessions">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Avg Duration</div>
+    <div class="value" id="avg-duration">0m 0s</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Total Events</div>
+    <div class="value" id="total-events">0</div>
+  </div>
+  <div class="stat-card">
+    <div class="label">Connected Clients</div>
+    <div class="value" id="connected-clients">1</div>
+  </div>
+</div>
+
+<!-- Charts -->
+<div class="charts">
+  <div class="chart-card">
+    <h3>Duration Distribution</h3>
+    <canvas id="duration-chart"></canvas>
+  </div>
+  <div class="chart-card">
+    <h3>Device Breakdown</h3>
+    <canvas id="device-chart"></canvas>
+  </div>
+  <div class="chart-card">
+    <h3>Engagement Breakdown</h3>
+    <canvas id="engagement-chart"></canvas>
+  </div>
+</div>
+
+<!-- Live Sessions Table -->
+<div class="table-section">
+  <h3>Live Sessions (Top 10)</h3>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>User</th>
+          <th>Session ID</th>
+          <th>Duration</th>
+          <th>Events</th>
+          <th>Score</th>
+          <th>Status</th>
+          <th>Device</th>
+        </tr>
+      </thead>
+      <tbody id="session-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+(function(){
+  /* ---- Chart defaults ---- */
+  Chart.defaults.color = '#94a3b8';
+  Chart.defaults.borderColor = '#1f2a44';
+  Chart.defaults.font.family = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
+
+  /* ---- Duration Bar Chart ---- */
+  const durationCtx = document.getElementById('duration-chart').getContext('2d');
+  const durationChart = new Chart(durationCtx, {
+    type: 'bar',
+    data: {
+      labels: ['0-30s','30-60s','1-5m','5-15m','15-30m','30m+'],
+      datasets: [{
+        label: 'Sessions',
+        data: [0,0,0,0,0,0],
+        backgroundColor: '#3b82f6',
+        borderRadius: 6,
+        maxBarThickness: 48,
+      }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        y: { beginAtZero: true, ticks: { stepSize: 1, precision: 0 }, grid: { color: '#1f2a44' } },
+        x: { grid: { display: false } }
+      }
+    }
+  });
+
+  /* ---- Device Doughnut ---- */
+  const deviceCtx = document.getElementById('device-chart').getContext('2d');
+  const deviceColors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6'];
+  const deviceChart = new Chart(deviceCtx, {
+    type: 'doughnut',
+    data: {
+      labels: [],
+      datasets: [{ data: [], backgroundColor: deviceColors, borderWidth: 0 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '60%',
+      plugins: {
+        legend: { position: 'bottom', labels: { padding: 14, usePointStyle: true, pointStyleWidth: 10 } }
+      }
+    }
+  });
+
+  /* ---- Engagement Doughnut ---- */
+  const engCtx = document.getElementById('engagement-chart').getContext('2d');
+  const engColors = ['#ef4444','#f59e0b','#3b82f6','#10b981'];
+  const engChart = new Chart(engCtx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Bounce','Low','Moderate','High'],
+      datasets: [{ data: [0,0,0,0], backgroundColor: engColors, borderWidth: 0 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      cutout: '60%',
+      plugins: {
+        legend: { position: 'bottom', labels: { padding: 14, usePointStyle: true, pointStyleWidth: 10 } }
+      }
+    }
+  });
+
+  /* ---- Helpers ---- */
+  function fmtDuration(secs) {
+    const m = Math.floor(secs / 60);
+    const s = Math.round(secs % 60);
+    return m + 'm ' + s + 's';
+  }
+
+  function badgeClass(state) {
+    switch(state) {
+      case 'active':  return 'badge badge-active';
+      case 'created': return 'badge badge-created';
+      case 'idle':    return 'badge badge-idle';
+      case 'expired': return 'badge badge-expired';
+      default:        return 'badge';
+    }
+  }
+
+  /* ---- Update Functions ---- */
+  function updateStats(d) {
+    document.getElementById('active-sessions').textContent = d.active_sessions;
+    document.getElementById('avg-duration').textContent = fmtDuration(d.avg_duration);
+    document.getElementById('total-events').textContent = d.total_events.toLocaleString();
+  }
+
+  function updateDurationChart(dist) {
+    const keys = ['0-30s','30-60s','1-5m','5-15m','15-30m','30m+'];
+    durationChart.data.datasets[0].data = keys.map(function(k){ return dist[k] || 0; });
+    durationChart.update('none');
+  }
+
+  function updateDeviceChart(breakdown) {
+    const labels = Object.keys(breakdown);
+    const data   = Object.values(breakdown);
+    deviceChart.data.labels = labels;
+    deviceChart.data.datasets[0].data = data;
+    deviceChart.update('none');
+  }
+
+  function updateEngagementChart(breakdown) {
+    const keys = ['bounce','low','moderate','high'];
+    engChart.data.datasets[0].data = keys.map(function(k){ return breakdown[k] || 0; });
+    engChart.update('none');
+  }
+
+  function updateSessionTable(sessions) {
+    const tbody = document.getElementById('session-tbody');
+    if (!sessions || sessions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#64748b;padding:1.5rem">No active sessions</td></tr>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < sessions.length; i++) {
+      var s = sessions[i];
+      html += '<tr>'
+        + '<td>' + s.user_id + '</td>'
+        + '<td style="font-family:monospace;font-size:.78rem">' + s.session_id + '</td>'
+        + '<td>' + fmtDuration(s.duration) + '</td>'
+        + '<td>' + s.event_count + '</td>'
+        + '<td>' + s.quality_score.toFixed(1) + '</td>'
+        + '<td><span class="' + badgeClass(s.state) + '">' + s.state + '</span></td>'
+        + '<td>' + s.device_type + '</td>'
+        + '</tr>';
+    }
+    tbody.innerHTML = html;
+  }
+
+  /* ---- WebSocket ---- */
+  var ws = null;
+  var reconnectTimer = null;
+
+  function connect() {
+    var protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(protocol + '//' + location.host + '/ws/dashboard');
+
+    ws.onopen = function() {
+      document.getElementById('status-dot').classList.add('connected');
+      document.getElementById('status-text').textContent = 'Connected';
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    };
+
+    ws.onclose = function() {
+      document.getElementById('status-dot').classList.remove('connected');
+      document.getElementById('status-text').textContent = 'Disconnected';
+      scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+      ws.close();
+    };
+
+    ws.onmessage = function(evt) {
+      var d;
+      try { d = JSON.parse(evt.data); } catch(e) { return; }
+      if (d.type !== 'session_update') return;
+
+      updateStats(d);
+      updateDurationChart(d.duration_distribution);
+      updateDeviceChart(d.device_breakdown);
+      updateEngagementChart(d.engagement_breakdown);
+      updateSessionTable(d.live_sessions);
+    };
+  }
+
+  function scheduleReconnect() {
+    if (!reconnectTimer) {
+      reconnectTimer = setTimeout(function() {
+        reconnectTimer = null;
+        connect();
+      }, 3000);
+    }
+  }
+
+  connect();
+})();
+</script>
+</body>
+</html>

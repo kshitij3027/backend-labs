@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import pytest
 from httpx import AsyncClient, ASGITransport
 
+from src.api.websocket import ConnectionManager
 from src.config import Config
 from src.models import Event
 from src.redis_store import RedisStore
@@ -74,6 +75,7 @@ async def client(config):
     app.state.config = config
     app.state.redis_store = redis_store
     app.state.session_engine = engine
+    app.state.ws_manager = ConnectionManager()
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:

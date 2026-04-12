@@ -1,12 +1,15 @@
 """End-to-end verification script for the Distributed User Sessionization Engine."""
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import sys
 import time
 
 import httpx
 import redis
+import websockets
 
 
 def check_health(app_url: str) -> None:
@@ -103,6 +106,37 @@ def check_api_endpoints(app_url: str) -> None:
     print("API endpoints: OK")
 
 
+async def _ws_check(ws_url: str) -> None:
+    """Connect to the WebSocket endpoint, receive 3 messages, and validate."""
+    required_fields = {
+        "type", "active_sessions", "duration_distribution",
+        "device_breakdown", "engagement_breakdown", "live_sessions",
+    }
+    async with websockets.connect(ws_url, open_timeout=10) as ws:
+        for i in range(3):
+            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+            data = json.loads(raw)
+            assert data.get("type") == "session_update", (
+                f"Message {i+1}: expected type=session_update, got {data.get('type')}"
+            )
+            missing = required_fields - set(data.keys())
+            assert not missing, f"Message {i+1}: missing fields {missing}"
+            print(f"  WebSocket message {i+1}: OK (active={data['active_sessions']})")
+
+
+def check_websocket(app_url: str) -> None:
+    """Verify real-time WebSocket broadcast is working."""
+    ws_url = app_url.replace("http://", "ws://").replace("https://", "wss://")
+    ws_url = f"{ws_url}/ws/dashboard"
+    print(f"E2E: checking WebSocket ({ws_url}) ...")
+    try:
+        asyncio.run(_ws_check(ws_url))
+        print("WebSocket: OK")
+    except Exception as exc:
+        print(f"E2E FAILED: WebSocket check failed: {exc}")
+        sys.exit(1)
+
+
 def main() -> None:
     app_url = os.environ.get("APP_URL", "http://engine:8000")
     redis_url = os.environ.get("REDIS_URL", "redis://redis:6379/0")
@@ -110,6 +144,7 @@ def main() -> None:
     check_health(app_url)
     check_redis(redis_url)
     check_api_endpoints(app_url)
+    check_websocket(app_url)
 
     print("E2E: all checks passed")
 

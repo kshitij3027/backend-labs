@@ -6,12 +6,13 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from src.api.analytics import router as analytics_router
 from src.api.events import router as events_router
 from src.api.sessions import router as sessions_router
+from src.api.websocket import ConnectionManager, broadcast_loop
 from src.config import get_config
 from src.redis_store import RedisStore
 from src.session_engine import SessionEngine
@@ -49,11 +50,21 @@ async def lifespan(app: FastAPI):
     # Start partition workers
     await engine.start_workers()
 
+    # WebSocket connection manager
+    ws_manager = ConnectionManager()
+    app.state.ws_manager = ws_manager
+
     # Start cleanup background task
     stop_event = asyncio.Event()
     cleanup_task = asyncio.create_task(
         _cleanup_loop(engine, config.cleanup_interval_seconds, stop_event),
         name="cleanup-loop",
+    )
+
+    # Start WebSocket broadcast loop
+    broadcast_task = asyncio.create_task(
+        broadcast_loop(ws_manager, engine, config.ws_push_interval_seconds, stop_event),
+        name="ws-broadcast-loop",
     )
 
     logger.info("Sessionization engine started (port=%s)", config.port)
@@ -63,8 +74,13 @@ async def lifespan(app: FastAPI):
     logger.info("Sessionization engine shutting down")
     stop_event.set()
     cleanup_task.cancel()
+    broadcast_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await broadcast_task
     except asyncio.CancelledError:
         pass
 
@@ -85,6 +101,21 @@ async def health():
     return JSONResponse({"status": "healthy"})
 
 
+_DASHBOARD_PATH = Path(__file__).parent / "templates" / "dashboard.html"
+
+
 @app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTMLResponse(content="<h1>Distributed User Sessionization Engine</h1><p>Dashboard coming soon.</p>")
+async def dashboard():
+    html = _DASHBOARD_PATH.read_text()
+    return HTMLResponse(content=html)
+
+
+@app.websocket("/ws/dashboard")
+async def websocket_dashboard(websocket: WebSocket):
+    manager = app.state.ws_manager
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
