@@ -158,7 +158,8 @@ def test_state_transition_idle(make_event):
     assert session.state == SessionState.IDLE
 
 
-def test_state_transition_expired(make_event):
+@pytest.mark.asyncio
+async def test_state_transition_expired(make_event):
     """An IDLE session transitions to EXPIRED during cleanup."""
     engine = SessionEngine(_config(timeout=1.0))
     # Create a session with a timestamp far in the past
@@ -171,7 +172,7 @@ def test_state_transition_expired(make_event):
     assert session.state == SessionState.IDLE
 
     # cleanup_idle_sessions uses datetime.now(utc), so the gap is huge
-    expired = engine.cleanup_idle_sessions()
+    expired = await engine.cleanup_idle_sessions()
 
     assert len(expired) == 1
     assert expired[0].state == SessionState.EXPIRED
@@ -356,7 +357,8 @@ def test_metadata_device_type(make_event):
 # ---------------------------------------------------------------------------
 
 
-def test_cleanup_idle_sessions(make_event):
+@pytest.mark.asyncio
+async def test_cleanup_idle_sessions(make_event):
     """cleanup_idle_sessions expires IDLE sessions past timeout and idles long-inactive ACTIVE ones."""
     engine = SessionEngine(_config(timeout=1.0))
     past = datetime(2023, 6, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -370,7 +372,7 @@ def test_cleanup_idle_sessions(make_event):
     # Move one to IDLE (eligible for expiration), leave other ACTIVE (eligible for idle)
     engine._transition_to_idle(s1)
 
-    expired = engine.cleanup_idle_sessions()
+    expired = await engine.cleanup_idle_sessions()
 
     # s1 was IDLE + past timeout => EXPIRED and removed
     assert len(expired) == 1

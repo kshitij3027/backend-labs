@@ -1,11 +1,14 @@
 """Shared pytest fixtures for the sessionization engine test suite."""
 from __future__ import annotations
 
+import os
 from datetime import datetime, timezone
 
 import pytest
 
+from src.config import Config
 from src.models import Event
+from src.redis_store import RedisStore
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
@@ -34,3 +37,22 @@ def make_event():
             metadata=metadata or {},
         )
     return _make
+
+
+@pytest.fixture
+def config():
+    """Default test config with short timeouts."""
+    return Config(
+        session_timeout_seconds=60.0,
+        redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    )
+
+
+@pytest.fixture
+async def redis_store(config):
+    """Create a RedisStore connected to the test Redis, flush after each test."""
+    store = RedisStore(config)
+    await store.connect()
+    yield store
+    await store.redis.flushdb()
+    await store.close()

@@ -1,6 +1,7 @@
 """Core sessionization engine with hybrid boundary detection and quality scoring."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timezone, timedelta
@@ -36,11 +37,17 @@ FUNNEL_SCORES = {
 class SessionEngine:
     """Manages session lifecycle with hybrid boundary detection."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, redis_store=None):
         self._config = config
         # In-memory active sessions: user_id -> Session
         self._active_sessions: dict[str, Session] = {}
         self._total_events: int = 0
+        # Hash-partitioned queues for concurrent event processing
+        self._queues: list[asyncio.Queue] = [
+            asyncio.Queue(maxsize=1000) for _ in range(config.num_partitions)
+        ]
+        self._workers: list[asyncio.Task] = []
+        self._redis_store = redis_store
 
     @property
     def active_sessions(self) -> dict[str, Session]:
@@ -49,6 +56,85 @@ class SessionEngine:
     @property
     def total_events(self) -> int:
         return self._total_events
+
+    def _partition_for(self, user_id: str) -> int:
+        """Determine which partition queue handles a given user."""
+        return hash(user_id) % self._config.num_partitions
+
+    async def enqueue_event(self, event: Event) -> tuple[Session, SessionAnalysis]:
+        """Put event into the correct partition queue and await the result."""
+        partition = self._partition_for(event.user_id)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[tuple[Session, SessionAnalysis]] = loop.create_future()
+        await self._queues[partition].put((event, future))
+        return await future
+
+    async def start_workers(self) -> None:
+        """Create asyncio tasks for each partition worker."""
+        for i in range(self._config.num_partitions):
+            task = asyncio.create_task(
+                self._run_partition_worker(i), name=f"partition-worker-{i}"
+            )
+            self._workers.append(task)
+        logger.info("Started %d partition workers", len(self._workers))
+
+    async def stop_workers(self) -> None:
+        """Cancel all partition worker tasks."""
+        for task in self._workers:
+            task.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()
+        logger.info("All partition workers stopped")
+
+    async def _run_partition_worker(self, partition_id: int) -> None:
+        """Drain queue for a partition, process events, and set results."""
+        queue = self._queues[partition_id]
+        logger.info("Partition worker %d started", partition_id)
+        try:
+            while True:
+                event, future = await queue.get()
+                try:
+                    result = self.process_event(event)
+                    if not future.cancelled():
+                        future.set_result(result)
+                except Exception as exc:
+                    if not future.cancelled():
+                        future.set_exception(exc)
+                finally:
+                    queue.task_done()
+        except asyncio.CancelledError:
+            logger.info("Partition worker %d cancelled", partition_id)
+
+    async def flush_to_redis(self) -> None:
+        """Persist all active sessions to Redis (for graceful shutdown)."""
+        if not self._redis_store:
+            return
+        for session in self._active_sessions.values():
+            try:
+                await self._redis_store.save_session(session)
+            except Exception:
+                logger.exception(
+                    "Failed to flush session %s to Redis", session.session_id
+                )
+        logger.info("Flushed %d sessions to Redis", len(self._active_sessions))
+
+    async def get_user_sessions(self, user_id: str) -> list[Session]:
+        """Check in-memory first, then fall back to Redis store."""
+        sessions: list[Session] = []
+        # Check in-memory active sessions
+        active = self._active_sessions.get(user_id)
+        if active:
+            sessions.append(active)
+        # Fall back to Redis for historical sessions
+        if self._redis_store:
+            redis_sessions = await self._redis_store.get_user_sessions(user_id)
+            # Deduplicate: skip any already found in-memory
+            active_ids = {s.session_id for s in sessions}
+            for rs in redis_sessions:
+                if rs.session_id not in active_ids:
+                    sessions.append(rs)
+        return sessions
 
     def process_event(self, event: Event) -> tuple[Session, SessionAnalysis]:
         """Process a single event and return (session, analysis)."""
@@ -131,13 +217,16 @@ class SessionEngine:
         """Mark session as expired and remove from active sessions."""
         session.state = SessionState.EXPIRED
         self._active_sessions.pop(session.user_id, None)
+        # Persist to Redis if available
+        if self._redis_store:
+            asyncio.create_task(self._redis_store.save_session(session))
 
     def _transition_to_idle(self, session: Session) -> None:
         """Transition session to IDLE state."""
         if SessionState.IDLE in VALID_TRANSITIONS.get(session.state, set()):
             session.state = SessionState.IDLE
 
-    def cleanup_idle_sessions(self) -> list[Session]:
+    async def cleanup_idle_sessions(self) -> list[Session]:
         """Scan active sessions, idle those past timeout, expire those already idle."""
         now = datetime.now(timezone.utc)
         expired = []
@@ -154,6 +243,16 @@ class SessionEngine:
 
         for uid in to_remove:
             self._active_sessions.pop(uid, None)
+
+        # Persist expired sessions to Redis
+        if self._redis_store:
+            for session in expired:
+                try:
+                    await self._redis_store.save_session(session)
+                except Exception:
+                    logger.exception(
+                        "Failed to persist expired session %s", session.session_id
+                    )
 
         return expired
 
