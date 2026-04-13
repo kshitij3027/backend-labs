@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from src.advanced.adaptive_threshold import AdaptiveThreshold
 from src.advanced.contextual import ContextualDetector
 from src.advanced.false_positive import FalsePositiveManager
+from src.advanced.memory_efficient import PatternStore
 from src.config import Config
 from src.detectors.ensemble import EnsembleDecider
 from src.detectors.isolation_forest import IsolationForestDetector
@@ -61,6 +62,9 @@ class DetectionEngine:
         # Contextual detection and false positive management
         self._contextual = ContextualDetector()
         self._fp_manager = FalsePositiveManager()
+
+        # Memory-efficient pattern storage (HLL + CMS)
+        self._pattern_store = PatternStore()
 
         # Ordered detector list for iteration
         self._detectors = [self._zscore, self._iforest, self._temporal]
@@ -143,7 +147,12 @@ class DetectionEngine:
                 "anomaly_type": getattr(log_entry, "_anomaly_type", "unknown"),
             })
 
-        # 8. Thread-safe stats update
+        # 8. Record pattern in memory-efficient store
+        self._pattern_store.add_pattern(
+            log_entry.ip, log_entry.user_agent, log_entry.path,
+        )
+
+        # 9. Thread-safe stats update
         with self._lock:
             self.total_processed += 1
 
@@ -200,6 +209,7 @@ class DetectionEngine:
             "adaptive_threshold": self._adaptive_threshold.get_stats(),
             "contextual": self._contextual.get_stats(),
             "false_positive_manager": self._fp_manager.get_stats(),
+            "memory_efficient": self._pattern_store.get_stats(),
         }
 
     def get_recent_anomalies(self, limit: int = 50) -> list[dict]:
