@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import numpy as np
 import pytest
 
 from src.models import LogEntry
@@ -33,5 +34,15 @@ def make_log_entry():
         }
         defaults.update(kwargs)
         return LogEntry(**defaults)
+
+    return _make
+
+
+@pytest.fixture
+def make_feature_vector():
+    """Factory fixture that produces random feature vectors of shape (9,)."""
+
+    def _make() -> np.ndarray:
+        return np.random.rand(9).astype(np.float64)
 
     return _make
