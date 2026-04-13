@@ -1,0 +1,192 @@
+/* Anomaly Detection Engine — Dashboard Styles */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #0b1020;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  padding: 20px;
+  min-height: 100vh;
+}
+
+/* Header */
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #1e2a4a;
+}
+
+header h1 {
+  font-size: 1.6rem;
+  color: #00e5ff;
+  font-weight: 600;
+}
+
+.conn-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot.connected {
+  background: #00e676;
+  box-shadow: 0 0 6px #00e676;
+}
+
+.dot.disconnected {
+  background: #ff1744;
+  box-shadow: 0 0 6px #ff1744;
+}
+
+/* Stat Cards */
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.card {
+  background: #131a2e;
+  border: 1px solid #1e2a4a;
+  border-radius: 8px;
+  padding: 20px;
+  text-align: center;
+}
+
+.card-label {
+  font-size: 0.8rem;
+  color: #8892b0;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 8px;
+}
+
+.card-value {
+  font-size: 1.8rem;
+  font-weight: 700;
+  color: #ccd6f6;
+}
+
+.card-value.anomaly-count {
+  color: #ff1744;
+}
+
+/* Charts */
+.charts-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.chart-container {
+  background: #131a2e;
+  border: 1px solid #1e2a4a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.chart-container h3 {
+  font-size: 0.9rem;
+  color: #8892b0;
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.chart-container canvas {
+  max-height: 260px;
+}
+
+/* Table */
+.table-section {
+  background: #131a2e;
+  border: 1px solid #1e2a4a;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.table-section h3 {
+  font-size: 0.9rem;
+  color: #8892b0;
+  margin-bottom: 12px;
+  font-weight: 500;
+}
+
+.table-wrapper {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+thead th {
+  background: #0d1528;
+  color: #8892b0;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.5px;
+  padding: 10px 8px;
+  text-align: left;
+  border-bottom: 1px solid #1e2a4a;
+  position: sticky;
+  top: 0;
+}
+
+tbody td {
+  padding: 8px;
+  border-bottom: 1px solid #0f1a30;
+  white-space: nowrap;
+}
+
+tbody tr:hover {
+  background: #172040;
+}
+
+/* Score bars */
+.score-bar {
+  display: inline-block;
+  height: 6px;
+  border-radius: 3px;
+  min-width: 4px;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.score-bar.zscore   { background: #00e5ff; }
+.score-bar.iforest  { background: #76ff03; }
+.score-bar.temporal { background: #ffab00; }
+
+/* Row anomaly-type accents */
+tr.type-slow_response   { border-left: 3px solid #ff1744; }
+tr.type-unusual_payload  { border-left: 3px solid #ff9100; }
+tr.type-suspicious_agent { border-left: 3px solid #ffd600; }
+tr.type-bad_status       { border-left: 3px solid #d500f9; }
+
+/* Confidence badge */
+.confidence {
+  font-weight: 600;
+}
+
+.confidence.high { color: #ff1744; }
+.confidence.med  { color: #ffab00; }
+.confidence.low  { color: #00e676; }

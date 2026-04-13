@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Anomaly Detection Engine</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <link rel="stylesheet" href="/static/css/dashboard.css">
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>Anomaly Detection Engine</h1>
+    <div class="conn-status">
+      <span id="status-dot" class="dot disconnected"></span>
+      <span id="status-text">Disconnected</span>
+    </div>
+  </header>
+
+  <!-- Stat Cards -->
+  <section class="stats-row">
+    <div class="card">
+      <div class="card-label">Total Logs Processed</div>
+      <div class="card-value" id="stat-total">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Anomalies Detected</div>
+      <div class="card-value anomaly-count" id="stat-anomalies">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label">True Positive Rate</div>
+      <div class="card-value" id="stat-tpr">0.0%</div>
+    </div>
+    <div class="card">
+      <div class="card-label">False Positive Rate</div>
+      <div class="card-value" id="stat-fpr">0.0%</div>
+    </div>
+  </section>
+
+  <!-- Charts -->
+  <section class="charts-row">
+    <div class="chart-container">
+      <h3>Anomaly Timeline</h3>
+      <canvas id="timelineChart"></canvas>
+    </div>
+    <div class="chart-container">
+      <h3>Anomaly Type Distribution</h3>
+      <canvas id="typeChart"></canvas>
+    </div>
+    <div class="chart-container">
+      <h3>Per-Algorithm Scores</h3>
+      <canvas id="algoChart"></canvas>
+    </div>
+  </section>
+
+  <!-- Live Anomaly Table -->
+  <section class="table-section">
+    <h3>Live Anomaly Feed</h3>
+    <div class="table-wrapper">
+      <table id="anomaly-table">
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>IP</th>
+            <th>Method</th>
+            <th>Path</th>
+            <th>Status</th>
+            <th>Resp. Time</th>
+            <th>Confidence</th>
+            <th>Z-Score</th>
+            <th>IForest</th>
+            <th>Temporal</th>
+          </tr>
+        </thead>
+        <tbody id="anomaly-tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
