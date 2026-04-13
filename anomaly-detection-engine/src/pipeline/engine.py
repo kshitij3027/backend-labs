@@ -6,6 +6,8 @@ import threading
 from datetime import datetime, timezone
 
 from src.advanced.adaptive_threshold import AdaptiveThreshold
+from src.advanced.contextual import ContextualDetector
+from src.advanced.false_positive import FalsePositiveManager
 from src.config import Config
 from src.detectors.ensemble import EnsembleDecider
 from src.detectors.isolation_forest import IsolationForestDetector
@@ -56,6 +58,10 @@ class DetectionEngine:
             initial_threshold=config.ensemble_threshold,
         )
 
+        # Contextual detection and false positive management
+        self._contextual = ContextualDetector()
+        self._fp_manager = FalsePositiveManager()
+
         # Ordered detector list for iteration
         self._detectors = [self._zscore, self._iforest, self._temporal]
 
@@ -102,7 +108,21 @@ class DetectionEngine:
         # 4. Ensemble decision
         anomaly_result = self._ensemble.decide(results, log_entry)
 
-        # 5. Update adaptive threshold and feed back to ensemble
+        # 5. Contextual adjustment (post-ensemble multiplier)
+        self._contextual.update(log_entry)
+        adjustment = self._contextual.get_context_adjustment(log_entry)
+        adjusted_confidence = max(0.0, min(1.0, anomaly_result.confidence * adjustment))
+        adjusted_is_anomaly = adjusted_confidence >= self._ensemble._threshold
+
+        anomaly_result = AnomalyResult(
+            is_anomaly=adjusted_is_anomaly,
+            confidence=adjusted_confidence,
+            scores=anomaly_result.scores,
+            log_entry=log_entry,
+            timestamp=anomaly_result.timestamp,
+        )
+
+        # 6. Update adaptive threshold and feed back to ensemble
         #    Only adjust once detectors are warmed up to avoid premature drift.
         if self.is_warm():
             self._adaptive_threshold.update(
@@ -111,7 +131,19 @@ class DetectionEngine:
             )
             self._ensemble.set_threshold(self._adaptive_threshold.get_threshold())
 
-        # 6. Thread-safe stats update
+        # 7. False positive tracking
+        if anomaly_result.is_anomaly:
+            self._fp_manager.add_anomaly({
+                "anomaly_id": str(id(anomaly_result)),
+                "ip": log_entry.ip,
+                "status_code": log_entry.status_code,
+                "method": log_entry.method,
+                "path": log_entry.path,
+                "confidence": anomaly_result.confidence,
+                "anomaly_type": getattr(log_entry, "_anomaly_type", "unknown"),
+            })
+
+        # 8. Thread-safe stats update
         with self._lock:
             self.total_processed += 1
 
@@ -166,6 +198,8 @@ class DetectionEngine:
             "detection_rate": anomalies / total if total > 0 else 0.0,
             "detectors_ready": {d.name: d.is_ready() for d in self._detectors},
             "adaptive_threshold": self._adaptive_threshold.get_stats(),
+            "contextual": self._contextual.get_stats(),
+            "false_positive_manager": self._fp_manager.get_stats(),
         }
 
     def get_recent_anomalies(self, limit: int = 50) -> list[dict]:
@@ -197,6 +231,25 @@ class DetectionEngine:
             )
 
         return results
+
+    def get_anomaly_groups(self) -> list[dict]:
+        """Return current anomaly groups from the false positive manager.
+
+        Each group is serialised to a dict with group_id, count,
+        common_features, first_seen, last_seen, and the raw anomalies.
+        """
+        groups = self._fp_manager.group_anomalies()
+        return [
+            {
+                "group_id": g.group_id,
+                "count": g.count,
+                "common_features": g.common_features,
+                "first_seen": g.first_seen.isoformat(),
+                "last_seen": g.last_seen.isoformat(),
+                "anomalies": g.anomalies,
+            }
+            for g in groups
+        ]
 
     def is_warm(self) -> bool:
         """Return ``True`` when every detector reports ready."""

@@ -104,6 +104,12 @@ def api_anomalies():
     return jsonify(engine.get_recent_anomalies(limit=limit))
 
 
+@app.route("/api/anomalies/groups")
+def api_anomaly_groups():
+    """Return anomaly groups identified by the false positive manager."""
+    return jsonify(engine.get_anomaly_groups())
+
+
 @app.route("/api/feedback", methods=["POST"])
 def api_feedback():
     """Accept operator feedback on a flagged anomaly.
