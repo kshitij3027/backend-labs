@@ -4,80 +4,157 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Anomaly Detection Engine</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
   <link rel="stylesheet" href="/static/css/dashboard.css">
 </head>
 <body>
 
-  <!-- Header -->
-  <header>
-    <h1>Anomaly Detection Engine</h1>
-    <div class="conn-status">
-      <span id="status-dot" class="dot disconnected"></span>
-      <span id="status-text">Disconnected</span>
+  <!-- Fixed Header -->
+  <header class="top-bar">
+    <div class="top-bar__title">
+      <svg class="top-bar__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+      <h1>Anomaly Detection Engine</h1>
+    </div>
+    <div class="top-bar__status">
+      <span id="status-dot" class="status-dot status-dot--off"></span>
+      <span id="status-text" class="status-label">Disconnected</span>
     </div>
   </header>
 
-  <!-- Stat Cards -->
-  <section class="stats-row">
-    <div class="card">
-      <div class="card-label">Total Logs Processed</div>
-      <div class="card-value" id="stat-total">0</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Anomalies Detected</div>
-      <div class="card-value anomaly-count" id="stat-anomalies">0</div>
-    </div>
-    <div class="card">
-      <div class="card-label">True Positive Rate</div>
-      <div class="card-value" id="stat-tpr">0.0%</div>
-    </div>
-    <div class="card">
-      <div class="card-label">False Positive Rate</div>
-      <div class="card-value" id="stat-fpr">0.0%</div>
-    </div>
-  </section>
+  <main class="dashboard">
 
-  <!-- Charts -->
-  <section class="charts-row">
-    <div class="chart-container">
-      <h3>Anomaly Timeline</h3>
-      <canvas id="timelineChart"></canvas>
-    </div>
-    <div class="chart-container">
-      <h3>Anomaly Type Distribution</h3>
-      <canvas id="typeChart"></canvas>
-    </div>
-    <div class="chart-container">
-      <h3>Per-Algorithm Scores</h3>
-      <canvas id="algoChart"></canvas>
-    </div>
-  </section>
+    <!-- Stat Cards -->
+    <section class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-card__icon stat-card__icon--logs">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        </div>
+        <div class="stat-card__body">
+          <span class="stat-card__label">Total Logs Processed</span>
+          <span class="stat-card__value" id="stat-total">0</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__icon stat-card__icon--anomalies">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        </div>
+        <div class="stat-card__body">
+          <span class="stat-card__label">Anomalies Detected</span>
+          <span class="stat-card__value stat-card__value--red" id="stat-anomalies">0</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__icon stat-card__icon--tpr">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+        </div>
+        <div class="stat-card__body">
+          <span class="stat-card__label">True Positive Rate</span>
+          <span class="stat-card__value stat-card__value--green" id="stat-tpr">0.0%</span>
+        </div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card__icon stat-card__icon--fpr">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+        </div>
+        <div class="stat-card__body">
+          <span class="stat-card__label">False Positive Rate</span>
+          <span class="stat-card__value stat-card__value--amber" id="stat-fpr">0.0%</span>
+        </div>
+      </div>
+    </section>
 
-  <!-- Live Anomaly Table -->
-  <section class="table-section">
-    <h3>Live Anomaly Feed</h3>
-    <div class="table-wrapper">
-      <table id="anomaly-table">
-        <thead>
-          <tr>
-            <th>Timestamp</th>
-            <th>IP</th>
-            <th>Method</th>
-            <th>Path</th>
-            <th>Status</th>
-            <th>Resp. Time</th>
-            <th>Confidence</th>
-            <th>Z-Score</th>
-            <th>IForest</th>
-            <th>Temporal</th>
-          </tr>
-        </thead>
-        <tbody id="anomaly-tbody"></tbody>
-      </table>
-    </div>
-  </section>
+    <!-- Charts Row 1: Timeline + Type Distribution -->
+    <section class="charts-grid charts-grid--two">
+      <div class="card">
+        <h3 class="card__title">Anomaly Timeline</h3>
+        <div class="card__chart-wrap">
+          <canvas id="timelineChart"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card__title">Anomaly Type Distribution</h3>
+        <div class="card__chart-wrap">
+          <canvas id="typeChart"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Charts Row 2: Algorithm Scores + System Memory -->
+    <section class="charts-grid charts-grid--two">
+      <div class="card">
+        <h3 class="card__title">Per-Algorithm Scores</h3>
+        <div class="card__chart-wrap">
+          <canvas id="algoChart"></canvas>
+        </div>
+      </div>
+      <div class="card">
+        <h3 class="card__title">System Memory</h3>
+        <div class="memory-panel" id="memory-panel">
+          <div class="memory-gauge">
+            <div class="memory-gauge__track">
+              <div class="memory-gauge__fill" id="mem-gauge-fill" style="width:0%"></div>
+            </div>
+            <div class="memory-gauge__labels">
+              <span id="mem-usage-text">0 B</span>
+              <span class="memory-gauge__limit">/ 200 MB</span>
+            </div>
+          </div>
+          <div class="memory-stats">
+            <div class="memory-stat">
+              <span class="memory-stat__label">Unique IPs</span>
+              <span class="memory-stat__value" id="mem-unique-ips">0</span>
+            </div>
+            <div class="memory-stat">
+              <span class="memory-stat__label">Unique User Agents</span>
+              <span class="memory-stat__value" id="mem-unique-uas">0</span>
+            </div>
+            <div class="memory-stat">
+              <span class="memory-stat__label">Unique Paths</span>
+              <span class="memory-stat__value" id="mem-unique-paths">0</span>
+            </div>
+            <div class="memory-stat">
+              <span class="memory-stat__label">Adaptive Threshold</span>
+              <span class="memory-stat__value" id="mem-threshold">0.700</span>
+            </div>
+            <div class="memory-stat">
+              <span class="memory-stat__label">Load Factor</span>
+              <span class="memory-stat__value" id="mem-load-factor">0.00</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Live Anomaly Feed -->
+    <section class="card anomaly-feed">
+      <div class="anomaly-feed__header">
+        <h3 class="card__title">Recent Anomalies</h3>
+        <span class="anomaly-feed__badge" id="anomaly-count-badge">0</span>
+      </div>
+      <div class="table-wrap">
+        <table class="anomaly-table" id="anomaly-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>IP</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Status</th>
+              <th>Resp Time</th>
+              <th>Confidence</th>
+              <th>Z-Score</th>
+              <th>IForest</th>
+              <th>Temporal</th>
+              <th>Type</th>
+            </tr>
+          </thead>
+          <tbody id="anomaly-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
 
   <script src="/static/js/dashboard.js"></script>
 </body>

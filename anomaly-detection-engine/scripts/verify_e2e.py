@@ -1,4 +1,8 @@
-"""End-to-end verification script for the Anomaly Detection Engine."""
+"""End-to-end verification script for the Anomaly Detection Engine.
+
+Runs against a live Flask instance (typically inside Docker).  Every check
+must pass for the script to exit 0.
+"""
 from __future__ import annotations
 
 import json
@@ -48,52 +52,67 @@ except ImportError:
 
 
 # -----------------------------------------------------------------------
+# Result tracking
+# -----------------------------------------------------------------------
+_passed = 0
+_failed = 0
+
+
+def _ok(msg: str) -> None:
+    global _passed
+    _passed += 1
+    print(f"  PASS: {msg}")
+
+
+def _fail(msg: str) -> None:
+    global _failed
+    _failed += 1
+    print(f"  FAIL: {msg}")
+
+
+# -----------------------------------------------------------------------
 # Checks
 # -----------------------------------------------------------------------
 
 def check_health(app_url: str) -> None:
-    """Poll the /health endpoint until it responds successfully."""
+    """Poll /health until it responds 200."""
     health_url = f"{app_url}/health"
     max_attempts = 30
-    sleep_seconds = 1
 
-    print(f"E2E: polling {health_url} (max {max_attempts} attempts) ...")
+    print(f"\n[1/8] Health check: polling {health_url} ...")
 
     for attempt in range(1, max_attempts + 1):
         try:
             resp = _get(health_url)
             if resp.status_code == 200:
                 body = resp.json()
-                assert body.get("status") == "healthy", f"Unexpected body: {body}"
-                print(f"  PASSED (attempt {attempt}): {body}")
-                return
-            else:
-                print(f"  attempt {attempt}: HTTP {resp.status_code}")
-        except Exception as exc:
-            print(f"  attempt {attempt}: {exc}")
+                if body.get("status") == "healthy":
+                    _ok(f"healthy (attempt {attempt})")
+                    return
+        except Exception:
+            pass
+        time.sleep(1)
 
-        time.sleep(sleep_seconds)
-
-    print("E2E FAILED: health check never succeeded")
-    sys.exit(1)
+    _fail("health check never succeeded after 30 attempts")
 
 
 def check_root(app_url: str) -> None:
-    """Verify the root endpoint returns the dashboard page."""
-    print(f"E2E: GET {app_url}/ ...")
+    """GET / should return the dashboard HTML."""
+    print(f"\n[2/8] Root endpoint ...")
     try:
         resp = _get(app_url)
-        assert resp.status_code == 200, f"Root returned HTTP {resp.status_code}"
-        print("  PASSED: Root endpoint returned 200")
+        if resp.status_code == 200:
+            _ok("root returned 200")
+        else:
+            _fail(f"root returned HTTP {resp.status_code}")
     except Exception as exc:
-        print(f"E2E FAILED: root check failed: {exc}")
-        sys.exit(1)
+        _fail(f"root: {exc}")
 
 
 def check_post_logs(app_url: str) -> None:
-    """POST a test log entry to /api/logs and verify the response."""
+    """POST /api/logs with a test entry."""
     url = f"{app_url}/api/logs"
-    print(f"E2E: POST {url} ...")
+    print(f"\n[3/8] POST {url} ...")
 
     payload = {
         "ip": "10.0.0.42",
@@ -102,108 +121,184 @@ def check_post_logs(app_url: str) -> None:
         "status_code": 200,
         "response_time": 150.0,
         "bytes_sent": 2048,
-        "user_agent": "e2e-test/1.0",
+        "user_agent": "e2e-verify/1.0",
         "session_duration": 120.0,
         "page_views": 3,
     }
 
     try:
         resp = _post(url, payload)
-        assert resp.status_code == 200, f"POST /api/logs returned HTTP {resp.status_code}"
+        if resp.status_code != 200:
+            _fail(f"POST /api/logs returned HTTP {resp.status_code}")
+            return
+
         body = resp.json()
-        assert "is_anomaly" in body, f"Missing 'is_anomaly' in response: {body}"
-        assert "confidence" in body, f"Missing 'confidence' in response: {body}"
-        assert "scores" in body, f"Missing 'scores' in response: {body}"
-        print(f"  PASSED: POST /api/logs -> is_anomaly={body['is_anomaly']}, confidence={body['confidence']:.3f}")
+        for key in ("is_anomaly", "confidence", "scores"):
+            if key not in body:
+                _fail(f"Missing '{key}' in POST /api/logs response")
+                return
+
+        _ok(f"is_anomaly={body['is_anomaly']}, confidence={body['confidence']:.3f}")
     except Exception as exc:
-        print(f"E2E FAILED: POST /api/logs: {exc}")
-        sys.exit(1)
+        _fail(f"POST /api/logs: {exc}")
 
 
 def check_api_stats(app_url: str) -> None:
-    """GET /api/stats and verify the JSON shape."""
+    """GET /api/stats — verify all expected keys including sub-objects."""
     url = f"{app_url}/api/stats"
-    print(f"E2E: GET {url} ...")
+    print(f"\n[4/8] GET {url} ...")
 
     try:
         resp = _get(url)
-        assert resp.status_code == 200, f"GET /api/stats returned HTTP {resp.status_code}"
+        if resp.status_code != 200:
+            _fail(f"GET /api/stats returned HTTP {resp.status_code}")
+            return
+
         body = resp.json()
 
-        required_keys = [
-            "total_processed",
-            "anomalies_detected",
-            "true_positive_rate",
-            "false_positive_rate",
+        required = [
+            "total_processed", "anomalies_detected",
+            "true_positive_rate", "false_positive_rate",
             "detectors_ready",
+            "adaptive_threshold", "contextual",
+            "false_positive_manager", "memory_efficient",
         ]
-        for key in required_keys:
-            assert key in body, f"Missing key '{key}' in stats: {body}"
+        missing = [k for k in required if k not in body]
+        if missing:
+            _fail(f"Missing keys in stats: {missing}")
+            return
 
-        print(f"  PASSED: stats shape OK (total_processed={body['total_processed']})")
+        # Check sub-objects exist
+        if not isinstance(body["memory_efficient"], dict):
+            _fail("memory_efficient is not a dict")
+            return
+        if not isinstance(body["adaptive_threshold"], dict):
+            _fail("adaptive_threshold is not a dict")
+            return
+
+        _ok(f"stats shape OK (total_processed={body['total_processed']})")
     except Exception as exc:
-        print(f"E2E FAILED: GET /api/stats: {exc}")
-        sys.exit(1)
+        _fail(f"GET /api/stats: {exc}")
 
 
 def check_api_anomalies(app_url: str) -> None:
-    """GET /api/anomalies and verify the response is a JSON list."""
+    """GET /api/anomalies — verify list with per-algorithm scores."""
     url = f"{app_url}/api/anomalies"
-    print(f"E2E: GET {url} ...")
+    print(f"\n[5/8] GET {url} ...")
 
     try:
         resp = _get(url)
-        assert resp.status_code == 200, f"GET /api/anomalies returned HTTP {resp.status_code}"
+        if resp.status_code != 200:
+            _fail(f"GET /api/anomalies returned HTTP {resp.status_code}")
+            return
+
         body = resp.json()
-        assert isinstance(body, list), f"Expected list, got {type(body).__name__}"
-        print(f"  PASSED: anomalies endpoint returned list (len={len(body)})")
+        if not isinstance(body, list):
+            _fail(f"Expected list, got {type(body).__name__}")
+            return
+
+        _ok(f"anomalies list (len={len(body)})")
+
+        # If there are anomalies, verify shape
+        if len(body) > 0:
+            entry = body[-1]
+            for key in ("timestamp", "confidence", "is_anomaly", "scores", "log_summary"):
+                if key not in entry:
+                    _fail(f"Anomaly entry missing '{key}'")
+                    return
+
+            # Per-algorithm scores may be partial or empty depending on
+            # warm-up state.  Just verify that any score keys present are
+            # from the expected set, and that at least some entries have
+            # non-empty scores.
+            valid_algos = {"zscore", "isolation_forest", "temporal"}
+            any_populated = False
+            for e in body:
+                scores = e.get("scores", {})
+                if scores:
+                    any_populated = True
+                    unknown = set(scores.keys()) - valid_algos
+                    if unknown:
+                        _fail(f"Unexpected algorithm keys in scores: {unknown}")
+                        return
+
+            if any_populated:
+                _ok("anomaly score keys validated (subset of zscore/isolation_forest/temporal)")
+            else:
+                _ok("anomaly entries present (scores empty — detectors still warming up)")
     except Exception as exc:
-        print(f"E2E FAILED: GET /api/anomalies: {exc}")
-        sys.exit(1)
+        _fail(f"GET /api/anomalies: {exc}")
+
+
+def check_anomaly_groups(app_url: str) -> None:
+    """GET /api/anomalies/groups — verify groups response."""
+    url = f"{app_url}/api/anomalies/groups"
+    print(f"\n[6/8] GET {url} ...")
+
+    try:
+        resp = _get(url)
+        if resp.status_code != 200:
+            _fail(f"GET /api/anomalies/groups returned HTTP {resp.status_code}")
+            return
+
+        body = resp.json()
+        if not isinstance(body, list):
+            _fail(f"Expected list, got {type(body).__name__}")
+            return
+
+        _ok(f"anomaly groups (len={len(body)})")
+    except Exception as exc:
+        _fail(f"GET /api/anomalies/groups: {exc}")
+
+
+def check_feedback(app_url: str) -> None:
+    """POST /api/feedback — verify feedback accepted."""
+    url = f"{app_url}/api/feedback"
+    print(f"\n[7/8] POST {url} ...")
+
+    payload = {"anomaly_id": "test-id-001", "confirmed": True}
+
+    try:
+        resp = _post(url, payload)
+        if resp.status_code != 200:
+            _fail(f"POST /api/feedback returned HTTP {resp.status_code}")
+            return
+
+        body = resp.json()
+        if body.get("status") != "ok":
+            _fail(f"Unexpected feedback response: {body}")
+            return
+        if "current_threshold" not in body:
+            _fail("Missing 'current_threshold' in feedback response")
+            return
+
+        _ok(f"feedback accepted (threshold={body['current_threshold']:.4f})")
+    except Exception as exc:
+        _fail(f"POST /api/feedback: {exc}")
 
 
 def check_background_processing(app_url: str) -> None:
-    """Wait a few seconds and verify that the background task is processing logs."""
+    """Wait and verify background task is producing logs."""
     url = f"{app_url}/api/stats"
-    print("E2E: checking background processing (waiting 5s) ...")
+    print(f"\n[8/8] Background processing (waiting 5s) ...")
 
     time.sleep(5)
 
     try:
         resp = _get(url)
-        assert resp.status_code == 200
+        if resp.status_code != 200:
+            _fail(f"GET /api/stats returned HTTP {resp.status_code}")
+            return
+
         body = resp.json()
         total = body.get("total_processed", 0)
-        assert total > 0, f"Expected total_processed > 0 after 5s, got {total}"
-        print(f"  PASSED: background task running (total_processed={total})")
+        if total <= 0:
+            _fail(f"total_processed={total} after 5s (expected > 0)")
+            return
+
+        _ok(f"background task running (total_processed={total})")
     except Exception as exc:
-        print(f"E2E FAILED: background processing check: {exc}")
-        sys.exit(1)
-
-
-def check_socketio(app_url: str) -> None:
-    """Optionally test SocketIO connectivity (non-fatal if library missing)."""
-    try:
-        import socketio as sio_client
-    except ImportError:
-        print("E2E: SKIPPED SocketIO check (python-socketio not installed)")
-        return
-
-    print("E2E: testing SocketIO connection ...")
-    client = sio_client.SimpleClient()
-
-    try:
-        client.connect(app_url, transports=["websocket"])
-        event = client.receive(timeout=5)
-        assert event is not None, "No event received within 5s"
-        print(f"  PASSED: received SocketIO event: {event[0]}")
-    except Exception as exc:
-        print(f"  WARNING: SocketIO test failed (non-fatal): {exc}")
-    finally:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
+        _fail(f"background processing: {exc}")
 
 
 # -----------------------------------------------------------------------
@@ -213,17 +308,30 @@ def check_socketio(app_url: str) -> None:
 def main() -> None:
     app_url = os.environ.get("APP_URL", "http://localhost:5000")
 
+    print("=" * 60)
+    print("  Anomaly Detection Engine — E2E Verification")
+    print(f"  Target: {app_url}")
+    print("=" * 60)
+
     check_health(app_url)
     check_root(app_url)
     check_post_logs(app_url)
     check_api_stats(app_url)
     check_api_anomalies(app_url)
+    check_anomaly_groups(app_url)
+    check_feedback(app_url)
     check_background_processing(app_url)
-    check_socketio(app_url)
 
-    print("\n" + "=" * 40)
-    print("E2E: ALL CHECKS PASSED")
-    print("=" * 40)
+    print("\n" + "=" * 60)
+    print(f"  Results: {_passed} passed, {_failed} failed")
+    print("=" * 60)
+
+    if _failed > 0:
+        print("\nE2E VERIFICATION FAILED")
+        sys.exit(1)
+    else:
+        print("\nALL CHECKS PASSED")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
