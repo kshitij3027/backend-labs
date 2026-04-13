@@ -1,0 +1,16 @@
+.git
+__pycache__
+*.pyc
+*.pyo
+.env
+.pytest_cache
+.coverage
+htmlcov
+plan.md
+project_requirements.md
+*.egg-info
+.venv
+venv
+.DS_Store
+.idea
+.vscode

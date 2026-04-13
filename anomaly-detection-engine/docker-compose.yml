@@ -1,0 +1,57 @@
+services:
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${HOST_PORT:-5050}:5000"
+    env_file:
+      - .env.example
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+    environment:
+      - PYTHONPATH=/app
+    command: ["pytest", "-v", "--tb=short"]
+
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - e2e
+    environment:
+      - APP_URL=http://engine:5000
+      - PYTHONPATH=/app
+    depends_on:
+      engine:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - loadtest
+    environment:
+      - APP_URL=http://engine:5000
+      - PYTHONPATH=/app
+    depends_on:
+      engine:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py"]
