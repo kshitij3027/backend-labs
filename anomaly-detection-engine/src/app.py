@@ -104,6 +104,24 @@ def api_anomalies():
     return jsonify(engine.get_recent_anomalies(limit=limit))
 
 
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """Accept operator feedback on a flagged anomaly.
+
+    Expects JSON: {"anomaly_id": "...", "confirmed": true/false}
+    """
+    data = request.get_json(force=True)
+    anomaly_id = data.get("anomaly_id", "")
+    confirmed = bool(data.get("confirmed", False))
+
+    engine.feedback(anomaly_id, confirmed)
+
+    return jsonify({
+        "status": "ok",
+        "current_threshold": engine._adaptive_threshold.get_threshold(),
+    })
+
+
 @app.route("/api/logs", methods=["POST"])
 def api_logs():
     """Accept an external log entry, process it, and return the result."""

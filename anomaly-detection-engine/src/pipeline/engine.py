@@ -5,6 +5,7 @@ import collections
 import threading
 from datetime import datetime, timezone
 
+from src.advanced.adaptive_threshold import AdaptiveThreshold
 from src.config import Config
 from src.detectors.ensemble import EnsembleDecider
 from src.detectors.isolation_forest import IsolationForestDetector
@@ -48,6 +49,11 @@ class DetectionEngine:
         self._ensemble = EnsembleDecider(
             weights=config.ensemble_weights,
             threshold=config.ensemble_threshold,
+        )
+
+        # Adaptive threshold
+        self._adaptive_threshold = AdaptiveThreshold(
+            initial_threshold=config.ensemble_threshold,
         )
 
         # Ordered detector list for iteration
@@ -96,7 +102,16 @@ class DetectionEngine:
         # 4. Ensemble decision
         anomaly_result = self._ensemble.decide(results, log_entry)
 
-        # 5. Thread-safe stats update
+        # 5. Update adaptive threshold and feed back to ensemble
+        #    Only adjust once detectors are warmed up to avoid premature drift.
+        if self.is_warm():
+            self._adaptive_threshold.update(
+                was_flagged=anomaly_result.is_anomaly,
+                was_true_anomaly=log_entry._is_anomaly,
+            )
+            self._ensemble.set_threshold(self._adaptive_threshold.get_threshold())
+
+        # 6. Thread-safe stats update
         with self._lock:
             self.total_processed += 1
 
@@ -113,6 +128,16 @@ class DetectionEngine:
                 self.false_negatives += 1
 
         return anomaly_result
+
+    def feedback(self, anomaly_id: str, confirmed: bool) -> None:
+        """Forward operator feedback to the adaptive threshold.
+
+        Args:
+            anomaly_id: Identifier of the anomaly being reviewed.
+            confirmed: ``True`` if the operator confirms a real anomaly.
+        """
+        self._adaptive_threshold.operator_feedback(anomaly_id, confirmed)
+        self._ensemble.set_threshold(self._adaptive_threshold.get_threshold())
 
     def get_stats(self) -> dict:
         """Return a snapshot of detection statistics.
@@ -140,6 +165,7 @@ class DetectionEngine:
             "false_positive_rate": fp / actual_negatives if actual_negatives > 0 else 0.0,
             "detection_rate": anomalies / total if total > 0 else 0.0,
             "detectors_ready": {d.name: d.is_ready() for d in self._detectors},
+            "adaptive_threshold": self._adaptive_threshold.get_stats(),
         }
 
     def get_recent_anomalies(self, limit: int = 50) -> list[dict]:
