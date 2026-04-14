@@ -6,10 +6,13 @@
 * ``POST /api/generate-sample-data`` — generate and store sample data.
 * ``GET /api/metrics/{service}/{metric_name}`` — query metrics with trend.
 * ``GET /api/anomalies`` — query detected anomalies.
+* ``GET /api/ws-status`` — active WebSocket connection info.
+* ``WS /ws`` — WebSocket endpoint for real-time streaming.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict
@@ -17,8 +20,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.config import get_config
@@ -34,6 +37,7 @@ from src.models import (
     MetricResponse,
 )
 from src.storage import RedisStorage
+from src.websocket import ConnectionManager, broadcast_loop, heartbeat_loop
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +46,7 @@ _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Build singletons and manage the Redis connection lifecycle."""
+    """Build singletons, start background tasks, manage the Redis lifecycle."""
     config = get_config()
 
     storage = RedisStorage(
@@ -53,6 +57,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await storage.connect()
     app.state.storage = storage
 
+    # WebSocket infrastructure
+    ws_manager = ConnectionManager()
+    app.state.ws_manager = ws_manager
+
+    stop_event = asyncio.Event()
+    app.state.stop_event = stop_event
+
+    # Start background tasks
+    heartbeat_task = asyncio.create_task(
+        heartbeat_loop(ws_manager, config.ws_heartbeat_interval, stop_event),
+    )
+    broadcast_task = asyncio.create_task(
+        broadcast_loop(ws_manager, storage, config, stop_event),
+    )
+
     logger.info(
         "real-time-analytics started (redis=%s:%d)",
         config.redis_host,
@@ -62,6 +81,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Signal background tasks to stop, then cancel them
+        stop_event.set()
+        heartbeat_task.cancel()
+        broadcast_task.cancel()
+        for task in (heartbeat_task, broadcast_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await storage.close()
         logger.info("real-time-analytics shut down")
 
@@ -93,6 +121,7 @@ async def ingest(request: IngestRequest) -> IngestResponse:
 
     # Group metrics by (service, metric_name) and run anomaly detection
     anomalies_detected = 0
+    all_anomalies = []
     groups: dict[tuple[str, str], list] = defaultdict(list)
     for m in metrics:
         groups[(m.service, m.metric_name)].append(m)
@@ -101,7 +130,20 @@ async def ingest(request: IngestRequest) -> IngestResponse:
         anomalies = detect_anomalies(group_points, threshold=config.anomaly_zscore_threshold)
         for anomaly in anomalies:
             await storage.store_anomaly(anomaly)
+            all_anomalies.append(anomaly)
         anomalies_detected += len(anomalies)
+
+    # Broadcast anomalies to WebSocket subscribers
+    ws_manager: ConnectionManager = app.state.ws_manager
+    if ws_manager.active_count > 0 and all_anomalies:
+        for anomaly in all_anomalies:
+            await ws_manager.broadcast_alert({
+                "service": anomaly.service,
+                "metric_name": anomaly.metric_name,
+                "value": anomaly.value,
+                "z_score": anomaly.z_score,
+                "timestamp": anomaly.timestamp,
+            })
 
     return IngestResponse(
         ingested=len(request.logs),
@@ -178,6 +220,60 @@ async def get_anomalies(
         count=len(anomalies),
         hours=hours,
     )
+
+
+@app.get("/api/ws-status")
+async def ws_status() -> dict:
+    """Return active WebSocket connection count and per-stream subscription counts."""
+    ws_manager: ConnectionManager = app.state.ws_manager
+    return {
+        "active_connections": ws_manager.active_count,
+        "subscriptions": ws_manager.subscriptions_summary,
+    }
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    """WebSocket endpoint for real-time metric/alert streaming.
+
+    Protocol:
+    - Server sends ``{"type": "connected", ...}`` on connect.
+    - Client sends ``{"type": "subscribe", "streams": [...]}`` to subscribe.
+    - Client sends ``{"type": "unsubscribe", "streams": [...]}`` to unsubscribe.
+    - Client sends ``{"type": "pong"}`` in reply to server pings.
+    """
+    manager: ConnectionManager = app.state.ws_manager
+    client_id = await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type", "")
+
+            if msg_type == "subscribe":
+                streams = data.get("streams", [])
+                subscribed = await manager.subscribe(client_id, streams)
+                await websocket.send_json({
+                    "type": "subscribed",
+                    "streams": sorted(subscribed),
+                })
+
+            elif msg_type == "unsubscribe":
+                streams = data.get("streams", [])
+                await manager.unsubscribe(client_id, streams)
+                await websocket.send_json({
+                    "type": "unsubscribed",
+                    "streams": streams,
+                })
+
+            elif msg_type == "pong":
+                await manager.handle_pong(client_id)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        await manager.disconnect(client_id)
 
 
 @app.get("/", response_class=HTMLResponse)
