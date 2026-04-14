@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Log Pattern Alerting System</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #0b1020;
+            color: #e6e8ef;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                         'Helvetica Neue', Arial, sans-serif;
+            padding: 24px;
+            min-height: 100vh;
+        }
+
+        /* ── Header ─────────────────────────────────────────── */
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid #1f2a44;
+        }
+        .header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #ffffff;
+            letter-spacing: -0.02em;
+        }
+        .header .subtitle {
+            color: #8893b5;
+            font-size: 0.85rem;
+            margin-top: 4px;
+        }
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: #131a33;
+            padding: 10px 16px;
+            border-radius: 999px;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ef4444;
+            box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.15);
+            transition: all 0.3s;
+        }
+        .status-dot.connected {
+            background: #22c55e;
+            box-shadow: 0 0 0 4px rgba(34, 197, 94, 0.15);
+        }
+
+        /* ── Stats Row ──────────────────────────────────────── */
+        .stats-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 16px;
+            margin-bottom: 28px;
+        }
+        .stat-card {
+            background: linear-gradient(180deg, #131a33 0%, #0f1528 100%);
+            border: 1px solid #1f2a44;
+            border-radius: 12px;
+            padding: 20px 22px;
+        }
+        .stat-card .label {
+            font-size: 0.72rem;
+            color: #8893b5;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 10px;
+            font-weight: 600;
+        }
+        .stat-card .value {
+            font-size: 2rem;
+            font-weight: 700;
+            color: #ffffff;
+            line-height: 1;
+        }
+
+        /* ── Section Title ──────────────────────────────────── */
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #e6e8ef;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .section-title::before {
+            content: '';
+            width: 4px;
+            height: 18px;
+            background: #6366f1;
+            border-radius: 2px;
+        }
+
+        /* ── Alert Cards Grid ───────────────────────────────── */
+        .alerts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+            gap: 16px;
+        }
+        .alert-card {
+            background: linear-gradient(180deg, #131a33 0%, #0f1528 100%);
+            border: 1px solid #1f2a44;
+            border-radius: 12px;
+            padding: 20px 22px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            transition: border-color 0.2s;
+        }
+        .alert-card:hover {
+            border-color: #2d3a5c;
+        }
+        .alert-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 10px;
+        }
+        .alert-card-title {
+            font-size: 1rem;
+            font-weight: 600;
+            color: #ffffff;
+            word-break: break-word;
+        }
+        .badges {
+            display: flex;
+            gap: 6px;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+
+        /* ── Badges ─────────────────────────────────────────── */
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 0.68rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .badge-critical { background: rgba(239,68,68,0.18); color: #f87171; }
+        .badge-high     { background: rgba(249,115,22,0.18); color: #fb923c; }
+        .badge-medium   { background: rgba(234,179,8,0.18);  color: #facc15; }
+        .badge-low      { background: rgba(34,197,94,0.18);  color: #4ade80; }
+
+        .badge-NEW          { background: rgba(59,130,246,0.18);  color: #60a5fa; }
+        .badge-ACKNOWLEDGED { background: rgba(139,92,246,0.18);  color: #a78bfa; }
+        .badge-ESCALATED    { background: rgba(239,68,68,0.18);   color: #f87171; }
+        .badge-RESOLVED     { background: rgba(107,114,128,0.18); color: #9ca3af; }
+
+        /* ── Alert Card Details ─────────────────────────────── */
+        .alert-card-message {
+            font-size: 0.85rem;
+            color: #8893b5;
+            line-height: 1.5;
+            word-break: break-word;
+        }
+        .alert-card-meta {
+            display: flex;
+            gap: 16px;
+            font-size: 0.75rem;
+            color: #5a658a;
+            flex-wrap: wrap;
+        }
+        .alert-card-meta span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .alert-card-actions {
+            display: flex;
+            gap: 8px;
+            margin-top: 4px;
+        }
+
+        /* ── Buttons ────────────────────────────────────────── */
+        .btn {
+            padding: 7px 16px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s, opacity 0.15s;
+        }
+        .btn:disabled {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+        .btn-acknowledge {
+            background: rgba(139,92,246,0.2);
+            color: #a78bfa;
+        }
+        .btn-acknowledge:hover:not(:disabled) {
+            background: rgba(139,92,246,0.35);
+        }
+        .btn-resolve {
+            background: rgba(34,197,94,0.2);
+            color: #4ade80;
+        }
+        .btn-resolve:hover:not(:disabled) {
+            background: rgba(34,197,94,0.35);
+        }
+
+        /* ── Empty state ────────────────────────────────────── */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #5a658a;
+            font-size: 0.95rem;
+        }
+
+        /* ── Footer ─────────────────────────────────────────── */
+        footer {
+            margin-top: 40px;
+            text-align: center;
+            color: #5a658a;
+            font-size: 0.75rem;
+        }
+
+        /* ── Responsive ─────────────────────────────────────── */
+        @media (max-width: 900px) {
+            .stats-row { grid-template-columns: repeat(2, 1fr); }
+            .alerts-grid { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 500px) {
+            .stats-row { grid-template-columns: 1fr; }
+            body { padding: 12px; }
+        }
+
+        /* ── Pulse animation for new alerts ─────────────────── */
+        @keyframes pulse-border {
+            0%   { border-color: #6366f1; }
+            50%  { border-color: #1f2a44; }
+            100% { border-color: #6366f1; }
+        }
+        .alert-card.new-alert {
+            animation: pulse-border 1.5s ease-in-out 2;
+        }
+    </style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────── -->
+<div class="header">
+    <div>
+        <h1>Log Pattern Alerting System</h1>
+        <div class="subtitle">Real-time pattern detection and alert management</div>
+    </div>
+    <div class="status">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Disconnected</span>
+    </div>
+</div>
+
+<!-- ── Stats Row ───────────────────────────────────────── -->
+<div class="stats-row">
+    <div class="stat-card">
+        <div class="label">Active Alerts</div>
+        <div class="value" id="statActive">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Patterns Matched</div>
+        <div class="value" id="statPatterns">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Alerts / Min</div>
+        <div class="value" id="statRate">0</div>
+    </div>
+    <div class="stat-card">
+        <div class="label">Escalated</div>
+        <div class="value" id="statEscalated">0</div>
+    </div>
+</div>
+
+<!-- ── Alerts Section ──────────────────────────────────── -->
+<div class="section-title">Active Alerts</div>
+<div class="alerts-grid" id="alertsGrid">
+    <div class="empty-state" id="emptyState">No alerts yet. The dashboard will update in real time.</div>
+</div>
+
+<footer>log-pattern-alerting &mdash; real-time pattern detection &amp; alert management</footer>
+
+<script>
+/* ================================================================
+   Log Pattern Alerting Dashboard  --  vanilla JS, no dependencies
+   ================================================================ */
+
+/* ── State ──────────────────────────────────────────────── */
+const alertsMap = {};          /* id -> alert object */
+let ws = null;
+let reconnectTimer = null;
+const RECONNECT_MS = 3000;
+
+/* ── DOM refs ───────────────────────────────────────────── */
+const $grid       = document.getElementById('alertsGrid');
+const $empty      = document.getElementById('emptyState');
+const $statActive = document.getElementById('statActive');
+const $statPatt   = document.getElementById('statPatterns');
+const $statRate   = document.getElementById('statRate');
+const $statEsc    = document.getElementById('statEscalated');
+const $dot        = document.getElementById('statusDot');
+const $dotText    = document.getElementById('statusText');
+
+/* ── Helpers ────────────────────────────────────────────── */
+function severityClass(sev) {
+    return 'badge-' + (sev || 'low').toLowerCase();
+}
+function stateClass(st) {
+    return 'badge-' + (st || 'NEW');
+}
+function fmtTime(iso) {
+    if (!iso) return '--';
+    const d = new Date(iso);
+    return d.toLocaleTimeString();
+}
+
+function setStatus(connected) {
+    if (connected) {
+        $dot.classList.add('connected');
+        $dotText.textContent = 'Connected';
+    } else {
+        $dot.classList.remove('connected');
+        $dotText.textContent = 'Disconnected';
+    }
+}
+
+/* ── Render a single alert card ────────────────────────── */
+function renderAlertCard(a) {
+    const canAck = a.state === 'NEW' || a.state === 'ESCALATED';
+    const canRes = a.state !== 'RESOLVED';
+
+    return `
+    <div class="alert-card" id="alert-${a.id}" data-alert-id="${a.id}">
+        <div class="alert-card-header">
+            <span class="alert-card-title">${escHtml(a.pattern_name)}</span>
+            <div class="badges">
+                <span class="badge ${severityClass(a.severity)}">${escHtml(a.severity)}</span>
+                <span class="badge ${stateClass(a.state)}">${escHtml(a.state)}</span>
+            </div>
+        </div>
+        <div class="alert-card-message">${escHtml(a.message)}</div>
+        <div class="alert-card-meta">
+            <span>Count: ${a.count}</span>
+            <span>Last: ${fmtTime(a.last_occurrence)}</span>
+            ${a.acknowledged_by ? '<span>Acked by: ' + escHtml(a.acknowledged_by) + '</span>' : ''}
+        </div>
+        <div class="alert-card-actions">
+            <button class="btn btn-acknowledge"
+                    ${canAck ? '' : 'disabled'}
+                    onclick="ackAlert(${a.id})">Acknowledge</button>
+            <button class="btn btn-resolve"
+                    ${canRes ? '' : 'disabled'}
+                    onclick="resolveAlert(${a.id})">Resolve</button>
+        </div>
+    </div>`;
+}
+
+function escHtml(s) {
+    if (s == null) return '';
+    return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+/* ── Rebuild the entire grid from alertsMap ─────────────── */
+function rebuildGrid() {
+    const sorted = Object.values(alertsMap)
+        .sort(function(a, b) {
+            return new Date(b.last_occurrence) - new Date(a.last_occurrence);
+        });
+
+    if (sorted.length === 0) {
+        $grid.innerHTML = '<div class="empty-state">No alerts yet. The dashboard will update in real time.</div>';
+        return;
+    }
+
+    $grid.innerHTML = sorted.map(renderAlertCard).join('');
+}
+
+/* ── Update or insert a single alert ────────────────────── */
+function upsertAlert(a, animate) {
+    alertsMap[a.id] = a;
+    const existing = document.getElementById('alert-' + a.id);
+    if (existing) {
+        existing.outerHTML = renderAlertCard(a);
+    } else {
+        /* Hide empty state, prepend card */
+        if ($empty) $empty.style.display = 'none';
+        $grid.insertAdjacentHTML('afterbegin', renderAlertCard(a));
+    }
+    if (animate) {
+        const el = document.getElementById('alert-' + a.id);
+        if (el) el.classList.add('new-alert');
+    }
+}
+
+/* ── Stats helpers ──────────────────────────────────────── */
+function updateStatsFromAlerts() {
+    const all = Object.values(alertsMap);
+    const active = all.filter(function(a) { return a.state !== 'RESOLVED'; });
+    const escalated = all.filter(function(a) { return a.state === 'ESCALATED'; });
+
+    /* Unique pattern names among active alerts */
+    const patterns = new Set(active.map(function(a) { return a.pattern_name; }));
+
+    $statActive.textContent = active.length;
+    $statPatt.textContent   = patterns.size;
+    $statEsc.textContent    = escalated.length;
+}
+
+function updateStatsFromPayload(data) {
+    if (data.active_alerts !== undefined)  $statActive.textContent = data.active_alerts;
+    if (data.total_patterns !== undefined) $statPatt.textContent   = data.total_patterns;
+    if (data.alerts_per_minute !== undefined) $statRate.textContent = data.alerts_per_minute;
+    if (data.escalated !== undefined) $statEsc.textContent = data.escalated;
+}
+
+/* ── API calls ──────────────────────────────────────────── */
+function ackAlert(id) {
+    fetch('/alerts/' + id + '/acknowledge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ acknowledged_by: 'dashboard_user' })
+    })
+    .then(function(r) {
+        if (!r.ok) return r.json().then(function(e) { throw new Error(e.detail || r.statusText); });
+        return r.json();
+    })
+    .then(function(a) { upsertAlert(a, false); updateStatsFromAlerts(); })
+    .catch(function(e) { console.error('Acknowledge failed:', e); });
+}
+
+function resolveAlert(id) {
+    fetch('/alerts/' + id + '/resolve', {
+        method: 'POST'
+    })
+    .then(function(r) {
+        if (!r.ok) return r.json().then(function(e) { throw new Error(e.detail || r.statusText); });
+        return r.json();
+    })
+    .then(function(a) { upsertAlert(a, false); updateStatsFromAlerts(); })
+    .catch(function(e) { console.error('Resolve failed:', e); });
+}
+
+/* ── Initial data load ──────────────────────────────────── */
+function loadInitialData() {
+    fetch('/alerts')
+        .then(function(r) { return r.json(); })
+        .then(function(alerts) {
+            alerts.forEach(function(a) { alertsMap[a.id] = a; });
+            rebuildGrid();
+            updateStatsFromAlerts();
+        })
+        .catch(function(e) { console.error('Failed to load alerts:', e); });
+
+    fetch('/stats')
+        .then(function(r) { return r.json(); })
+        .then(function(data) { updateStatsFromPayload(data); })
+        .catch(function(e) { console.error('Failed to load stats:', e); });
+}
+
+/* ── WebSocket client with auto-reconnect ───────────────── */
+function connectWs() {
+    var proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    var url = proto + '://' + window.location.host + '/ws';
+
+    try {
+        ws = new WebSocket(url);
+    } catch (e) {
+        scheduleReconnect();
+        return;
+    }
+
+    ws.onopen = function() {
+        setStatus(true);
+    };
+
+    ws.onmessage = function(event) {
+        try {
+            var msg = JSON.parse(event.data);
+            if (!msg || !msg.type) return;
+
+            if (msg.type === 'alert_update' && msg.data) {
+                upsertAlert(msg.data, true);
+                updateStatsFromAlerts();
+            } else if (msg.type === 'stats_update' && msg.data) {
+                updateStatsFromPayload(msg.data);
+            }
+        } catch (e) { /* ignore parse errors */ }
+    };
+
+    ws.onclose = function() {
+        setStatus(false);
+        scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+        try { ws.close(); } catch (e) { /* ignore */ }
+    };
+}
+
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    reconnectTimer = setTimeout(function() {
+        reconnectTimer = null;
+        connectWs();
+    }, RECONNECT_MS);
+}
+
+/* ── Boot ────────────────────────────────────────────────── */
+loadInitialData();
+connectWs();
+</script>
+</body>
+</html>

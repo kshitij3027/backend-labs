@@ -4,17 +4,20 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 import redis.asyncio as aioredis
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.api.alerts import router as alerts_router
 from src.api.health import router as health_router
 from src.config import get_settings
 from src.models import Base
+from src.websocket import ConnectionManager
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +54,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:
         logger.warning("Redis connection failed on startup: %s", exc)
 
+    # Create WebSocket connection manager
+    connection_manager = ConnectionManager()
+
     # Store in app state
     app.state.engine = engine
     app.state.async_session = session_factory
     app.state.redis = redis_client
     app.state.settings = settings
+    app.state.connection_manager = connection_manager
 
     try:
         yield
@@ -83,3 +90,24 @@ app.add_middleware(
 # Include routers
 app.include_router(alerts_router, prefix="", tags=["alerts"])
 app.include_router(health_router)
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    """Serve the single-file HTML dashboard."""
+    html_path = Path(__file__).parent / "templates" / "dashboard.html"
+    return HTMLResponse(content=html_path.read_text())
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time alert updates."""
+    manager = websocket.app.state.connection_manager
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep alive, detect disconnect
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await manager.disconnect(websocket)
