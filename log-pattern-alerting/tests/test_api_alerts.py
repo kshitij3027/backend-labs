@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from src.database import get_db
 from src.main import app
 from src.models import Alert, AlertRule, AlertState, Base
+from src.websocket import ConnectionManager
 
 
 # ---------------------------------------------------------------------------
@@ -72,12 +73,19 @@ async def client(async_engine, test_session):
 
     app.dependency_overrides[get_db] = _override_get_db
 
+    # Wire up a ConnectionManager on app.state so the acknowledge/resolve
+    # endpoints can broadcast via WebSocket without a running lifespan.
+    ws_manager = ConnectionManager()
+    app.state.connection_manager = ws_manager
+
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
 
     # Restore and clean after test
     app.dependency_overrides.clear()
+    if hasattr(app.state, "connection_manager"):
+        del app.state.connection_manager
     async with async_engine.begin() as conn:
         await conn.execute(text("DELETE FROM alerts"))
         await conn.execute(text("DELETE FROM alert_rules"))

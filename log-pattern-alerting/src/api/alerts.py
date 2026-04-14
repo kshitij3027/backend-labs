@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,7 @@ async def get_alert(
 async def acknowledge_alert(
     alert_id: int,
     body: AcknowledgeRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Acknowledge an alert. Sets state to ACKNOWLEDGED with acknowledger info."""
@@ -87,12 +88,62 @@ async def acknowledge_alert(
         alert_id=alert_id,
         acknowledged_by=body.acknowledged_by,
     )
+
+    # Broadcast alert update via WebSocket
+    connection_manager = request.app.state.connection_manager
+    await connection_manager.broadcast_json({
+        "type": "alert_update",
+        "alert": {
+            "id": alert.id,
+            "pattern_name": alert.pattern_name,
+            "severity": alert.severity,
+            "message": alert.message,
+            "count": alert.count,
+            "state": alert.state,
+            "first_occurrence": (
+                alert.first_occurrence.isoformat()
+                if alert.first_occurrence else None
+            ),
+            "last_occurrence": (
+                alert.last_occurrence.isoformat()
+                if alert.last_occurrence else None
+            ),
+        },
+    })
+
+    # Broadcast updated stats
+    active_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            Alert.state != AlertState.RESOLVED.value
+        )
+    )
+    active_alerts = active_result.scalar() or 0
+    patterns_result = await db.execute(
+        select(func.count(AlertRule.id)).where(AlertRule.enabled.is_(True))
+    )
+    total_patterns = patterns_result.scalar() or 0
+    severity_result = await db.execute(
+        select(Alert.severity, func.count(Alert.id))
+        .where(Alert.state != AlertState.RESOLVED.value)
+        .group_by(Alert.severity)
+    )
+    alerts_by_severity = {row[0]: row[1] for row in severity_result.all()}
+    await connection_manager.broadcast_json({
+        "type": "stats_update",
+        "stats": {
+            "active_alerts": active_alerts,
+            "total_patterns": total_patterns,
+            "alerts_by_severity": alerts_by_severity,
+        },
+    })
+
     return alert
 
 
 @router.post("/alerts/{alert_id}/resolve", response_model=AlertResponse)
 async def resolve_alert(
     alert_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Resolve an alert. Sets state to RESOLVED with resolved_at timestamp."""
@@ -115,6 +166,55 @@ async def resolve_alert(
     await db.refresh(alert)
 
     logger.info("alert_resolved", alert_id=alert_id)
+
+    # Broadcast alert update via WebSocket
+    connection_manager = request.app.state.connection_manager
+    await connection_manager.broadcast_json({
+        "type": "alert_update",
+        "alert": {
+            "id": alert.id,
+            "pattern_name": alert.pattern_name,
+            "severity": alert.severity,
+            "message": alert.message,
+            "count": alert.count,
+            "state": alert.state,
+            "first_occurrence": (
+                alert.first_occurrence.isoformat()
+                if alert.first_occurrence else None
+            ),
+            "last_occurrence": (
+                alert.last_occurrence.isoformat()
+                if alert.last_occurrence else None
+            ),
+        },
+    })
+
+    # Broadcast updated stats
+    active_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            Alert.state != AlertState.RESOLVED.value
+        )
+    )
+    active_alerts = active_result.scalar() or 0
+    patterns_result = await db.execute(
+        select(func.count(AlertRule.id)).where(AlertRule.enabled.is_(True))
+    )
+    total_patterns = patterns_result.scalar() or 0
+    severity_result = await db.execute(
+        select(Alert.severity, func.count(Alert.id))
+        .where(Alert.state != AlertState.RESOLVED.value)
+        .group_by(Alert.severity)
+    )
+    alerts_by_severity = {row[0]: row[1] for row in severity_result.all()}
+    await connection_manager.broadcast_json({
+        "type": "stats_update",
+        "stats": {
+            "active_alerts": active_alerts,
+            "total_patterns": total_patterns,
+            "alerts_by_severity": alerts_by_severity,
+        },
+    })
+
     return alert
 
 

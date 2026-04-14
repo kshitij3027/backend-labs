@@ -15,7 +15,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.api.alerts import router as alerts_router
 from src.api.health import router as health_router
+from src.api.logs import router as logs_router
 from src.config import get_settings
+from src.engine.correlation import AlertCorrelator
+from src.engine.pattern_matcher import PatternMatcher
+from src.engine.pipeline import AlertPipeline
+from src.engine.rate_limiter import RateLimiter
 from src.models import Base
 from src.websocket import ConnectionManager
 
@@ -57,12 +62,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Create WebSocket connection manager
     connection_manager = ConnectionManager()
 
+    # Build the alert processing pipeline
+    pattern_matcher = PatternMatcher()
+    correlator = AlertCorrelator(settings.correlation_window)
+    rate_limiter = RateLimiter(redis_client, settings.max_alerts_per_minute)
+    pipeline = AlertPipeline(
+        pattern_matcher, correlator, rate_limiter,
+        connection_manager, session_factory,
+    )
+
+    # Initialize pipeline (load alert rules from DB)
+    async with session_factory() as init_session:
+        await pipeline.initialize(init_session)
+
     # Store in app state
     app.state.engine = engine
     app.state.async_session = session_factory
     app.state.redis = redis_client
     app.state.settings = settings
     app.state.connection_manager = connection_manager
+    app.state.pipeline = pipeline
 
     try:
         yield
@@ -89,6 +108,7 @@ app.add_middleware(
 
 # Include routers
 app.include_router(alerts_router, prefix="", tags=["alerts"])
+app.include_router(logs_router, prefix="", tags=["logs"])
 app.include_router(health_router)
 
 
