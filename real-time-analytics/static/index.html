@@ -1,0 +1,949 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Real-Time Analytics Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<style>
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f0f1a;
+    color: #e0e0e0;
+    min-height: 100vh;
+}
+
+/* Header */
+.header {
+    background: #1a1a2e;
+    padding: 1rem 2rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid #2a2a4a;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+}
+
+.header-left {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.header h1 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+}
+
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+}
+
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    transition: background-color 0.3s ease;
+}
+
+.status-dot.connected {
+    background: #00b894;
+    box-shadow: 0 0 6px #00b894;
+}
+
+.status-dot.disconnected {
+    background: #e94560;
+    box-shadow: 0 0 6px #e94560;
+}
+
+.status-dot.connecting {
+    background: #fdcb6e;
+    box-shadow: 0 0 6px #fdcb6e;
+}
+
+#generateBtn {
+    background: #0f3460;
+    color: #e0e0e0;
+    border: 1px solid #1a4a8a;
+    padding: 0.5rem 1.25rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.85rem;
+    font-weight: 500;
+    transition: all 0.2s ease;
+    white-space: nowrap;
+}
+
+#generateBtn:hover:not(:disabled) {
+    background: #1a4a8a;
+    border-color: #2a5a9a;
+}
+
+#generateBtn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* KPI Grid */
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem;
+    padding: 1.25rem 2rem;
+}
+
+.kpi-card {
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 1.5rem;
+    text-align: center;
+    border: 1px solid #2a2a4a;
+    transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.kpi-card:hover {
+    transform: translateY(-2px);
+    border-color: #3a3a5a;
+}
+
+.kpi-value {
+    font-size: 2rem;
+    font-weight: bold;
+    color: #00b894;
+    line-height: 1.2;
+}
+
+.kpi-value.warning {
+    color: #fdcb6e;
+}
+
+.kpi-value.danger {
+    color: #e94560;
+}
+
+.kpi-label {
+    font-size: 0.85rem;
+    color: #888;
+    margin-top: 0.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+/* Charts */
+.charts-container {
+    padding: 0.5rem 2rem 1rem;
+}
+
+.chart-card {
+    background: #1a1a2e;
+    border-radius: 12px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid #2a2a4a;
+}
+
+.chart-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #ccc;
+    margin-bottom: 0.5rem;
+    padding-left: 0.5rem;
+}
+
+/* Alert Feed */
+.alert-section {
+    padding: 0 2rem 1rem;
+}
+
+.alert-section-title {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: #ccc;
+    margin-bottom: 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.alert-badge {
+    background: #e94560;
+    color: #fff;
+    font-size: 0.7rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 10px;
+    font-weight: 600;
+}
+
+.alert-feed {
+    max-height: 300px;
+    overflow-y: auto;
+    border-radius: 8px;
+}
+
+.alert-feed::-webkit-scrollbar {
+    width: 6px;
+}
+
+.alert-feed::-webkit-scrollbar-track {
+    background: #0f0f1a;
+}
+
+.alert-feed::-webkit-scrollbar-thumb {
+    background: #3a3a5a;
+    border-radius: 3px;
+}
+
+.alert-item {
+    background: rgba(233, 69, 96, 0.12);
+    border-left: 3px solid #e94560;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.5rem;
+    border-radius: 0 4px 4px 0;
+    font-size: 0.85rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    transition: background 0.2s ease;
+}
+
+.alert-item:hover {
+    background: rgba(233, 69, 96, 0.2);
+}
+
+.alert-info {
+    flex: 1;
+}
+
+.alert-service {
+    font-weight: 600;
+    color: #e94560;
+}
+
+.alert-metric {
+    color: #aaa;
+    margin-left: 0.5rem;
+}
+
+.alert-details {
+    color: #888;
+    font-size: 0.8rem;
+    margin-top: 0.25rem;
+}
+
+.alert-time {
+    color: #666;
+    font-size: 0.75rem;
+    white-space: nowrap;
+}
+
+.alert-empty {
+    color: #555;
+    font-style: italic;
+    padding: 1rem;
+    text-align: center;
+}
+
+/* Footer */
+.footer {
+    background: #1a1a2e;
+    padding: 0.75rem 2rem;
+    text-align: center;
+    font-size: 0.75rem;
+    color: #555;
+    border-top: 1px solid #2a2a4a;
+    margin-top: 1rem;
+}
+
+.footer span {
+    margin: 0 0.75rem;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .header {
+        padding: 0.75rem 1rem;
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    .header-right {
+        width: 100%;
+        justify-content: space-between;
+    }
+
+    .kpi-grid {
+        padding: 1rem;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 0.75rem;
+    }
+
+    .kpi-card {
+        padding: 1rem;
+    }
+
+    .kpi-value {
+        font-size: 1.5rem;
+    }
+
+    .charts-container {
+        padding: 0.5rem 1rem;
+    }
+
+    .alert-section {
+        padding: 0 1rem 1rem;
+    }
+
+    .footer {
+        padding: 0.75rem 1rem;
+    }
+}
+
+@media (max-width: 480px) {
+    .kpi-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .header h1 {
+        font-size: 1.1rem;
+    }
+}
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="header-left">
+        <h1>Real-Time Analytics Dashboard</h1>
+    </div>
+    <div class="header-right">
+        <button id="generateBtn" onclick="generateData()">Generate Sample Data</button>
+        <div class="status-indicator">
+            <div id="statusDot" class="status-dot disconnected"></div>
+            <span id="statusText">Disconnected</span>
+        </div>
+    </div>
+</div>
+
+<!-- KPI Cards -->
+<div class="kpi-grid">
+    <div class="kpi-card">
+        <div class="kpi-value" id="kpiServices">0</div>
+        <div class="kpi-label">Active Services</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-value" id="kpiResponseTime">--</div>
+        <div class="kpi-label">Avg Response Time (ms)</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-value" id="kpiErrorRate">--</div>
+        <div class="kpi-label">Error Rate (%)</div>
+    </div>
+    <div class="kpi-card">
+        <div class="kpi-value" id="kpiAnomalies">0</div>
+        <div class="kpi-label">Anomalies Detected</div>
+    </div>
+</div>
+
+<!-- Charts -->
+<div class="charts-container">
+    <div class="chart-card">
+        <div class="chart-title">Response Time (ms)</div>
+        <div id="chartResponseTime"></div>
+    </div>
+    <div class="chart-card">
+        <div class="chart-title">Request Count</div>
+        <div id="chartRequestCount"></div>
+    </div>
+    <div class="chart-card">
+        <div class="chart-title">Error Count</div>
+        <div id="chartErrorCount"></div>
+    </div>
+</div>
+
+<!-- Alert Feed -->
+<div class="alert-section">
+    <div class="alert-section-title">
+        Anomaly Alerts
+        <span class="alert-badge" id="alertCount">0</span>
+    </div>
+    <div class="alert-feed" id="alertFeed">
+        <div class="alert-empty">No anomalies detected yet. Generate sample data to get started.</div>
+    </div>
+</div>
+
+<!-- Footer -->
+<div class="footer">
+    <span id="footerConnection">WebSocket: disconnected</span>
+    <span>|</span>
+    <span id="footerLastUpdate">Last update: --</span>
+    <span>|</span>
+    <span>Real-Time Analytics Dashboard</span>
+</div>
+
+<script>
+(function() {
+    'use strict';
+
+    // ---------------------------------------------------------------
+    // State
+    // ---------------------------------------------------------------
+    const MAX_POINTS = 500;
+    const MAX_ALERTS = 20;
+
+    let ws = null;
+    let retryDelay = 1000;
+    let reconnectTimer = null;
+    let anomalyPollTimer = null;
+
+    // Chart data arrays
+    const chartData = {
+        response_time: { x: [], y: [] },
+        request_count: { x: [], y: [] },
+        error_count:   { x: [], y: [] },
+    };
+
+    // KPI tracking
+    const kpiState = {
+        services: new Set(),
+        latestResponseTimes: {},
+        latestRequestCounts: {},
+        latestErrorCounts: {},
+        anomalyCount: 0,
+    };
+
+    const alerts = [];
+
+    // ---------------------------------------------------------------
+    // Chart setup
+    // ---------------------------------------------------------------
+    const darkLayout = {
+        paper_bgcolor: '#1a1a2e',
+        plot_bgcolor: '#1a1a2e',
+        font: { color: '#aaa', size: 11 },
+        margin: { l: 50, r: 20, t: 10, b: 40 },
+        xaxis: {
+            gridcolor: '#2a2a4a',
+            linecolor: '#2a2a4a',
+            tickformat: '%H:%M:%S',
+        },
+        yaxis: {
+            gridcolor: '#2a2a4a',
+            linecolor: '#2a2a4a',
+        },
+    };
+
+    const plotConfig = { responsive: true, displayModeBar: false };
+
+    function initCharts() {
+        Plotly.newPlot('chartResponseTime', [{
+            x: [],
+            y: [],
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Response Time',
+            line: { color: '#00b894', width: 2 },
+            marker: { color: '#00b894', size: 4 },
+        }], {
+            ...darkLayout,
+            yaxis: { ...darkLayout.yaxis, title: { text: 'ms', font: { size: 11, color: '#888' } } },
+        }, plotConfig);
+
+        Plotly.newPlot('chartRequestCount', [{
+            x: [],
+            y: [],
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Request Count',
+            line: { color: '#74b9ff', width: 2 },
+            marker: { color: '#74b9ff', size: 4 },
+        }], {
+            ...darkLayout,
+            yaxis: { ...darkLayout.yaxis, title: { text: 'count', font: { size: 11, color: '#888' } } },
+        }, plotConfig);
+
+        Plotly.newPlot('chartErrorCount', [{
+            x: [],
+            y: [],
+            type: 'scatter',
+            mode: 'lines+markers',
+            name: 'Error Count',
+            line: { color: '#e94560', width: 2 },
+            marker: { color: '#e94560', size: 4 },
+        }], {
+            ...darkLayout,
+            yaxis: { ...darkLayout.yaxis, title: { text: 'errors', font: { size: 11, color: '#888' } } },
+        }, plotConfig);
+    }
+
+    // ---------------------------------------------------------------
+    // Chart updates
+    // ---------------------------------------------------------------
+    function capArray(arr) {
+        if (arr.length > MAX_POINTS) {
+            arr.splice(0, arr.length - MAX_POINTS);
+        }
+    }
+
+    function plotMetricData(metricName, data) {
+        if (!data || !data.data_points || data.data_points.length === 0) return;
+
+        const cd = chartData[metricName];
+        if (!cd) return;
+
+        // Replace data with fetched points
+        cd.x = data.data_points.map(function(p) { return new Date(p.timestamp * 1000); });
+        cd.y = data.data_points.map(function(p) { return p.value; });
+        capArray(cd.x);
+        capArray(cd.y);
+
+        const chartId = {
+            response_time: 'chartResponseTime',
+            request_count: 'chartRequestCount',
+            error_count: 'chartErrorCount',
+        }[metricName];
+
+        if (chartId) {
+            Plotly.react(chartId, [{
+                x: cd.x,
+                y: cd.y,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: metricName.replace(/_/g, ' '),
+                line: { color: getMetricColor(metricName), width: 2 },
+                marker: { color: getMetricColor(metricName), size: 4 },
+            }], getChartLayout(metricName), plotConfig);
+        }
+    }
+
+    function getMetricColor(metricName) {
+        switch (metricName) {
+            case 'response_time': return '#00b894';
+            case 'request_count': return '#74b9ff';
+            case 'error_count': return '#e94560';
+            default: return '#aaa';
+        }
+    }
+
+    function getChartLayout(metricName) {
+        var yTitle = { response_time: 'ms', request_count: 'count', error_count: 'errors' }[metricName] || '';
+        return {
+            paper_bgcolor: '#1a1a2e',
+            plot_bgcolor: '#1a1a2e',
+            font: { color: '#aaa', size: 11 },
+            margin: { l: 50, r: 20, t: 10, b: 40 },
+            xaxis: { gridcolor: '#2a2a4a', linecolor: '#2a2a4a', tickformat: '%H:%M:%S' },
+            yaxis: { gridcolor: '#2a2a4a', linecolor: '#2a2a4a', title: { text: yTitle, font: { size: 11, color: '#888' } } },
+        };
+    }
+
+    function appendChartPoint(metricName, timestamp, value) {
+        const cd = chartData[metricName];
+        if (!cd) return;
+
+        cd.x.push(new Date(timestamp * 1000));
+        cd.y.push(value);
+        capArray(cd.x);
+        capArray(cd.y);
+
+        const chartId = {
+            response_time: 'chartResponseTime',
+            request_count: 'chartRequestCount',
+            error_count: 'chartErrorCount',
+        }[metricName];
+
+        if (chartId) {
+            Plotly.react(chartId, [{
+                x: cd.x,
+                y: cd.y,
+                type: 'scatter',
+                mode: 'lines+markers',
+                name: metricName.replace(/_/g, ' '),
+                line: { color: getMetricColor(metricName), width: 2 },
+                marker: { color: getMetricColor(metricName), size: 4 },
+            }], getChartLayout(metricName), plotConfig);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // KPI updates
+    // ---------------------------------------------------------------
+    function updateKPIs(data) {
+        if (!data || !data.metrics) return;
+
+        for (var i = 0; i < data.metrics.length; i++) {
+            var m = data.metrics[i];
+            kpiState.services.add(m.service);
+
+            if (m.metric_name === 'response_time') {
+                kpiState.latestResponseTimes[m.service] = m.latest_value;
+            } else if (m.metric_name === 'request_count') {
+                kpiState.latestRequestCounts[m.service] = m.latest_value;
+            } else if (m.metric_name === 'error_count') {
+                kpiState.latestErrorCounts[m.service] = m.latest_value;
+            }
+        }
+
+        // Active services
+        document.getElementById('kpiServices').textContent = kpiState.services.size;
+
+        // Avg response time
+        var rtValues = Object.values(kpiState.latestResponseTimes);
+        if (rtValues.length > 0) {
+            var avgRt = rtValues.reduce(function(a, b) { return a + b; }, 0) / rtValues.length;
+            var rtEl = document.getElementById('kpiResponseTime');
+            rtEl.textContent = avgRt.toFixed(1);
+            rtEl.className = 'kpi-value' + (avgRt > 500 ? ' danger' : avgRt > 200 ? ' warning' : '');
+        }
+
+        // Error rate
+        var totalReq = 0;
+        var totalErr = 0;
+        var reqValues = Object.values(kpiState.latestRequestCounts);
+        var errValues = Object.values(kpiState.latestErrorCounts);
+        for (var j = 0; j < reqValues.length; j++) totalReq += reqValues[j];
+        for (var k = 0; k < errValues.length; k++) totalErr += errValues[k];
+
+        if (totalReq > 0) {
+            var errorRate = (totalErr / totalReq) * 100;
+            var erEl = document.getElementById('kpiErrorRate');
+            erEl.textContent = errorRate.toFixed(1);
+            erEl.className = 'kpi-value' + (errorRate > 10 ? ' danger' : errorRate > 5 ? ' warning' : '');
+        }
+
+        // Update footer timestamp
+        document.getElementById('footerLastUpdate').textContent =
+            'Last update: ' + new Date().toLocaleTimeString();
+    }
+
+    function updateKPIsFromRest(metricName, data) {
+        if (!data || !data.data_points || data.data_points.length === 0) return;
+
+        kpiState.services.add(data.service);
+
+        var lastPoint = data.data_points[data.data_points.length - 1];
+        if (metricName === 'response_time') {
+            kpiState.latestResponseTimes[data.service] = lastPoint.value;
+        } else if (metricName === 'request_count') {
+            kpiState.latestRequestCounts[data.service] = lastPoint.value;
+        } else if (metricName === 'error_count') {
+            kpiState.latestErrorCounts[data.service] = lastPoint.value;
+        }
+
+        document.getElementById('kpiServices').textContent = kpiState.services.size;
+
+        var rtValues = Object.values(kpiState.latestResponseTimes);
+        if (rtValues.length > 0) {
+            var avgRt = rtValues.reduce(function(a, b) { return a + b; }, 0) / rtValues.length;
+            var rtEl = document.getElementById('kpiResponseTime');
+            rtEl.textContent = avgRt.toFixed(1);
+            rtEl.className = 'kpi-value' + (avgRt > 500 ? ' danger' : avgRt > 200 ? ' warning' : '');
+        }
+
+        var totalReq = 0;
+        var totalErr = 0;
+        var reqValues = Object.values(kpiState.latestRequestCounts);
+        var errValues = Object.values(kpiState.latestErrorCounts);
+        for (var j = 0; j < reqValues.length; j++) totalReq += reqValues[j];
+        for (var k = 0; k < errValues.length; k++) totalErr += errValues[k];
+
+        if (totalReq > 0) {
+            var errorRate = (totalErr / totalReq) * 100;
+            var erEl = document.getElementById('kpiErrorRate');
+            erEl.textContent = errorRate.toFixed(1);
+            erEl.className = 'kpi-value' + (errorRate > 10 ? ' danger' : errorRate > 5 ? ' warning' : '');
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Charts from WebSocket metrics_update
+    // ---------------------------------------------------------------
+    function updateCharts(data) {
+        if (!data || !data.metrics) return;
+
+        for (var i = 0; i < data.metrics.length; i++) {
+            var m = data.metrics[i];
+            if (chartData[m.metric_name]) {
+                appendChartPoint(m.metric_name, data.timestamp, m.latest_value);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Alerts
+    // ---------------------------------------------------------------
+    function addAlert(data) {
+        var alert = {
+            service: data.service || 'unknown',
+            metric_name: data.metric_name || 'unknown',
+            value: data.value != null ? data.value : 0,
+            z_score: data.z_score != null ? data.z_score : 0,
+            timestamp: data.timestamp || (Date.now() / 1000),
+        };
+
+        alerts.unshift(alert);
+        if (alerts.length > MAX_ALERTS) {
+            alerts.pop();
+        }
+
+        kpiState.anomalyCount++;
+        document.getElementById('kpiAnomalies').textContent = kpiState.anomalyCount;
+        document.getElementById('kpiAnomalies').className = 'kpi-value danger';
+        document.getElementById('alertCount').textContent = kpiState.anomalyCount;
+
+        renderAlerts();
+    }
+
+    function renderAlerts() {
+        var feed = document.getElementById('alertFeed');
+
+        if (alerts.length === 0) {
+            feed.innerHTML = '<div class="alert-empty">No anomalies detected yet. Generate sample data to get started.</div>';
+            return;
+        }
+
+        var html = '';
+        for (var i = 0; i < alerts.length; i++) {
+            var a = alerts[i];
+            var t = new Date(a.timestamp * 1000);
+            var timeStr = t.toLocaleTimeString();
+            html += '<div class="alert-item">' +
+                '<div class="alert-info">' +
+                    '<span class="alert-service">' + escapeHtml(a.service) + '</span>' +
+                    '<span class="alert-metric"> / ' + escapeHtml(a.metric_name) + '</span>' +
+                    '<div class="alert-details">' +
+                        'Value: ' + a.value.toFixed(2) +
+                        ' | Z-Score: ' + a.z_score.toFixed(2) +
+                    '</div>' +
+                '</div>' +
+                '<div class="alert-time">' + timeStr + '</div>' +
+            '</div>';
+        }
+
+        feed.innerHTML = html;
+    }
+
+    function escapeHtml(str) {
+        var div = document.createElement('div');
+        div.appendChild(document.createTextNode(str));
+        return div.innerHTML;
+    }
+
+    // ---------------------------------------------------------------
+    // WebSocket
+    // ---------------------------------------------------------------
+    function updateStatus(status) {
+        var dot = document.getElementById('statusDot');
+        var text = document.getElementById('statusText');
+        var footer = document.getElementById('footerConnection');
+
+        dot.className = 'status-dot ' + status;
+
+        switch (status) {
+            case 'connected':
+                text.textContent = 'Connected';
+                footer.textContent = 'WebSocket: connected';
+                break;
+            case 'disconnected':
+                text.textContent = 'Disconnected';
+                footer.textContent = 'WebSocket: disconnected';
+                break;
+            case 'connecting':
+                text.textContent = 'Connecting...';
+                footer.textContent = 'WebSocket: connecting...';
+                break;
+        }
+    }
+
+    function connectWebSocket() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+            return;
+        }
+
+        updateStatus('connecting');
+
+        var wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(wsProtocol + '//' + location.host + '/ws');
+
+        ws.onopen = function() {
+            updateStatus('connected');
+            retryDelay = 1000;
+            ws.send(JSON.stringify({
+                type: 'subscribe',
+                streams: ['metrics', 'alerts', 'system'],
+            }));
+        };
+
+        ws.onmessage = function(event) {
+            var msg;
+            try {
+                msg = JSON.parse(event.data);
+            } catch (e) {
+                return;
+            }
+
+            switch (msg.type) {
+                case 'connected':
+                    break;
+                case 'subscribed':
+                    break;
+                case 'ping':
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'pong' }));
+                    }
+                    break;
+                case 'metrics_update':
+                    updateCharts(msg.data);
+                    updateKPIs(msg.data);
+                    break;
+                case 'alerts_update':
+                    addAlert(msg.data);
+                    break;
+            }
+        };
+
+        ws.onclose = function() {
+            updateStatus('disconnected');
+            scheduleReconnect();
+        };
+
+        ws.onerror = function() {
+            updateStatus('disconnected');
+        };
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) return;
+        var delay = Math.min(retryDelay, 30000);
+        reconnectTimer = setTimeout(function() {
+            reconnectTimer = null;
+            retryDelay *= 2;
+            connectWebSocket();
+        }, delay);
+    }
+
+    // ---------------------------------------------------------------
+    // Initial data load via REST
+    // ---------------------------------------------------------------
+    async function loadInitialData() {
+        var metrics = ['response_time', 'request_count', 'error_count'];
+
+        for (var i = 0; i < metrics.length; i++) {
+            var metric = metrics[i];
+            try {
+                var resp = await fetch('/api/metrics/web-api/' + metric + '?minutes=60');
+                if (resp.ok) {
+                    var data = await resp.json();
+                    plotMetricData(metric, data);
+                    updateKPIsFromRest(metric, data);
+                }
+            } catch (e) {
+                // Silently ignore fetch errors on initial load
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Anomaly count polling
+    // ---------------------------------------------------------------
+    async function pollAnomalies() {
+        try {
+            var resp = await fetch('/api/anomalies?hours=1');
+            if (resp.ok) {
+                var data = await resp.json();
+                kpiState.anomalyCount = data.count;
+                document.getElementById('kpiAnomalies').textContent = data.count;
+                document.getElementById('alertCount').textContent = data.count;
+
+                if (data.count > 0) {
+                    document.getElementById('kpiAnomalies').className = 'kpi-value danger';
+                }
+
+                // Populate alerts from REST if we have none locally
+                if (alerts.length === 0 && data.anomalies && data.anomalies.length > 0) {
+                    var toAdd = data.anomalies.slice(0, MAX_ALERTS);
+                    for (var i = 0; i < toAdd.length; i++) {
+                        alerts.push({
+                            service: toAdd[i].service,
+                            metric_name: toAdd[i].metric_name,
+                            value: toAdd[i].value,
+                            z_score: toAdd[i].z_score,
+                            timestamp: toAdd[i].timestamp,
+                        });
+                    }
+                    renderAlerts();
+                }
+            }
+        } catch (e) {
+            // Silently ignore
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Generate sample data
+    // ---------------------------------------------------------------
+    window.generateData = async function() {
+        var btn = document.getElementById('generateBtn');
+        btn.disabled = true;
+        btn.textContent = 'Generating...';
+
+        try {
+            var resp = await fetch('/api/generate-sample-data', { method: 'POST' });
+            if (resp.ok) {
+                var data = await resp.json();
+                btn.textContent = 'Generated ' + data.metrics_stored + ' metrics';
+            } else {
+                btn.textContent = 'Error generating data';
+            }
+        } catch (e) {
+            btn.textContent = 'Connection error';
+        }
+
+        setTimeout(function() {
+            btn.textContent = 'Generate Sample Data';
+            btn.disabled = false;
+        }, 2000);
+
+        // Reload charts after generation
+        setTimeout(function() {
+            loadInitialData();
+            pollAnomalies();
+        }, 500);
+    };
+
+    // ---------------------------------------------------------------
+    // Init
+    // ---------------------------------------------------------------
+    document.addEventListener('DOMContentLoaded', function() {
+        initCharts();
+        loadInitialData();
+        connectWebSocket();
+        pollAnomalies();
+
+        // Poll anomalies every 30 seconds
+        anomalyPollTimer = setInterval(pollAnomalies, 30000);
+    });
+
+})();
+</script>
+</body>
+</html>

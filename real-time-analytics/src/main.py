@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.config import get_config
@@ -276,22 +276,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await manager.disconnect(client_id)
 
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard() -> HTMLResponse:
-    """Serve the dashboard HTML.
+@app.get("/")
+async def dashboard():
+    """Serve the dashboard HTML from ``static/index.html``.
 
-    Returns a placeholder page if ``static/index.html`` doesn't exist yet
-    (it will be created in a later commit).
+    Returns a placeholder page if the file doesn't exist yet.
     """
     index_path = _STATIC_DIR / "index.html"
-    try:
-        html = index_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        html = (
-            "<!DOCTYPE html><html><head><title>Real-Time Analytics</title></head>"
-            "<body><h1>Dashboard coming soon</h1></body></html>"
-        )
-    return HTMLResponse(content=html)
+    if index_path.is_file():
+        return FileResponse(str(index_path), media_type="text/html")
+    return HTMLResponse(
+        "<!DOCTYPE html><html><head><title>Real-Time Analytics</title></head>"
+        "<body><h1>Dashboard coming soon</h1></body></html>"
+    )
 
 
 if __name__ == "__main__":
