@@ -159,6 +159,42 @@ class RedisStorage:
         members = await self._client.smembers("services")
         return sorted(members)
 
+    async def get_all_metrics_for_service(
+        self,
+        service: str,
+        start_time: float,
+        end_time: float,
+    ) -> dict[str, list[MetricPoint]]:
+        """Get all metrics for a service within a time range.
+
+        SCAN for all ``metrics:{service}:*`` keys, fetch each with
+        ZRANGEBYSCORE, and return a dict keyed by metric_name.
+        """
+        prefix = f"metrics:{service}:"
+        result: dict[str, list[MetricPoint]] = {}
+        cursor = 0
+        while True:
+            cursor, keys = await self._client.scan(
+                cursor, match=f"{prefix}*", count=100,
+            )
+            for key in keys:
+                metric_name = key[len(prefix):]
+                members = await self._client.zrangebyscore(key, start_time, end_time)
+                points: list[MetricPoint] = []
+                for m in members:
+                    data = json.loads(m)
+                    points.append(MetricPoint(
+                        service=service,
+                        metric_name=metric_name,
+                        value=data["value"],
+                        timestamp=data["timestamp"],
+                        tags=data.get("tags", {}),
+                    ))
+                result[metric_name] = points
+            if cursor == 0:
+                break
+        return result
+
     async def get_metric_names(self, service: str) -> list[str]:
         """Get all metric names for a given service by scanning keys."""
         prefix = f"metrics:{service}:"

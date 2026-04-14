@@ -262,6 +262,55 @@ body {
     text-align: center;
 }
 
+/* Controls Bar */
+.controls-bar {
+    display: flex;
+    align-items: center;
+    gap: 2rem;
+    padding: 0.75rem 2rem;
+    background: #16213e;
+    flex-wrap: wrap;
+}
+.control-group { display: flex; align-items: center; gap: 0.5rem; }
+.control-group label { font-size: 0.8rem; color: #888; text-transform: uppercase; }
+.control-group select {
+    background: #0f0f1a;
+    color: #e0e0e0;
+    border: 1px solid #2a2a4a;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    font-size: 0.9rem;
+}
+.time-buttons { display: flex; gap: 0.25rem; }
+.time-btn {
+    background: #0f0f1a;
+    color: #888;
+    border: 1px solid #2a2a4a;
+    padding: 0.3rem 0.7rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.time-btn.active { background: #0f3460; color: #00b894; border-color: #00b894; }
+.export-btn {
+    background: #0f3460;
+    color: #e0e0e0;
+    border: 1px solid #2a2a4a;
+    padding: 0.3rem 0.8rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.8rem;
+}
+.export-btn:hover { background: #155d8b; }
+
+.kpi-change {
+    font-size: 0.75rem;
+    margin-top: 0.25rem;
+    font-weight: 500;
+}
+.kpi-change.up { color: #00b894; }
+.kpi-change.down { color: #e94560; }
+
 /* Footer */
 .footer {
     background: #1a1a2e;
@@ -344,6 +393,31 @@ body {
     </div>
 </div>
 
+<!-- Controls Bar -->
+<div class="controls-bar">
+    <div class="control-group">
+        <label>Service</label>
+        <select id="serviceSelector">
+            <option value="web-api">web-api</option>
+        </select>
+    </div>
+    <div class="control-group">
+        <label>Time Range</label>
+        <div class="time-buttons">
+            <button class="time-btn active" data-minutes="5">5m</button>
+            <button class="time-btn" data-minutes="15">15m</button>
+            <button class="time-btn" data-minutes="30">30m</button>
+            <button class="time-btn" data-minutes="60">1h</button>
+            <button class="time-btn" data-minutes="360">6h</button>
+        </div>
+    </div>
+    <div class="control-group">
+        <label>Export</label>
+        <button id="exportCsvBtn" class="export-btn">CSV</button>
+        <button id="exportJsonBtn" class="export-btn">JSON</button>
+    </div>
+</div>
+
 <!-- KPI Cards -->
 <div class="kpi-grid">
     <div class="kpi-card">
@@ -352,10 +426,12 @@ body {
     </div>
     <div class="kpi-card">
         <div class="kpi-value" id="kpiResponseTime">--</div>
+        <div class="kpi-change" id="kpiResponseTimeChange"></div>
         <div class="kpi-label">Avg Response Time (ms)</div>
     </div>
     <div class="kpi-card">
         <div class="kpi-value" id="kpiErrorRate">--</div>
+        <div class="kpi-change" id="kpiErrorRateChange"></div>
         <div class="kpi-label">Error Rate (%)</div>
     </div>
     <div class="kpi-card">
@@ -414,6 +490,13 @@ body {
     let retryDelay = 1000;
     let reconnectTimer = null;
     let anomalyPollTimer = null;
+    let selectedMinutes = 5;
+
+    // Previous-period KPI values for comparison
+    const prevKpi = {
+        responseTime: null,
+        errorRate: null,
+    };
 
     // Chart data arrays
     const chartData = {
@@ -613,6 +696,8 @@ body {
             var rtEl = document.getElementById('kpiResponseTime');
             rtEl.textContent = avgRt.toFixed(1);
             rtEl.className = 'kpi-value' + (avgRt > 500 ? ' danger' : avgRt > 200 ? ' warning' : '');
+            updateKpiChangeIndicator('kpiResponseTimeChange', avgRt, prevKpi.responseTime);
+            prevKpi.responseTime = avgRt;
         }
 
         // Error rate
@@ -628,6 +713,8 @@ body {
             var erEl = document.getElementById('kpiErrorRate');
             erEl.textContent = errorRate.toFixed(1);
             erEl.className = 'kpi-value' + (errorRate > 10 ? ' danger' : errorRate > 5 ? ' warning' : '');
+            updateKpiChangeIndicator('kpiErrorRateChange', errorRate, prevKpi.errorRate);
+            prevKpi.errorRate = errorRate;
         }
 
         // Update footer timestamp
@@ -657,6 +744,8 @@ body {
             var rtEl = document.getElementById('kpiResponseTime');
             rtEl.textContent = avgRt.toFixed(1);
             rtEl.className = 'kpi-value' + (avgRt > 500 ? ' danger' : avgRt > 200 ? ' warning' : '');
+            updateKpiChangeIndicator('kpiResponseTimeChange', avgRt, prevKpi.responseTime);
+            prevKpi.responseTime = avgRt;
         }
 
         var totalReq = 0;
@@ -671,6 +760,8 @@ body {
             var erEl = document.getElementById('kpiErrorRate');
             erEl.textContent = errorRate.toFixed(1);
             erEl.className = 'kpi-value' + (errorRate > 10 ? ' danger' : errorRate > 5 ? ' warning' : '');
+            updateKpiChangeIndicator('kpiErrorRateChange', errorRate, prevKpi.errorRate);
+            prevKpi.errorRate = errorRate;
         }
     }
 
@@ -845,12 +936,13 @@ body {
     // Initial data load via REST
     // ---------------------------------------------------------------
     async function loadInitialData() {
+        var service = document.getElementById('serviceSelector').value || 'web-api';
         var metrics = ['response_time', 'request_count', 'error_count'];
 
         for (var i = 0; i < metrics.length; i++) {
             var metric = metrics[i];
             try {
-                var resp = await fetch('/api/metrics/web-api/' + metric + '?minutes=60');
+                var resp = await fetch('/api/metrics/' + service + '/' + metric + '?minutes=' + selectedMinutes);
                 if (resp.ok) {
                     var data = await resp.json();
                     plotMetricData(metric, data);
@@ -926,9 +1018,77 @@ body {
         // Reload charts after generation
         setTimeout(function() {
             loadInitialData();
+            loadServices();
             pollAnomalies();
         }, 500);
     };
+
+    // ---------------------------------------------------------------
+    // Service selector
+    // ---------------------------------------------------------------
+    async function loadServices() {
+        try {
+            var resp = await fetch('/api/services');
+            if (resp.ok) {
+                var data = await resp.json();
+                var sel = document.getElementById('serviceSelector');
+                var current = sel.value;
+                sel.innerHTML = '';
+                data.services.forEach(function(s) {
+                    var opt = document.createElement('option');
+                    opt.value = s;
+                    opt.textContent = s;
+                    if (s === current) opt.selected = true;
+                    sel.appendChild(opt);
+                });
+                if (data.services.length > 0 && !data.services.includes(current)) {
+                    sel.value = data.services[0];
+                }
+            }
+        } catch (e) {
+            // Silently ignore
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // KPI comparison helper
+    // ---------------------------------------------------------------
+    function updateKpiChangeIndicator(elementId, currentValue, prevValue) {
+        var el = document.getElementById(elementId);
+        if (!el) return;
+        if (prevValue === null || prevValue === 0) {
+            el.textContent = '';
+            el.className = 'kpi-change';
+            return;
+        }
+        var pctChange = ((currentValue - prevValue) / prevValue) * 100;
+        var arrow, cssClass;
+        if (Math.abs(pctChange) < 0.1) {
+            el.textContent = '';
+            el.className = 'kpi-change';
+            return;
+        }
+        // For response time and error rate, down is good (green), up is bad (red)
+        if (pctChange > 0) {
+            arrow = '\u2191';
+            cssClass = 'kpi-change down'; // up = degradation = red
+        } else {
+            arrow = '\u2193';
+            cssClass = 'kpi-change up'; // down = improvement = green
+        }
+        el.textContent = arrow + Math.abs(pctChange).toFixed(1) + '%';
+        el.className = cssClass;
+    }
+
+    // ---------------------------------------------------------------
+    // Time range buttons
+    // ---------------------------------------------------------------
+    // (Attached after DOMContentLoaded in Init section)
+
+    // ---------------------------------------------------------------
+    // Export buttons
+    // ---------------------------------------------------------------
+    // (Attached after DOMContentLoaded in Init section)
 
     // ---------------------------------------------------------------
     // Init
@@ -936,11 +1096,39 @@ body {
     document.addEventListener('DOMContentLoaded', function() {
         initCharts();
         loadInitialData();
+        loadServices();
         connectWebSocket();
         pollAnomalies();
 
         // Poll anomalies every 30 seconds
         anomalyPollTimer = setInterval(pollAnomalies, 30000);
+
+        // Service selector change handler
+        document.getElementById('serviceSelector').addEventListener('change', function() {
+            loadInitialData();
+        });
+
+        // Time range button handlers
+        document.querySelectorAll('.time-btn').forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.time-btn').forEach(function(b) {
+                    b.classList.remove('active');
+                });
+                this.classList.add('active');
+                selectedMinutes = parseInt(this.dataset.minutes);
+                loadInitialData();
+            });
+        });
+
+        // Export button handlers
+        document.getElementById('exportCsvBtn').addEventListener('click', function() {
+            var service = document.getElementById('serviceSelector').value || 'web-api';
+            window.open('/api/export?service=' + service + '&metric_name=response_time&minutes=' + selectedMinutes + '&format=csv');
+        });
+        document.getElementById('exportJsonBtn').addEventListener('click', function() {
+            var service = document.getElementById('serviceSelector').value || 'web-api';
+            window.open('/api/export?service=' + service + '&metric_name=response_time&minutes=' + selectedMinutes + '&format=json');
+        });
     });
 
 })();

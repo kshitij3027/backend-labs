@@ -6,6 +6,8 @@
 * ``POST /api/generate-sample-data`` — generate and store sample data.
 * ``GET /api/metrics/{service}/{metric_name}`` — query metrics with trend.
 * ``GET /api/anomalies`` — query detected anomalies.
+* ``GET /api/services`` — list all known services.
+* ``GET /api/export`` — export metrics as CSV or JSON.
 * ``GET /api/ws-status`` — active WebSocket connection info.
 * ``WS /ws`` — WebSocket endpoint for real-time streaming.
 """
@@ -13,6 +15,8 @@
 from __future__ import annotations
 
 import asyncio
+import csv
+import io
 import logging
 import time
 from collections import defaultdict
@@ -21,8 +25,9 @@ from pathlib import Path
 from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import StreamingResponse
 
 from src.config import get_config
 from src.engine.anomalies import detect_anomalies
@@ -220,6 +225,59 @@ async def get_anomalies(
         count=len(anomalies),
         hours=hours,
     )
+
+
+@app.get("/api/services")
+async def get_services() -> dict:
+    """Return a list of all known service names."""
+    storage: RedisStorage = app.state.storage
+    services = await storage.get_services()
+    return {"services": services}
+
+
+@app.get("/api/export", response_model=None)
+async def export_metrics(
+    service: str = Query(..., description="Service name"),
+    metric_name: str = Query(..., description="Metric name"),
+    minutes: float = Query(default=60.0, gt=0, description="Time window in minutes"),
+    format: str = Query(default="json", description="Export format: json or csv"),
+):
+    """Export metrics for a service/metric as CSV or JSON file download."""
+    storage: RedisStorage = app.state.storage
+    now = time.time()
+    start_time = now - (minutes * 60)
+    end_time = now
+
+    data_points = await storage.get_metrics(service, metric_name, start_time, end_time)
+
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["timestamp", "value", "service", "metric_name", "tags"])
+        for p in data_points:
+            writer.writerow([p.timestamp, p.value, p.service, p.metric_name, str(p.tags)])
+        output.seek(0)
+
+        filename = f"{service}_{metric_name}_{int(minutes)}m.csv"
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+    else:
+        # JSON export
+        filename = f"{service}_{metric_name}_{int(minutes)}m.json"
+        json_data = {
+            "service": service,
+            "metric_name": metric_name,
+            "minutes": minutes,
+            "data_points": [p.model_dump() for p in data_points],
+            "count": len(data_points),
+        }
+        return JSONResponse(
+            content=json_data,
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
 
 
 @app.get("/api/ws-status")
