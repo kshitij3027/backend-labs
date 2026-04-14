@@ -19,7 +19,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.config import get_config
-from src.models import HealthResponse
+from src.ingestion import extract_metrics, generate_sample_logs
+from src.models import (
+    GenerateResponse,
+    HealthResponse,
+    IngestRequest,
+    IngestResponse,
+)
 from src.storage import RedisStorage
 
 logger = logging.getLogger(__name__)
@@ -68,6 +74,36 @@ async def health() -> HealthResponse:
     if storage is not None:
         connected = await storage.ping()
     return HealthResponse(status="healthy", redis_connected=connected)
+
+
+@app.post("/api/ingest", response_model=IngestResponse)
+async def ingest(request: IngestRequest) -> IngestResponse:
+    """Ingest raw log entries, extract metrics, and store them in Redis."""
+    storage: RedisStorage = app.state.storage
+    metrics = extract_metrics(request.logs)
+    await storage.store_metrics_batch(metrics)
+    return IngestResponse(
+        ingested=len(request.logs),
+        metrics_stored=len(metrics),
+        services=list({m.service for m in metrics}),
+    )
+
+
+@app.post("/api/generate-sample-data", response_model=GenerateResponse)
+async def generate_sample_data(
+    service: str = "web-api",
+    count: int = 50,
+) -> GenerateResponse:
+    """Generate sample log data, extract metrics, and store them in Redis."""
+    storage: RedisStorage = app.state.storage
+    logs = generate_sample_logs(service=service, count=count)
+    metrics = extract_metrics(logs)
+    await storage.store_metrics_batch(metrics)
+    return GenerateResponse(
+        logs_generated=len(logs),
+        metrics_stored=len(metrics),
+        services=[service],
+    )
 
 
 @app.get("/", response_class=HTMLResponse)

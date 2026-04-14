@@ -57,3 +57,19 @@ class AnomalyResponse(BaseModel):
     anomalies: list[AnomalyRecord]
     count: int
     hours: float
+
+
+class IngestRequest(BaseModel):
+    logs: list[LogEntry]
+
+
+class IngestResponse(BaseModel):
+    ingested: int
+    metrics_stored: int
+    services: list[str]
+
+
+class GenerateResponse(BaseModel):
+    logs_generated: int
+    metrics_stored: int
+    services: list[str]
