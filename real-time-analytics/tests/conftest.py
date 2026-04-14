@@ -31,8 +31,7 @@ async def fake_redis():
 @pytest.fixture
 async def storage(fake_redis):
     """Provide a RedisStorage instance backed by fakeredis."""
-    s = RedisStorage(client=fake_redis)
-    await s.connect()  # no-op since client is injected
+    s = RedisStorage(client=fake_redis, metric_ttl_seconds=3600)
     yield s
     await s.close()
 

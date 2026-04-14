@@ -32,7 +32,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build singletons and manage the Redis connection lifecycle."""
     config = get_config()
 
-    storage = RedisStorage(host=config.redis_host, port=config.redis_port)
+    storage = RedisStorage(
+        host=config.redis_host,
+        port=config.redis_port,
+        metric_ttl_seconds=config.metric_ttl_seconds,
+    )
     await storage.connect()
     app.state.storage = storage
 
