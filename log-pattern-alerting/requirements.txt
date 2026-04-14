@@ -1,0 +1,32 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+websockets==14.1
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.1
+psycopg2-binary==2.9.10
+
+# Redis
+redis==5.2.1
+
+# Validation & serialization
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# HTTP client (for webhook notifications)
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+httpx==0.28.1
+
+# Structured logging
+structlog==24.4.0
+
+# Utilities
+python-dateutil==2.9.0
