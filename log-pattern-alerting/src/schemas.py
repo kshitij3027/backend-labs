@@ -34,7 +34,7 @@ class AcknowledgeRequest(BaseModel):
 class StatsResponse(BaseModel):
     active_alerts: int
     total_patterns: int
-    alerts_by_severity: dict
+    alerts_by_severity: dict[str, int]
 
 
 class HealthResponse(BaseModel):

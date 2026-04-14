@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from src.api.alerts import router as alerts_router
 from src.api.health import router as health_router
 from src.config import get_settings
 from src.models import Base
@@ -80,4 +81,5 @@ app.add_middleware(
 )
 
 # Include routers
+app.include_router(alerts_router, prefix="", tags=["alerts"])
 app.include_router(health_router)
