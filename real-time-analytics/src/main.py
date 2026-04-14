@@ -1,30 +1,37 @@
 """FastAPI entrypoint for the real-time analytics dashboard.
 
-Commit 1 scope: minimal skeleton with health check, Redis storage
-wiring via lifespan, and static file serving.
-
 * ``GET /`` — serves the dashboard HTML from ``static/index.html``.
 * ``GET /health`` — liveness probe returning Redis connectivity status.
+* ``POST /api/ingest`` — ingest logs, extract metrics, detect anomalies.
+* ``POST /api/generate-sample-data`` — generate and store sample data.
+* ``GET /api/metrics/{service}/{metric_name}`` — query metrics with trend.
+* ``GET /api/anomalies`` — query detected anomalies.
 """
 
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.config import get_config
+from src.engine.anomalies import detect_anomalies
+from src.engine.trends import calculate_trend
 from src.ingestion import extract_metrics, generate_sample_logs
 from src.models import (
+    AnomalyResponse,
     GenerateResponse,
     HealthResponse,
     IngestRequest,
     IngestResponse,
+    MetricResponse,
 )
 from src.storage import RedisStorage
 
@@ -78,14 +85,29 @@ async def health() -> HealthResponse:
 
 @app.post("/api/ingest", response_model=IngestResponse)
 async def ingest(request: IngestRequest) -> IngestResponse:
-    """Ingest raw log entries, extract metrics, and store them in Redis."""
+    """Ingest raw log entries, extract metrics, detect anomalies, and store."""
     storage: RedisStorage = app.state.storage
+    config = get_config()
     metrics = extract_metrics(request.logs)
     await storage.store_metrics_batch(metrics)
+
+    # Group metrics by (service, metric_name) and run anomaly detection
+    anomalies_detected = 0
+    groups: dict[tuple[str, str], list] = defaultdict(list)
+    for m in metrics:
+        groups[(m.service, m.metric_name)].append(m)
+
+    for (service, metric_name), group_points in groups.items():
+        anomalies = detect_anomalies(group_points, threshold=config.anomaly_zscore_threshold)
+        for anomaly in anomalies:
+            await storage.store_anomaly(anomaly)
+        anomalies_detected += len(anomalies)
+
     return IngestResponse(
         ingested=len(request.logs),
         metrics_stored=len(metrics),
         services=list({m.service for m in metrics}),
+        anomalies_detected=anomalies_detected,
     )
 
 
@@ -103,6 +125,58 @@ async def generate_sample_data(
         logs_generated=len(logs),
         metrics_stored=len(metrics),
         services=[service],
+    )
+
+
+@app.get("/api/metrics/{service}/{metric_name}", response_model=MetricResponse)
+async def get_metrics(
+    service: str,
+    metric_name: str,
+    minutes: float = Query(default=60.0, gt=0, description="Time window in minutes"),
+    include_trend: bool = Query(default=True, description="Include trend analysis"),
+) -> MetricResponse:
+    """Query stored metrics for a service/metric_name with optional trend analysis."""
+    storage: RedisStorage = app.state.storage
+    config = get_config()
+    now = time.time()
+    start_time = now - (minutes * 60)
+    end_time = now
+
+    data_points = await storage.get_metrics(service, metric_name, start_time, end_time)
+
+    trend = None
+    if include_trend and data_points:
+        trend = calculate_trend(data_points, window_minutes=config.trend_window_minutes)
+
+    return MetricResponse(
+        service=service,
+        metric_name=metric_name,
+        data_points=data_points,
+        count=len(data_points),
+        trend=trend,
+    )
+
+
+@app.get("/api/anomalies", response_model=AnomalyResponse)
+async def get_anomalies(
+    hours: float = Query(default=1.0, gt=0, description="Lookback window in hours"),
+    service: Optional[str] = Query(default=None, description="Filter by service name"),
+    threshold: Optional[float] = Query(default=None, gt=0, description="Z-score threshold filter"),
+) -> AnomalyResponse:
+    """Query detected anomalies with optional service and threshold filters."""
+    storage: RedisStorage = app.state.storage
+    anomalies = await storage.get_anomalies(hours=hours)
+
+    if service is not None:
+        anomalies = [a for a in anomalies if a.service == service]
+
+    if threshold is not None:
+        anomalies = [a for a in anomalies if abs(a.z_score) >= threshold]
+
+    return AnomalyResponse(
+        anomalies=anomalies,
+        count=len(anomalies),
+        hours=hours,
     )
 
 

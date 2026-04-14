@@ -67,6 +67,7 @@ class IngestResponse(BaseModel):
     ingested: int
     metrics_stored: int
     services: list[str]
+    anomalies_detected: int = 0
 
 
 class GenerateResponse(BaseModel):
