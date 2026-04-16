@@ -113,6 +113,21 @@ def main():
     data = r.json()
     check("results limited to 1", len(data["results"]) <= 1)
 
+    print("\n=== 8. Frontend ===")
+    try:
+        frontend_url = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+        fc = httpx.Client(base_url=frontend_url, timeout=10.0)
+        r = fc.get("/")
+        check("frontend serves HTML", r.status_code == 200)
+        check("frontend has React root", '<div id="root">' in r.text or 'id="root"' in r.text)
+
+        # Verify proxy works
+        r = fc.get("/health")
+        check("frontend proxies /health", r.status_code == 200 and "healthy" in r.text)
+        fc.close()
+    except Exception as e:
+        check("frontend accessible", False, str(e))
+
     # Summary
     print(f"\n{'=' * 40}")
     print(f"Results: {PASSED} passed, {FAILED} failed")

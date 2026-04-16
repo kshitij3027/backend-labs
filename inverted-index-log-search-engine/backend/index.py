@@ -98,6 +98,18 @@ class InvertedIndex:
         """Return a *copy* of the posting list for *term* (or empty list)."""
         return list(self._postings.get(term.lower(), []))
 
+    def get_posting_list_raw(self, term: str) -> List[Tuple[int, List[int]]]:
+        """Return a *reference* to the internal posting list for *term*.
+
+        This avoids the copy overhead of ``get_posting_list`` and is safe
+        for read-only iteration (e.g. AND-intersection, scoring).  Callers
+        must **never** mutate the returned list.
+
+        Returns the internal list directly, or an empty list (singleton)
+        if the term is absent.
+        """
+        return self._postings.get(term.lower(), [])
+
     def get_document(self, doc_id: int) -> Optional[DocumentMeta]:
         """Return the metadata for *doc_id*, or ``None`` if not found."""
         return self._documents.get(doc_id)

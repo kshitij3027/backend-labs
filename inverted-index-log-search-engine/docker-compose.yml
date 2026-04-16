@@ -38,9 +38,12 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+      frontend:
+        condition: service_started
     profiles: ["e2e"]
     environment:
       - BACKEND_URL=http://backend:8000
+      - FRONTEND_URL=http://frontend:80
 
   loadtest:
     build:

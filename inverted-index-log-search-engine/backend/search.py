@@ -1,5 +1,6 @@
 """Search engine with TF-IDF scoring and AND-intersection semantics."""
 
+import heapq
 import math
 import re
 import time
@@ -26,82 +27,79 @@ class SearchEngine:
     # ------------------------------------------------------------------
 
     def search(self, query: str, limit: int = 100) -> SearchResponse:
-        """Execute a search query and return ranked results.
-
-        Parameters
-        ----------
-        query:
-            Free-text search string.  Tokenized with the same pipeline as
-            indexed documents.
-        limit:
-            Maximum number of results to return.
-
-        Returns
-        -------
-        SearchResponse
-            Ranked results with TF-IDF scores and timing information.
-        """
         start = time.perf_counter()
 
-        # Empty / whitespace query -> empty response
         if not query or not query.strip():
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return SearchResponse(
-                results=[],
-                total_results=0,
-                search_time_ms=elapsed_ms,
-                query=query,
-            )
+            return self._empty_response(start, query)
 
         terms = self._tokenizer.tokenize(query)
         if not terms:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return SearchResponse(
-                results=[],
-                total_results=0,
-                search_time_ms=elapsed_ms,
-                query=query,
-            )
+            return self._empty_response(start, query)
 
-        # Gather posting lists for every query term
+        # Single-term fast path: skip intersection overhead entirely
+        if len(terms) == 1:
+            return self._search_single_term(terms[0], terms, limit, start, query)
+
+        return self._search_multi_term(terms, limit, start, query)
+
+    def _empty_response(self, start: float, query: str) -> SearchResponse:
+        return SearchResponse(
+            results=[],
+            total_results=0,
+            search_time_ms=(time.perf_counter() - start) * 1000,
+            query=query,
+        )
+
+    def _search_single_term(
+        self, term: str, terms: list[str], limit: int, start: float, query: str
+    ) -> SearchResponse:
+        """Optimized path for single-term queries — no intersection needed."""
+        postings = self._index.get_posting_list_raw(term)
+        if not postings:
+            return self._empty_response(start, query)
+
+        total_docs = self._index.get_total_documents()
+        df = self._index.get_term_doc_frequency(term)
+        idf = math.log(total_docs / df) if df > 0 else 0.0
+
+        _get_doc = self._index.get_document
+        total_results = len(postings)
+
+        # Score inline and use heapq for top-K (avoids sorting full list)
+        def _scored_iter():
+            for doc_id, positions in postings:
+                doc = _get_doc(doc_id)
+                if doc is None:
+                    continue
+                tf = len(positions) / doc.term_count if doc.term_count > 0 else 0.0
+                score = tf * idf
+                yield score, doc.timestamp, doc_id
+
+        top_k = heapq.nlargest(limit, _scored_iter(), key=lambda s: (s[0], s[1]))
+
+        return self._build_response(top_k, terms, total_results, start, query)
+
+    def _search_multi_term(
+        self, terms: list[str], limit: int, start: float, query: str
+    ) -> SearchResponse:
+        """Multi-term search with AND intersection and TF-IDF scoring."""
         posting_lists = []
         for term in terms:
-            postings = self._index.get_posting_list(term)
+            postings = self._index.get_posting_list_raw(term)
             if not postings:
-                # AND semantics: if any term is absent, no documents match
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                return SearchResponse(
-                    results=[],
-                    total_results=0,
-                    search_time_ms=elapsed_ms,
-                    query=query,
-                )
+                return self._empty_response(start, query)
             posting_lists.append((term, postings))
 
-        # ----------------------------------------------------------
-        # AND intersection: sort posting lists smallest-first, then
-        # keep only doc_ids present in every list.
-        # ----------------------------------------------------------
         posting_lists.sort(key=lambda tp: len(tp[1]))
 
-        # Seed with doc_ids from the smallest posting list
+        # AND intersection using sets
         candidate_ids = {doc_id for doc_id, _ in posting_lists[0][1]}
-
         for _, postings in posting_lists[1:]:
-            other_ids = {doc_id for doc_id, _ in postings}
-            candidate_ids &= other_ids
+            candidate_ids &= {doc_id for doc_id, _ in postings}
             if not candidate_ids:
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                return SearchResponse(
-                    results=[],
-                    total_results=0,
-                    search_time_ms=elapsed_ms,
-                    query=query,
-                )
+                return self._empty_response(start, query)
 
-        # ----------------------------------------------------------
-        # Build a lookup: doc_id -> { term -> positions } for scoring
-        # ----------------------------------------------------------
+        # Build position lookup only for candidates
         term_postings_by_doc: dict[int, dict[str, list[int]]] = {}
         for term, postings in posting_lists:
             for doc_id, positions in postings:
@@ -109,45 +107,53 @@ class SearchEngine:
                     term_postings_by_doc.setdefault(doc_id, {})[term] = positions
 
         total_docs = self._index.get_total_documents()
+        _log = math.log
+        idf_cache = {}
+        for term, _ in posting_lists:
+            df = self._index.get_term_doc_frequency(term)
+            idf_cache[term] = _log(total_docs / df) if df > 0 else 0.0
 
-        # ----------------------------------------------------------
-        # Score each candidate document using TF-IDF
-        # ----------------------------------------------------------
-        scored: list[tuple[float, float, int]] = []
-        for doc_id in candidate_ids:
-            doc = self._index.get_document(doc_id)
-            if doc is None:
-                continue
+        _get_doc = self._index.get_document
+        total_results = len(candidate_ids)
 
-            score = 0.0
-            term_positions = term_postings_by_doc.get(doc_id, {})
+        def _scored_iter():
+            for doc_id in candidate_ids:
+                doc = _get_doc(doc_id)
+                if doc is None:
+                    continue
+                score = 0.0
+                tp = term_postings_by_doc.get(doc_id, {})
+                inv_tc = 1.0 / doc.term_count if doc.term_count > 0 else 0.0
+                for term, _ in posting_lists:
+                    positions = tp.get(term, [])
+                    score += len(positions) * inv_tc * idf_cache[term]
+                yield score, doc.timestamp, doc_id
 
-            for term, _ in posting_lists:
-                positions = term_positions.get(term, [])
-                # TF = positions count / total unique terms in document
-                tf = len(positions) / doc.term_count if doc.term_count > 0 else 0.0
-                # IDF = log(N / df)
-                df = self._index.get_term_doc_frequency(term)
-                idf = math.log(total_docs / df) if df > 0 else 0.0
-                score += tf * idf
+        top_k = heapq.nlargest(limit, _scored_iter(), key=lambda s: (s[0], s[1]))
 
-            scored.append((score, doc.timestamp, doc_id))
+        return self._build_response(top_k, terms, total_results, start, query)
 
-        # Sort: highest score first, then newest timestamp first (tiebreaker)
-        scored.sort(key=lambda s: (-s[0], -s[1]))
+    def _build_response(
+        self,
+        scored: list[tuple[float, float, int]],
+        terms: list[str],
+        total_results: int,
+        start: float,
+        query: str,
+    ) -> SearchResponse:
+        """Build SearchResponse from scored tuples — highlight only final set."""
+        escaped = [re.escape(t) for t in terms]
+        highlight_pattern = re.compile("|".join(escaped), re.IGNORECASE)
+        _get_doc = self._index.get_document
 
-        total_results = len(scored)
-        scored = scored[:limit]
-
-        # ----------------------------------------------------------
-        # Build response objects with highlighting
-        # ----------------------------------------------------------
-        results: list[SearchResult] = []
+        results = []
         for score, _, doc_id in scored:
-            doc = self._index.get_document(doc_id)
+            doc = _get_doc(doc_id)
             if doc is None:
                 continue
-            highlighted = self.highlight(doc.message, terms)
+            highlighted = highlight_pattern.sub(
+                lambda m: f"<mark>{m.group()}</mark>", doc.message
+            )
             results.append(
                 SearchResult(
                     doc_id=doc_id,
