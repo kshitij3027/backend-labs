@@ -1,0 +1,48 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - index-data:/app/storage
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["python", "-m", "scripts.verify_e2e"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    profiles: ["e2e"]
+    environment:
+      - BACKEND_URL=http://backend:8000
+
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    command: ["python", "-m", "scripts.load_test"]
+    depends_on:
+      backend:
+        condition: service_healthy
+    profiles: ["loadtest"]
+    environment:
+      - BACKEND_URL=http://backend:8000
+
+volumes:
+  index-data:
