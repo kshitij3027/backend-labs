@@ -67,6 +67,31 @@ services:
       redis:
         condition: service_healthy
 
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    environment:
+      COORDINATOR_PORT: "8000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      VIRTUAL_NODES: "100"
+      REQUEST_TIMEOUT: "5.0"
+      NODE_URLS: "node-1=http://node-1:8101,node-2=http://node-2:8102,node-3=http://node-3:8103,node-4=http://node-4:8104"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      node-1:
+        condition: service_healthy
+      node-2:
+        condition: service_healthy
+      node-3:
+        condition: service_healthy
+      node-4:
+        condition: service_healthy
+
   test:
     build:
       context: .
@@ -77,5 +102,5 @@ services:
     environment:
       PYTHONPATH: /app
     depends_on:
-      redis:
-        condition: service_healthy
+      - redis
+      - coordinator
