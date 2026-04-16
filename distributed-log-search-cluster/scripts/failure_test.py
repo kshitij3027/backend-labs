@@ -73,12 +73,15 @@ async def main() -> None:
         # Vary the query each iteration so coordinator result cache never
         # serves a stale entry — we need every request to actually hit the
         # scatter-gather path so partial-failure behavior is observable.
-        # Pairs of words spanning the full vocabulary — guarantees queries
-        # route to every node in the ring (including the target node that
-        # is taken down mid-run), making partial failure observable.
+        # Every 2-word pair spanning the full vocabulary — 1500+ unique
+        # queries to outrun the coordinator's 60s result cache during the
+        # outage window, so every request genuinely scatters and any
+        # partial failure is visible in the response.
         query_pool = [
-            f"{_WORDS[i]} {_WORDS[(i + 7) % len(_WORDS)]}"
+            f"{_WORDS[i]} {_WORDS[j]}"
             for i in range(len(_WORDS))
+            for j in range(len(_WORDS))
+            if i != j
         ]
         while time.monotonic() < t_end:
             q = query_pool[iteration % len(query_pool)]
