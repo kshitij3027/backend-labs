@@ -1,5 +1,7 @@
 """FastAPI application for the inverted index log search engine."""
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query
@@ -18,25 +20,60 @@ from backend.tokenizer import LogTokenizer
 from backend.index import InvertedIndex
 from backend.search import SearchEngine
 from backend.sample_data import generate_sample_logs
+from backend.persistence import IndexPersistence
+
+logger = logging.getLogger(__name__)
+
+
+async def _periodic_flush(
+    index: InvertedIndex, persistence: IndexPersistence
+) -> None:
+    """Background task to periodically save the index."""
+    while True:
+        await asyncio.sleep(settings.FLUSH_INTERVAL)
+        try:
+            persistence.save(index)
+            logger.debug("Index flushed to disk")
+        except Exception as e:
+            logger.error(f"Failed to flush index: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler for startup/shutdown."""
-    # Startup: create core components and seed with sample data
+    # Startup: create core components
     tokenizer = LogTokenizer()
     index = InvertedIndex(tokenizer)
     search_engine = SearchEngine(index, tokenizer)
+    persistence = IndexPersistence(settings.STORAGE_DIR)
 
     app.state.tokenizer = tokenizer
     app.state.index = index
     app.state.search_engine = search_engine
+    app.state.persistence = persistence
 
-    sample_logs = generate_sample_logs(10)
-    await index.add_documents_bulk(sample_logs)
+    # Try to load persisted index
+    if persistence.load(index):
+        logger.info(f"Loaded {index.get_total_documents()} documents from disk")
+    else:
+        # No persisted index, generate sample data
+        sample_logs = generate_sample_logs(10)
+        await index.add_documents_bulk(sample_logs)
+        logger.info(f"Generated {len(sample_logs)} sample documents")
+
+    # Start background flush task
+    flush_task = asyncio.create_task(_periodic_flush(index, persistence))
 
     yield
-    # Shutdown: nothing to clean up yet
+
+    # Shutdown: cancel flush task, save final state
+    flush_task.cancel()
+    try:
+        await flush_task
+    except asyncio.CancelledError:
+        pass
+    persistence.save(index)
+    logger.info("Index saved to disk")
 
 
 app = FastAPI(
