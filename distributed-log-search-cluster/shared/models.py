@@ -78,6 +78,7 @@ class SearchResponse(BaseModel):
     routing_ms: float = 0.0
     scatter_ms: float = 0.0
     merge_ms: float = 0.0
+    cached: bool = False
 
 
 class HealthResponse(BaseModel):

@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import ConnectionPool, Redis
 
+from coordinator.cache import ResultCache
 from coordinator.cluster import ClusterRegistry
 from coordinator.http_client import close_client, get_client
 from coordinator.indexer import Indexer
@@ -43,13 +44,23 @@ def create_app(settings: CoordinatorSettings | None = None) -> FastAPI:
         )
         redis = Redis(connection_pool=pool)
 
+        cache = ResultCache(size=settings.cache_size, ttl=settings.cache_ttl)
+
         app.state.registry = registry
         app.state.ring = ring
         app.state.tokenizer = tokenizer
         app.state.client = client
         app.state.redis = redis
+        app.state.cache = cache
         app.state.planner = QueryPlanner(
-            registry, ring, tokenizer, client, redis
+            registry,
+            ring,
+            tokenizer,
+            client,
+            redis,
+            cache=cache,
+            retry_count=settings.retry_count,
+            retry_base_delay=settings.retry_base_delay,
         )
         app.state.indexer = Indexer(registry, ring, tokenizer, client, redis)
         app.state.settings = settings

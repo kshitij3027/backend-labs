@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 import httpx
 
+from coordinator.retry import retry_async
 from shared.models import (
     PostingEntry,
     SearchRequest,
@@ -37,12 +38,18 @@ class QueryPlanner:
         tokenizer: Any,
         client: httpx.AsyncClient | None,
         shared_redis: Any,
+        cache: Any = None,
+        retry_count: int = 3,
+        retry_base_delay: float = 0.1,
     ) -> None:
         self.registry = registry
         self.ring = ring
         self.tokenizer = tokenizer
         self.client = client
         self.redis = shared_redis
+        self.cache = cache
+        self.retry_count = retry_count
+        self.retry_base_delay = retry_base_delay
 
     # ------------------------------------------------------------------
     # Doc hydration
@@ -95,7 +102,26 @@ class QueryPlanner:
             if base is None:
                 raise RuntimeError(f"unknown node_id: {node_id}")
             url = base.rstrip("/") + "/search_terms"
-            return await self.client.post(url, json={"terms": terms})
+
+            async def _do() -> Any:
+                resp = await self.client.post(url, json={"terms": terms})
+                # Treat 5xx as retryable failures.
+                if resp.status_code >= 500:
+                    raise httpx.HTTPStatusError(
+                        f"server error {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                return resp
+
+            try:
+                return await retry_async(
+                    _do,
+                    attempts=self.retry_count,
+                    base_delay=self.retry_base_delay,
+                )
+            except Exception as e:
+                return e
 
         tasks = [_call(nid, term_groups[nid]) for nid in node_ids]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -218,6 +244,17 @@ class QueryPlanner:
     async def search(self, req: SearchRequest) -> SearchResponse:
         t0 = time.perf_counter()
 
+        # Cache lookup (only successful previous responses are cached)
+        if self.cache is not None:
+            cached = self.cache.get(req)
+            if cached is not None:
+                return cached.model_copy(
+                    update={
+                        "cached": True,
+                        "search_time_ms": (time.perf_counter() - t0) * 1000,
+                    }
+                )
+
         terms = self.tokenizer.tokenize(req.query) if self.tokenizer else []
         if not terms:
             return SearchResponse(
@@ -262,7 +299,7 @@ class QueryPlanner:
         merge_ms = (time.perf_counter() - t_merge) * 1000
 
         search_time_ms = (time.perf_counter() - t0) * 1000
-        return SearchResponse(
+        response = SearchResponse(
             documents=items,
             total_results=len(scored),
             search_time_ms=search_time_ms,
@@ -271,4 +308,9 @@ class QueryPlanner:
             routing_ms=routing_ms,
             scatter_ms=scatter_ms,
             merge_ms=merge_ms,
+            cached=False,
         )
+        # Only cache successful, complete responses.
+        if self.cache is not None and not failed:
+            self.cache.put(req, response)
+        return response

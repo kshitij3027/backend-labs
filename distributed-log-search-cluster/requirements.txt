@@ -7,5 +7,6 @@ pytest>=8.0.0
 pytest-asyncio>=0.23.0
 pydantic-settings>=2.0.0
 redis>=5.0.0
+cachetools>=5.3.0
 fakeredis>=2.21.0
 respx>=0.21.0
