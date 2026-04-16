@@ -7,6 +7,66 @@ services:
       timeout: 3s
       retries: 5
 
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-1
+      NODE_PORT: "8101"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8101:8101"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  node-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-2
+      NODE_PORT: "8102"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8102:8102"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  node-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-3
+      NODE_PORT: "8103"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8103:8103"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  node-4:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-4
+      NODE_PORT: "8104"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    ports:
+      - "8104:8104"
+    depends_on:
+      redis:
+        condition: service_healthy
+
   test:
     build:
       context: .
