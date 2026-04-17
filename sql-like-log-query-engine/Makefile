@@ -13,15 +13,18 @@ test:
 	docker compose run --rm test pytest -v
 
 e2e:
-	docker compose run --rm test python scripts/demo.py
+	./start.sh && docker compose run --rm test python scripts/demo.py && ./stop.sh
 
-demo: e2e
+demo:
+	docker compose run --rm test python scripts/demo.py
 
 load:
 	docker compose run --rm test python scripts/load_test.py --concurrent-users 20 --duration 30 --target-url http://coordinator:8000
 
 ui:
-	@echo "UI at http://localhost:8000 once coordinator is up"
+	@command -v open >/dev/null 2>&1 && open http://localhost:8000/ \
+		|| command -v xdg-open >/dev/null 2>&1 && xdg-open http://localhost:8000/ \
+		|| echo "Open http://localhost:8000"
 
 logs:
 	docker compose logs -f
