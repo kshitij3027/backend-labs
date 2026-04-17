@@ -53,9 +53,12 @@ class QueryPlanner:
     1. **Partition pruning** — inspect WHERE for time-range predicates on
        ``timestamp``/``ts`` and drop any partition whose ``time_range``
        cannot intersect the resulting interval.
-    2. **Predicate pushdown** — strip the time predicates out of WHERE and
-       hand the remaining expression to each surviving partition as a
-       serialized AST, so filtering runs at the storage layer.
+    2. **Predicate pushdown** — hand the full WHERE expression to each
+       surviving partition as a serialized AST, so filtering runs at the
+       storage layer. Time predicates are kept in the pushed-down filter
+       because a partition's ``time_range`` can partially overlap the
+       query bound; the partition executor still needs to apply the
+       predicate row-by-row (it uses a timestamp index for efficiency).
     3. **Aggregation distribution** — when the query has aggregate functions
        or a GROUP BY, emit per-partition partial aggregations plus a single
        coordinator-side global aggregation merge step.
@@ -89,10 +92,16 @@ class QueryPlanner:
         )
 
         # ---- (2) Predicate pushdown ------------------------------------
-        stripped_where = _strip_time_predicates(ast_root.where, bound.valid)
+        # Push the full WHERE subtree down to every surviving partition.
+        # Partition pruning at the coordinator is only an optimization: when
+        # a partition's time_range *partially* overlaps the query bound, the
+        # time predicate still has to be evaluated per-row at the partition
+        # (the partition executor already handles timestamp comparisons, and
+        # uses a timestamp index for efficiency). Stripping time predicates
+        # here was incorrect and let out-of-bound rows leak through.
         pushed_filter: dict[str, Any] | None = (
-            {"ast": serialize_ast(stripped_where)}
-            if stripped_where is not None
+            {"ast": serialize_ast(ast_root.where)}
+            if ast_root.where is not None
             else None
         )
         notes.append("Predicate pushdown: WHERE conditions pushed to storage layer")
@@ -442,68 +451,6 @@ def _strip_tz(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt
     return dt.astimezone(timezone.utc).replace(tzinfo=None)
-
-
-# --- predicate stripping ----------------------------------------------------
-
-
-def _strip_time_predicates(
-    where: ast.Expr | None, bound_valid: bool
-) -> ast.Expr | None:
-    """Remove any time-column predicates from WHERE.
-
-    - If ``bound_valid`` is False (we couldn't safely prune — OR/NOT case),
-      we leave the expression untouched. The partition still needs to
-      evaluate the full WHERE, including the time predicate.
-    - Otherwise, every leaf touching the time column is replaced with
-      ``None`` and the AND-tree is rebuilt around the survivors.
-    """
-
-    if where is None:
-        return None
-    if not bound_valid:
-        return where
-    return _strip_walk(where)
-
-
-def _strip_walk(expr: ast.Expr) -> ast.Expr | None:
-    """Recursively drop time-touching leaves inside an AND tree."""
-
-    if isinstance(expr, ast.BinOp) and expr.op == "AND":
-        left = _strip_walk(expr.left)
-        right = _strip_walk(expr.right)
-        if left is None and right is None:
-            return None
-        if left is None:
-            return right
-        if right is None:
-            return left
-        return ast.BinOp(op="AND", left=left, right=right)
-
-    # Don't recurse into OR / NOT — those are treated as opaque by pruning
-    # (and bound_valid would be False in the first place if they touched
-    # time). Leave them intact.
-    if isinstance(expr, ast.BinOp) and expr.op == "OR":
-        return expr
-    if isinstance(expr, ast.Not):
-        return expr
-
-    # Leaf predicate.
-    if _leaf_is_time(expr):
-        return None
-    return expr
-
-
-def _leaf_is_time(expr: ast.Expr) -> bool:
-    if isinstance(expr, ast.BinOp) and expr.op in _COMPARISON_OPS:
-        return _is_time_ident(expr.left)
-    if isinstance(expr, ast.Between):
-        return _is_time_ident(expr.field)
-    if isinstance(expr, ast.In):
-        return _is_time_ident(expr.field)
-    if isinstance(expr, ast.Contains):
-        return _is_time_ident(expr.field)
-    return False
 
 
 # --- aggregation detection --------------------------------------------------

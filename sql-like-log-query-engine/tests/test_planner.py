@@ -116,7 +116,7 @@ def test_or_disables_pruning(sample_partitions):
 # ---------------------------------------------------------------------------
 
 
-def test_predicate_pushdown_attaches_non_time_subtree(sample_partitions):
+def test_predicate_pushdown_attaches_full_where(sample_partitions):
     plan, _ = _plan_sql(
         "SELECT * FROM logs WHERE level = 'ERROR' AND timestamp > '2026-04-15'",
         sample_partitions,
@@ -132,7 +132,10 @@ def test_predicate_pushdown_attaches_non_time_subtree(sample_partitions):
     assert filter_step.filter is not None
     assert "ast" in filter_step.filter
 
-    # The remaining AST should contain the level='ERROR' predicate...
+    # The pushed-down AST must contain BOTH the non-time predicate AND the
+    # time predicate. Partition-level pruning is just an optimization; when
+    # a partition partially overlaps the bound, the time predicate still
+    # has to be applied per-row by the partition executor.
     serialized = filter_step.filter["ast"]
     # must be valid JSON (no tuples / datetimes)
     json.dumps(serialized)
@@ -140,22 +143,30 @@ def test_predicate_pushdown_attaches_non_time_subtree(sample_partitions):
     text = json.dumps(serialized)
     assert '"level"' in text
     assert "ERROR" in text
-    # ... but NOT the timestamp > predicate.
-    assert "timestamp" not in text.lower()
+    # ... and the timestamp > predicate is preserved too.
+    assert "timestamp" in text.lower()
+    assert "2026-04-15" in text
 
     # And the pushdown note must be present.
     notes = plan.optimization_notes
     assert any("Predicate pushdown" in n for n in notes)
 
 
-def test_pushdown_reduces_to_none_when_only_time_filter(sample_partitions):
+def test_pushdown_passes_time_only_filter(sample_partitions):
     plan, _ = _plan_sql(
         "SELECT * FROM logs WHERE timestamp > '2026-04-15'", sample_partitions
     )
     parts = _partition_steps(plan)
     assert parts, "expected at least one partition step"
-    # After stripping the solitary time predicate, no filter should remain.
-    assert parts[0].filter is None
+    # The time predicate is the sole WHERE — it must still be pushed down
+    # so partitions whose time_range partially overlaps the bound can
+    # filter out rows that fall outside it.
+    filter_step = parts[0]
+    assert filter_step.filter is not None
+    assert "ast" in filter_step.filter
+    text = json.dumps(filter_step.filter["ast"])
+    assert "timestamp" in text.lower()
+    assert "2026-04-15" in text
 
 
 def test_serialize_ast_handles_all_node_kinds():
@@ -236,12 +247,17 @@ def test_combined_where_and_group_by(sample_partitions):
     assert len(partial) == 2  # one per surviving partition
     assert len(global_agg) == 1
 
-    # Each partial step has the aggregation spec but no remaining filter
-    # (time predicate was the only WHERE; it's been stripped).
+    # Each partial step carries the aggregation spec AND the time predicate
+    # as its pushed-down filter. Partition-2 partially overlaps the bound
+    # so we still need row-level filtering on ``timestamp > '2026-04-08'``.
     for step in partial:
         assert step.aggregation["group_by"] == ["level"]
         assert ["COUNT", "*"] in step.aggregation["functions"]
-        assert step.filter is None
+        assert step.filter is not None
+        assert "ast" in step.filter
+        blob = json.dumps(step.filter["ast"])
+        assert "timestamp" in blob.lower()
+        assert "2026-04-08" in blob
 
     assert global_agg[0].aggregation["group_by"] == ["level"]
 
@@ -261,9 +277,13 @@ def test_combined_where_and_group_by_retains_non_time_filter(sample_partitions):
         assert step.filter is not None
         assert "ast" in step.filter
         blob = json.dumps(step.filter["ast"])
+        # Non-time predicate is preserved.
         assert "service" in blob
         assert "api" in blob
-        assert "timestamp" not in blob.lower()
+        # And the time predicate is preserved alongside it — partitions
+        # with partial overlap need it for correctness.
+        assert "timestamp" in blob.lower()
+        assert "2026-04-08" in blob
 
 
 # ---------------------------------------------------------------------------
