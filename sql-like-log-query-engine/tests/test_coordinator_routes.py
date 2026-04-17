@@ -275,14 +275,27 @@ def test_explain_invalid_sql_returns_400(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# root placeholder
+# root UI
 # ---------------------------------------------------------------------------
 
 
-def test_root_returns_501(client: TestClient) -> None:
+def test_root_serves_ui_html(client: TestClient) -> None:
+    """GET / returns the single-page UI — or, if the template directory
+    didn't get mounted onto ``app.state.templates`` (which happens in the
+    bare ``_build_test_app`` factory used by these tests), the fallback
+    HTML stub. Either way the response is HTML and contains the sentinel
+    elements the Chrome smoke test looks for.
+    """
+
     resp = client.get("/")
-    assert resp.status_code == 501
-    assert resp.json()["detail"] == "UI coming in commit 7"
+    assert resp.status_code == 200
+    content_type = resp.headers.get("content-type", "")
+    assert "text/html" in content_type
+    body = resp.text
+    assert '<textarea id="sql"' in body
+    # Button labels — either from the real template or the fallback stub.
+    assert "Run" in body
+    assert "Explain" in body
 
 
 # ---------------------------------------------------------------------------

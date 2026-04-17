@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title | default("Distributed SQL Log Query Engine") }}</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1 class="topbar__title">Distributed SQL Log Query Engine</h1>
+      <div class="topbar__right">
+        <span
+          id="health-pill"
+          class="health-pill health-pill--unknown"
+          title="Coordinator + partition health"
+        >
+          health: unknown
+        </span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="editor-panel" aria-label="SQL editor">
+        <div class="editor-panel__head">
+          <h2>Query</h2>
+          <div class="sample-buttons">
+            <button
+              type="button"
+              class="sample-btn"
+              data-sample="SELECT service, COUNT(*) AS error_count FROM logs WHERE level = 'ERROR' GROUP BY service ORDER BY error_count DESC LIMIT 10"
+            >
+              Errors by service
+            </button>
+            <button
+              type="button"
+              class="sample-btn"
+              data-sample="SELECT * FROM logs WHERE message CONTAINS 'timeout' LIMIT 20"
+            >
+              Text search
+            </button>
+            <button
+              type="button"
+              class="sample-btn"
+              data-sample="SELECT * FROM logs WHERE timestamp > '2026-04-15' LIMIT 20"
+            >
+              Temporal window
+            </button>
+          </div>
+        </div>
+        <textarea
+          id="sql"
+          name="sql"
+          rows="12"
+          spellcheck="false"
+          placeholder="SELECT * FROM logs WHERE level = 'ERROR' LIMIT 20"
+        >SELECT service, COUNT(*) AS error_count FROM logs WHERE level = 'ERROR' GROUP BY service ORDER BY error_count DESC LIMIT 10</textarea>
+        <div class="editor-panel__actions">
+          <button id="run-btn" type="button" class="btn btn--primary">
+            Run
+          </button>
+          <button id="explain-btn" type="button" class="btn">Explain</button>
+          <span id="status-line" class="status-line"></span>
+        </div>
+      </section>
+
+      <section class="right-column" aria-label="Results">
+        <section id="plan-panel" class="panel panel--plan">
+          <h3 class="panel__title">Execution plan</h3>
+          <pre id="plan-text" class="plan-text">—</pre>
+        </section>
+
+        <section id="progress-panel" class="panel panel--progress">
+          <h3 class="panel__title">Progress</h3>
+          <ul id="progress-list" class="progress-list"></ul>
+        </section>
+
+        <section id="results-panel" class="panel panel--results">
+          <h3 class="panel__title">
+            Results
+            <span id="results-meta" class="results-meta"></span>
+          </h3>
+          <div class="results-scroll">
+            <table id="results-table" class="results-table">
+              <thead id="results-head"></thead>
+              <tbody id="results-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

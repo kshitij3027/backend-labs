@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from src.shared.config import CoordinatorSettings
 
@@ -15,6 +18,13 @@ from .executor import QueryExecutor
 from .progress import ProgressRegistry
 from .registry import PartitionRegistry
 from .routes import router
+
+
+# ``src/`` — this module lives at ``src/coordinator/app.py`` so its parent's
+# parent is the ``src/`` root where ``templates/`` and ``static/`` live.
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+_TEMPLATES_DIR = _SRC_ROOT / "templates"
+_STATIC_DIR = _SRC_ROOT / "static"
 
 
 def create_coordinator_app(settings: CoordinatorSettings) -> FastAPI:
@@ -69,6 +79,22 @@ def create_coordinator_app(settings: CoordinatorSettings) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Mount static assets (JS + CSS) and expose the shared Jinja2Templates
+    # instance via ``app.state.templates`` so the route handlers can render
+    # ``index.html`` without rebuilding the Templates object on every call.
+    # We only mount when the directory actually exists, which keeps the app
+    # importable in environments where the UI assets weren't copied in.
+    if _STATIC_DIR.is_dir():
+        app.mount(
+            "/static",
+            StaticFiles(directory=str(_STATIC_DIR)),
+            name="static",
+        )
+    if _TEMPLATES_DIR.is_dir():
+        app.state.templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+    else:
+        app.state.templates = None
 
     app.include_router(router)
     return app

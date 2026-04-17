@@ -8,6 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf 
 RUN useradd --create-home --uid 1000 appuser
 WORKDIR /app
 COPY --from=builder /install /usr/local
+# Copy the full `src/` tree: Python packages plus the UI assets at
+# `src/templates/` and `src/static/` that the coordinator serves at `/`.
 COPY src/ src/
 RUN chown -R appuser:appuser /app
 USER appuser
