@@ -1,0 +1,89 @@
+services:
+  partition-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.partition
+    environment:
+      PARTITION_ID: partition-1
+      PARTITION_PORT: "8101"
+      PARTITION_TIME_START: "2026-04-01T00:00:00"
+      PARTITION_TIME_END: "2026-04-07T23:59:59"
+      INDEXED_FIELDS: "level,service,timestamp"
+      LOG_SAMPLE_COUNT: "5000"
+    ports:
+      - "8101:8101"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8101/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  partition-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.partition
+    environment:
+      PARTITION_ID: partition-2
+      PARTITION_PORT: "8102"
+      PARTITION_TIME_START: "2026-04-08T00:00:00"
+      PARTITION_TIME_END: "2026-04-14T23:59:59"
+      INDEXED_FIELDS: "level,service,timestamp"
+      LOG_SAMPLE_COUNT: "5000"
+    ports:
+      - "8102:8102"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8102/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  partition-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.partition
+    environment:
+      PARTITION_ID: partition-3
+      PARTITION_PORT: "8103"
+      PARTITION_TIME_START: "2026-04-15T00:00:00"
+      PARTITION_TIME_END: "2026-04-21T23:59:59"
+      INDEXED_FIELDS: "level,service,timestamp"
+      LOG_SAMPLE_COUNT: "5000"
+    ports:
+      - "8103:8103"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8103/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  coordinator:
+    build:
+      context: .
+      dockerfile: Dockerfile.coordinator
+    environment:
+      COORDINATOR_PORT: "8000"
+      PARTITION_URLS: "partition-1=http://partition-1:8101,partition-2=http://partition-2:8102,partition-3=http://partition-3:8103"
+    ports:
+      - "8000:8000"
+    depends_on:
+      partition-1:
+        condition: service_healthy
+      partition-2:
+        condition: service_healthy
+      partition-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+    volumes:
+      - ./:/app
+    environment:
+      PYTHONPATH: /app
