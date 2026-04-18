@@ -1,0 +1,27 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Data validation
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Redis (hot facet counts, query cache)
+redis[hiredis]==5.2.1
+
+# SQLite async driver (primary log store)
+aiosqlite==0.20.0
+
+# Static files / templating for dashboard
+jinja2==3.1.5
+
+# HTTP client (testing + optional ingestion tools)
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+
+# Utilities
+python-dateutil==2.9.0

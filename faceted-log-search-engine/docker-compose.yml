@@ -1,0 +1,63 @@
+services:
+  redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      DB_PATH: "/data/logs.db"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      FACET_CACHE_TTL: "30"
+      FACET_VALUES_TTL: "300"
+      MAX_FACET_VALUES: "8"
+      DEFAULT_SEARCH_LIMIT: "10"
+    volumes:
+      - app_data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+    volumes:
+      - ./:/app
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: "redis://redis:6379"
+      DB_PATH: "/data/logs.db"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      FACET_CACHE_TTL: "30"
+      FACET_VALUES_TTL: "300"
+      MAX_FACET_VALUES: "8"
+      DEFAULT_SEARCH_LIMIT: "10"
+      APP_URL: "http://app:8000"
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  app_data:
