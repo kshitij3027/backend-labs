@@ -15,10 +15,12 @@ from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from src.api import logs as logs_api
 from src.api import search as search_api
 from src.api import stats as stats_api
+from src.api import ui as ui_api
 from src.config import settings
 from src.storage import redis_cache, sqlite_store
 
@@ -76,6 +78,12 @@ app = FastAPI(
 app.include_router(logs_api.router)
 app.include_router(search_api.router)
 app.include_router(stats_api.router)
+
+# Static assets for the dashboard. Mount before including the UI
+# router so ``/static/*`` always routes to StaticFiles regardless of
+# future ``/`` catch-all changes.
+app.mount("/static", StaticFiles(directory="src/static"), name="static")
+app.include_router(ui_api.router)
 
 
 @app.get("/health")

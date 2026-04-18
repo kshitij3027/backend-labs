@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Faceted Log Search</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-row">
+      <h1 class="app-title">Faceted Log Search</h1>
+      <form id="search-form" class="search-form" autocomplete="off" onsubmit="return false;">
+        <input
+          id="query-input"
+          type="search"
+          name="query"
+          placeholder="Search message text..."
+          aria-label="Free-text message search"
+        />
+      </form>
+      <div class="topbar-buttons">
+        <button id="generate-btn" type="button" class="btn btn-primary">Generate 1000 logs</button>
+        <button id="clear-btn" type="button" class="btn btn-secondary">Clear filters</button>
+      </div>
+    </div>
+    <div id="stats-strip" class="stats-strip" aria-live="polite">
+      <span class="stat"><span class="stat-label">Total:</span> <span id="stat-total">0</span></span>
+      <span class="stat"><span class="stat-label">Query:</span> <span id="stat-time">0.0ms</span></span>
+      <span class="stat"><span class="stat-label">Filters:</span> <span id="stat-filters">0</span></span>
+      <span class="stat"><span class="stat-label">Cache:</span> <span id="stat-cache">miss</span></span>
+    </div>
+    <div id="error-bar" class="error-bar" hidden></div>
+  </header>
+
+  <div class="layout">
+    <aside id="facet-panel" class="facet-panel" aria-label="Facet filters">
+      <div class="facet-empty-state">Loading facets...</div>
+    </aside>
+
+    <main id="results" class="results" aria-label="Log results">
+      <div class="results-empty-state">Loading results...</div>
+    </main>
+  </div>
+
+  <div class="load-more-wrap">
+    <button id="load-more-btn" type="button" class="btn btn-secondary" hidden>Load more</button>
+  </div>
+
+  <footer class="footer">
+    <a href="/api/docs">API docs</a>
+    <span class="sep"> - </span>
+    <a href="/api/stats">Stats</a>
+  </footer>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
