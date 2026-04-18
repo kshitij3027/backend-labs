@@ -120,6 +120,10 @@ class SearchResponse(BaseModel):
     pass of Pydantic validation. Field order mirrors
     ``query_builder.RESULT_COLUMNS`` with ``metadata`` parsed back
     from JSON text into a dict.
+
+    ``cached`` is stamped True when the response was served from the
+    Redis cache-aside layer (see ``storage/redis_cache.py``). It
+    defaults to False so cold paths don't need to set it explicitly.
     """
 
     logs: List[Dict[str, Any]] = Field(default_factory=list)
@@ -129,6 +133,7 @@ class SearchResponse(BaseModel):
     facets: List[FacetSummary] = Field(default_factory=list)
     query_time_ms: float = 0.0
     applied_filters: Dict[str, List[Union[str, int]]] = Field(default_factory=dict)
+    cached: bool = False
 
 
 class FacetsOnlyResponse(BaseModel):
@@ -137,3 +142,39 @@ class FacetsOnlyResponse(BaseModel):
     facets: List[FacetSummary] = Field(default_factory=list)
     query_time_ms: float = 0.0
     applied_filters: Dict[str, List[Union[str, int]]] = Field(default_factory=dict)
+    cached: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Stats / diagnostics models.
+# ---------------------------------------------------------------------------
+
+class CacheStatsModel(BaseModel):
+    """Serialized view of the Redis cache-counter dataclass.
+
+    ``hit_rate`` is ``hits / (hits + misses)`` as a float in [0, 1], or
+    ``None`` when the denominator is zero (no lookups yet). Kept
+    separate from the ``CacheStats`` dataclass in
+    ``storage/redis_cache.py`` to keep that module free of Pydantic.
+    """
+
+    hits: int = 0
+    misses: int = 0
+    errors: int = 0
+    hit_rate: Optional[float] = None
+
+
+class StatsResponse(BaseModel):
+    """Response body for ``GET /api/stats``.
+
+    * ``total_logs`` — ``SELECT COUNT(*) FROM logs``.
+    * ``facet_cardinality`` — per-dimension ``COUNT(DISTINCT ...)``
+      so the UI can decide whether to surface a dimension at all.
+    * ``cache`` — current hit/miss/error counters + derived hit rate.
+    * ``redis_reachable`` — live ``PING`` result at request time.
+    """
+
+    total_logs: int
+    facet_cardinality: Dict[str, int] = Field(default_factory=dict)
+    cache: CacheStatsModel = Field(default_factory=CacheStatsModel)
+    redis_reachable: bool = False

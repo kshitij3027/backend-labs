@@ -41,3 +41,28 @@ async def test_health_returns_ok(tmp_path, monkeypatch):
     assert isinstance(body.get("redis_url"), str) and body["redis_url"], (
         f"expected redis_url to be a non-empty string, got {body.get('redis_url')!r}"
     )
+
+
+async def test_health_reports_redis_field(tmp_path, monkeypatch):
+    """GET /health includes a ``redis`` field set to ``"ok"`` when Redis is up.
+
+    Inside the test container Redis is reachable at ``redis://redis:6379``
+    (see ``docker-compose.yml``) so the lifespan's ``ping`` call succeeds
+    and the endpoint surfaces ``"ok"``. The ``"down"`` case is covered
+    by the simulated-outage test in ``test_cache.py``.
+    """
+    db_file = str(tmp_path / "health_redis.db")
+    monkeypatch.setattr(settings, "db_path", db_file)
+
+    transport = ASGITransport(app=app)
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/health")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "redis" in body, f"expected 'redis' key in /health response; got {body!r}"
+    assert body["redis"] == "ok", (
+        f"expected redis='ok' when Redis is up (container provides redis:6379); "
+        f"got {body['redis']!r} -- full body: {body!r}"
+    )

@@ -1,24 +1,26 @@
 """FastAPI application entrypoint.
 
-Wires the SQLite connection into ``app.state.db`` for the lifetime
-of the process via a lifespan context manager, exposes ``/health``,
-and runs uvicorn when executed directly. Later commits mount API
-routers (logs, search, stats, ui) onto this same app instance.
+Wires the SQLite connection into ``app.state.db`` and the Redis
+client into ``app.state.redis`` for the lifetime of the process via
+a lifespan context manager. Exposes ``/health`` (with live DB and
+Redis probes) and runs uvicorn when executed directly. Later
+commits mount API routers (ui) onto this same app instance.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 
 from src.api import logs as logs_api
 from src.api import search as search_api
+from src.api import stats as stats_api
 from src.config import settings
-from src.storage import sqlite_store
+from src.storage import redis_cache, sqlite_store
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -29,7 +31,7 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open + migrate sqlite at startup, close at shutdown."""
+    """Open DB + Redis at startup, close both at shutdown."""
     # Ensure DB parent directory exists (volume mount may be empty).
     parent = os.path.dirname(settings.db_path)
     if parent:
@@ -38,11 +40,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db = await sqlite_store.connect(settings.db_path)
     await sqlite_store.migrate(db)
     app.state.db = db
-    logger.info("startup complete db_path=%s", settings.db_path)
+
+    # Redis is lazy-connected — ``connect`` does not ping, so even if
+    # Redis is down the server still comes up. Individual requests
+    # fall through to the compute path via ``get_or_compute``.
+    app.state.redis = await redis_cache.connect(settings.redis_url)
+    reachable = await redis_cache.ping(app.state.redis)
+    logger.info(
+        "startup complete db_path=%s redis_url=%s redis_reachable=%s",
+        settings.db_path,
+        settings.redis_url,
+        reachable,
+    )
     try:
         yield
     finally:
         await sqlite_store.close(db)
+        # ``aclose`` is best-effort; swallow errors so shutdown never
+        # blocks on a transient Redis issue.
+        if app.state.redis is not None:
+            with suppress(Exception):
+                await app.state.redis.aclose()
         logger.info("shutdown complete")
 
 
@@ -57,18 +75,25 @@ app = FastAPI(
 # endpoint is stable regardless of future router reorganizations.
 app.include_router(logs_api.router)
 app.include_router(search_api.router)
+app.include_router(stats_api.router)
 
 
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Liveness/readiness probe.
 
-    Redis reachability is reported as the configured URL for now;
-    a real ping is added in C4 when the Redis cache client lands.
+    DB is considered primary — if it's up the overall status is
+    ``ok`` even when Redis is reported as ``down``. This keeps the
+    app healthy from the Docker/k8s healthcheck perspective when the
+    cache layer is transiently unavailable (cache-aside fallback
+    handles the rest at request time).
     """
+    redis_client = getattr(app.state, "redis", None)
+    redis_ok = await redis_cache.ping(redis_client)
     return {
         "status": "ok",
         "db": "connected",
+        "redis": "ok" if redis_ok else "down",
         "redis_url": settings.redis_url,
     }
 

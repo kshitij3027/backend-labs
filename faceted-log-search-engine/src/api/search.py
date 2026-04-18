@@ -8,19 +8,24 @@ Exposes two routes that both return facet-counting responses:
   params (facet dims accept comma-separated values), for clients that
   want to refresh the sidebar without a row fetch.
 
-Both routes share the same underlying ``facet_counter`` engine so the
-excluded-self semantics are identical between them.
+Both routes are wrapped in a cache-aside layer backed by Redis (see
+``src/storage/redis_cache.py``). Cache outages are transparent — the
+handler still returns a valid response, ``cached=False``, and the
+error counter bumps in ``storage.redis_cache.stats.errors``.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+import time
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query, Request
 
+from src.config import settings
 from src.models import FacetsOnlyResponse, SearchRequest, SearchResponse
 from src.search import facet_counter
+from src.storage import redis_cache
 
 logger = logging.getLogger(__name__)
 
@@ -39,26 +44,56 @@ async def search_logs(
     unknown keys are ignored silently. Pagination is keyset-based:
     pass ``cursor`` from the previous response's ``next_cursor`` to
     fetch the next page.
+
+    Responses are cached in Redis keyed on the full request body so
+    identical queries short-circuit to an in-memory deserialize.
     """
+    t0 = time.perf_counter_ns()
     db = request.app.state.db
-    response = await facet_counter.search(
-        conn=db,
-        filters=payload.filters,
-        query=payload.query,
-        ts_start=payload.ts_start,
-        ts_end=payload.ts_end,
-        cursor=payload.cursor,
-        limit=payload.limit,
+    redis_client = getattr(request.app.state, "redis", None)
+
+    # Key off the full request body so any filter/cursor/query change
+    # produces a distinct entry. ``sort_keys`` in ``make_key`` keeps
+    # Python dict iteration order out of the hash.
+    key = redis_cache.make_key("search", payload.model_dump())
+
+    async def _compute() -> Dict[str, Any]:
+        response = await facet_counter.search(
+            conn=db,
+            filters=payload.filters,
+            query=payload.query,
+            ts_start=payload.ts_start,
+            ts_end=payload.ts_end,
+            cursor=payload.cursor,
+            limit=payload.limit,
+        )
+        return response.model_dump()
+
+    cached_payload, was_hit = await redis_cache.get_or_compute(
+        client=redis_client,
+        key=key,
+        compute=_compute,
+        ttl=settings.facet_cache_ttl,
     )
+
+    # On a hit, overwrite ``query_time_ms`` with the true request-
+    # level elapsed time so p95 numbers reflect cache speed, not the
+    # original miss cost we happened to capture at insert time.
+    if was_hit:
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000
+        cached_payload["query_time_ms"] = round(elapsed_ms, 3)
+    cached_payload["cached"] = was_hit
+
     logger.info(
-        "search filters=%s query=%s limit=%d returned=%d query_time_ms=%.3f",
+        "search filters=%s query=%s limit=%d returned=%d cached=%s query_time_ms=%.3f",
         payload.filters,
         payload.query,
         payload.limit,
-        len(response.logs),
-        response.query_time_ms,
+        len(cached_payload.get("logs", [])),
+        was_hit,
+        cached_payload.get("query_time_ms", 0.0),
     )
-    return response
+    return SearchResponse(**cached_payload)
 
 
 def _split_csv(raw: Optional[str]) -> List[str]:
@@ -93,8 +128,10 @@ async def get_facets(
 
     Filters arrive as comma-separated query parameters for ease of
     use from ``curl`` and the frontend's URL-sync logic. The response
-    is shaped identically to the ``facets`` block of ``/api/search``.
+    is shaped identically to the ``facets`` block of ``/api/search``
+    and is cached with the same TTL.
     """
+    t0 = time.perf_counter_ns()
     filters = {
         "service": _split_csv(service),
         "level": _split_csv(level),
@@ -108,17 +145,46 @@ async def get_facets(
     filters = {k: v for k, v in filters.items() if v}
 
     db = request.app.state.db
-    response = await facet_counter.facets_only(
-        conn=db,
-        filters=filters,
-        query=query,
-        ts_start=ts_start,
-        ts_end=ts_end,
+    redis_client = getattr(request.app.state, "redis", None)
+
+    # Cache-key payload mirrors the logical request shape (filters +
+    # free-text + time window). Using ``sort_keys=True`` inside
+    # ``make_key`` keeps us order-independent.
+    key_payload = {
+        "filters": filters,
+        "query": query,
+        "ts_start": ts_start,
+        "ts_end": ts_end,
+    }
+    key = redis_cache.make_key("facets_only", key_payload)
+
+    async def _compute() -> Dict[str, Any]:
+        response = await facet_counter.facets_only(
+            conn=db,
+            filters=filters,
+            query=query,
+            ts_start=ts_start,
+            ts_end=ts_end,
+        )
+        return response.model_dump()
+
+    cached_payload, was_hit = await redis_cache.get_or_compute(
+        client=redis_client,
+        key=key,
+        compute=_compute,
+        ttl=settings.facet_cache_ttl,
     )
+
+    if was_hit:
+        elapsed_ms = (time.perf_counter_ns() - t0) / 1_000_000
+        cached_payload["query_time_ms"] = round(elapsed_ms, 3)
+    cached_payload["cached"] = was_hit
+
     logger.info(
-        "facets filters=%s query=%s query_time_ms=%.3f",
+        "facets filters=%s query=%s cached=%s query_time_ms=%.3f",
         filters,
         query,
-        response.query_time_ms,
+        was_hit,
+        cached_payload.get("query_time_ms", 0.0),
     )
-    return response
+    return FacetsOnlyResponse(**cached_payload)
