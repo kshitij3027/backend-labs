@@ -16,7 +16,9 @@ test:
 	docker compose --profile test run --rm test pytest -v
 
 e2e:
-	./start.sh && docker compose --profile test run --rm test pytest -v tests/test_e2e.py; ./stop.sh
+	./start.sh
+	docker compose --profile test run --rm test pytest -v tests/test_e2e.py || (./stop.sh; exit 1)
+	./stop.sh
 
 demo:
 	docker compose --profile test run --rm test python scripts/demo.py
