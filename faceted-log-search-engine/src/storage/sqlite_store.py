@@ -12,11 +12,14 @@ on a pre-existing database.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import AsyncIterator
+from typing import AsyncIterator, Iterable, List
 
 import aiosqlite
+
+from src.models import LogEntry
 
 logger = logging.getLogger(__name__)
 
@@ -127,3 +130,75 @@ async def get_db() -> AsyncIterator[aiosqlite.Connection]:
     if db is None:
         raise RuntimeError("database not initialized; app lifespan did not run")
     yield db
+
+
+# ---------------------------------------------------------------------------
+# Bulk insert + helpers used by the ingest / generate / analyze flow.
+# ---------------------------------------------------------------------------
+
+_INSERT_SQL = (
+    "INSERT OR IGNORE INTO logs"
+    "(id, ts, service, level, region, response_time_ms, source_ip, request_id, message, metadata) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _entry_row(entry: LogEntry) -> tuple:
+    """Flatten one ``LogEntry`` into the SQL parameter tuple."""
+    return (
+        entry.id,
+        entry.ts,
+        entry.service,
+        entry.level,
+        entry.region,
+        float(entry.response_time_ms),
+        entry.source_ip,
+        entry.request_id,
+        entry.message,
+        json.dumps(entry.metadata) if entry.metadata is not None else None,
+    )
+
+
+async def insert_logs(
+    conn: aiosqlite.Connection,
+    entries: Iterable[LogEntry],
+) -> List[str]:
+    """Bulk-insert ``entries`` using a single transaction.
+
+    Uses ``INSERT OR IGNORE`` so re-inserting the same ``id`` is a
+    no-op rather than an error. Returns the list of ids we attempted
+    to insert — the caller can treat it as "ids submitted for ingest"
+    even if duplicates were silently skipped.
+    """
+    # Materialize once so we can emit both the row list (for executemany)
+    # and the id list (for the response) without iterating twice.
+    rows: list[tuple] = []
+    ids: list[str] = []
+    for entry in entries:
+        rows.append(_entry_row(entry))
+        ids.append(entry.id)
+
+    if not rows:
+        return ids
+
+    await conn.executemany(_INSERT_SQL, rows)
+    await conn.commit()
+    logger.info("inserted logs count=%d", len(rows))
+    return ids
+
+
+async def count_logs(conn: aiosqlite.Connection) -> int:
+    """Return ``SELECT COUNT(*) FROM logs``. Useful in tests."""
+    async with conn.execute("SELECT COUNT(*) FROM logs") as cur:
+        row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def analyze(conn: aiosqlite.Connection) -> None:
+    """Run ``ANALYZE logs`` to refresh query-planner statistics.
+
+    Called after a big bulk generate so subsequent SELECTs pick the
+    right composite index instead of falling back to a scan.
+    """
+    await conn.execute("ANALYZE logs;")
+    await conn.commit()
