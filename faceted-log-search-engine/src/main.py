@@ -16,6 +16,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from src.api import logs as logs_api
+from src.api import search as search_api
 from src.config import settings
 from src.storage import sqlite_store
 
@@ -55,6 +56,7 @@ app = FastAPI(
 # Router wiring. /health stays on the app itself so the healthcheck
 # endpoint is stable regardless of future router reorganizations.
 app.include_router(logs_api.router)
+app.include_router(search_api.router)
 
 
 @app.get("/health")

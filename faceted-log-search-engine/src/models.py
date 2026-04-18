@@ -9,12 +9,24 @@ match the SQLite schema in ``src/storage/sqlite_store.py``.
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
 LogLevel = Literal["DEBUG", "INFO", "WARN", "ERROR", "FATAL"]
+
+
+# Human-readable labels for facet dimensions. Kept next to the models
+# so both the backend response and any dashboard template can import
+# the same mapping and stay in lock-step with FACET_DIMS.
+FACET_DISPLAY_NAMES: Dict[str, str] = {
+    "service": "Service",
+    "level": "Level",
+    "region": "Region",
+    "latency_bucket": "Response time",
+    "hour_bucket": "Hour of day",
+}
 
 
 class LogEntry(BaseModel):
@@ -55,3 +67,73 @@ class GenerateResponse(BaseModel):
 
     generated_count: int
     query_time_ms: float
+
+
+# ---------------------------------------------------------------------------
+# Faceted search models.
+# ---------------------------------------------------------------------------
+
+class FacetValue(BaseModel):
+    """A single bucket inside one facet dimension."""
+
+    # Values can be ints (hour_bucket) or strings (everything else).
+    value: Union[str, int]
+    count: int
+    selected: bool = False
+
+
+class FacetSummary(BaseModel):
+    """Top-N values for one facet dimension, plus truncation flag."""
+
+    name: str
+    display_name: str
+    values: List[FacetValue] = Field(default_factory=list)
+    # True iff there were more values than the UI cap (``MAX_FACET_VALUES``)
+    # so the client can render a "Show more" affordance.
+    has_more_values: bool = False
+
+
+class SearchRequest(BaseModel):
+    """Input body for ``POST /api/search``.
+
+    ``filters`` is a dimension → list-of-values map. ``cursor`` is the
+    ``ts`` of the last row returned from the previous page (keyset
+    pagination, see ``build_results_sql``). ``limit`` is clamped to a
+    reasonable range to protect the server.
+    """
+
+    query: Optional[str] = None
+    filters: Dict[str, List[Union[str, int]]] = Field(default_factory=dict)
+    ts_start: Optional[int] = None
+    ts_end: Optional[int] = None
+    cursor: Optional[int] = None
+    limit: int = Field(default=10, ge=1, le=200)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SearchResponse(BaseModel):
+    """Full response shape for ``POST /api/search``.
+
+    ``logs`` carries already-materialized dicts (one per row) so the
+    server can hand rows straight to the frontend without a second
+    pass of Pydantic validation. Field order mirrors
+    ``query_builder.RESULT_COLUMNS`` with ``metadata`` parsed back
+    from JSON text into a dict.
+    """
+
+    logs: List[Dict[str, Any]] = Field(default_factory=list)
+    total_count: Optional[int] = None
+    has_more: bool = False
+    next_cursor: Optional[int] = None
+    facets: List[FacetSummary] = Field(default_factory=list)
+    query_time_ms: float = 0.0
+    applied_filters: Dict[str, List[Union[str, int]]] = Field(default_factory=dict)
+
+
+class FacetsOnlyResponse(BaseModel):
+    """Response shape for ``GET /api/facets`` — facets without rows."""
+
+    facets: List[FacetSummary] = Field(default_factory=list)
+    query_time_ms: float = 0.0
+    applied_filters: Dict[str, List[Union[str, int]]] = Field(default_factory=dict)
