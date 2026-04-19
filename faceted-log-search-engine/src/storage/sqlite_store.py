@@ -8,13 +8,22 @@ that match the faceted filter shape.
 
 ``connect`` + ``migrate`` are idempotent and safe to run at startup
 on a pre-existing database.
+
+Also exposes ``AsyncSqlitePool``: an async pool of read connections
+plus one dedicated write connection. In WAL mode SQLite permits many
+concurrent readers + a single writer, so a small pool unblocks the
+search hot path from aiosqlite's per-connection thread bottleneck
+while keeping writes serialized on one handle to avoid "database is
+locked" windows.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import AsyncIterator, Iterable, List
 
 import aiosqlite
@@ -130,6 +139,113 @@ async def get_db() -> AsyncIterator[aiosqlite.Connection]:
     if db is None:
         raise RuntimeError("database not initialized; app lifespan did not run")
     yield db
+
+
+# ---------------------------------------------------------------------------
+# Async read pool + single write connection.
+#
+# aiosqlite runs one background thread per Connection, so all reads
+# through a single handle serialize. Under 100-way concurrency the
+# tail latency blew up (p95 ≈ 2.8s with p50 ≈ 6ms) — classic bimodal
+# queueing. SQLite WAL mode supports many concurrent readers plus one
+# writer, so we bank a small pool of read connections and keep writes
+# on a dedicated handle.
+# ---------------------------------------------------------------------------
+
+
+class AsyncSqlitePool:
+    """Async pool of aiosqlite read connections + one write connection.
+
+    WAL mode allows many concurrent readers; we keep writes on a
+    dedicated connection to avoid the "database is locked" window that
+    opens when a second connection tries to write while another is
+    mid-transaction.
+
+    Usage::
+
+        pool = AsyncSqlitePool(db_path, read_size=8)
+        await pool.open()
+        async with pool.read() as conn:
+            ...  # SELECT queries
+        # writes go through pool.write
+        await sqlite_store.insert_logs(pool.write, batch)
+        await pool.close()
+    """
+
+    def __init__(self, db_path: str, read_size: int = 8) -> None:
+        self._db_path = db_path
+        self._read_size = read_size
+        self._read_queue: asyncio.Queue[aiosqlite.Connection] | None = None
+        self._write: aiosqlite.Connection | None = None
+
+    async def open(self) -> None:
+        """Open the write connection (running migrations), then the read pool."""
+        # Open the write connection first + run migrate. Doing this
+        # before readers guarantees the schema exists by the time any
+        # reader runs a query.
+        self._write = await connect(self._db_path)
+        await migrate(self._write)
+
+        # Open read-pool connections. Each gets the same pragmas so
+        # they all benefit from the 64MB page cache + 256MB mmap.
+        self._read_queue = asyncio.Queue(maxsize=self._read_size)
+        for _ in range(self._read_size):
+            r = await connect(self._db_path)
+            await self._read_queue.put(r)
+        logger.info(
+            "sqlite pool opened path=%s read_size=%d",
+            self._db_path,
+            self._read_size,
+        )
+
+    @asynccontextmanager
+    async def read(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Check out a read connection for the duration of the block.
+
+        Blocks via ``asyncio.Queue.get`` when every reader is busy, so
+        at most ``read_size`` queries run concurrently — the rest queue
+        asynchronously without blocking the event loop.
+        """
+        assert self._read_queue is not None, "pool not opened"
+        conn = await self._read_queue.get()
+        try:
+            yield conn
+        finally:
+            # ``put_nowait`` is safe here: the queue's maxsize equals
+            # the number of connections we ever put in, and we only
+            # return one at a time, so it never exceeds capacity.
+            self._read_queue.put_nowait(conn)
+
+    @property
+    def write(self) -> aiosqlite.Connection:
+        """Return the single dedicated write connection.
+
+        Callers must serialize their own logical write transactions if
+        correctness requires it — aiosqlite funnels all operations on
+        a single connection through one thread, so two concurrent
+        ``executemany`` calls interleave their commits.
+        """
+        assert self._write is not None, "pool not opened"
+        return self._write
+
+    async def close(self) -> None:
+        """Close every reader and the write connection. Best-effort.
+
+        Safe to call more than once. Swallowed errors keep shutdown
+        from hanging on a transient SQLite issue.
+        """
+        if self._read_queue is not None:
+            while not self._read_queue.empty():
+                try:
+                    conn = self._read_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                await close(conn)
+            self._read_queue = None
+
+        if self._write is not None:
+            await close(self._write)
+            self._write = None
 
 
 # ---------------------------------------------------------------------------

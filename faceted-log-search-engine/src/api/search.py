@@ -49,7 +49,10 @@ async def search_logs(
     identical queries short-circuit to an in-memory deserialize.
     """
     t0 = time.perf_counter_ns()
-    db = request.app.state.db
+    # Pass the pool (not the raw write conn) so facet_counter can fan
+    # out reads across the connection pool — otherwise every request
+    # serializes on aiosqlite's single background thread.
+    pool = request.app.state.db_pool
     redis_client = getattr(request.app.state, "redis", None)
 
     # Key off the full request body so any filter/cursor/query change
@@ -59,7 +62,7 @@ async def search_logs(
 
     async def _compute() -> Dict[str, Any]:
         response = await facet_counter.search(
-            conn=db,
+            conn=pool,
             filters=payload.filters,
             query=payload.query,
             ts_start=payload.ts_start,
@@ -144,7 +147,7 @@ async def get_facets(
     # Drop empty lists so _normalize_filters sees a clean dict.
     filters = {k: v for k, v in filters.items() if v}
 
-    db = request.app.state.db
+    pool = request.app.state.db_pool
     redis_client = getattr(request.app.state, "redis", None)
 
     # Cache-key payload mirrors the logical request shape (filters +
@@ -160,7 +163,7 @@ async def get_facets(
 
     async def _compute() -> Dict[str, Any]:
         response = await facet_counter.facets_only(
-            conn=db,
+            conn=pool,
             filters=filters,
             query=query,
             ts_start=ts_start,

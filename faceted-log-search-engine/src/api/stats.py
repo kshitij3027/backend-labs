@@ -49,11 +49,15 @@ async def _facet_cardinality(db) -> Dict[str, int]:
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats(request: Request) -> StatsResponse:
     """Return a snapshot of server statistics and cache counters."""
-    db = request.app.state.db
+    pool = request.app.state.db_pool
     redis_client = getattr(request.app.state, "redis", None)
 
-    total = await sqlite_store.count_logs(db)
-    cardinality = await _facet_cardinality(db)
+    # Run total + cardinality reads through a pooled read connection
+    # so the stats endpoint doesn't compete with the search hot path
+    # on the single write handle.
+    async with pool.read() as db:
+        total = await sqlite_store.count_logs(db)
+        cardinality = await _facet_cardinality(db)
 
     # Cache counters are process-local; read the shared dataclass.
     raw_stats = redis_cache.stats

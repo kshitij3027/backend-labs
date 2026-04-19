@@ -24,7 +24,9 @@ demo:
 	docker compose --profile test run --rm test python scripts/demo.py
 
 load:
-	docker compose --profile test run --rm test python scripts/load_test.py
+	./start.sh
+	docker compose --profile test run --rm test python scripts/load_test.py || (./stop.sh; exit 1)
+	./stop.sh
 
 logs:
 	docker compose logs -f app

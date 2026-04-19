@@ -78,6 +78,19 @@ stats = CacheStats()
 
 
 # ---------------------------------------------------------------------------
+# Single-flight dedup for concurrent cache misses.
+#
+# Without this, 100 workers hitting an uncached key all compute the
+# SAME search — 100x the DB load, 100x the pool queue pressure, and
+# a catastrophic p95. We keep a per-process map of in-flight futures
+# keyed by cache key so a second caller with the same key just awaits
+# the first one's result.
+# ---------------------------------------------------------------------------
+
+_inflight: dict[str, asyncio.Future[Any]] = {}
+
+
+# ---------------------------------------------------------------------------
 # Key derivation + client lifecycle.
 # ---------------------------------------------------------------------------
 
@@ -138,6 +151,51 @@ async def ping(client: Optional[aioredis.Redis]) -> bool:
 ComputeFn = Callable[[], Awaitable[Any]]
 
 
+async def _compute_with_singleflight(
+    key: str,
+    compute: ComputeFn,
+) -> Any:
+    """Run ``compute`` at most once per in-flight ``key``.
+
+    Concurrent callers with the same key wait for the first caller's
+    future instead of racing into their own computes. This is the
+    single biggest p95 lever under load: without it, 100 workers all
+    missing the same cache key will each grab a reader from the pool
+    and do the full 40-80ms facet scan, multiplying DB pressure 100x.
+    """
+    # Fast path: an in-flight future already exists. Awaiting it
+    # piggybacks on the first caller's work and does not touch the DB.
+    inflight = _inflight.get(key)
+    if inflight is not None:
+        return await inflight
+
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[Any] = loop.create_future()
+    # Race check: another task may have inserted a future between our
+    # .get above and here. Since this coroutine hasn't awaited anything
+    # in between, under asyncio's cooperative scheduling no other task
+    # can have run, but we defensively look again to make the code
+    # safe under future refactors.
+    existing = _inflight.setdefault(key, fut)
+    if existing is not fut:
+        # Another caller won the race. Drop ours, await theirs.
+        return await existing
+
+    try:
+        value = await compute()
+        fut.set_result(value)
+        return value
+    except BaseException as exc:  # noqa: BLE001 - propagate to all waiters
+        fut.set_exception(exc)
+        raise
+    finally:
+        # Remove ourselves from the inflight map only if we're still
+        # the registered future. Safe even if another coroutine has
+        # already replaced it (defensive; can't happen today).
+        if _inflight.get(key) is fut:
+            _inflight.pop(key, None)
+
+
 async def get_or_compute(
     client: Optional[aioredis.Redis],
     key: str,
@@ -154,15 +212,20 @@ async def get_or_compute(
     * On Redis connection error: log WARNING, bump ``stats.errors``,
       return ``(await compute(), False)``. We never raise.
 
-    ``compute`` is called at most once per invocation. Serialization
-    uses ``json.dumps(..., default=str)`` so any Pydantic-emitted
-    non-JSON-native types still round-trip.
+    Concurrent callers with the same ``key`` share one compute via a
+    per-process in-flight map — without that, 100 workers missing on
+    the same key would each run the full facet scan and crush the
+    read pool.
+
+    ``compute`` is called at most once per key per in-flight window.
+    Serialization uses ``json.dumps(..., default=str)`` so any
+    Pydantic-emitted non-JSON-native types still round-trip.
     """
     # Redis unreachable from the outset — skip the lookup entirely
     # and just compute. Counters still get bumped as an "error".
     if client is None:
         stats.errors += 1
-        value = await compute()
+        value = await _compute_with_singleflight(key, compute)
         return value, False
 
     # --- Try GET ---
@@ -171,14 +234,14 @@ async def get_or_compute(
     except _REDIS_CONNECTION_ERRORS as exc:
         logger.warning("redis get failed key=%s err=%s", key, exc)
         stats.errors += 1
-        value = await compute()
+        value = await _compute_with_singleflight(key, compute)
         return value, False
     except RedisError as exc:
         # Non-connection Redis errors (e.g. OOM, auth) — treat as
         # cache miss with error bump; request must still succeed.
         logger.warning("redis get redis-error key=%s err=%s", key, exc)
         stats.errors += 1
-        value = await compute()
+        value = await _compute_with_singleflight(key, compute)
         return value, False
 
     if cached is not None:
@@ -191,14 +254,14 @@ async def get_or_compute(
         except (TypeError, ValueError) as exc:
             logger.warning("redis cache decode failed key=%s err=%s", key, exc)
             stats.errors += 1
-            value = await compute()
+            value = await _compute_with_singleflight(key, compute)
             return value, False
         stats.hits += 1
         return value, True
 
     # --- Cache miss: compute + setex ---
     stats.misses += 1
-    value = await compute()
+    value = await _compute_with_singleflight(key, compute)
     try:
         await client.setex(key, ttl, json.dumps(value, default=str))
     except _REDIS_CONNECTION_ERRORS as exc:

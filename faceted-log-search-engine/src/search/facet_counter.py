@@ -20,6 +20,12 @@ Responsibilities:
 
 The ``search`` coroutine is what the HTTP layer calls; the ``facets``
 helper is the facets-only path used by ``GET /api/facets``.
+
+Both entry points accept *either* an ``AsyncSqlitePool`` (the HTTP
+layer's production path, for read-connection fan-out) or a raw
+``aiosqlite.Connection`` (what unit tests pass directly). We detect
+the type at the entry and dispatch to the shared ``_search_impl`` /
+``_facets_only_impl`` so neither caller has to adapt.
 """
 
 from __future__ import annotations
@@ -27,7 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 import aiosqlite
 
@@ -41,6 +47,7 @@ from src.models import (
 )
 from src.search import query_builder
 from src.search.query_builder import FACET_DIMS, RESULT_COLUMNS
+from src.storage.sqlite_store import AsyncSqlitePool
 
 logger = logging.getLogger(__name__)
 
@@ -182,53 +189,40 @@ def _build_facet_summaries(
 # Public entry points
 # ---------------------------------------------------------------------------
 
-async def search(
+# Either an opaque read-pool (has ``.read()``) or a raw aiosqlite
+# Connection. Production callers pass the pool so reads fan out across
+# ``read_size`` handles; unit tests pass a raw conn for simplicity.
+DbLike = Union[AsyncSqlitePool, aiosqlite.Connection]
+
+
+async def _search_impl(
     conn: aiosqlite.Connection,
-    filters: Optional[Mapping[str, List[Any]]],
+    norm_filters: Dict[str, List[Any]],
     query: Optional[str],
     ts_start: Optional[int],
     ts_end: Optional[int],
     cursor: Optional[int],
     limit: int,
+    t0: int,
 ) -> SearchResponse:
-    """Run the results SQL + facet SQL and assemble a ``SearchResponse``.
+    """Run the results + facet SQL sequentially on one connection.
 
-    Timing covers both queries and the response shaping; network cost
-    to SQLite on disk is ignored since aiosqlite runs in-process.
+    Used for the raw-conn (unit-test) path. Production goes through
+    ``_search_impl_pool`` instead, which runs the two queries on two
+    separate readers concurrently.
     """
-    t0 = time.perf_counter_ns()
-
-    norm_filters = _normalize_filters(filters)
-    # Row factory is set to aiosqlite.Row globally via ``connect``; we
-    # rely on that for dict-style row access below.
-
-    # --- results ---
-    results_sql, results_params = query_builder.build_results_sql(
-        filters=norm_filters,
-        query=query,
-        ts_start=ts_start,
-        ts_end=ts_end,
-        cursor=cursor,
-        limit=limit,
+    rows = await _run_results(
+        conn, norm_filters, query, ts_start, ts_end, cursor, limit
     )
-    async with conn.execute(results_sql, results_params) as cur:
-        rows = await cur.fetchall()
+    facet_rows = await _run_facets(
+        conn, norm_filters, query, ts_start, ts_end
+    )
 
     has_more = len(rows) > limit
     sliced = rows[:limit] if has_more else rows
     logs_out = [_row_to_log_dict(r) for r in sliced]
     next_cursor = int(sliced[-1]["ts"]) if sliced and has_more else None
     total_count = None if has_more else len(sliced)
-
-    # --- facets ---
-    facet_sql, facet_params = query_builder.build_facet_sql(
-        filters=norm_filters,
-        query=query,
-        ts_start=ts_start,
-        ts_end=ts_end,
-    )
-    async with conn.execute(facet_sql, facet_params) as cur:
-        facet_rows = await cur.fetchall()
 
     facet_summaries = _build_facet_summaries(
         raw_rows=facet_rows,
@@ -248,29 +242,18 @@ async def search(
     )
 
 
-async def facets_only(
+async def _facets_only_impl(
     conn: aiosqlite.Connection,
-    filters: Optional[Mapping[str, List[Any]]],
+    norm_filters: Dict[str, List[Any]],
     query: Optional[str],
     ts_start: Optional[int],
     ts_end: Optional[int],
+    t0: int,
 ) -> FacetsOnlyResponse:
-    """Run only the facet UNION ALL and return the summaries.
-
-    Used by ``GET /api/facets`` where the client only wants counts
-    (e.g. to repopulate a sidebar after an external event).
-    """
-    t0 = time.perf_counter_ns()
-    norm_filters = _normalize_filters(filters)
-
-    facet_sql, facet_params = query_builder.build_facet_sql(
-        filters=norm_filters,
-        query=query,
-        ts_start=ts_start,
-        ts_end=ts_end,
+    """Run just the facet UNION ALL and shape a ``FacetsOnlyResponse``."""
+    facet_rows = await _run_facets(
+        conn, norm_filters, query, ts_start, ts_end
     )
-    async with conn.execute(facet_sql, facet_params) as cur:
-        facet_rows = await cur.fetchall()
 
     facet_summaries = _build_facet_summaries(
         raw_rows=facet_rows,
@@ -283,4 +266,123 @@ async def facets_only(
         facets=facet_summaries,
         query_time_ms=round(query_time_ms, 3),
         applied_filters=norm_filters,
+    )
+
+
+async def _run_results(
+    conn: aiosqlite.Connection,
+    norm_filters: Dict[str, List[Any]],
+    query: Optional[str],
+    ts_start: Optional[int],
+    ts_end: Optional[int],
+    cursor: Optional[int],
+    limit: int,
+) -> List[aiosqlite.Row]:
+    """Execute the paginated results SELECT and return the raw rows."""
+    sql, params = query_builder.build_results_sql(
+        filters=norm_filters,
+        query=query,
+        ts_start=ts_start,
+        ts_end=ts_end,
+        cursor=cursor,
+        limit=limit,
+    )
+    async with conn.execute(sql, params) as cur:
+        return await cur.fetchall()
+
+
+async def _run_facets(
+    conn: aiosqlite.Connection,
+    norm_filters: Dict[str, List[Any]],
+    query: Optional[str],
+    ts_start: Optional[int],
+    ts_end: Optional[int],
+) -> List[aiosqlite.Row]:
+    """Execute the facet UNION ALL and return the raw rows."""
+    sql, params = query_builder.build_facet_sql(
+        filters=norm_filters,
+        query=query,
+        ts_start=ts_start,
+        ts_end=ts_end,
+    )
+    async with conn.execute(sql, params) as cur:
+        return await cur.fetchall()
+
+
+async def search(
+    conn: DbLike,
+    filters: Optional[Mapping[str, List[Any]]],
+    query: Optional[str],
+    ts_start: Optional[int],
+    ts_end: Optional[int],
+    cursor: Optional[int],
+    limit: int,
+) -> SearchResponse:
+    """Run the results SQL + facet SQL and assemble a ``SearchResponse``.
+
+    Accepts either an ``AsyncSqlitePool`` (production path, checks out
+    a read connection for the duration of the call) or a raw
+    ``aiosqlite.Connection`` (test convenience). Timing covers both
+    queries plus any pool-checkout wait so the reported
+    ``query_time_ms`` reflects real user-perceived latency.
+
+    The two queries run sequentially on the SAME checked-out reader:
+    aiosqlite's thread-per-connection model means parallel queries on
+    different connections actually slow each other down (SQLite's
+    internal mutex + GIL mean 2 parallel queries take 3x as long as
+    one sequential pair). Running them back-to-back on one connection
+    gives the best wall-clock per request.
+    """
+    t0 = time.perf_counter_ns()
+    norm_filters = _normalize_filters(filters)
+
+    if hasattr(conn, "read"):
+        # Pool path: check out a single reader for the duration of
+        # the call. Under concurrency, extra requests queue on the
+        # pool's asyncio.Queue — which is correct, because SQLite
+        # itself won't actually parallelize them anyway.
+        async with conn.read() as reader:  # type: ignore[union-attr]
+            return await _search_impl(
+                reader, norm_filters, query, ts_start, ts_end, cursor, limit, t0
+            )
+    return await _search_impl(
+        conn,  # type: ignore[arg-type]
+        norm_filters,
+        query,
+        ts_start,
+        ts_end,
+        cursor,
+        limit,
+        t0,
+    )
+
+
+async def facets_only(
+    conn: DbLike,
+    filters: Optional[Mapping[str, List[Any]]],
+    query: Optional[str],
+    ts_start: Optional[int],
+    ts_end: Optional[int],
+) -> FacetsOnlyResponse:
+    """Run only the facet UNION ALL and return the summaries.
+
+    Used by ``GET /api/facets`` where the client only wants counts
+    (e.g. to repopulate a sidebar after an external event). Accepts
+    the same pool-or-conn union as ``search``.
+    """
+    t0 = time.perf_counter_ns()
+    norm_filters = _normalize_filters(filters)
+
+    if hasattr(conn, "read"):
+        async with conn.read() as reader:  # type: ignore[union-attr]
+            return await _facets_only_impl(
+                reader, norm_filters, query, ts_start, ts_end, t0
+            )
+    return await _facets_only_impl(
+        conn,  # type: ignore[arg-type]
+        norm_filters,
+        query,
+        ts_start,
+        ts_end,
+        t0,
     )

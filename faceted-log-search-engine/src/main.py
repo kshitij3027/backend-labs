@@ -33,15 +33,26 @@ logging.basicConfig(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Open DB + Redis at startup, close both at shutdown."""
+    """Open DB pool + Redis at startup, close both at shutdown.
+
+    Uses ``AsyncSqlitePool`` so the search hot path can fan out across
+    multiple read connections (aiosqlite serializes per-Connection, so
+    one shared conn turns 100-way concurrency into a queue). Writes
+    still go through a single dedicated connection to avoid SQLite's
+    "database is locked" window when two writers race.
+    """
     # Ensure DB parent directory exists (volume mount may be empty).
     parent = os.path.dirname(settings.db_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    db = await sqlite_store.connect(settings.db_path)
-    await sqlite_store.migrate(db)
-    app.state.db = db
+    pool = sqlite_store.AsyncSqlitePool(settings.db_path, read_size=8)
+    await pool.open()
+    app.state.db_pool = pool
+    # Keep ``app.state.db`` pointing at the write connection so the
+    # handful of legacy call sites (ingest, generate, analyze, tests
+    # that reuse the lifespan) keep working unchanged.
+    app.state.db = pool.write
 
     # Redis is lazy-connected — ``connect`` does not ping, so even if
     # Redis is down the server still comes up. Individual requests
@@ -57,7 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        await sqlite_store.close(db)
+        await pool.close()
         # ``aclose`` is best-effort; swallow errors so shutdown never
         # blocks on a transient Redis issue.
         if app.state.redis is not None:
