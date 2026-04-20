@@ -1,10 +1,10 @@
-"""HTTP routes for health and stats.
+"""HTTP routes for health, stats, and search.
 
 The router here is mounted onto the FastAPI app in :mod:`src.main`.
-Only ``/health`` and ``/api/stats`` ship in Commit 7. ``/api/search``,
-``/api/generate-sample``, and the WebSocket endpoint land in Commits
-8, 9, and 11 respectively and will be added to this module without
-breaking the existing surface.
+``/health`` and ``/api/stats`` shipped in Commit 7; Commit 8 adds
+``/api/search``. ``/api/generate-sample`` and the WebSocket endpoint
+land in Commits 9 and 11 respectively and will be added to this
+module without breaking the existing surface.
 
 Design notes
 ------------
@@ -23,6 +23,10 @@ Design notes
   (uptime) — into the single :class:`StatsResponse` shape the
   dashboard plots. Throughput is a best-effort running average for
   now; a real 1-minute rolling counter lands in a later commit.
+* ``/api/search`` measures ``took_ms`` at the endpoint boundary (not
+  inside the index) so the reported latency reflects the whole
+  request — tokenise-then-scan plus response marshalling — which is
+  what a dashboard user actually perceives.
 """
 
 from __future__ import annotations
@@ -31,9 +35,9 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 
-from src.models import HealthResponse, StatsResponse
+from src.models import HealthResponse, SearchResponse, StatsResponse
 
 
 logger = logging.getLogger(__name__)
@@ -147,4 +151,74 @@ async def api_stats(request: Request) -> StatsResponse:
         query_p95_ms=0.0,
         errors=errors,
         uptime_s=uptime,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Search
+# ---------------------------------------------------------------------------
+
+@router.get("/api/search", response_model=SearchResponse)
+async def api_search(
+    request: Request,
+    q: str = Query(..., min_length=1, description="Search query"),
+    service: str | None = Query(
+        None, description="Optional service name filter (exact match)."
+    ),
+    level: str | None = Query(
+        None, description="Optional log level filter (exact match)."
+    ),
+    limit: int = Query(
+        50, ge=1, le=500, description="Maximum number of results to return."
+    ),
+) -> SearchResponse:
+    """Search the inverted index and return results newest-first.
+
+    FastAPI's ``Query`` validators handle the 422 responses for us:
+
+    * missing or empty ``q`` (``min_length=1``) → 422,
+    * ``limit`` outside [1, 500] → 422.
+
+    The ``service`` / ``level`` filters are passed through unchanged
+    to :meth:`InvertedIndex.search`, which does exact-match filtering
+    on the stored :class:`LogEntry`. Unknown levels aren't rejected
+    explicitly — they'll simply match zero documents, which is the
+    same outcome as rejecting them but without paying a validator
+    cost on the hot path.
+
+    ``took_ms`` is measured at the endpoint boundary so it reflects
+    the whole request: tokenise → fan-out → dedup → filter → sort →
+    highlight → response build. Measuring inside
+    :meth:`InvertedIndex.search` would under-report by hiding the
+    tokenisation and Pydantic marshalling cost.
+
+    Accessing the tokenizer via ``index._tokenizer`` is intentional:
+    we want the exact tokens the index would have used so the UI can
+    highlight consistently. Adding a public helper on
+    :class:`InvertedIndex` would mean widening its surface for a
+    single caller; the package-private attribute keeps the diff small
+    and stays within the same package.
+    """
+    index = request.app.state.index
+
+    t0 = time.perf_counter()
+    # ``InvertedIndex.search`` is deliberately sync — it runs under the
+    # GIL on append-only posting lists and is fast enough that kicking
+    # it out to a threadpool would cost more in hop-around than it
+    # saves. If profiling later shows search blocking the loop for too
+    # long, wrap this call in ``await asyncio.to_thread(...)``.
+    results = index.search(q, service=service, level=level, limit=limit)
+    took_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Surface the tokenised query terms so the UI (and any API
+    # consumer) can produce highlight markup that matches the
+    # server-side marks exactly.
+    terms = index._tokenizer.tokenize(q)
+
+    return SearchResponse(
+        results=results,
+        total=len(results),
+        took_ms=round(took_ms, 3),
+        query=q,
+        terms=terms,
     )
