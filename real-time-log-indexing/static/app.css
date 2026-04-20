@@ -1,0 +1,33 @@
+/* Placeholder stylesheet — the full dashboard UI ships in Commit 10. */
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  margin: 2rem;
+  color: #222;
+  background: #fafafa;
+  line-height: 1.5;
+}
+
+header h1 {
+  color: #0369a1;
+  margin-bottom: 0.25rem;
+}
+
+.tagline {
+  color: #64748b;
+  margin-top: 0;
+}
+
+code {
+  background: #f1f5f9;
+  padding: 0.1rem 0.3rem;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#placeholder {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border-left: 3px solid #0369a1;
+  background: #fff;
+}
