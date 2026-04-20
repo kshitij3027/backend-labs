@@ -55,32 +55,42 @@
     </div>
   </section>
 
-  <section class="search-panel" aria-label="Search">
-    <div class="search-bar">
-      <input
-        id="search-input"
-        type="text"
-        placeholder="Search logs &mdash; e.g. error, 192.168.1.1, payment"
-        autocomplete="off"
-        spellcheck="false">
-      <select id="search-service" aria-label="Filter by service">
-        <option value="">All services</option>
-        {% for svc in services %}<option value="{{ svc }}">{{ svc }}</option>{% endfor %}
-      </select>
-      <select id="search-level" aria-label="Filter by level">
-        <option value="">All levels</option>
-        <option value="DEBUG">DEBUG</option>
-        <option value="INFO">INFO</option>
-        <option value="WARN">WARN</option>
-        <option value="ERROR">ERROR</option>
-        <option value="FATAL">FATAL</option>
-      </select>
-      <input id="search-limit" type="number" min="1" max="500" value="50" aria-label="Result limit">
-      <button id="search-button" class="btn btn-primary" type="button">Search</button>
-    </div>
-    <div id="search-meta" class="search-meta"></div>
-    <ul id="search-results" class="results"></ul>
-  </section>
+  <div class="main-grid">
+    <section class="search-panel" aria-label="Search">
+      <div class="search-bar">
+        <input
+          id="search-input"
+          type="text"
+          placeholder="Search logs &mdash; e.g. error, 192.168.1.1, payment"
+          autocomplete="off"
+          spellcheck="false">
+        <select id="search-service" aria-label="Filter by service">
+          <option value="">All services</option>
+          {% for svc in services %}<option value="{{ svc }}">{{ svc }}</option>{% endfor %}
+        </select>
+        <select id="search-level" aria-label="Filter by level">
+          <option value="">All levels</option>
+          <option value="DEBUG">DEBUG</option>
+          <option value="INFO">INFO</option>
+          <option value="WARN">WARN</option>
+          <option value="ERROR">ERROR</option>
+          <option value="FATAL">FATAL</option>
+        </select>
+        <input id="search-limit" type="number" min="1" max="500" value="50" aria-label="Result limit">
+        <button id="search-button" class="btn btn-primary" type="button">Search</button>
+      </div>
+      <div id="search-meta" class="search-meta"></div>
+      <ul id="search-results" class="results"></ul>
+    </section>
+
+    <aside class="live-feed-panel" aria-label="Live feed">
+      <div class="live-feed-header">
+        <h3 class="live-feed-title">Live feed</h3>
+        <span id="live-feed-status" class="live-feed-status" aria-live="polite">disconnected</span>
+      </div>
+      <ul id="live-feed" class="live-feed"></ul>
+    </aside>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

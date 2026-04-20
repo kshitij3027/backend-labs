@@ -50,6 +50,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from src.api.routes import router
+from src.api.websocket import ConnectionManager, register_ws_routes
 from src.config import Settings, settings as default_settings
 from src.index.inverted_index import InvertedIndex
 from src.index.tokenizer import LogTokenizer
@@ -66,12 +67,25 @@ logger = logging.getLogger(__name__)
 # down` / pytest teardown doesn't stall on a stuck XREADGROUP.
 _CONSUMER_SHUTDOWN_TIMEOUT_S: float = 5.0
 
+# Bound the wait for WebSocket background loops (stats broadcast +
+# heartbeat) to wind down during shutdown. Their loops check the stop
+# event at each interval boundary, so this only matters if a slow
+# broadcast coroutine gets stuck mid-send.
+_WS_TASK_SHUTDOWN_TIMEOUT_S: float = 3.0
+
+# Cadence for the stats-broadcast loop. One second matches the dashboard
+# polling rate that existed before WS landed, so toggling between the
+# two transports is imperceptible.
+_STATS_BROADCAST_INTERVAL_S: float = 1.0
+
 
 # ---------------------------------------------------------------------------
 # App state construction
 # ---------------------------------------------------------------------------
 
-async def build_app_state(settings: Settings) -> dict:
+async def build_app_state(
+    settings: Settings, ws_manager: ConnectionManager | None = None
+) -> dict:
     """Build every object the lifespan will stash on ``app.state``.
 
     Returns a dict of:
@@ -93,6 +107,13 @@ async def build_app_state(settings: Settings) -> dict:
     * ``settings``       — the exact :class:`Settings` used to build
                            the rest, stashed so handlers/tests can
                            introspect.
+    * ``ws_manager``     — the :class:`ConnectionManager` used by the
+                           WebSocket endpoint and broadcast loops.
+
+    If *ws_manager* is ``None`` a fresh one is created; the builder
+    accepts an explicit instance so :func:`build_app` can register the
+    ``/ws`` route against the same manager that later receives the
+    index callback and broadcasts.
 
     Splitting this out keeps the lifespan readable (it just plumbs
     the dict into ``app.state``, spawns the consumer task, and yields)
@@ -101,7 +122,18 @@ async def build_app_state(settings: Settings) -> dict:
     tokenizer = LogTokenizer()
     disk_dir = Path(settings.disk_segment_dir)
 
-    index = InvertedIndex(settings, tokenizer, disk_dir=disk_dir)
+    if ws_manager is None:
+        ws_manager = ConnectionManager()
+
+    # Wiring the WS broadcast as the index's on_new_document callback
+    # means every successfully indexed document lands on every
+    # connected dashboard without the index knowing anything about WS.
+    index = InvertedIndex(
+        settings,
+        tokenizer,
+        disk_dir=disk_dir,
+        on_new_document=ws_manager.broadcast_new_document,
+    )
     await index.load_from_disk()
 
     stop_event = asyncio.Event()
@@ -147,7 +179,72 @@ async def build_app_state(settings: Settings) -> dict:
         "redis_connected": redis_connected,
         "stop_event": stop_event,
         "settings": settings,
+        "ws_manager": ws_manager,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stats broadcast loop
+# ---------------------------------------------------------------------------
+
+async def stats_broadcast_loop(
+    app: FastAPI,
+    stop_event: asyncio.Event,
+    interval: float = _STATS_BROADCAST_INTERVAL_S,
+) -> None:
+    """Periodically broadcast the latest stats to every WS client.
+
+    Mirrors the payload shape of ``GET /api/stats`` so the dashboard
+    can use the same ``applyStats`` handler for both transport paths —
+    the only difference is the trigger (1 Hz timer vs. push). We
+    assemble the dict here rather than calling the FastAPI handler
+    directly because the handler is request-scoped; duplicating the
+    compose is cheaper than running a fake request through the router.
+    """
+    while not stop_event.is_set():
+        try:
+            index = getattr(app.state, "index", None)
+            ws_manager: ConnectionManager | None = getattr(
+                app.state, "ws_manager", None
+            )
+            if index is None or ws_manager is None:
+                # Lifespan hasn't finished wiring yet — skip this tick.
+                pass
+            else:
+                consumer = getattr(app.state, "consumer", None)
+                started_at = getattr(app.state, "started_at", time.time())
+                uptime = max(time.time() - started_at, 0.0)
+
+                raw = index.stats()
+                denom = max(uptime, 1.0)
+                throughput = raw["docs_indexed"] / denom
+                consumer_errors = (
+                    getattr(consumer, "errors", 0) if consumer else 0
+                )
+
+                payload = {
+                    "docs_indexed": raw["docs_indexed"],
+                    "current_segment_docs": raw["current_segment_docs"],
+                    "flushed_memory_segments": raw["flushed_memory_segments"],
+                    "disk_segments": raw["disk_segments"],
+                    "vocab_size": raw["vocab_size"],
+                    "memory_bytes": raw["memory_bytes"],
+                    "throughput_1m": throughput,
+                    "ingest_lag": 0,
+                    "query_p95_ms": 0.0,
+                    "errors": consumer_errors + raw.get("errors", 0),
+                    "uptime_s": uptime,
+                }
+                await ws_manager.broadcast_stats(payload)
+        except Exception as exc:  # noqa: BLE001 — never kill the loop
+            logger.warning("stats broadcast error: %s", exc)
+
+        # Honour the stop event so shutdown doesn't wait a full
+        # interval before the loop exits.
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -170,13 +267,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # repeatedly — ``setup_logging`` scrubs existing handlers first.
     setup_logging(settings.log_level)
 
-    state = await build_app_state(settings)
+    # The ws_manager was built in ``build_app`` so the ``/ws`` route
+    # could be registered at route-time. Reuse it here — building a
+    # second one would split the client set between the endpoint and
+    # the index callback.
+    ws_manager: ConnectionManager = getattr(app.state, "ws_manager", None)
+    state = await build_app_state(settings, ws_manager=ws_manager)
     app.state.index = state["index"]
     app.state.consumer = state["consumer"]
     app.state.redis_client = state["redis_client"]
     app.state.redis_connected = state["redis_connected"]
     app.state.stop_event = state["stop_event"]
     app.state.settings = settings
+    app.state.ws_manager = state["ws_manager"]
     app.state.started_at = time.time()
 
     # Spawn the consumer as a background task owned by the current
@@ -187,6 +290,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         consumer.run(), name="redis-stream-consumer"
     )
     app.state.consumer_task = consumer_task
+
+    # Spawn the two WebSocket background tasks. Both honour the shared
+    # stop_event so shutdown drains them in lockstep with the consumer.
+    stats_task: asyncio.Task[None] = asyncio.create_task(
+        stats_broadcast_loop(app, state["stop_event"]),
+        name="ws-stats-broadcast",
+    )
+    app.state.stats_broadcast_task = stats_task
+
+    heartbeat_task: asyncio.Task[None] = asyncio.create_task(
+        state["ws_manager"].heartbeat_loop(
+            float(settings.ws_heartbeat_interval_s), state["stop_event"]
+        ),
+        name="ws-heartbeat",
+    )
+    app.state.ws_heartbeat_task = heartbeat_task
+
     logger.info(
         "startup complete disk_dir=%s redis_url=%s redis_connected=%s",
         settings.disk_segment_dir,
@@ -238,7 +358,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("consumer task exited with error: %s", exc)
 
-        # 4) Close the Redis client we constructed for the health probe.
+        # 4) Drain the WebSocket background tasks. Both loops check the
+        #    shared stop_event so they unwind on their own; we just
+        #    bound how long we'll wait. If they miss the deadline we
+        #    cancel them — nothing they do at this point is critical.
+        for task in (stats_task, heartbeat_task):
+            if task.done():
+                continue
+            try:
+                await asyncio.wait_for(
+                    task, timeout=_WS_TASK_SHUTDOWN_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "ws task %s did not exit within %.1fs; cancelling",
+                    task.get_name(),
+                    _WS_TASK_SHUTDOWN_TIMEOUT_S,
+                )
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "ws task %s exited with error: %s", task.get_name(), exc
+                )
+
+        # 5) Close every connected WS client cleanly. The manager's
+        #    close_all swallows individual close errors so one bad
+        #    socket can't stall shutdown.
+        try:
+            await state["ws_manager"].close_all()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ws_manager.close_all raised on shutdown: %s", exc)
+
+        # 6) Close the Redis client we constructed for the health probe.
         redis_client = state.get("redis_client")
         if redis_client is not None:
             try:
@@ -282,7 +439,17 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     # lifespan (and any early request) sees the right values.
     app.state.settings = s
 
+    # Build the ConnectionManager here so the ``/ws`` route can be
+    # registered at route-time (before the lifespan runs). The same
+    # instance is stashed on ``app.state`` and reused by
+    # ``build_app_state`` — otherwise we'd end up with two managers,
+    # and the index callback would fire against a different client set
+    # than the endpoint accepts.
+    ws_manager = ConnectionManager()
+    app.state.ws_manager = ws_manager
+
     app.include_router(router)
+    register_ws_routes(app, ws_manager)
 
     # Mount static assets for the dashboard. ``StaticFiles`` resolves
     # paths relative to the working directory by default; using an
