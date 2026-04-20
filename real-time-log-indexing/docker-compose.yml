@@ -1,0 +1,62 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: "redis://redis:6379"
+      REDIS_STREAM_NAME: "logs"
+      REDIS_CONSUMER_GROUP: "indexer"
+      DISK_SEGMENT_DIR: "/data/segments"
+      HTTP_PORT: "8080"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - app_data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      APP_URL: "http://app:8080"
+      REDIS_URL: "redis://redis:6379"
+      REDIS_STREAM_NAME: "logs"
+      REDIS_CONSUMER_GROUP: "indexer"
+      DISK_SEGMENT_DIR: "/tmp/segments"
+      HTTP_PORT: "8080"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./:/app
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  app_data:

@@ -1,0 +1,22 @@
+## Test image for the real-time log indexing engine.
+##
+## Dependencies are baked in so ``docker compose run test`` starts
+## fast, but the source tree is bind-mounted from the host via the
+## compose config so tests always see the freshest code.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# curl is handy for ad-hoc probing inside the test container.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+CMD ["pytest", "-v", "--tb=short"]

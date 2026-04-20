@@ -1,0 +1,27 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Data validation / settings
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Templating for the dashboard
+jinja2==3.1.5
+
+# Redis (streams + consumer groups for the ingest pipeline)
+redis[hiredis]==5.2.1
+
+# HTTP client (tests + optional ingestion tools)
+httpx==0.28.1
+
+# Memory-mapped disk segment reads
+mmh3==5.0.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+
+# Utilities
+python-dateutil==2.9.0
