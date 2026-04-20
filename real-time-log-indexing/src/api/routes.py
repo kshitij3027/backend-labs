@@ -35,9 +35,16 @@ import asyncio
 import logging
 import time
 
-from fastapi import APIRouter, Query, Request
+import redis.exceptions
+from fastapi import APIRouter, HTTPException, Query, Request
 
-from src.models import HealthResponse, SearchResponse, StatsResponse
+from src.models import (
+    GenerateSampleRequest,
+    HealthResponse,
+    SearchResponse,
+    StatsResponse,
+)
+from src.sample_data import generate_log_entries
 
 
 logger = logging.getLogger(__name__)
@@ -222,3 +229,94 @@ async def api_search(
         query=q,
         terms=terms,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sample-data generation
+# ---------------------------------------------------------------------------
+
+@router.post("/api/generate-sample")
+async def api_generate_sample(
+    request: Request, body: GenerateSampleRequest
+) -> dict:
+    """Generate and push ``count`` synthetic log entries onto the Redis stream.
+
+    This closes the full ingest loop for smoke-testing and demos:
+    we produce synthetic logs (via :func:`generate_log_entries`), XADD
+    them onto the stream the consumer is already reading, and rely on
+    the running :class:`RedisStreamConsumer` to pick them up, index
+    them, and make them searchable via ``/api/search``.
+
+    Two modes:
+
+    * ``rate is None`` — pipelined XADDs (single round-trip-per-chunk)
+      for maximum throughput. This is the path that matters when the
+      dashboard demos "push 10k logs and watch the counters move".
+    * ``rate`` set — throttle to roughly ``rate`` logs/sec by sleeping
+      between each XADD. Useful for realistic streaming demos where we
+      want the counters to tick upward over time rather than jump.
+
+    Returns a thin JSON envelope so the caller can reason about how
+    long the push took without having to separately query stats.
+    """
+    settings = request.app.state.settings
+    redis_client = getattr(request.app.state, "redis_client", None)
+    if redis_client is None:
+        # Lifespan couldn't reach Redis at startup and we haven't
+        # reconnected. 503 Service Unavailable is the right signal —
+        # the endpoint is temporarily unable to accept writes.
+        raise HTTPException(status_code=503, detail="Redis not connected")
+
+    entries = generate_log_entries(count=body.count)
+    stream = settings.redis_stream_name
+    t0 = time.perf_counter()
+
+    try:
+        if body.rate is None:
+            # Pipelined XADD — one aiohttp-style round-trip per
+            # ``pipe.execute()``, which is drastically cheaper than
+            # ``body.count`` separate awaited calls.
+            async with redis_client.pipeline(transaction=False) as pipe:
+                for entry in entries:
+                    pipe.xadd(
+                        stream,
+                        {
+                            "message": entry["message"],
+                            "timestamp": str(entry["timestamp"]),
+                            "service": entry["service"],
+                            "level": entry["level"],
+                        },
+                    )
+                await pipe.execute()
+        else:
+            # ``max(rate, 1e-6)`` keeps the divide safe; Pydantic
+            # already bounds ``rate > 0`` so this is belt-and-braces.
+            interval = 1.0 / max(body.rate, 1e-6)
+            for entry in entries:
+                await redis_client.xadd(
+                    stream,
+                    {
+                        "message": entry["message"],
+                        "timestamp": str(entry["timestamp"]),
+                        "service": entry["service"],
+                        "level": entry["level"],
+                    },
+                )
+                await asyncio.sleep(interval)
+    except (
+        redis.exceptions.ConnectionError,
+        redis.exceptions.TimeoutError,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    ) as exc:
+        # Redis dropped out mid-push. Surface as 503 so the caller knows
+        # it's an infra blip, not a bad request. Some entries may have
+        # landed — that's fine, the consumer will index whatever made it.
+        logger.warning("redis error during /api/generate-sample: %s", exc)
+        raise HTTPException(
+            status_code=503, detail=f"Redis unavailable: {exc}"
+        ) from exc
+
+    took_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    return {"ingested": body.count, "stream": stream, "took_ms": took_ms}
