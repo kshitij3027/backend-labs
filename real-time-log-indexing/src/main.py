@@ -54,6 +54,7 @@ from src.config import Settings, settings as default_settings
 from src.index.inverted_index import InvertedIndex
 from src.index.tokenizer import LogTokenizer
 from src.logging_setup import setup_logging
+from src.sample_data import LEVELS, SERVICES
 from src.stream.redis_consumer import RedisStreamConsumer
 
 
@@ -302,12 +303,17 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     async def index_page(request: Request) -> HTMLResponse:
         """Serve the dashboard HTML.
 
-        In Commit 7 this is a placeholder — the real dashboard (with
-        search, filters, live stats card, and the WebSocket hookup)
-        lands in Commit 10 behind this same URL.
+        The template renders the service and level dropdowns from the
+        canonical :mod:`src.sample_data` lists so adding a new service
+        here flows into the UI without a separate client-side edit.
         """
         return templates.TemplateResponse(
-            "dashboard.html", {"request": request}
+            "dashboard.html",
+            {
+                "request": request,
+                "services": SERVICES,
+                "levels": LEVELS,
+            },
         )
 
     return app

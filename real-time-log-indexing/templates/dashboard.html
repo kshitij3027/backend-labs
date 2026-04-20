@@ -7,16 +7,81 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <header>
-    <h1>Real-Time Log Indexing</h1>
-    <p class="tagline">Streaming log index with sub-second search.</p>
+  <header class="topbar">
+    <div class="brand">
+      <span id="status-dot" class="status-dot status-degraded" aria-hidden="true"></span>
+      <span class="brand-title">Real-Time Log Indexing</span>
+      <span class="brand-tag">streaming inverted index &middot; sub-second search</span>
+    </div>
+    <div class="actions">
+      <button id="generate-500" class="btn" type="button">Generate 500</button>
+      <button id="generate-5000" class="btn" type="button">Generate 5,000</button>
+      <button id="generate-50000" class="btn" type="button">Generate 50,000</button>
+    </div>
   </header>
-  <main>
-    <p id="placeholder">
-      Dashboard coming soon. Use <code>GET /api/stats</code> or
-      <code>GET /health</code> for now.
-    </p>
-  </main>
+
+  <section class="stats-grid" aria-label="Live index metrics">
+    <div class="stat-card">
+      <div class="stat-label">Docs indexed</div>
+      <div class="stat-value" id="stats-docs-indexed">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Current segment</div>
+      <div class="stat-value" id="stats-current-segment-docs">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Flushed in-memory</div>
+      <div class="stat-value" id="stats-flushed-memory-segments">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Disk segments</div>
+      <div class="stat-value" id="stats-disk-segments">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Memory</div>
+      <div class="stat-value" id="stats-memory-bytes">0 B</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Throughput</div>
+      <div class="stat-value" id="stats-throughput">0.0 /s</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Vocab</div>
+      <div class="stat-value" id="stats-vocab-size">0</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Search p95</div>
+      <div class="stat-value" id="stats-query-p95">&mdash;</div>
+    </div>
+  </section>
+
+  <section class="search-panel" aria-label="Search">
+    <div class="search-bar">
+      <input
+        id="search-input"
+        type="text"
+        placeholder="Search logs &mdash; e.g. error, 192.168.1.1, payment"
+        autocomplete="off"
+        spellcheck="false">
+      <select id="search-service" aria-label="Filter by service">
+        <option value="">All services</option>
+        {% for svc in services %}<option value="{{ svc }}">{{ svc }}</option>{% endfor %}
+      </select>
+      <select id="search-level" aria-label="Filter by level">
+        <option value="">All levels</option>
+        <option value="DEBUG">DEBUG</option>
+        <option value="INFO">INFO</option>
+        <option value="WARN">WARN</option>
+        <option value="ERROR">ERROR</option>
+        <option value="FATAL">FATAL</option>
+      </select>
+      <input id="search-limit" type="number" min="1" max="500" value="50" aria-label="Result limit">
+      <button id="search-button" class="btn btn-primary" type="button">Search</button>
+    </div>
+    <div id="search-meta" class="search-meta"></div>
+    <ul id="search-results" class="results"></ul>
+  </section>
+
   <script src="/static/app.js"></script>
 </body>
 </html>

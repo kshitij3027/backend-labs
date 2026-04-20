@@ -19,10 +19,27 @@ and the roundtrip tests skip, keeping the suite green on the host.
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
+import pytest_asyncio
 from fastapi import FastAPI
 from httpx import AsyncClient
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _flush_redis_between_tests():
+    """Flush Redis state before each test so stream offsets, consumer group
+    cursors, and leftover XADD entries from earlier tests cannot bleed in."""
+    import redis.asyncio as redis_async
+    url = os.environ.get("REDIS_URL", "redis://redis:6379")
+    try:
+        client = redis_async.from_url(url, decode_responses=False)
+        await client.flushall()
+        await client.aclose()
+    except Exception:
+        pass
+    yield
 
 
 # ---------------------------------------------------------------------------
