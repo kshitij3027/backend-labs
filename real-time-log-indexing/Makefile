@@ -13,10 +13,10 @@ clean:
 	docker compose down -v && docker image prune -f
 
 test:
-	docker compose --profile test run --rm test pytest -v --tb=short
+	docker compose --profile test run --rm test pytest -v --tb=short --ignore=tests/test_e2e.py
 
 e2e:
-	./start.sh && docker compose --profile test run --rm test pytest -v tests/test_e2e.py || (./stop.sh; exit 1)
+	./start.sh && docker compose --profile test run --rm test pytest -v tests/test_e2e.py; code=$$?; docker compose down; exit $$code
 
 load:
 	./start.sh && docker compose --profile test run --rm test python scripts/load_test.py

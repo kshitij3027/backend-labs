@@ -338,14 +338,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort
             logger.warning("consumer.stop raised on shutdown: %s", exc)
 
-        # 2) Best-effort flush of the current in-memory segment so a
-        #    restart doesn't drop the most-recent writes. Failure here
-        #    is not fatal — the next startup will simply rehydrate
-        #    whatever did get spilled.
+        # 2) Best-effort flush of ALL in-memory segments (current +
+        #    flushed_memory FIFO) to disk so a restart doesn't drop the
+        #    most-recent writes. ``flush_current`` alone would only
+        #    rotate the active segment into the memory queue, leaving
+        #    everything queued there unspilled. Failure here is not
+        #    fatal — the next startup will rehydrate whatever did get
+        #    spilled.
         try:
-            await state["index"].flush_current()
+            await state["index"].flush_all_to_disk()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("index.flush_current raised on shutdown: %s", exc)
+            logger.warning("index.flush_all_to_disk raised on shutdown: %s", exc)
 
         # 3) Wait for the consumer task to actually exit, bounded so a
         #    stuck XREADGROUP can't hang shutdown forever. If it misses

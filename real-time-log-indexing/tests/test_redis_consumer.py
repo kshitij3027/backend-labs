@@ -371,6 +371,79 @@ async def test_consumer_group_shared_state(redis_client, clean_stream, tmp_path)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_consumer_recovers_from_nogroup(
+    redis_client, clean_stream, tmp_path
+):
+    """FLUSHALL-style group deletion is absorbed, consumer keeps indexing.
+
+    Flow: XADD 5, wait for drain → delete the stream+group (same net
+    effect as ``FLUSHALL``) → XADD 5 more → assert the consumer
+    recreated the group and processed the new batch. If the NOGROUP
+    handler is missing, the second batch never arrives because the
+    background task has died with an unhandled ``ResponseError``.
+    """
+    stream, group = clean_stream
+    settings = _make_settings(
+        redis_stream_name=stream,
+        redis_consumer_group=group,
+        disk_segment_dir=str(tmp_path),
+        batch_timeout_ms=50,
+    )
+    index = await _make_index(tmp_path)
+    consumer = RedisStreamConsumer(settings=settings, index=index, batch_count=50)
+
+    task = asyncio.create_task(consumer.run())
+    await asyncio.sleep(0.1)
+
+    first = generate_log_entries(5, rng=random.Random(21))
+    for e in first:
+        await _xadd(redis_client, stream, e)
+
+    # Wait for the first batch to drain.
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if consumer.messages_processed >= 5:
+            break
+        await asyncio.sleep(0.05)
+    assert consumer.messages_processed >= 5
+
+    # Blow the stream + group away. Deleting the stream key is the
+    # lightest-touch way to reproduce what ``FLUSHALL`` does to this
+    # consumer — the next ``XREADGROUP`` will raise
+    # ``ResponseError("NOGROUP ...")``.
+    await redis_client.delete(stream)
+
+    # Give the consumer a moment to hit the NOGROUP path and recreate
+    # the group. The loop's BLOCK is 50 ms so this is plenty.
+    await asyncio.sleep(0.3)
+    assert not task.done(), (
+        "consumer task died on NOGROUP instead of recovering: "
+        f"exc={task.exception() if task.done() else None}"
+    )
+
+    # Second batch — must be picked up after the group is recreated.
+    second = generate_log_entries(5, rng=random.Random(22))
+    for e in second:
+        await _xadd(redis_client, stream, e)
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if consumer.messages_processed >= 10:
+            break
+        await asyncio.sleep(0.05)
+
+    await consumer.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2.0)
+    except asyncio.TimeoutError:
+        task.cancel()
+
+    assert consumer.messages_processed >= 10, (
+        f"consumer did not recover: processed={consumer.messages_processed}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_reconnect_on_connection_error(
     redis_client, clean_stream, tmp_path, monkeypatch
 ):

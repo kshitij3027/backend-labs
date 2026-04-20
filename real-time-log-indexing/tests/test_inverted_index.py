@@ -420,3 +420,55 @@ async def test_flush_current_noop_when_empty(tmp_path: Path) -> None:
     """flush_current() on an empty current returns None."""
     idx = _mk_index(tmp_path)
     assert await idx.flush_current() is None
+
+
+async def test_flush_all_to_disk_spills_everything(tmp_path: Path) -> None:
+    """flush_all_to_disk drains current + flushed_memory to disk.
+
+    Simulates the shutdown path: a small segment_max_docs forces many
+    rotations into the memory FIFO, and max_memory_segments keeps a
+    few segments in RAM that ``flush_current`` would leave behind.
+    After ``flush_all_to_disk``, the memory queue must be empty and
+    disk_segments must reflect every document ever written.
+    """
+    # Small per-segment cap + memory FIFO slack so the in-memory queue
+    # is non-trivially full when we invoke the flush.
+    idx = _mk_index(tmp_path, segment_max_docs=5, max_memory_segments=3)
+
+    for i in range(50):
+        await idx.add_document(_mk_entry(f"row {i}"))
+
+    # Preconditions: some segments have spilled already (because the
+    # FIFO overflowed), but the memory queue still holds some and the
+    # current segment is non-empty.
+    pre = idx.stats()
+    assert pre["docs_indexed"] == 50
+    assert pre["flushed_memory_segments"] > 0, (
+        "test setup invalid: nothing left in memory FIFO to spill"
+    )
+    pre_disk = pre["disk_segments"]
+
+    await idx.flush_all_to_disk()
+
+    post = idx.stats()
+    # Every memory-resident segment must now be on disk; the current
+    # segment must be empty (rotated then spilled).
+    assert post["current_segment_docs"] == 0
+    assert post["flushed_memory_segments"] == 0
+    assert post["disk_segments"] > pre_disk
+    assert post["docs_indexed"] == 50
+
+    # Search must still return all 50 matches — the on-disk caches
+    # were primed during the spill, so everything is reachable.
+    results = idx.search("row", limit=100)
+    assert len(results) == 50
+
+
+async def test_flush_all_to_disk_is_noop_when_empty(tmp_path: Path) -> None:
+    """flush_all_to_disk on a brand-new index does not create disk segments."""
+    idx = _mk_index(tmp_path)
+    await idx.flush_all_to_disk()
+    s = idx.stats()
+    assert s["current_segment_docs"] == 0
+    assert s["flushed_memory_segments"] == 0
+    assert s["disk_segments"] == 0

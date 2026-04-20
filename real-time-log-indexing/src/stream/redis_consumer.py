@@ -112,7 +112,24 @@ class RedisStreamConsumer:
                     # processed; we don't sleep between iterations
                     # because ``BLOCK`` inside xreadgroup already paces
                     # us (up to ``batch_timeout_ms``).
-                    await self._consume_once(self._client)
+                    try:
+                        await self._consume_once(self._client)
+                    except redis.exceptions.ResponseError as re_exc:
+                        # ``NOGROUP`` fires when the consumer group (or
+                        # the whole stream) is gone — e.g. a test /
+                        # operator called ``FLUSHALL``. Recreate the
+                        # group and keep going rather than bubbling up
+                        # and killing the background task.
+                        if "NOGROUP" in str(re_exc):
+                            logger.warning(
+                                "consumer group missing (FLUSHALL?); "
+                                "recreating and retrying"
+                            )
+                            await self._ensure_group(self._client)
+                            continue
+                        # Any other ResponseError is a real protocol
+                        # problem; escalate to the outer handler.
+                        raise
             except (
                 ConnectionError,
                 TimeoutError,

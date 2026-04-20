@@ -245,6 +245,22 @@ class InvertedIndex:
                 await self._spill_oldest_memory_to_disk()
             return flushed
 
+    async def flush_all_to_disk(self) -> None:
+        """Force-flush the current segment AND every memory-resident segment to disk.
+
+        Called at shutdown so in-memory docs don't disappear on
+        restart. ``flush_current`` only rotates the current segment
+        into the memory FIFO — it does NOT drain that FIFO. This
+        helper does both: rotate whatever is in ``current`` (if any)
+        and then spill every queued memory segment until the FIFO is
+        empty.
+        """
+        async with self._write_lock:
+            if self._current.doc_count() > 0:
+                await self._rotate_current_to_memory_queue()
+            while self._flushed_memory:
+                await self._spill_oldest_memory_to_disk()
+
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------

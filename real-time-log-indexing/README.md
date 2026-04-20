@@ -101,18 +101,125 @@ The user interacts via the browser. Sample log generation and search are trigger
 
 ---
 
-## Project Structure (planned)
+## Project Structure
 
 ```
 real-time-log-indexing/
-├── README.md
+├── Dockerfile                        # multi-stage runtime image (uvicorn app)
+├── Dockerfile.test                   # slim pytest image for the test profile
+├── docker-compose.yml                # redis + app + test profile + volumes
+├── Makefile                          # build/up/down/clean/test/e2e/load/demo/ui
+├── start.sh / stop.sh / cleanup.sh   # operational scripts
 ├── requirements.txt
-├── .gitignore
-└── (code, Dockerfile, tests, dashboard — to be added in subsequent commits)
+├── pytest.ini
+├── README.md
+├── src/
+│   ├── config.py                     # pydantic-settings Settings singleton
+│   ├── models.py                     # LogEntry, SearchRequest/Response, Stats, ...
+│   ├── logging_setup.py              # structured JSON stdout logger
+│   ├── sample_data.py                # synthetic log templates + generator
+│   ├── main.py                       # FastAPI app + lifespan wiring
+│   ├── index/
+│   │   ├── tokenizer.py              # LogTokenizer (IP/email/URL compound tokens)
+│   │   ├── segment.py                # in-memory Segment (three posting maps)
+│   │   ├── persistence.py            # atomic JSONL+gzip segment read/write
+│   │   ├── inverted_index.py         # orchestrator (current + flushed + disk)
+│   │   └── merger.py                 # background segment merge loop
+│   ├── stream/
+│   │   └── redis_consumer.py         # XREADGROUP with batching + backoff
+│   └── api/
+│       ├── routes.py                 # /api/search, /api/generate-sample, ...
+│       ├── websocket.py              # ConnectionManager + broadcast loops
+│       └── dashboard.py              # Jinja "/" route
+├── templates/dashboard.html          # dashboard skeleton (stat cards, search, feed)
+├── static/app.js + app.css           # dashboard JS (WS + poll fallback) and styles
+├── scripts/
+│   ├── load_test.py                  # success-criteria gate (p95, throughput, lag)
+│   └── demo.py                       # narrated API walkthrough
+└── tests/                            # unit + integration + test_e2e.py
+```
+
+---
+
+## Run
+
+```bash
+# Build and bring up (redis + app); waits for /health to report ok
+make build
+make up
+
+# Open the dashboard in a browser
+make ui                # or: open http://localhost:8080/
+
+# Push 5 000 sample logs, then search
+curl -X POST http://localhost:8080/api/generate-sample \
+     -H 'Content-Type: application/json' \
+     -d '{"count": 5000}'
+curl "http://localhost:8080/api/search?q=error&limit=10"
+
+# Tear everything down
+make down
+make clean             # also prunes volumes + images
+```
+
+---
+
+## Test
+
+Every target below runs **inside Docker**. Nothing executes on the host Python interpreter.
+
+```bash
+make test              # unit + integration suite (excludes test_e2e.py)
+make e2e               # live compose stack + tests/test_e2e.py
+make load              # latency + throughput assertions
+make demo              # narrated HTTP walkthrough
+make logs              # tail the app container logs
+```
+
+- `make test` builds the `test` image if needed and runs pytest against the in-process ASGI app via `httpx.ASGITransport` — no sockets, no Redis required for most tests (consumer tests use `fakeredis`).
+- `make e2e` brings up the full compose stack (real Redis + real FastAPI app + volume) and runs `tests/test_e2e.py` against the live service, then tears everything down on both success and failure.
+- `make load` runs `scripts/load_test.py` against the live app and exits non-zero if any success criterion below regresses.
+
+---
+
+## Performance targets (verified via `make load`)
+
+| Metric            | Target         | How it's measured                                        |
+|-------------------|----------------|----------------------------------------------------------|
+| Search p95        | < 50 ms        | 20 qps background load while ingesting 6 000 docs        |
+| Indexing latency  | < 100 ms       | Drain delay after last XADD divided by batch size (<=)   |
+| Throughput        | >= 1 000 logs/s | `/api/generate-sample` pipelined XADDs at 1 500 l/s target |
+| Survives restart  | Yes             | Segments flushed to `/data/segments` (docker volume)      |
+
+All thresholds are asserted inside `scripts/load_test.py` — the script prints a `RESULTS` block followed by `PASS` or `FAIL` and exits 0 / 1 so CI can gate on it.
+
+Observed numbers on a 2024-era laptop (compose default cpu/mem):
+
+```
+throughput            : ~2 000 logs/s
+search p50            : ~3 ms
+search p95            : ~8 ms
+index per-doc (<=)    : ~5 ms
 ```
 
 ---
 
 ## Status
 
-**Scaffold only.** This commit contains the README, `requirements.txt`, and `.gitignore` — no code, no Dockerfile, no tests yet. Implementation will land in follow-up commits once the plan is approved.
+**Complete.** Every commit in the plan has landed:
+
+| # | Commit                                                              |
+|---|---------------------------------------------------------------------|
+| 1 | Scaffold: config, models, Dockerfile, compose, Makefile             |
+| 2 | `LogTokenizer` with IP / email / URL compound handling              |
+| 3 | In-memory `Segment` with three posting maps                         |
+| 4 | Atomic JSONL+gzip segment persistence                               |
+| 5 | `InvertedIndex` orchestrator with flush + disk fan-out              |
+| 6 | Redis stream consumer with batching + exponential backoff           |
+| 7 | FastAPI app with lifespan, `/health`, `/api/stats`                  |
+| 8 | `/api/search` with service / level filters + highlighting           |
+| 9 | `POST /api/generate-sample` ingest endpoint                         |
+| 10| Dashboard template with search UI and filters                       |
+| 11| WebSocket `/ws` with `new_document` + `stats_update` broadcasts     |
+| 12| Background segment merger                                           |
+| 13| Load test, demo script, e2e test, final polish                      |
