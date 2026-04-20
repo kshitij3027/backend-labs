@@ -53,6 +53,7 @@ from src.api.routes import router
 from src.api.websocket import ConnectionManager, register_ws_routes
 from src.config import Settings, settings as default_settings
 from src.index.inverted_index import InvertedIndex
+from src.index.merger import merge_loop
 from src.index.tokenizer import LogTokenizer
 from src.logging_setup import setup_logging
 from src.sample_data import LEVELS, SERVICES
@@ -307,6 +308,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.ws_heartbeat_task = heartbeat_task
 
+    # Spawn the background segment merger. It owns its own cadence via
+    # ``settings.background_merge_interval_s`` and honours the shared
+    # stop_event so shutdown drains it alongside the consumer/WS tasks.
+    merger_task: asyncio.Task[None] = asyncio.create_task(
+        merge_loop(
+            state["index"],
+            state["stop_event"],
+            float(settings.background_merge_interval_s),
+        ),
+        name="segment-merger",
+    )
+    app.state.merger_task = merger_task
+
     logger.info(
         "startup complete disk_dir=%s redis_url=%s redis_connected=%s",
         settings.disk_segment_dir,
@@ -358,11 +372,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("consumer task exited with error: %s", exc)
 
-        # 4) Drain the WebSocket background tasks. Both loops check the
-        #    shared stop_event so they unwind on their own; we just
-        #    bound how long we'll wait. If they miss the deadline we
-        #    cancel them — nothing they do at this point is critical.
-        for task in (stats_task, heartbeat_task):
+        # 4) Drain the WebSocket + merger background tasks. All three
+        #    loops check the shared stop_event so they unwind on their
+        #    own; we just bound how long we'll wait. If any miss the
+        #    deadline we cancel them — nothing they do at this point is
+        #    critical (the merger's on-disk state is always durable).
+        for task in (stats_task, heartbeat_task, merger_task):
             if task.done():
                 continue
             try:
@@ -371,7 +386,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "ws task %s did not exit within %.1fs; cancelling",
+                    "background task %s did not exit within %.1fs; cancelling",
                     task.get_name(),
                     _WS_TASK_SHUTDOWN_TIMEOUT_S,
                 )
@@ -384,7 +399,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 pass
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "ws task %s exited with error: %s", task.get_name(), exc
+                    "background task %s exited with error: %s",
+                    task.get_name(),
+                    exc,
                 )
 
         # 5) Close every connected WS client cleanly. The manager's
