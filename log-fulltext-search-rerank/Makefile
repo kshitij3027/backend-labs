@@ -2,6 +2,7 @@
 
 build:
 	docker compose build
+	docker compose --profile test build
 
 up:
 	./start.sh
