@@ -1,0 +1,42 @@
+# VCS metadata — never copy into an image.
+.git
+.gitignore
+
+# Python byte/cache artifacts.
+__pycache__
+*.py[cod]
+*$py.class
+
+# Virtual environments — the image uses its own site-packages.
+.venv
+venv
+env
+ENV
+
+# Local env files — secrets must never be baked into an image.
+.env
+.env.local
+*.env
+
+# Tests are mounted by the compose test service, not copied into the
+# runtime image.
+tests
+
+# Dev-only docs — the runtime image does not need them.
+plan.md
+project_requirements.md
+README.md
+*.md
+
+# Caches.
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# OS / IDE droppings.
+.DS_Store
+.vscode
+.idea
+*.swp

@@ -1,0 +1,31 @@
+## Test-runner image for the intelligent log search & ranking engine.
+##
+## Dependencies are baked in so ``docker compose run test`` starts
+## fast, but the project tree is bind-mounted via compose so tests
+## always see the freshest code without a rebuild. NLTK corpora are
+## baked here too — tests that touch the tokenizer must not depend on
+## a network download at runtime.
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# curl is handy for ad-hoc probing inside the test container.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake NLTK corpora to the same location as the runtime image so test
+# code can rely on NLTK_DATA being populated.
+ENV NLTK_DATA=/usr/share/nltk_data
+RUN python -m nltk.downloader -d /usr/share/nltk_data \
+        stopwords wordnet punkt punkt_tab \
+    && chmod -R 755 /usr/share/nltk_data
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+CMD ["pytest", "-v", "--tb=short"]

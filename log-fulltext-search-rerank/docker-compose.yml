@@ -1,0 +1,31 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      HTTP_HOST: "0.0.0.0"
+      HTTP_PORT: "8000"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: ["test"]
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      HTTP_HOST: "0.0.0.0"
+      HTTP_PORT: "8000"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - ./:/app
