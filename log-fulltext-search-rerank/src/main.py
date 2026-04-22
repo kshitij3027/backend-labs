@@ -17,9 +17,11 @@ from fastapi import FastAPI
 
 from src.api.routes_health import router as health_router
 from src.api.routes_logs import router as logs_router
+from src.api.routes_search import router as search_router
 from src.config import Settings, get_settings
 from src.index.inverted_index import InvertedIndex
 from src.index.tokenizer import LogTokenizer
+from src.index.trie import PrefixTrie
 from src.logging_setup import configure_logging
 
 
@@ -51,6 +53,7 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     # so ingest and search always agree on tokenisation rules.
     tokenizer = LogTokenizer(settings)
     index = InvertedIndex(settings=settings, tokenizer=tokenizer)
+    trie = PrefixTrie()
 
     app = FastAPI(title="log-fulltext-search-rerank")
     # Stash on state so later-commit routes/middleware can reach the
@@ -59,9 +62,11 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.tokenizer = tokenizer
     app.state.index = index
+    app.state.trie = trie
 
     app.include_router(health_router)
     app.include_router(logs_router)
+    app.include_router(search_router)
 
     return app
 

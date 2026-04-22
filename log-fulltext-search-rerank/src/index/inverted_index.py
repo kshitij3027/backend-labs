@@ -30,7 +30,7 @@ Python (no ``await``) lets that offload be a trivial call.
 
 import asyncio
 from collections import Counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Iterator
 
 from src.models import LogEntry
 
@@ -214,6 +214,26 @@ class InvertedIndex:
             ),
         )
         return ordered[:cap]
+
+    def unique_tokens(self) -> Iterator[str]:
+        """Iterate distinct tokens currently in the index.
+
+        Used by the trie in commit 05 to rebuild autocomplete state lazily.
+        Safe for concurrent use because postings is append-only and new
+        keys become visible atomically under the GIL.
+        """
+        return iter(self._postings.keys())
+
+    def doc_frequency(self, token: str) -> int:
+        """Return the number of documents containing ``token``.
+
+        Reads the length of the token's posting list. Zero if the token
+        is unknown. Used by the suggestions route so the trie's per-
+        terminal frequency mirrors real-world popularity rather than a
+        flat count.
+        """
+        postings = self._postings.get(token)
+        return len(postings) if postings else 0
 
     def doc(self, doc_id: int) -> LogEntry | None:
         """Return the stored entry for ``doc_id`` or ``None`` if absent.
