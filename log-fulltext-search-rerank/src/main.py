@@ -2,19 +2,25 @@
 
 The module exports a :func:`build_app` factory and a module-level
 ``app = build_app()`` so ``uvicorn src.main:app`` still resolves
-directly. Later commits will extend the factory with routers,
-lifespan wiring, and component construction — this commit keeps the
-shape minimal but forward-compatible: settings are read at build
-time, structured JSON logging is installed once, and the
-:class:`Settings` instance is stashed on ``app.state`` so handlers
-can introspect it later without re-reading the env.
+directly. Commit 04 extends the factory to construct the tokenizer
+and inverted index up front (so every request sees the same
+long-lived instance) and mount the health + ingest routers.
+
+Settings, tokenizer, and index are stashed on ``app.state`` so
+downstream handlers can reach them without re-reading env or
+importing module-level singletons. Tests that need a fresh index can
+overwrite ``app.state.index`` between cases — that is the pattern
+``tests/test_api_logs.py`` uses for function-scoped isolation.
 """
 
 from fastapi import FastAPI
 
+from src.api.routes_health import router as health_router
+from src.api.routes_logs import router as logs_router
 from src.config import Settings, get_settings
+from src.index.inverted_index import InvertedIndex
+from src.index.tokenizer import LogTokenizer
 from src.logging_setup import configure_logging
-from src.models import HealthResponse
 
 
 def build_app(settings: Settings | None = None) -> FastAPI:
@@ -28,24 +34,34 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     Logging is configured here — callers that construct multiple apps
     in-process (tests) pay a cheap handler swap each time, which is
     the intended behaviour of :func:`configure_logging`.
+
+    The tokenizer and index are constructed once per app so their
+    per-instance caches (lemma cache, postings, docs, version
+    counter) are shared across every request. Fresh apps start with
+    empty state — by design, since the service is single-node in-
+    memory.
     """
     settings = settings or get_settings()
     configure_logging(settings.log_level)
 
+    # Build the core search components up front. The tokenizer and
+    # index are intentionally constructed here (not lazily on first
+    # request) so a health probe immediately after startup reflects
+    # a fully-ready app. The index owns a reference to the tokenizer
+    # so ingest and search always agree on tokenisation rules.
+    tokenizer = LogTokenizer(settings)
+    index = InvertedIndex(settings=settings, tokenizer=tokenizer)
+
     app = FastAPI(title="log-fulltext-search-rerank")
     # Stash on state so later-commit routes/middleware can reach the
-    # same instance via ``request.app.state.settings`` without importing
-    # the cached accessor.
+    # same instances via ``request.app.state.*`` without importing
+    # the cached accessor or the module-level ``app``.
     app.state.settings = settings
+    app.state.tokenizer = tokenizer
+    app.state.index = index
 
-    @app.get("/health", response_model=HealthResponse)
-    async def health() -> HealthResponse:
-        """Liveness probe used by Docker and the start.sh wait loop.
-
-        Response shape is locked to ``{"status": "ok"}`` — the compose
-        healthcheck and ``tests/test_bootstrap.py`` both assert on it.
-        """
-        return HealthResponse()
+    app.include_router(health_router)
+    app.include_router(logs_router)
 
     return app
 
