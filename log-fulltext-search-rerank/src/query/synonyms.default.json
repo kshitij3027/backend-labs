@@ -1,0 +1,15 @@
+{
+  "error": ["failure", "exception", "fault"],
+  "errors": ["failures", "exceptions"],
+  "fail": ["error", "crash"],
+  "failure": ["error", "exception"],
+  "slow": ["latency", "sluggish"],
+  "timeout": ["stall", "deadline"],
+  "crash": ["panic", "abort"],
+  "payment": ["transaction", "charge"],
+  "user": ["account", "session"],
+  "login": ["signin", "authentication"],
+  "signup": ["registration", "onboarding"],
+  "db": ["database", "store"],
+  "latency": ["slow", "delay"]
+}
