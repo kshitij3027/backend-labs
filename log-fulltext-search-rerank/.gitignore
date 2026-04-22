@@ -53,7 +53,9 @@ coverage.xml
 *.log
 logs/
 data/
-index/
+# Only ignore an ``index/`` directory at the project root (e.g. on-disk
+# index snapshots) — NOT the Python package at ``src/index/``.
+/index/
 *.db
 *.sqlite
 *.sqlite3
