@@ -235,6 +235,14 @@ class InvertedIndex:
         postings = self._postings.get(token)
         return len(postings) if postings else 0
 
+    def token_frequency(self, token: str, doc_id: int) -> int:
+        """TF for ``token`` in ``doc_id``. Returns 0 when either is absent."""
+        return self._postings.get(token, {}).get(doc_id, 0)
+
+    def doc_length(self, doc_id: int) -> int:
+        """Total tokens in ``doc_id`` (pre-lemmatization sum). Returns 0 when absent."""
+        return self._doc_token_counts.get(doc_id, 0)
+
     def doc(self, doc_id: int) -> LogEntry | None:
         """Return the stored entry for ``doc_id`` or ``None`` if absent.
 
