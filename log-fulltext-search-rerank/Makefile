@@ -17,13 +17,23 @@ test:
 	docker compose --profile test run --rm test pytest -v --tb=short
 
 e2e:
-	@echo "e2e tests wired in commit 04+"; exit 0
+	./start.sh
+	docker compose --profile test run --rm -e APP_URL=http://app:8000 test python scripts/demo.py
+	docker compose down
 
 load:
-	@echo "load tests wired in commit 10"; exit 0
+	./start.sh
+	docker compose --profile test run --rm -e APP_URL=http://app:8000 -e CHECK_RSS=1 test python scripts/load_test.py; \
+	rc=$$?; \
+	docker compose down; \
+	exit $$rc
 
 demo:
-	@echo "demo wired in commit 10"; exit 0
+	./start.sh
+	docker compose --profile test run --rm -e APP_URL=http://app:8000 test python scripts/demo.py; \
+	rc=$$?; \
+	docker compose down; \
+	exit $$rc
 
 logs:
 	docker compose logs -f app
