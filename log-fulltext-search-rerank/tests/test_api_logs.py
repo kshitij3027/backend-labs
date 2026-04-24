@@ -16,29 +16,23 @@ from __future__ import annotations
 import pytest
 import pytest_asyncio
 
-from src.config import get_settings
-from src.index.inverted_index import InvertedIndex
-from src.index.tokenizer import LogTokenizer
-from src.main import app
+from src.main import app, reset_app_state
 
 
 @pytest_asyncio.fixture(autouse=True)
 async def _fresh_index():
-    """Rebuild the index on ``app.state`` before each test.
+    """Rebuild the full app state on ``app.state`` before each test.
 
     The module-level ``app`` is shared across all tests in the
     suite, so without this reset a test that ingests five docs
-    would leak those docs into the next test. Overwriting the
-    attribute is the simplest way to guarantee isolation — and it's
-    safe because nothing else holds a reference to the old index by
-    the time ``yield`` fires.
+    would leak those docs into the next test. The helper rebuilds
+    every component (index, trie, cache, search service) so the
+    SearchService's internal references stay in sync with what
+    the routes see on ``app.state``.
     """
-    settings = get_settings()
-    tokenizer = LogTokenizer(settings)
-    app.state.index = InvertedIndex(settings, tokenizer)
-    app.state.tokenizer = tokenizer
+    reset_app_state(app)
     yield
-    # No teardown — the next test's fixture overwrites the state.
+    # No teardown — the next test's fixture rebuilds the state.
 
 
 # ---------------------------------------------------------------------------

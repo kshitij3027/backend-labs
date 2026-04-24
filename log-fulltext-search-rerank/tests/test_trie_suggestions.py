@@ -22,11 +22,8 @@ import time
 import pytest
 import pytest_asyncio
 
-from src.config import get_settings
-from src.index.inverted_index import InvertedIndex
-from src.index.tokenizer import LogTokenizer
 from src.index.trie import PrefixTrie
-from src.main import app
+from src.main import app, reset_app_state
 
 
 # ---------------------------------------------------------------------------
@@ -35,17 +32,15 @@ from src.main import app
 
 @pytest_asyncio.fixture(autouse=True)
 async def _fresh_state():
-    """Reset ``app.state.index`` and ``app.state.trie`` per test.
+    """Rebuild the whole app state before every test.
 
     Same pattern ``test_api_logs.py`` uses for isolation — without it,
     a suggestion test that ingests 500 docs would leak them into the
-    next test's trie.
+    next test's trie. Using :func:`reset_app_state` rebuilds the
+    :class:`SearchService` too so its internal references point at
+    the fresh index/trie.
     """
-    settings = get_settings()
-    tokenizer = LogTokenizer(settings)
-    app.state.index = InvertedIndex(settings, tokenizer)
-    app.state.tokenizer = tokenizer
-    app.state.trie = PrefixTrie()
+    reset_app_state(app)
     yield
 
 
