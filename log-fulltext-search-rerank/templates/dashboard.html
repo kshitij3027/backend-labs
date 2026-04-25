@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }}</title>
+    <link rel="stylesheet" href="/static/app.css">
+  </head>
+  <body>
+    <header>
+      <h1>{{ title }}</h1>
+      <p class="subtitle">Intelligent Log Search &amp; Ranking</p>
+    </header>
+
+    <main>
+      <section class="controls">
+        <form id="search-form" autocomplete="off">
+          <div class="row">
+            <input id="search-input" type="text" placeholder="Search logs e.g. 'authentication error'" aria-label="Query" />
+            <select id="mode-select" aria-label="Context mode">
+              <option value="">Normal mode</option>
+              <option value="incident">Incident mode</option>
+            </select>
+            <input id="limit-input" type="number" min="1" max="100" value="10" aria-label="Limit" />
+            <button id="submit-btn" type="submit">Search</button>
+          </div>
+          <ul id="suggestions" class="suggestions" hidden></ul>
+        </form>
+
+        <div class="seed-row">
+          <button id="seed-btn" type="button">Seed 500 sample logs</button>
+          <span id="seed-status" class="seed-status"></span>
+        </div>
+
+        <div id="error-banner" class="error-banner" hidden></div>
+      </section>
+
+      <section id="stats" class="stats" aria-live="polite"></section>
+
+      <section id="results" class="results" aria-live="polite"></section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

@@ -49,6 +49,8 @@ RUN python -m nltk.downloader -d /usr/share/nltk_data \
 
 # App source.
 COPY src/ /app/src/
+COPY templates/ /app/templates/
+COPY static/ /app/static/
 
 RUN chown -R app:app /app
 

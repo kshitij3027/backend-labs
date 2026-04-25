@@ -1,0 +1,167 @@
+:root {
+  --bg: #0f1419;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --error: #f85149;
+  --warn: #d29922;
+  --info: #58a6ff;
+  --debug: #8b949e;
+  --fatal: #b62324;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+header {
+  padding: 1.5rem 2rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+header h1 { margin: 0; font-size: 1.4rem; }
+header .subtitle { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.95rem; }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.controls { margin-bottom: 1.5rem; position: relative; }
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 0.5rem;
+}
+input, select, button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 0.95rem;
+}
+button {
+  background: var(--accent);
+  color: #0d1117;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+}
+button:hover { filter: brightness(1.1); }
+
+.suggestions {
+  position: absolute;
+  top: 2.5rem;
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 0;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  list-style: none;
+  z-index: 10;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.suggestions li { padding: 0.4rem 0.75rem; cursor: pointer; }
+.suggestions li:hover { background: #21262d; }
+
+.seed-row { display: flex; align-items: center; gap: 1rem; margin-top: 0.75rem; }
+.seed-row button { background: var(--panel); color: var(--accent); border: 1px solid var(--border); }
+.seed-status { color: var(--muted); font-size: 0.9rem; }
+
+.error-banner {
+  margin-top: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid var(--error);
+  color: var(--error);
+  border-radius: 6px;
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1.25rem;
+}
+.stat-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+}
+.stat-card .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.stat-card .value { font-size: 1.4rem; font-weight: 600; margin-top: 0.25rem; }
+
+.results { display: flex; flex-direction: column; gap: 0.75rem; }
+.result-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.85rem 1rem;
+}
+.result-head {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.score { font-weight: 600; color: var(--accent); }
+.level-pill {
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.level-pill.ERROR, .level-pill.error { background: var(--error); color: #fff; }
+.level-pill.WARN, .level-pill.warn, .level-pill.WARNING { background: var(--warn); color: #0d1117; }
+.level-pill.INFO, .level-pill.info { background: var(--info); color: #0d1117; }
+.level-pill.DEBUG, .level-pill.debug { background: var(--debug); color: #0d1117; }
+.level-pill.FATAL, .level-pill.fatal { background: var(--fatal); color: #fff; }
+.service-tag {
+  background: rgba(88, 166, 255, 0.12);
+  color: var(--accent);
+  padding: 0.05rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+.message { font-family: "JetBrains Mono", "Fira Code", monospace; font-size: 0.92rem; }
+
+.explain {
+  margin-top: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  display: none;
+}
+.result-card[open] .explain, .result-card.expanded .explain { display: block; }
+.explain-toggle { background: transparent; color: var(--accent); border: none; padding: 0; cursor: pointer; font-size: 0.85rem; }
+.factor-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 0.4rem 1rem;
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+}
+.factor-grid .label { color: var(--muted); }
+.reasons { margin-top: 0.4rem; font-size: 0.85rem; color: var(--muted); }
+.reasons strong { color: var(--text); }
+
+@media (max-width: 600px) {
+  .row { grid-template-columns: 1fr; }
+}

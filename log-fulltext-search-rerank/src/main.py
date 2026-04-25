@@ -14,8 +14,12 @@ importing module-level singletons. Tests that need a fresh state use
 leaks between cases.
 """
 
-from fastapi import FastAPI
+from pathlib import Path
 
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+
+from src.api.routes_dashboard import router as dashboard_router
 from src.api.routes_health import router as health_router
 from src.api.routes_logs import router as logs_router
 from src.api.routes_search import router as search_router
@@ -34,6 +38,11 @@ from src.ranking.severity import SeverityScorer
 from src.ranking.temporal import TemporalScorer
 from src.ranking.tfidf import TfIdfScorer
 from src.service import SearchService
+
+# Project-root path resolved from the ``src/main.py`` location so the
+# ``StaticFiles`` mount and the dashboard template directory both work
+# regardless of the process CWD inside the container.
+ROOT = Path(__file__).resolve().parent.parent
 
 
 def build_app(settings: Settings | None = None) -> FastAPI:
@@ -119,6 +128,18 @@ def build_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health_router)
     app.include_router(logs_router)
     app.include_router(search_router)
+    app.include_router(dashboard_router)
+
+    # Static-asset mount for the dashboard. ``check_dir=False`` would
+    # let the app start without the directory; we prefer the explicit
+    # exists() guard so a missing build is loud rather than silent.
+    static_dir = ROOT / "static"
+    if static_dir.exists():
+        app.mount(
+            "/static",
+            StaticFiles(directory=str(static_dir)),
+            name="static",
+        )
 
     return app
 
