@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +18,8 @@ class DetailedHealthResponse(BaseModel):
 
     status: str
     timestamp: datetime
-    dependencies: dict[str, str] = Field(default_factory=dict)
+    dependencies: dict[str, Literal["ok", "down", "unknown"]] = Field(default_factory=dict)
+    details: dict[str, str] | None = None
 
 
 class ErrorBody(BaseModel):

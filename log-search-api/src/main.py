@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
 from src.api.v1.router import router as v1_router
+from src.clients.elasticsearch import make_es_client
+from src.clients.redis import make_redis_client, make_redis_pool
 from src.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -19,11 +21,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     logging.basicConfig(level=settings.LOG_LEVEL.upper())
     logger.info("starting %s version %s", settings.PROJECT_NAME, app.version)
-    # TODO(commit-2): construct AsyncElasticsearch + redis.asyncio.Redis here and attach to app.state
+
+    app.state.es = make_es_client(settings)
+    app.state.redis_cache_pool = make_redis_pool(settings.REDIS_URL, settings.CACHE_REDIS_DB)
+    app.state.redis_cache = make_redis_client(app.state.redis_cache_pool)
+
     try:
         yield
     finally:
         logger.info("stopping %s", settings.PROJECT_NAME)
+        try:
+            await app.state.es.close()
+        except Exception as exc:
+            logger.warning("error closing elasticsearch client: %s", exc)
+        try:
+            await app.state.redis_cache.aclose()
+        except Exception as exc:
+            logger.warning("error closing redis client: %s", exc)
+        try:
+            await app.state.redis_cache_pool.aclose()
+        except Exception as exc:
+            logger.warning("error closing redis pool: %s", exc)
 
 
 def build_app() -> FastAPI:

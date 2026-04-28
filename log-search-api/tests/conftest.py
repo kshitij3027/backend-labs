@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import AsyncIterator
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -12,9 +13,25 @@ from httpx import ASGITransport, AsyncClient
 @pytest.fixture(scope="session")
 def app_instance() -> FastAPI:
     os.environ.setdefault("SECRET_KEY", "test-secret-key-please-change")
+    from src.clients.elasticsearch import get_es
+    from src.clients.redis import get_redis
     from src.main import build_app
 
-    return build_app()
+    app = build_app()
+
+    fake_es = AsyncMock()
+    fake_es.cluster = AsyncMock()
+    fake_es.cluster.health = AsyncMock(return_value={})
+    fake_es.close = AsyncMock(return_value=None)
+
+    fake_redis = AsyncMock()
+    fake_redis.ping = AsyncMock(return_value=True)
+    fake_redis.aclose = AsyncMock(return_value=None)
+
+    app.dependency_overrides[get_es] = lambda: fake_es
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+
+    return app
 
 
 @pytest_asyncio.fixture
