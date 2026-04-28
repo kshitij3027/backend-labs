@@ -32,5 +32,11 @@ async def ping_es(es: AsyncElasticsearch) -> tuple[bool, str | None]:
         return False, str(exc)
 
 
+async def bootstrap_index(es: AsyncElasticsearch, index: str) -> None:
+    from src.services.ingest import ensure_index
+
+    await ensure_index(es, index)
+
+
 def get_es(request: Request) -> AsyncElasticsearch:
     return request.app.state.es

@@ -10,7 +10,7 @@ from fastapi.responses import ORJSONResponse
 from slowapi.middleware import SlowAPIMiddleware
 
 from src.api.v1.router import router as v1_router
-from src.clients.elasticsearch import make_es_client
+from src.clients.elasticsearch import bootstrap_index, make_es_client
 from src.clients.redis import make_redis_client, make_redis_pool
 from src.config import get_settings
 from src.middleware.errors import register_error_handlers
@@ -29,6 +29,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.es = make_es_client(settings)
     app.state.redis_cache_pool = make_redis_pool(settings.REDIS_URL, settings.CACHE_REDIS_DB)
     app.state.redis_cache = make_redis_client(app.state.redis_cache_pool)
+
+    try:
+        await bootstrap_index(app.state.es, settings.ELASTICSEARCH_INDEX)
+    except Exception as exc:
+        logger.warning(
+            "elasticsearch index bootstrap failed for %s: %s",
+            settings.ELASTICSEARCH_INDEX,
+            exc,
+        )
 
     try:
         yield
