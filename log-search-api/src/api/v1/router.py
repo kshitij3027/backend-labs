@@ -11,3 +11,8 @@ settings = get_settings()
 router = APIRouter(prefix=settings.API_V1_PREFIX)
 router.include_router(health.router)
 router.include_router(auth_router.router)
+
+if settings.DEBUG_ENDPOINTS_ENABLED:
+    from src.api.v1 import debug as debug_router
+
+    router.include_router(debug_router.router)

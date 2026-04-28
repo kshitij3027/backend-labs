@@ -7,11 +7,15 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+from slowapi.middleware import SlowAPIMiddleware
 
 from src.api.v1.router import router as v1_router
 from src.clients.elasticsearch import make_es_client
 from src.clients.redis import make_redis_client, make_redis_pool
 from src.config import get_settings
+from src.middleware.errors import register_error_handlers
+from src.middleware.rate_limit import limiter
+from src.middleware.request_id import RequestIDMiddleware
 
 logger = logging.getLogger(__name__)
 
@@ -55,13 +59,26 @@ def build_app() -> FastAPI:
         redoc_url=None,
     )
 
+    app.state.limiter = limiter
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins_list(),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "X-Request-ID",
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+            "Retry-After",
+        ],
     )
+    app.add_middleware(SlowAPIMiddleware)
+    app.add_middleware(RequestIDMiddleware)
+
+    register_error_handlers(app)
 
     app.include_router(v1_router)
     return app

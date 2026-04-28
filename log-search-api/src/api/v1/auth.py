@@ -1,15 +1,14 @@
-from __future__ import annotations
-
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.security import OAuth2PasswordRequestForm
 
 from src.auth.dependencies import RequireUser
 from src.auth.security import create_access_token
 from src.auth.users import SeededUserStore, get_user_store
 from src.config import Settings, get_settings
+from src.middleware.rate_limit import DEFAULT_LIMIT, limiter
 from src.schemas.auth import TokenResponse, UserPublic
 
 logger = logging.getLogger(__name__)
@@ -24,7 +23,10 @@ def _get_user_store(
 
 
 @router.post("/token", response_model=TokenResponse)
+@limiter.limit(DEFAULT_LIMIT)
 async def issue_token(
+    request: Request,
+    response: Response,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     settings: Annotated[Settings, Depends(get_settings)],
     user_store: Annotated[SeededUserStore, Depends(_get_user_store)],
@@ -41,5 +43,8 @@ async def issue_token(
 
 
 @router.get("/me", response_model=UserPublic)
-async def read_me(current_user: RequireUser) -> UserPublic:
+@limiter.limit(DEFAULT_LIMIT)
+async def read_me(
+    request: Request, response: Response, current_user: RequireUser
+) -> UserPublic:
     return UserPublic(username=current_user)

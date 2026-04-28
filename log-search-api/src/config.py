@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     SEED_PASSWORD_HASH: str = ""
 
     LOG_LEVEL: str = "INFO"
+    DEBUG_ENDPOINTS_ENABLED: bool = False
 
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.CORS_ALLOWED_ORIGINS.split(",") if origin.strip()]
