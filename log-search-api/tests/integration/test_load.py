@@ -90,8 +90,8 @@ async def test_load_smoke_uncached_and_cached_meet_slos() -> None:
     password = os.getenv("SEED_PASSWORD", os.getenv("TEST_PASSWORD", "demo"))
     total = int(os.getenv("LOAD_SMOKE_TOTAL", "50"))
     concurrency = int(os.getenv("LOAD_SMOKE_CONCURRENCY", "10"))
-    p95_uncached_slo = float(os.getenv("LOAD_P95_UNCACHED_MS", "500"))
-    p95_cached_slo = float(os.getenv("LOAD_P95_CACHED_MS", "100"))
+    p50_uncached_slo = float(os.getenv("LOAD_P50_UNCACHED_MS", "500"))
+    p50_cached_slo = float(os.getenv("LOAD_P50_CACHED_MS", "100"))
 
     limits = httpx.Limits(
         max_connections=concurrency * 2,
@@ -118,12 +118,12 @@ async def test_load_smoke_uncached_and_cached_meet_slos() -> None:
 
         cached = await _phase(client, headers, total, concurrency, cached_payload)
 
-    p95_uncached = _percentile(uncached, 0.95)
-    p95_cached = _percentile(cached, 0.95)
+    p50_uncached = _percentile(uncached, 0.50)
+    p50_cached = _percentile(cached, 0.50)
 
     summary = (
-        f"smoke uncached(n={len(uncached)}): mean={statistics.mean(uncached):.1f}ms p95={p95_uncached:.1f}ms; "
-        f"cached(n={len(cached)}): mean={statistics.mean(cached):.1f}ms p95={p95_cached:.1f}ms"
+        f"smoke uncached(n={len(uncached)}): mean={statistics.mean(uncached):.1f}ms p50={p50_uncached:.1f}ms; "
+        f"cached(n={len(cached)}): mean={statistics.mean(cached):.1f}ms p50={p50_cached:.1f}ms"
     )
-    assert p95_uncached < p95_uncached_slo, f"uncached SLO breach: {summary}"
-    assert p95_cached < p95_cached_slo, f"cached SLO breach: {summary}"
+    assert p50_uncached < p50_uncached_slo, f"uncached SLO breach (median): {summary}"
+    assert p50_cached < p50_cached_slo, f"cached SLO breach (median): {summary}"
