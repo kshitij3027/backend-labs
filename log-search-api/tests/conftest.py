@@ -44,3 +44,14 @@ async def async_client(app_instance: FastAPI) -> AsyncIterator[AsyncClient]:
 @pytest.fixture(scope="session")
 def live_url() -> str:
     return os.getenv("API_URL", "http://api:8000")
+
+
+@pytest.fixture
+def api_token() -> str:
+    os.environ.setdefault("SECRET_KEY", "test-secret-key-please-change")
+    from src.auth.security import create_access_token
+    from src.config import Settings
+
+    settings = Settings()
+    token, _ = create_access_token("testuser", settings)
+    return token

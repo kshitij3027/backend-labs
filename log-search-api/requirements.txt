@@ -5,6 +5,7 @@ pydantic-settings==2.6.1
 python-multipart==0.0.12
 pyjwt[crypto]==2.9.0
 passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
 slowapi==0.1.9
 redis==5.1.1
 elasticsearch[async]==8.15.1
