@@ -16,6 +16,7 @@ from src.config import get_settings
 from src.middleware.errors import register_error_handlers
 from src.middleware.rate_limit import limiter
 from src.middleware.request_id import RequestIDMiddleware
+from src.services.cache import CacheCounters, SearchCache
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.es = make_es_client(settings)
     app.state.redis_cache_pool = make_redis_pool(settings.REDIS_URL, settings.CACHE_REDIS_DB)
     app.state.redis_cache = make_redis_client(app.state.redis_cache_pool)
+    app.state.cache_counters = CacheCounters()
+    app.state.search_cache = SearchCache(
+        app.state.redis_cache,
+        settings.SEARCH_CACHE_TTL_SECONDS,
+        app.state.cache_counters,
+    )
 
     try:
         await bootstrap_index(app.state.es, settings.ELASTICSEARCH_INDEX)
