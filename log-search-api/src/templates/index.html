@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{ project_name }}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script defer src="/static/app.js"></script>
+</head>
+<body data-api-prefix="{{ api_v1_prefix }}">
+  <header class="app-header">
+    <h1>{{ project_name }}</h1>
+    <div id="auth-status" class="auth-status" aria-live="polite">not signed in</div>
+  </header>
+
+  <main class="app-main">
+    <section class="panel auth-panel" aria-labelledby="auth-heading">
+      <h2 id="auth-heading">Authenticate</h2>
+      <form id="login-form" autocomplete="off">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" required autocomplete="username" value="demo">
+
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required autocomplete="current-password">
+
+        <button type="submit" id="login-button">Login</button>
+        <button type="button" id="logout-button" class="ghost" hidden>Logout</button>
+      </form>
+    </section>
+
+    <section class="panel search-panel" aria-labelledby="search-heading">
+      <h2 id="search-heading">Search</h2>
+      <form id="search-form">
+        <label for="q">Query</label>
+        <input type="text" id="q" name="q" placeholder="e.g. payment error" maxlength="512">
+
+        <div class="grid">
+          <div>
+            <label for="levels">Level</label>
+            <select id="levels" name="levels" multiple size="5">
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+              <option value="CRITICAL">CRITICAL</option>
+            </select>
+          </div>
+
+          <div>
+            <label for="services">Service</label>
+            <select id="services" name="services" multiple size="5">
+              <option value="" disabled>(populated after first search)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <label for="start_time">Start time</label>
+            <input type="datetime-local" id="start_time" name="start_time">
+          </div>
+          <div>
+            <label for="end_time">End time</label>
+            <input type="datetime-local" id="end_time" name="end_time">
+          </div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <label for="sort_by">Sort by</label>
+            <select id="sort_by" name="sort_by">
+              <option value="relevance" selected>relevance</option>
+              <option value="timestamp">timestamp</option>
+            </select>
+          </div>
+          <div>
+            <label for="sort_order">Sort order</label>
+            <select id="sort_order" name="sort_order">
+              <option value="desc" selected>desc</option>
+              <option value="asc">asc</option>
+            </select>
+          </div>
+          <div>
+            <label for="limit">Limit</label>
+            <input type="number" id="limit" name="limit" min="1" max="1000" value="25">
+          </div>
+          <div>
+            <label for="offset">Offset</label>
+            <input type="number" id="offset" name="offset" min="0" value="0">
+          </div>
+        </div>
+
+        <button type="submit" id="search-button" disabled>Search</button>
+      </form>
+
+      <div id="result-meta" class="badges" hidden>
+        <span class="badge" id="badge-total"></span>
+        <span class="badge" id="badge-exec"></span>
+        <span class="badge" id="badge-cache"></span>
+      </div>
+    </section>
+
+    <section class="panel results-panel" aria-labelledby="results-heading">
+      <h2 id="results-heading">Results</h2>
+      <div class="table-wrap">
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Level</th>
+              <th>Service</th>
+              <th>Message</th>
+              <th>Score</th>
+            </tr>
+          </thead>
+          <tbody id="results-body">
+            <tr><td colspan="5" class="empty">No search executed yet.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <nav class="pagination" aria-label="results pagination">
+        <button type="button" id="prev-button" disabled>Prev</button>
+        <span id="page-info" class="page-info">offset 0</span>
+        <button type="button" id="next-button" disabled>Next</button>
+      </nav>
+    </section>
+
+    <section class="panel agg-panel" aria-labelledby="agg-heading">
+      <h2 id="agg-heading">Aggregations</h2>
+      <div class="agg-grid">
+        <div class="agg-block">
+          <h3>Levels</h3>
+          <ul id="agg-levels" class="agg-list"></ul>
+        </div>
+        <div class="agg-block">
+          <h3>Services</h3>
+          <ul id="agg-services" class="agg-list"></ul>
+        </div>
+        <div class="agg-block">
+          <h3>Timeline</h3>
+          <ul id="agg-timeline" class="agg-list"></ul>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast-container" class="toast-container" aria-live="assertive"></div>
+</body>
+</html>

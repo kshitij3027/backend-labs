@@ -7,8 +7,10 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi.middleware import SlowAPIMiddleware
 
+from src.api import dashboard as dashboard_router
 from src.api.v1.router import router as v1_router
 from src.clients.elasticsearch import bootstrap_index, make_es_client
 from src.clients.redis import make_redis_client, make_redis_pool
@@ -68,11 +70,18 @@ def build_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title=settings.PROJECT_NAME,
-        version="0.1.0",
+        version="1.0.0",
+        description=(
+            "JWT-protected, rate-limited, Redis-cached log search API backed by "
+            "Elasticsearch. Exposes single + bulk ingest, ranked full-text "
+            "search with filters, aggregations, pagination, and a built-in "
+            "dashboard at `GET /`."
+        ),
         default_response_class=ORJSONResponse,
         lifespan=lifespan,
-        docs_url=None,
-        redoc_url=None,
+        docs_url="/api/docs",
+        redoc_url="/api/redoc",
+        openapi_url="/openapi.json",
     )
 
     app.state.limiter = limiter
@@ -96,7 +105,11 @@ def build_app() -> FastAPI:
 
     register_error_handlers(app)
 
+    # Static assets + Jinja dashboard (mounted at app root, unversioned).
+    app.mount("/static", StaticFiles(directory="src/static"), name="static")
+
     app.include_router(v1_router)
+    app.include_router(dashboard_router.router)
     return app
 
 
