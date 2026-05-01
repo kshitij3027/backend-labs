@@ -197,6 +197,21 @@ class FailoverNode:
                     self.config.node_id,
                 )
 
+        # When the node moves back into STANDBY (from PRIMARY or ELECTION),
+        # reset the heartbeat monitor so a stale `_failure_fired=True` from
+        # an earlier failure window doesn't block re-detection. Without
+        # this, a brief PRIMARY interlude leaves the monitor wedged and
+        # the next missing-heartbeat condition would be silently ignored
+        # until a fresh heartbeat reappears (which it might never).
+        if old is not NodeState.STANDBY and new is NodeState.STANDBY:
+            try:
+                self.heartbeat_monitor.reset()
+            except Exception:
+                logger.exception(
+                    "heartbeat monitor reset failed on demotion (node=%s)",
+                    self.config.node_id,
+                )
+
     async def _on_lock_lost(self) -> None:
         """Self-demote when the heartbeat emitter loses the leader lock."""
         if self.state_machine.state is NodeState.PRIMARY:

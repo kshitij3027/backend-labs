@@ -15,6 +15,9 @@ Run by ``make e2e`` after ``docker compose up --build -d``. Asserts:
   the lock, a standby promotes within 12s (Step 7).
 * ``GET /metrics`` exposes the new ``circuit_breaker_*`` counters added
   in commit 5 (Step 8).
+* Network partition + heal — ``docker network disconnect`` the current
+  primary, expect a standby to promote, reconnect, expect the original
+  primary to rejoin as STANDBY (Step 9, added in commit 7).
 
 Exits non-zero on any assertion failure. Uses only the Python stdlib so
 the script can run from inside the ``make e2e`` shell on the host without
@@ -383,6 +386,60 @@ def _verify_circuit_breaker_metric_exposed(primary: int) -> None:
     print("  /metrics contains circuit_breaker_failures_total + circuit_breaker_opens_total")
 
 
+def _verify_partition_heal(current_primary: int) -> int:
+    """Step 9: network partition + heal recovery.
+
+    Disconnects the current primary from the failover network, expects a
+    standby to promote within 15s, reconnects, and expects the original
+    primary to rejoin as STANDBY within 15s. Returns the *new* primary
+    port so any further steps can chain off it.
+    """
+    print("=== Step 9: network partition + heal ===")
+    container = _container_for_port(current_primary)
+    candidate_networks = (
+        "active-passive-failover-log-processor_failover-net",
+        "failover-net",
+        "active-passive-failover-log-processor_default",
+    )
+
+    actual_net: Optional[str] = None
+    for net in candidate_networks:
+        proc = _docker("network", "disconnect", net, container)
+        if proc.returncode == 0:
+            actual_net = net
+            break
+    if actual_net is None:
+        print(
+            "!! could not disconnect from any candidate network; "
+            "skipping partition step",
+            file=sys.stderr,
+        )
+        return current_primary
+    print(f"  disconnected {container} from {actual_net}")
+
+    new_primary, elapsed = _wait_for_promotion(current_primary, timeout=15.0)
+    print(
+        f"  new primary on port {new_primary} after partition "
+        f"(elapsed {elapsed:.2f}s)"
+    )
+
+    # Give the new primary a moment to settle before healing.
+    time.sleep(2.0)
+    print(f"  reconnecting {container}")
+    proc = _docker("network", "connect", actual_net, container)
+    if proc.returncode != 0:
+        print(
+            f"  docker network connect stderr: {proc.stderr.strip()}",
+            file=sys.stderr,
+        )
+
+    # Original primary should rejoin as STANDBY within 15s.
+    ok = _wait_for_state(current_primary, "STANDBY", timeout=15.0)
+    assert ok, "original primary did not rejoin as STANDBY"
+    print("  partitioned node rejoined as STANDBY")
+    return new_primary
+
+
 # =========================================================================
 # Entry point
 # =========================================================================
@@ -412,9 +469,14 @@ def main() -> int:
         # Step 8: surface-level check on the breaker metric.
         _verify_circuit_breaker_metric_exposed(fourth_primary)
 
+        # Step 9: partition + heal. Disconnect the current primary from
+        # the failover network, expect a standby to promote, reconnect,
+        # expect the original primary to rejoin as STANDBY.
+        fifth_primary = _verify_partition_heal(fourth_primary)
+
         print(
             "=== ALL E2E ASSERTIONS PASSED — final primary "
-            f"on port {fourth_primary} ==="
+            f"on port {fifth_primary} ==="
         )
         return 0
     except AssertionError as exc:

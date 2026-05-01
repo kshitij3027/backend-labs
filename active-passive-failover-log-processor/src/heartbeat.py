@@ -208,10 +208,24 @@ class HeartbeatMonitor:
     async def start(self) -> None:
         """Spawn the background poll task and reset the freshness clock."""
         self._stop_event.clear()
+        self.reset()
+        self._task = asyncio.create_task(self._run(), name="heartbeat-monitor")
+
+    def reset(self) -> None:
+        """Reset the freshness clock and failure flag.
+
+        Called by ``start()`` and also by the FailoverNode whenever the
+        state machine transitions back into STANDBY from PRIMARY/ELECTION.
+        Without this, a stale ``_failure_fired=True`` from an earlier
+        failure window would block re-detection if the node was briefly
+        promoted and then demoted again — the monitor would silently
+        ignore the next missing-heartbeat condition until a fresh
+        heartbeat reappeared (which it might never, if the new primary
+        also dies).
+        """
         self._last_seen_at = None
         self._started_at = time.monotonic()
         self._failure_fired = False
-        self._task = asyncio.create_task(self._run(), name="heartbeat-monitor")
 
     async def stop(self) -> None:
         """Signal the loop to exit and await its cancellation."""

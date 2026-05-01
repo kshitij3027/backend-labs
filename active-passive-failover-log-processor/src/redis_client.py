@@ -72,10 +72,19 @@ class RedisClient:
         if self._redis is None:
             # decode_responses=False keeps everything in bytes — orjson gives
             # us bytes on the way out and we want byte-equality on round-trips.
+            #
+            # socket_timeout / socket_connect_timeout are critical for partition
+            # tolerance: without them, a partitioned primary's renew_lock call
+            # would block on the kernel's default TCP timeout (~60s), leaving
+            # the cluster wedged with a "zombie primary" that hasn't yet
+            # noticed it's lost the network. With 1.5s per op, the next
+            # heartbeat tick (every 2s) catches the failure and self-demotes.
             self._redis = aioredis.Redis(
                 host=self.host,
                 port=self.port,
                 decode_responses=False,
+                socket_timeout=1.5,
+                socket_connect_timeout=1.5,
             )
 
     async def close(self) -> None:

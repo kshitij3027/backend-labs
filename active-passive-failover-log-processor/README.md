@@ -1,207 +1,264 @@
 # active-passive-failover-log-processor
 
-A multi-node log processing service where one primary node handles all traffic while standby nodes monitor its health and automatically take over within 10 seconds if it fails.
+A 3-node Python/FastAPI log-processing cluster (1 primary + 2 standby + Redis) that fails over to a fresh primary in **under 10 seconds** when the active primary dies. Built end-to-end as a learning lab in active-passive coordination, hybrid leader election, and resilience patterns (circuit breaker, bulkhead, chaos testing).
 
 ## Tech Stack
-- **Language:** Python 3.11+
-- **HTTP framework:** FastAPI + Uvicorn
-- **Coordination / shared state:** Redis (leader lock, heartbeats)
-- **Inter-node health checks:** httpx
-- **Orchestration:** Docker Compose (primary path) or K3d (alt)
-- **Tests:** pytest + pytest-asyncio
+
+- **Language:** Python 3.11+ (asyncio)
+- **HTTP:** FastAPI + Uvicorn
+- **Inter-node calls:** httpx (async)
+- **Coordination / shared state:** Redis 7 (`SET NX EX` lock + heartbeat key + state snapshot)
+- **Serialization:** orjson
+- **Container:** Docker + Docker Compose (4 services: redis + 3 nodes + dashboard)
+- **Tests:** pytest + pytest-asyncio + fakeredis
 
 ## Architecture
 
 ```
-                  ┌──────────────┐
-        traffic → │   primary    │  (active — accepts log writes / queries)
-                  │  node-1:8001 │
-                  └──────┬───────┘
-                         │ heartbeat + leader lock
-                         ▼
-                   ┌───────────┐
-                   │   Redis   │  (lock key + last-heartbeat)
-                   └─────┬─────┘
-              ┌──────────┴──────────┐
-              ▼                     ▼
-       ┌──────────────┐      ┌──────────────┐
-       │  standby-2   │      │  standby-3   │
-       │  node-2:8002 │      │  node-3:8003 │
-       └──────────────┘      └──────────────┘
-              (idle, watching health; promote on missed heartbeats)
+                        ┌─────────────────────────┐
+       client traffic → │  primary (node-1:8001)  │  ← /logs, /admin/trigger-failover
+                        │  state = PRIMARY        │
+                        └────────────┬────────────┘
+                                     │ leader:lock + heartbeat:primary + state:snapshot
+                                     ▼
+                              ┌──────────────┐
+                              │    Redis     │
+                              └──────┬───────┘
+                       ┌─────────────┴─────────────┐
+                       ▼                           ▼
+            ┌─────────────────────┐      ┌─────────────────────┐
+            │ standby (node-2)    │      │ standby (node-3)    │
+            │ state = STANDBY     │      │ state = STANDBY     │
+            │ polls heartbeat     │      │ polls heartbeat     │
+            └─────────────────────┘      └─────────────────────┘
+
+                    ┌─────────────────────────┐
+                    │ dashboard (port 8080)   │  ← own container, polls all 3 nodes
+                    │ FastAPI + WS + static   │
+                    └─────────────────────────┘
 ```
 
-### Roles
-- **Primary (active):** Holds the leader lock in Redis. Accepts all log ingest + query traffic. Renews its lock TTL every ~2s.
-- **Standby (passive):** Polls Redis for the leader lock and the primary's `/health` endpoint. If both indicate failure for ≥10s, the first standby to grab the lock promotes itself.
+### State machine
 
-### Failover sequence (target: <10s)
-1. Primary stops renewing its Redis lock (crash / kill / network partition).
-2. Lock TTL expires (e.g., 5s).
-3. Standbys race to `SET NX` the lock; one wins.
-4. Winner flips internal role to `primary`, starts accepting traffic.
-5. Total target: end-to-end p95 promotion ≤ 10s.
-
-### HTTP surface (planned, per node)
-- `GET /health` — liveness + current role (`primary` / `standby`)
-- `GET /role` — current role + lock holder
-- `POST /logs` — ingest a log line (rejected with 503 if not primary)
-- `GET /logs` — query recent logs (primary only)
-- `GET /metrics` — prometheus-style counters (heartbeats, promotions, rejected writes)
-
-## HTTP Endpoints
-
-| Method | Path                            | Status code(s)               | Description                                                                       |
-|--------|---------------------------------|------------------------------|-----------------------------------------------------------------------------------|
-| GET    | `/health`                       | 200 (PRIMARY) / 503 (other)  | Liveness probe — only PRIMARY returns 200.                                        |
-| GET    | `/role`                         | 200                          | Returns `{node_id, state, role, lock_holder, known_winner, term}`.                |
-| GET    | `/metrics`                      | 200                          | Prometheus exposition text (counters + `node_state` gauge).                       |
-| POST   | `/logs`                         | 201 (PRIMARY) / 503 (other)  | Body: `{message, level?, log_id?}`. Idempotent on client-supplied `log_id`.       |
-| GET    | `/logs?limit=N`                 | 200 (PRIMARY) / 503 (other)  | Returns `{logs, count, last_log_id}` for the most recent `limit` entries.         |
-| POST   | `/admin/trigger-failover`       | 202 (PRIMARY) / 503 (other)  | Releases the lock and self-demotes; standbys promote within ~6s.                  |
-| POST   | `/heartbeat`                    | 200 / 400                    | Debug ping — accepts a `HeartbeatMessage` JSON body (real heartbeat goes via Redis). |
-| POST   | `/election/candidacy`           | 200 / 400                    | Internal — receives `ElectionMessage` from peers during elections.                |
-| POST   | `/election/result`              | 200 / 400                    | Internal — receives `ElectionResult` from peers; updates `known_winner`.          |
+```
+       INACTIVE ──IS_PRIMARY=true──► PRIMARY ◄─────────────┐
+          │                            │                   │
+          └──IS_PRIMARY=false──► STANDBY                    │
+                                  │                         │
+                  heartbeat_miss  │                         │ won_lock
+                                  ▼                         │
+                              ELECTION ─────────────────────┘
+                                  │
+                                  └─lost_lock──► STANDBY
+                                  │
+                                  └─lock_lost (PRIMARY only)──► STANDBY (self-demote)
+```
 
 ## Failover semantics
 
-The new primary picks up the cluster's monotonic log-id allocator from a
-periodic state snapshot the old primary writes to Redis. This means
-post-promotion `last_log_id` and `log_count` are continuous — clients
-keep seeing strictly-increasing ids across a failover.
+Total failover budget: **<10 seconds** end-to-end.
 
-A few subtleties worth being explicit about:
+| Stage                     | Budget    | Source                          |
+|---------------------------|-----------|---------------------------------|
+| Heartbeat-miss detection  | 6s        | `HEARTBEAT_TIMEOUT` (3 × 2s)    |
+| Election jitter           | <100ms    | `priority * 0.0001s`            |
+| `SET NX EX` lock race     | <50ms     | one Redis RTT                   |
+| Snapshot load             | <100ms    | `GET state:snapshot`            |
+| Role flip + warm-up       | ~500ms    | bind PRIMARY routes             |
+| **Total**                 | **~7s**   | observed: SIGKILL ~7.5s, SIGTERM ~6.4s, manual ~6.5s |
 
-- **Snapshot cadence.** The primary writes its snapshot every
-  `STATE_SYNC_INTERVAL` seconds (default `5`). On an uncoordinated
-  primary kill (`SIGKILL`, host crash, network partition), **up to ~5
-  seconds of writes can be lost** — the lost writes here are *the
-  ability to dedup retries of those exact ids* and *the precise
-  pre-failover `log_count` value*; the new primary's allocator is still
-  monotonic because `_next_id` is always seeded past `snap.last_log_id +
-  1`.
-- **Counters, not payloads.** The snapshot persists the
-  `LogProcessor` *counters* (`_next_id`, `_seen_ids`, derived
-  `last_log_id` / `log_count`) — it does **not** ship the actual log
-  entries. Replicating the log payload is a separate problem (Kafka /
-  Raft / cross-DC); this lab restricts scope to "the cluster's view of
-  itself stays continuous across promotion".
-- **Clean failover (manual / SIGTERM)** is no fresher than the last
-  scheduled snapshot. The release-lock path inside `stop()` does not
-  force an extra snapshot — it's purely time-driven. If you want
-  zero-loss failover you'd take an extra `snapshot_now()` immediately
-  before releasing the lock; that's a deliberate non-feature here.
-- **Schema versioning.** A snapshot whose `version` doesn't match the
-  loader's `schema_version` is refused — the new primary boots with
-  fresh-zero counters and logs a warning. Bump the version whenever the
-  snapshot dataclass shape changes.
+### Continuity guarantees
+
+- **Counters survive promotion.** The primary writes a counter snapshot (`_next_id`, `_seen_ids`, `last_log_id`, `log_count`) to Redis every `STATE_SYNC_INTERVAL` (default 5s). The new primary loads it before binding `/logs`, so `last_log_id` keeps strictly increasing across a failover.
+- **Bounded loss on uncoordinated kill.** Up to **~5 seconds of writes** can be lost on `SIGKILL` / network partition (one snapshot interval). The lost piece is the *idempotency-dedup capability* and *exact pre-failover `log_count`* — the allocator stays monotonic regardless.
+- **Idempotent ingest.** Clients may supply `log_id`; retries against a different primary post-failover are deduplicated by id within the snapshot window.
+- **Payloads are NOT replicated.** This lab persists *counters*, not log bodies. Cross-node payload replication is a separate problem (Kafka / Raft / cross-DC).
+
+## How to Run
+
+Prerequisites: Docker + Docker Compose.
+
+```bash
+# Bring up Redis + 3 nodes + dashboard
+make run
+
+# Tail logs from every service
+make logs
+
+# Run unit tests in Docker (224 tests, all green at last build)
+make test
+
+# Run the full E2E driver (9 steps, ~3 min)
+make e2e
+
+# Stop and remove everything
+make stop
+```
+
+Once `make run` is up, visit **http://localhost:8080** for the live dashboard.
+
+```bash
+# Quick smoke test
+curl http://localhost:8001/health           # 200 OK   (primary)
+curl http://localhost:8002/health           # 503      (standby)
+curl -X POST http://localhost:8001/logs \
+     -H 'Content-Type: application/json' \
+     -d '{"message":"hello","level":"INFO"}'
+# → {"status":"accepted","log_id":1}
+```
+
+## HTTP Endpoints
+
+Each node exposes these on its host port (8001 / 8002 / 8003).
+
+| Method | Path                            | Status code(s)              | Description                                                                       |
+|--------|---------------------------------|-----------------------------|-----------------------------------------------------------------------------------|
+| GET    | `/health`                       | 200 (PRIMARY) / 503 (other) | Liveness probe — only PRIMARY returns 200.                                        |
+| GET    | `/role`                         | 200                         | `{node_id, state, role, lock_holder, known_winner, term}`.                        |
+| GET    | `/metrics`                      | 200                         | Prometheus exposition text (counters + `node_state` gauge).                       |
+| POST   | `/logs`                         | 201 (PRIMARY) / 503 (other) | Body `{message, level?, log_id?}`. Idempotent on client-supplied `log_id`.        |
+| GET    | `/logs?limit=N`                 | 200 (PRIMARY) / 503 (other) | `{logs, count, last_log_id}` for the most recent `limit` entries.                 |
+| POST   | `/admin/trigger-failover`       | 202 (PRIMARY) / 503 (other) | Releases the lock and self-demotes; standbys promote within ~6s.                  |
+| POST   | `/heartbeat`                    | 200 / 400                   | Debug ping (real heartbeat goes via Redis).                                       |
+| POST   | `/election/candidacy`           | 200 / 400                   | Internal — receives `ElectionMessage` from peers during elections.                |
+| POST   | `/election/result`              | 200 / 400                   | Internal — receives `ElectionResult`; updates `known_winner`.                     |
+
+## Configurable Parameters
+
+All configuration is via environment variables (per node). See `.env.example` for an annotated copy.
+
+| Variable                  | Default     | Description                                                                  |
+|---------------------------|-------------|------------------------------------------------------------------------------|
+| `NODE_ID`                 | (required)  | Unique cluster identifier; seeds election priority via MD5.                  |
+| `IS_PRIMARY`              | `false`     | Bootstrap as PRIMARY. Set on exactly one node.                               |
+| `PORT`                    | `8001`      | HTTP listen port.                                                            |
+| `REDIS_HOST`              | `redis`     | Redis hostname.                                                              |
+| `REDIS_PORT`              | `6379`      | Redis port.                                                                  |
+| `HEARTBEAT_INTERVAL`      | `2.0`       | Seconds between heartbeat writes + lock renewals (PRIMARY only).             |
+| `HEARTBEAT_TIMEOUT`       | `6.0`       | Seconds without heartbeat before STANDBY triggers an election (3 × 2s).      |
+| `ELECTION_TIMEOUT`        | `10.0`      | Maximum total time allowed for an election to complete.                      |
+| `STATE_SYNC_INTERVAL`     | `5.0`       | Seconds between state snapshots written to Redis (PRIMARY only).             |
+| `LOCK_TTL`                | `3`         | TTL on `leader:lock` in Redis. Renewed every `HEARTBEAT_INTERVAL`.           |
+| `PEER_NODES`              | `""`        | CSV `host:port` list of peers (excludes self) for inter-node election RPCs.  |
+| `DASHBOARD_POLL_INTERVAL` | `1.0`       | Dashboard-only — how often the dashboard server polls every node.            |
+
+## Election protocol (hybrid: priority + Redis lock)
+
+A standby that misses 3 consecutive heartbeats kicks off an election:
+
+1. **Detect.** `STANDBY → ELECTION` after `HEARTBEAT_TIMEOUT` of silence (~6s).
+2. **Jitter.** Wait `priority * 0.0001s`, where `priority = md5(node_id)[:4] mod 1000`. Lowest priority races first; collisions break by lex order.
+3. **Broadcast candidacy.** Send `ElectionMessage` to every peer via `/election/candidacy` in parallel. Failures are logged but not fatal — Redis is the source of truth.
+4. **Race for the lock.** Attempt `SET leader:lock <node_id> NX EX <LOCK_TTL>` in Redis. **Redis is the tie-breaker — there is no quorum vote.**
+5. **Winner.** Loads the state snapshot, broadcasts `ElectionResult{winner=self}`, transitions `ELECTION → PRIMARY`, starts heartbeat emission + lock renewal.
+6. **Loser.** Reads the lock value, broadcasts `ElectionResult{winner=<lock_holder>}`, transitions `ELECTION → STANDBY`.
+7. **Self-demote.** A PRIMARY whose `renew_lock` returns 0 (lock stolen / expired) immediately transitions `PRIMARY → STANDBY`. This catches the network-partition case where Redis kept moving while the primary was severed.
+
+### Why hybrid?
+
+Pure Redis `SET NX` would work, but priority-based jitter gives a deterministic ordering that minimises wasted RPCs during the common case (one standby clearly should win). The Redis lock is the *correctness guarantee*; the broadcast is *informational* — every node updates its `known_winner` view but doesn't gate any decision on it.
 
 ## Resilience patterns
 
-Inter-node election traffic is wrapped in two layered protections so a
-single dead peer can't drag down an election:
+### Circuit breaker (per peer, DIY)
 
-### Circuit breaker (per peer)
+Each `(host, port)` peer gets its own `CircuitBreaker` (no `pybreaker` dependency).
 
-Each ``(host, port)`` peer gets its own ``CircuitBreaker`` with three
-states:
+| State        | Behaviour                                                                          |
+|--------------|------------------------------------------------------------------------------------|
+| **CLOSED**   | Calls pass through. 5 consecutive failures (`fail_max=5`) → OPEN.                  |
+| **OPEN**     | All calls rejected immediately with `CircuitBreakerOpen`. Stays open for 30s.      |
+| **HALF_OPEN**| Exactly one trial call. Success → CLOSED, failure → OPEN (cooldown clock resets).  |
 
-* **CLOSED** — calls pass through.
-* **OPEN** — after **5 consecutive failures**, the breaker opens and
-  every subsequent call is rejected immediately (``CircuitBreakerOpen``)
-  without touching the network. The breaker stays OPEN for **30
-  seconds** before allowing one trial.
-* **HALF_OPEN** — exactly one trial call after the cooldown elapses.
-  Success closes the breaker; failure re-opens it and resets the clock.
+Counters surface at `/metrics`:
 
-The ``InterNodeClient`` returns ``False`` when a breaker is OPEN, just
-as it does for any transport failure — peer-down is the *normal* path
-during failover and must never propagate as an exception.
-
-Counters are aggregated across all peers and exposed at ``/metrics``:
-
-* ``circuit_breaker_failures_total`` — sum of failed calls across every
-  peer's breaker.
-* ``circuit_breaker_opens_total`` — sum of times any breaker has
-  opened.
+- `circuit_breaker_failures_total` — sum across every peer breaker.
+- `circuit_breaker_opens_total` — sum of times any breaker has opened.
 
 ### Bulkhead (per call type)
 
-The ``InterNodeClient`` keeps two ``asyncio.Semaphore`` budgets:
+Two independent `asyncio.Semaphore` budgets in `InterNodeClient`:
 
-* ``send_candidacy`` — **3 concurrent** in-flight calls.
-* ``send_election_result`` — **3 concurrent** in-flight calls.
+- `send_candidacy` — **3 concurrent** calls.
+- `send_election_result` — **3 concurrent** calls.
 
-The two budgets are independent: a candidacy storm cannot starve the
-result broadcast (or vice versa). Three slots is comfortable headroom
-for a 3-node cluster (each election fans out to 2 peers) while
-preventing runaway parallelism if something upstream retries
-aggressively.
+Three slots is comfortable headroom for a 3-node cluster (each election fans out to 2 peers) while preventing runaway parallelism if something upstream retries aggressively. The two budgets are separate so a candidacy storm cannot starve the result broadcast.
 
-Heartbeat traffic is intentionally NOT routed through this client — it
-flows via Redis directly — so no semaphore or breaker is needed for
-that path.
+Heartbeat traffic flows through Redis (not httpx) so it has no breaker / semaphore — the resilience pattern there is "Redis is up or the cluster is down".
 
-## Dashboard
+### Dashboard as its own container
 
-A standalone web dashboard runs in its own container on
-`http://localhost:8080` (via the `dashboard` service in
-`docker-compose.yml`). It is independent of every cluster node — it
-polls all three over HTTP rather than being served by any one of them
-— so it survives primary failure cleanly.
+The dashboard runs in a fourth container on port 8080. It does **not** live on any cluster node — that would defeat the purpose, since the moment a primary dies you'd lose visibility into the failover you're trying to observe. By polling all three nodes from outside, the dashboard tolerates any single-node failure cleanly.
 
-### What it shows
+The "Trigger Failover" button proxies through the dashboard server, which reads `leader:lock` from Redis and forwards to whichever node currently holds it. The browser never has to discover the live primary.
 
-* **Three node cards**, one per cluster member, color-coded by state:
-  * **PRIMARY** — green border + green badge.
-  * **STANDBY** — blue border + blue badge.
-  * **ELECTION** — orange border + amber badge.
-  * **INACTIVE / FAILED / UNREACHABLE** — red border + red badge.
+## Chaos testing
 
-  Each card surfaces `node_id`, `state`, `role`, `lock_holder`,
-  `known_winner`, `term`, and `logs` (the node's
-  `logs_ingested_total` counter, scraped from `/metrics`).
+`scripts/chaos.py` is a standalone driver run against a *running* cluster. It does NOT bring the cluster up or tear it down — `make run` first, then disturb.
 
-* **Status bar** with connection state, last update timestamp, current
-  cluster throughput in logs/sec, and the active transport
-  (`websocket` or `polling (2s)` if the WS path failed to upgrade).
+```bash
+# 60 s of every-30s SIGKILL on a random node; assert exactly one PRIMARY at all samples
+python3 scripts/chaos.py --scenario random_kill --duration 60
 
-* **Throughput chart** (Chart.js) — a rolling 60-data-point line
-  graph of cluster-wide logs/sec computed from the delta of total
-  `logs_ingested_total` across the last minute.
+# Disconnect the primary from the network, expect a standby to promote, reconnect,
+# expect the original primary to rejoin as STANDBY
+python3 scripts/chaos.py --scenario partition --duration 30
 
-* **Trigger Failover button** — a single action that POSTs to
-  `/proxy/admin/trigger-failover` on the dashboard server. The
-  server-side proxy reads the current `leader:lock` value from Redis
-  and forwards the request to the actual primary, so the browser
-  doesn't need to discover which node is currently in charge.
-
-### How it stays correct mid-failover
-
-The dashboard polls every node once per second (`DASHBOARD_POLL_INTERVAL`)
-and broadcasts the aggregated snapshot to every connected WebSocket
-client. The same snapshot is also exposed at `GET /api/snapshot` so
-the JS client can fall back to 2s HTTP polling if the WebSocket
-upgrade fails (some proxies strip it).
-
-When the primary dies, the next poll returns `UNREACHABLE` for that
-node and `PRIMARY` for whichever standby has been promoted — the
-state pill updates within ~1s of the lock changing hands.
-
-### Open it
-
-```
-make run                      # bring up Redis + 3 nodes + dashboard
-open http://localhost:8080    # macOS; or just visit the URL in any browser
+# 50 logs/sec for 120s while random_kill runs in parallel; assert duplicate-id ratio < 5%
+python3 scripts/chaos.py --scenario sustained_load --duration 120 --rate 50
 ```
 
-## How to Run
-> _To be filled in once the implementation lands. Will be a single `docker compose up` that spins up Redis + 3 nodes (1 primary, 2 standby) on ports 8001-8003._
+The `tests/test_chaos.py` pytest module wraps the partition scenario as an integration test. It is **skipped by default**; enable with:
 
-Once Commit 4a lands, `docker compose up --build` will spin up Redis + 3 nodes on ports 8001-8003. (Commit 1 ships only the scaffold; the node service entrypoint is added in Commit 4a.)
+```bash
+RUN_CHAOS_TESTS=1 pytest tests/test_chaos.py
+```
+
+The full E2E driver `scripts/verify_failover.py` (run by `make e2e`) also exercises a partition + heal cycle as Step 9.
 
 ## What I Learned
-<!-- Filled in as the project evolves -->
-- _Why Redis SET NX + TTL is a viable poor-man's leader election (and where it falls short vs. Raft / etcd)._
-- _How to size lock TTL vs. heartbeat interval to balance false-failover risk against detection latency._
-- _Split-brain windows: what happens during the gap between "primary loses network" and "lock TTL expires."_
+
+- **Redis `SET NX EX` is a viable poor-man's leader lock.** Kleppmann's *How to do distributed locking* critique (Redlock isn't safe under arbitrary clock skew) is real but largely orthogonal for *availability* locks like this one — antirez's response (it's fine for "efficiency" use cases where occasional double-acquisition is recoverable) is the right framing for an active-passive failover where the new primary always idempotently picks up where the old one left off.
+- **Lock TTL must be shorter than the heartbeat-miss timeout.** With `LOCK_TTL=3` and `HEARTBEAT_TIMEOUT=6`, the lock has expired by the time standbys finish their failure-detection countdown — the winning standby's first `SET NX EX` succeeds rather than contending with a stale lease. Setting them equal would create a race.
+- **TTL/3 renewal cadence (Heartbeats).** Renewing every 1/3 of TTL tolerates two missed renewals before the lock expires. Heartbeats every 2s with TTL=6s is actually closer to TTL/2 here — but that's a deliberate trade for the 6s detection window required by the spec.
+- **Hybrid election > pure jitter.** Priority gives ordering without a coordination round; Redis `SET NX` gives mutual exclusion. The broadcast is informational. This avoids the "everyone races, one wins arbitrarily" pattern of pure SET-NX-only and the "extra round-trip per candidate" cost of a vote-based protocol.
+- **Idempotent log writes are non-negotiable for failover continuity.** Without dedup on `log_id`, a client retry post-failover would create a phantom duplicate. With it, the new primary can pick up a snapshot whose `_next_id` is past every id the client has ever seen.
+- **Single-Redis is a documented SPOF.** Sentinel / Redlock / Cluster would close it but add operational weight that doesn't pay back for a 3-node lab. Documented in *Known limitations*.
+- **The dashboard hosting model matters.** Hosting it on the primary defeats the point. Hosting it on a standby creates a chicken-and-egg ("which standby?"). Its own container, polling all three, is the only configuration that survives the failure mode the system is built to recover from.
+- **Snapshot-only state replication has a clear failure-loss bound** (`STATE_SYNC_INTERVAL`). It's the right level of effort for "the cluster's view of itself stays continuous" — but explicitly NOT the right tool for "no log entry is ever lost".
+
+## Known limitations
+
+- **Single-Redis SPOF.** No Sentinel / Cluster / Redlock. If Redis dies, the cluster loses both the lock and the state snapshot. Acceptable for a learning lab; would replace with Sentinel quorum in production.
+- **No fencing tokens.** A "stuck" old primary could in principle write past the moment its lock was stolen if Redis lost the lock for a beat. We rely on lock-renewal failure → self-demote to close this; a real system would attach a monotonically-increasing token to every write and reject stale tokens at the storage layer.
+- **Snapshot-only state replay (~5s window).** Up to 5s of un-snapshotted writes can be lost on uncoordinated primary kill. Tunable via `STATE_SYNC_INTERVAL`; lower it for fresher snapshots at the cost of Redis write pressure.
+- **No AuthN/Z.** `/admin/trigger-failover` is wide open. Fine on `localhost`-bound docker-compose; not fine in production.
+- **Log payloads are not replicated** between nodes — only counters. A real system would put Kafka or a Raft log between the client and the cluster.
+- **Manual failover is no fresher than the last scheduled snapshot.** The release-lock path inside `stop()` does not force an extra snapshot. If you want zero-loss failover you'd add `snapshot_now()` immediately before releasing the lock.
+
+## Project layout
+
+```
+src/
+  config.py             # NodeConfig (env vars)
+  models.py             # NodeState enum + dataclasses + orjson helpers
+  redis_client.py       # async wrapper: lock acquire/renew/release (Lua), heartbeat, snapshot
+  state_machine.py      # 5-state transition table with validation + callbacks
+  heartbeat.py          # HeartbeatEmitter (PRIMARY) + HeartbeatMonitor (STANDBY)
+  election.py           # ElectionCoordinator: jitter, broadcast, lock race
+  log_processor.py      # in-memory log store + idempotent ingest
+  state_persistence.py  # snapshot every 5s; load_into() on PRIMARY transition
+  http_server.py        # FastAPI app factory (/health, /logs, /role, /metrics, ...)
+  circuit_breaker.py    # DIY 3-state breaker
+  inter_node_client.py  # PeerClient + breaker + bulkhead semaphores
+  peer_client.py        # PeerClient Protocol + plain httpx impl
+  dashboard.py          # FastAPI + WebSocket dashboard (separate container)
+  node.py               # FailoverNode — wires everything
+  __main__.py           # entry point: load config, run node
+
+scripts/
+  verify_failover.py    # 9-step E2E driver invoked by `make e2e`
+  chaos.py              # standalone chaos driver (random_kill / partition / sustained_load)
+
+tests/                  # 224 unit tests + 1 opt-in chaos integration test
+```
