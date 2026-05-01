@@ -49,6 +49,20 @@ A multi-node log processing service where one primary node handles all traffic w
 - `GET /logs` — query recent logs (primary only)
 - `GET /metrics` — prometheus-style counters (heartbeats, promotions, rejected writes)
 
+## HTTP Endpoints
+
+| Method | Path                            | Status code(s)               | Description                                                                       |
+|--------|---------------------------------|------------------------------|-----------------------------------------------------------------------------------|
+| GET    | `/health`                       | 200 (PRIMARY) / 503 (other)  | Liveness probe — only PRIMARY returns 200.                                        |
+| GET    | `/role`                         | 200                          | Returns `{node_id, state, role, lock_holder, known_winner, term}`.                |
+| GET    | `/metrics`                      | 200                          | Prometheus exposition text (counters + `node_state` gauge).                       |
+| POST   | `/logs`                         | 201 (PRIMARY) / 503 (other)  | Body: `{message, level?, log_id?}`. Idempotent on client-supplied `log_id`.       |
+| GET    | `/logs?limit=N`                 | 200 (PRIMARY) / 503 (other)  | Returns `{logs, count, last_log_id}` for the most recent `limit` entries.         |
+| POST   | `/admin/trigger-failover`       | 202 (PRIMARY) / 503 (other)  | Releases the lock and self-demotes; standbys promote within ~6s.                  |
+| POST   | `/heartbeat`                    | 200 / 400                    | Debug ping — accepts a `HeartbeatMessage` JSON body (real heartbeat goes via Redis). |
+| POST   | `/election/candidacy`           | 200 / 400                    | Internal — receives `ElectionMessage` from peers during elections.                |
+| POST   | `/election/result`              | 200 / 400                    | Internal — receives `ElectionResult` from peers; updates `known_winner`.          |
+
 ## How to Run
 > _To be filled in once the implementation lands. Will be a single `docker compose up` that spins up Redis + 3 nodes (1 primary, 2 standby) on ports 8001-8003._
 
