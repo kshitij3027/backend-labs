@@ -74,6 +74,25 @@ services:
       - failover-net
     restart: "no"
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: failover-dashboard
+    environment:
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      PEER_NODES: "node-1:8001,node-2:8002,node-3:8003"
+      DASHBOARD_POLL_INTERVAL: "1.0"
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - failover-net
+    restart: "no"
+
 networks:
   failover-net:
     driver: bridge

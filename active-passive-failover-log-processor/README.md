@@ -142,6 +142,59 @@ Heartbeat traffic is intentionally NOT routed through this client — it
 flows via Redis directly — so no semaphore or breaker is needed for
 that path.
 
+## Dashboard
+
+A standalone web dashboard runs in its own container on
+`http://localhost:8080` (via the `dashboard` service in
+`docker-compose.yml`). It is independent of every cluster node — it
+polls all three over HTTP rather than being served by any one of them
+— so it survives primary failure cleanly.
+
+### What it shows
+
+* **Three node cards**, one per cluster member, color-coded by state:
+  * **PRIMARY** — green border + green badge.
+  * **STANDBY** — blue border + blue badge.
+  * **ELECTION** — orange border + amber badge.
+  * **INACTIVE / FAILED / UNREACHABLE** — red border + red badge.
+
+  Each card surfaces `node_id`, `state`, `role`, `lock_holder`,
+  `known_winner`, `term`, and `logs` (the node's
+  `logs_ingested_total` counter, scraped from `/metrics`).
+
+* **Status bar** with connection state, last update timestamp, current
+  cluster throughput in logs/sec, and the active transport
+  (`websocket` or `polling (2s)` if the WS path failed to upgrade).
+
+* **Throughput chart** (Chart.js) — a rolling 60-data-point line
+  graph of cluster-wide logs/sec computed from the delta of total
+  `logs_ingested_total` across the last minute.
+
+* **Trigger Failover button** — a single action that POSTs to
+  `/proxy/admin/trigger-failover` on the dashboard server. The
+  server-side proxy reads the current `leader:lock` value from Redis
+  and forwards the request to the actual primary, so the browser
+  doesn't need to discover which node is currently in charge.
+
+### How it stays correct mid-failover
+
+The dashboard polls every node once per second (`DASHBOARD_POLL_INTERVAL`)
+and broadcasts the aggregated snapshot to every connected WebSocket
+client. The same snapshot is also exposed at `GET /api/snapshot` so
+the JS client can fall back to 2s HTTP polling if the WebSocket
+upgrade fails (some proxies strip it).
+
+When the primary dies, the next poll returns `UNREACHABLE` for that
+node and `PRIMARY` for whichever standby has been promoted — the
+state pill updates within ~1s of the lock changing hands.
+
+### Open it
+
+```
+make run                      # bring up Redis + 3 nodes + dashboard
+open http://localhost:8080    # macOS; or just visit the URL in any browser
+```
+
 ## How to Run
 > _To be filled in once the implementation lands. Will be a single `docker compose up` that spins up Redis + 3 nodes (1 primary, 2 standby) on ports 8001-8003._
 
