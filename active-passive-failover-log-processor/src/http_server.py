@@ -48,6 +48,7 @@ from src.models import (
     NodeState,
     from_json,
 )
+from src.peer_client import PeerClient
 from src.redis_client import RedisClient
 from src.state_machine import NodeStateMachine
 from src.state_persistence import StatePersister
@@ -71,7 +72,40 @@ _COUNTER_DEFS: list[tuple[str, str]] = [
     ("logs_rejected_total", "Number of log ingest attempts rejected (not primary)."),
     ("snapshots_written_total", "Number of state snapshots written to Redis."),
     ("snapshots_loaded_total", "Number of state snapshots loaded from Redis on promotion."),
+    ("circuit_breaker_failures_total", "Total breaker failures across all peers."),
+    ("circuit_breaker_opens_total", "Total times any breaker opened."),
 ]
+
+
+def _aggregate_breaker_counters(peer_client: object) -> tuple[int, int]:
+    """Sum the per-peer breaker ``failures_total`` / ``opens_total``.
+
+    Returns ``(0, 0)`` if ``peer_client`` doesn't expose a ``metrics``
+    attribute (e.g. test stubs without the resilience layer). The
+    aggregation iterates over each peer's metrics dict and tolerates
+    a missing key by treating it as 0.
+    """
+    raw = getattr(peer_client, "metrics", None)
+    if raw is None:
+        return 0, 0
+    failures = 0
+    opens = 0
+    try:
+        # ``metrics`` is a property on InterNodeClient; we accept either
+        # a property snapshot or a callable returning the same shape so
+        # alternative implementations can plug in.
+        snapshot = raw() if callable(raw) else raw
+        if not isinstance(snapshot, dict):
+            return 0, 0
+        for per_peer in snapshot.values():
+            if not isinstance(per_peer, dict):
+                continue
+            failures += int(per_peer.get("failures_total", 0))
+            opens += int(per_peer.get("opens_total", 0))
+    except Exception:
+        logger.exception("aggregating circuit-breaker counters failed")
+        return 0, 0
+    return failures, opens
 
 
 def create_app(
@@ -84,6 +118,7 @@ def create_app(
     state_persister: StatePersister,
     redis_client: RedisClient,
     on_manual_failover: Callable[[], Awaitable[None]],
+    peer_client: PeerClient | None = None,
 ) -> FastAPI:
     """Build the FastAPI app for one node.
 
@@ -91,6 +126,12 @@ def create_app(
     handlers can pull them out via ``request.app.state``. This keeps
     each route function trivial and the factory itself a pure wiring
     layer.
+
+    ``peer_client`` is optional: when present and exposing a ``metrics``
+    attribute (i.e. the resilience-wrapped :class:`InterNodeClient`),
+    the /metrics endpoint will surface aggregated breaker counters.
+    Tests passing simple stubs without a metrics attribute see zero
+    counters — both code paths return well-formed Prometheus output.
     """
     app = FastAPI(title=f"failover-node-{config.node_id}")
 
@@ -104,6 +145,7 @@ def create_app(
     app.state.state_persister = state_persister
     app.state.redis_client = redis_client
     app.state.on_manual_failover = on_manual_failover
+    app.state.peer_client = peer_client
 
     # =====================================================================
     # GET /health — primary-only liveness probe.
@@ -164,6 +206,12 @@ def create_app(
         lp: LogProcessor = request.app.state.log_processor
         sm: NodeStateMachine = request.app.state.state_machine
         sp: StatePersister = request.app.state.state_persister
+        pc = getattr(request.app.state, "peer_client", None)
+
+        # Aggregate per-peer breaker counters into flat totals. If the
+        # peer_client doesn't expose .metrics (e.g. a test stub), this
+        # returns (0, 0) and the counters report 0 rather than break.
+        breaker_failures, breaker_opens = _aggregate_breaker_counters(pc)
 
         # Pull every counter in one shot so tests don't see partial state
         # from a concurrent mutation between reads.
@@ -181,6 +229,8 @@ def create_app(
             "logs_rejected_total": lp.logs_rejected_total,
             "snapshots_written_total": sp.snapshots_written_total,
             "snapshots_loaded_total": sp.snapshots_loaded_total,
+            "circuit_breaker_failures_total": breaker_failures,
+            "circuit_breaker_opens_total": breaker_opens,
         }
 
         lines: list[str] = []

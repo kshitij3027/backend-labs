@@ -47,9 +47,10 @@ from src.config import NodeConfig
 from src.election import ElectionCoordinator
 from src.heartbeat import HeartbeatEmitter, HeartbeatMonitor
 from src.http_server import create_app
+from src.inter_node_client import InterNodeClient
 from src.log_processor import LogProcessor
 from src.models import NodeState
-from src.peer_client import HttpxPeerClient, PeerClient
+from src.peer_client import PeerClient
 from src.redis_client import RedisClient
 from src.state_machine import NodeStateMachine
 from src.state_persistence import StatePersister
@@ -79,7 +80,9 @@ class FailoverNode:
             port=config.redis_port,
             node_id=config.node_id,
         )
-        self.peer_client: PeerClient = peer_client or HttpxPeerClient()
+        # Default to the resilience-wrapped client (commit 5). Tests can
+        # still inject any PeerClient-shaped stub to bypass the breaker.
+        self.peer_client: PeerClient = peer_client or InterNodeClient()
 
         # State machine starts INACTIVE; start() decides the next move.
         self.state_machine: NodeStateMachine = NodeStateMachine(
@@ -134,6 +137,7 @@ class FailoverNode:
             state_persister=self.state_persister,
             redis_client=self.redis_client,
             on_manual_failover=self._on_manual_failover,
+            peer_client=self.peer_client,
         )
 
         # Hook the persister into the state machine so a transition into

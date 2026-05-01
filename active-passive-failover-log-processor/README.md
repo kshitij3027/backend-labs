@@ -96,6 +96,52 @@ A few subtleties worth being explicit about:
   fresh-zero counters and logs a warning. Bump the version whenever the
   snapshot dataclass shape changes.
 
+## Resilience patterns
+
+Inter-node election traffic is wrapped in two layered protections so a
+single dead peer can't drag down an election:
+
+### Circuit breaker (per peer)
+
+Each ``(host, port)`` peer gets its own ``CircuitBreaker`` with three
+states:
+
+* **CLOSED** — calls pass through.
+* **OPEN** — after **5 consecutive failures**, the breaker opens and
+  every subsequent call is rejected immediately (``CircuitBreakerOpen``)
+  without touching the network. The breaker stays OPEN for **30
+  seconds** before allowing one trial.
+* **HALF_OPEN** — exactly one trial call after the cooldown elapses.
+  Success closes the breaker; failure re-opens it and resets the clock.
+
+The ``InterNodeClient`` returns ``False`` when a breaker is OPEN, just
+as it does for any transport failure — peer-down is the *normal* path
+during failover and must never propagate as an exception.
+
+Counters are aggregated across all peers and exposed at ``/metrics``:
+
+* ``circuit_breaker_failures_total`` — sum of failed calls across every
+  peer's breaker.
+* ``circuit_breaker_opens_total`` — sum of times any breaker has
+  opened.
+
+### Bulkhead (per call type)
+
+The ``InterNodeClient`` keeps two ``asyncio.Semaphore`` budgets:
+
+* ``send_candidacy`` — **3 concurrent** in-flight calls.
+* ``send_election_result`` — **3 concurrent** in-flight calls.
+
+The two budgets are independent: a candidacy storm cannot starve the
+result broadcast (or vice versa). Three slots is comfortable headroom
+for a 3-node cluster (each election fans out to 2 peers) while
+preventing runaway parallelism if something upstream retries
+aggressively.
+
+Heartbeat traffic is intentionally NOT routed through this client — it
+flows via Redis directly — so no semaphore or breaker is needed for
+that path.
+
 ## How to Run
 > _To be filled in once the implementation lands. Will be a single `docker compose up` that spins up Redis + 3 nodes (1 primary, 2 standby) on ports 8001-8003._
 

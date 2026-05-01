@@ -11,6 +11,10 @@ Run by ``make e2e`` after ``docker compose up --build -d``. Asserts:
   PRIMARY) within 15s.
 * Repeat with ``docker stop`` (SIGTERM) — primary releases lock cleanly,
   standby promotes faster.
+* Manual failover via ``POST /admin/trigger-failover`` — primary releases
+  the lock, a standby promotes within 12s (Step 7).
+* ``GET /metrics`` exposes the new ``circuit_breaker_*`` counters added
+  in commit 5 (Step 8).
 
 Exits non-zero on any assertion failure. Uses only the Python stdlib so
 the script can run from inside the ``make e2e`` shell on the host without
@@ -94,6 +98,27 @@ def _http_post(
     except (URLError, TimeoutError, OSError):
         # See _http_get: same rationale for catching OSError.
         return 0, None
+
+
+def _http_get_text(url: str, timeout: float = 2.0) -> str:
+    """GET ``url`` and return the body as plain UTF-8 text.
+
+    Used for ``/metrics`` whose response is Prometheus exposition format
+    (text/plain) rather than JSON. Returns ``""`` on any transport error
+    so the caller can simply check for substring presence rather than
+    branch on multiple failure modes.
+    """
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+    except HTTPError as exc:
+        try:
+            return exc.read().decode("utf-8")
+        except Exception:
+            return ""
+    except (URLError, TimeoutError, OSError):
+        return ""
 
 
 # =========================================================================
@@ -313,6 +338,51 @@ def _verify_failover_term_signal(primary_port: int) -> int:
     return new_primary
 
 
+def _verify_manual_failover(current_primary: int) -> int:
+    """Step 7: trigger manual failover via ``/admin/trigger-failover``.
+
+    Posts the trigger to the current primary, expects a 202, then waits
+    for any standby to promote within the 12-second budget (slightly
+    looser than the SIGKILL/SIGTERM steps because the operator-driven
+    path includes the heartbeat-miss-detection window even though the
+    lock is released cleanly).
+    """
+    print("=== Step 7: manual failover via /admin/trigger-failover ===")
+    code, _ = _http_post(
+        f"http://localhost:{current_primary}/admin/trigger-failover", {}
+    )
+    assert code == 202, f"manual trigger returned {code}"
+    new_primary, elapsed = _wait_for_promotion(current_primary, timeout=12.0)
+    print(
+        f"  manual failover: new primary on port {new_primary} after {elapsed:.2f}s"
+    )
+    assert elapsed <= 12.0, f"manual failover took {elapsed:.2f}s"
+    return new_primary
+
+
+def _verify_circuit_breaker_metric_exposed(primary: int) -> None:
+    """Step 8: confirm /metrics exposes the new breaker counters.
+
+    This is informational — we don't try to deliberately trip a breaker
+    in the E2E (that's the job of the unit tests). We just verify the
+    counter names appear in the Prometheus exposition output so a real
+    operator could scrape them.
+    """
+    print("=== Step 8: /metrics exposes breaker counters ===")
+    code, _ = _http_get(f"http://localhost:{primary}/metrics")
+    assert code == 200, f"/metrics returned {code}"
+
+    # /metrics is text/plain — fetch raw to avoid the JSON-decode path.
+    txt = _http_get_text(f"http://localhost:{primary}/metrics")
+    assert "circuit_breaker_failures_total" in txt, (
+        "breaker counter circuit_breaker_failures_total missing from /metrics"
+    )
+    assert "circuit_breaker_opens_total" in txt, (
+        "breaker counter circuit_breaker_opens_total missing from /metrics"
+    )
+    print("  /metrics contains circuit_breaker_failures_total + circuit_breaker_opens_total")
+
+
 # =========================================================================
 # Entry point
 # =========================================================================
@@ -331,9 +401,20 @@ def main() -> int:
         # primary is `new_primary`. SIGTERM the active primary and
         # watch another standby promote.
         third_primary = _verify_failover_term_signal(new_primary)
+
+        # Step 7: manual failover from the primary that just took over.
+        # The previous (SIGTERM'd) primary is still recovering; we let
+        # the cluster settle briefly before triggering a manual failover
+        # so the rejoining node has time to land back as STANDBY.
+        _verify_killed_node_rejoins(new_primary)
+        fourth_primary = _verify_manual_failover(third_primary)
+
+        # Step 8: surface-level check on the breaker metric.
+        _verify_circuit_breaker_metric_exposed(fourth_primary)
+
         print(
             "=== ALL E2E ASSERTIONS PASSED — final primary "
-            f"on port {third_primary} ==="
+            f"on port {fourth_primary} ==="
         )
         return 0
     except AssertionError as exc:
