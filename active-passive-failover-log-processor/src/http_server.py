@@ -50,6 +50,7 @@ from src.models import (
 )
 from src.redis_client import RedisClient
 from src.state_machine import NodeStateMachine
+from src.state_persistence import StatePersister
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,8 @@ _COUNTER_DEFS: list[tuple[str, str]] = [
     ("results_received_total", "Number of election result messages received from peers."),
     ("logs_ingested_total", "Number of log entries accepted and stored on this node."),
     ("logs_rejected_total", "Number of log ingest attempts rejected (not primary)."),
+    ("snapshots_written_total", "Number of state snapshots written to Redis."),
+    ("snapshots_loaded_total", "Number of state snapshots loaded from Redis on promotion."),
 ]
 
 
@@ -78,6 +81,7 @@ def create_app(
     election_coordinator: ElectionCoordinator,
     heartbeat_emitter: HeartbeatEmitter,
     heartbeat_monitor: HeartbeatMonitor,
+    state_persister: StatePersister,
     redis_client: RedisClient,
     on_manual_failover: Callable[[], Awaitable[None]],
 ) -> FastAPI:
@@ -97,6 +101,7 @@ def create_app(
     app.state.election_coordinator = election_coordinator
     app.state.heartbeat_emitter = heartbeat_emitter
     app.state.heartbeat_monitor = heartbeat_monitor
+    app.state.state_persister = state_persister
     app.state.redis_client = redis_client
     app.state.on_manual_failover = on_manual_failover
 
@@ -158,6 +163,7 @@ def create_app(
         coord: ElectionCoordinator = request.app.state.election_coordinator
         lp: LogProcessor = request.app.state.log_processor
         sm: NodeStateMachine = request.app.state.state_machine
+        sp: StatePersister = request.app.state.state_persister
 
         # Pull every counter in one shot so tests don't see partial state
         # from a concurrent mutation between reads.
@@ -173,6 +179,8 @@ def create_app(
             "results_received_total": coord.results_received_total,
             "logs_ingested_total": lp.logs_ingested_total,
             "logs_rejected_total": lp.logs_rejected_total,
+            "snapshots_written_total": sp.snapshots_written_total,
+            "snapshots_loaded_total": sp.snapshots_loaded_total,
         }
 
         lines: list[str] = []

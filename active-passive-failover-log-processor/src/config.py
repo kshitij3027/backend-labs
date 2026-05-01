@@ -37,7 +37,13 @@ class NodeConfig(BaseSettings):
     heartbeat_timeout: float = 6.0
     election_timeout: float = 10.0
     state_sync_interval: float = 5.0
-    lock_ttl: int = 6
+    # lock_ttl is intentionally shorter than heartbeat_timeout (6s) so that
+    # when the primary dies, the lock has typically expired by the time
+    # standbys finish their failure-detection countdown — letting the
+    # winning standby's first SET NX EX succeed instead of contending with
+    # a stale lease. With heartbeat_interval=2 and lock_ttl=3, the primary
+    # has a 1s renewal margin, which is enough for a learning project.
+    lock_ttl: int = 3
 
     # Comma-separated list of peer host:port pairs.
     peer_nodes: str = ""

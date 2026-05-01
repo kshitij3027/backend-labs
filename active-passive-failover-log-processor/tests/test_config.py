@@ -37,7 +37,10 @@ def test_defaults_when_only_node_id_set(monkeypatch: pytest.MonkeyPatch) -> None
     assert cfg.heartbeat_timeout == 6.0
     assert cfg.election_timeout == 10.0
     assert cfg.state_sync_interval == 5.0
-    assert cfg.lock_ttl == 6
+    # lock_ttl is intentionally smaller than heartbeat_timeout so the
+    # primary's lock typically expires before standbys finish their
+    # failure-detection countdown — see config.py for the full rationale.
+    assert cfg.lock_ttl == 3
     assert cfg.peer_nodes == ""
 
 

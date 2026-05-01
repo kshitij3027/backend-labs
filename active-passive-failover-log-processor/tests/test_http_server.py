@@ -32,6 +32,7 @@ from src.models import (
 from src.peer_client import PeerClient
 from src.redis_client import RedisClient
 from src.state_machine import NodeStateMachine
+from src.state_persistence import StatePersister
 
 
 # =========================================================================
@@ -96,6 +97,12 @@ def _build_components(
         poll_interval=1.0,
         failure_timeout=6.0,
     )
+    state_persister = StatePersister(
+        redis_client=fake_redis_client,
+        log_processor=log_processor,
+        state_provider=lambda: state_machine.state,
+        sync_interval=5.0,
+    )
 
     if on_manual_failover is None:
 
@@ -111,6 +118,7 @@ def _build_components(
         election_coordinator=election_coordinator,
         heartbeat_emitter=heartbeat_emitter,
         heartbeat_monitor=heartbeat_monitor,
+        state_persister=state_persister,
         redis_client=fake_redis_client,
         on_manual_failover=on_manual_failover,
     )
@@ -122,6 +130,7 @@ def _build_components(
         "election_coordinator": election_coordinator,
         "heartbeat_emitter": heartbeat_emitter,
         "heartbeat_monitor": heartbeat_monitor,
+        "state_persister": state_persister,
         "peer_client": peer_client,
     }
 
@@ -275,6 +284,8 @@ async def test_metrics_contains_every_documented_counter(
         "results_received_total",
         "logs_ingested_total",
         "logs_rejected_total",
+        "snapshots_written_total",
+        "snapshots_loaded_total",
     ]
     for name in expected:
         assert f"# HELP {name}" in body, f"missing HELP for {name!r}"

@@ -52,6 +52,7 @@ from src.models import NodeState
 from src.peer_client import HttpxPeerClient, PeerClient
 from src.redis_client import RedisClient
 from src.state_machine import NodeStateMachine
+from src.state_persistence import StatePersister
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,13 @@ class FailoverNode:
             on_primary_failed=self._on_primary_failed,
         )
 
+        self.state_persister: StatePersister = StatePersister(
+            redis_client=self.redis_client,
+            log_processor=self.log_processor,
+            state_provider=lambda: self.state_machine.state,
+            sync_interval=config.state_sync_interval,
+        )
+
         self.app: FastAPI = create_app(
             config=config,
             state_machine=self.state_machine,
@@ -123,9 +131,17 @@ class FailoverNode:
             election_coordinator=self.election_coordinator,
             heartbeat_emitter=self.heartbeat_emitter,
             heartbeat_monitor=self.heartbeat_monitor,
+            state_persister=self.state_persister,
             redis_client=self.redis_client,
             on_manual_failover=self._on_manual_failover,
         )
+
+        # Hook the persister into the state machine so a transition into
+        # PRIMARY (initial bootstrap or post-election promotion) loads the
+        # latest snapshot BEFORE we start accepting log writes. The
+        # callback is registered here so it fires inside the state-machine
+        # critical section, ahead of any heartbeat emission.
+        self.state_machine.on_transition(self._on_state_transition)
 
         # Concurrency guard: we don't want two parallel elections from
         # this node when the monitor fires twice in quick succession.
@@ -147,6 +163,35 @@ class FailoverNode:
         }
 
     # --- callbacks ------------------------------------------------------
+
+    async def _on_state_transition(
+        self,
+        old: NodeState,
+        new: NodeState,
+        reason: str,  # noqa: ARG002 — kept for callback signature parity
+    ) -> None:
+        """Load the snapshot on every ``* -> PRIMARY`` transition.
+
+        Covers both initial bootstrap (``INACTIVE -> PRIMARY``) and the
+        post-election promotion path (``ELECTION -> PRIMARY``). We load
+        BEFORE any /logs traffic could arrive — the heartbeat emitter
+        loop only flips on after start() returns, and the HTTP server
+        won't accept ingest until the state machine has already settled
+        in PRIMARY (the route checks state at request time).
+
+        Idempotent: if no snapshot exists in Redis yet (first-ever
+        bootstrap with an empty cluster), ``load_into`` returns False
+        and we proceed with a fresh-zero log processor.
+        """
+        if old is not NodeState.PRIMARY and new is NodeState.PRIMARY:
+            try:
+                await self.state_persister.load_into(self.log_processor)
+            except Exception:
+                logger.exception(
+                    "state snapshot load failed on promotion (node=%s); "
+                    "continuing with fresh counters",
+                    self.config.node_id,
+                )
 
     async def _on_lock_lost(self) -> None:
         """Self-demote when the heartbeat emitter loses the leader lock."""
@@ -242,6 +287,7 @@ class FailoverNode:
 
         await self.heartbeat_emitter.start()
         await self.heartbeat_monitor.start()
+        await self.state_persister.start()
 
     async def stop(self) -> None:
         """Tear the node down cleanly.
@@ -251,6 +297,7 @@ class FailoverNode:
         transports last. ``stop()`` is safe to call multiple times.
         """
         self._stopping = True
+        await self.state_persister.stop()
         await self.heartbeat_emitter.stop()
         await self.heartbeat_monitor.stop()
         if self.state_machine.state is NodeState.PRIMARY:
