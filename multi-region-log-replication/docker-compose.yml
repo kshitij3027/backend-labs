@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: mrlr-redis
+    networks:
+      - mrlr-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 1s
+      retries: 5
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multi-region-log-replication-app
+    container_name: mrlr-app
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8000"
+      REGIONS: "us-east,europe,asia"
+      PRIMARY_PREFERENCE: "us-east,europe,asia"
+      REPLICATION_LAG_TARGET_MS: "100"
+      WEBSOCKET_PUSH_INTERVAL_SEC: "5"
+      HEALTH_CHECK_INTERVAL_SEC: "1"
+      FAILOVER_TIMEOUT_SEC: "5"
+      MAX_LOGS_RETURNED: "25"
+      LOG_LEVEL: "INFO"
+      ALLOW_KILL_ENDPOINT: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mrlr-net
+    restart: "no"
+
+networks:
+  mrlr-net:
+    driver: bridge

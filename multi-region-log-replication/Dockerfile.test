@@ -1,0 +1,21 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# gcc + libc-dev cover any wheels we might need to compile from source.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        libc-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+COPY tests/ ./tests/
+COPY pytest.ini ./pytest.ini
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+CMD ["pytest", "-v", "--tb=short"]
