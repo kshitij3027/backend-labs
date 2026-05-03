@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Multi-Region Log Replication</title>
+  <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 text-slate-100">
+  <div id="app" class="p-6 max-w-6xl mx-auto">
+    <h1 class="text-2xl font-bold mb-2">Multi-Region Log Replication</h1>
+    <p class="text-sm text-slate-400 mb-6">
+      Overall: <span :class="overallClass">{{ snapshot.overall_status || 'connecting…' }}</span>
+      &nbsp;·&nbsp; Primary: <span class="font-mono">{{ snapshot.current_primary || '—' }}</span>
+      &nbsp;·&nbsp; WS: <span :class="wsConnected ? 'text-emerald-400' : 'text-amber-400'">{{ wsConnected ? 'live' : 'polling' }}</span>
+    </p>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div v-for="r in snapshot.regions" :key="r.region_id" class="rounded-lg border border-slate-700 p-4 bg-slate-800">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-lg font-semibold">{{ r.region_id }}</h2>
+          <span :class="r.is_primary ? 'bg-emerald-500/20 text-emerald-300' : 'bg-slate-700 text-slate-300'" class="px-2 py-0.5 rounded text-xs">
+            {{ r.is_primary ? 'PRIMARY' : 'SECONDARY' }}
+          </span>
+        </div>
+        <p class="text-xs text-slate-400">healthy: <span :class="r.is_healthy ? 'text-emerald-400' : 'text-rose-400'">{{ r.is_healthy }}</span></p>
+        <p class="text-xs text-slate-400">logs: <span class="text-slate-100">{{ r.log_count }}</span></p>
+        <p class="text-xs text-slate-400">logical ts: <span class="text-slate-100">{{ r.logical_ts }}</span></p>
+        <p class="text-xs text-slate-400">vc: <span class="font-mono text-slate-200">{{ JSON.stringify(r.vector_clock) }}</span></p>
+        <p class="text-xs text-slate-400">lag p95 ms: <span class="text-slate-100">{{ formatNum(r.replication_lag_ms) }}</span></p>
+        <p class="text-xs text-slate-400">success: <span class="text-slate-100">{{ formatPct(r.replication_success_rate) }}</span></p>
+      </div>
+    </div>
+    <div class="mt-6">
+      <button @click="postSampleLog" class="bg-blue-600 hover:bg-blue-500 px-3 py-1.5 rounded text-sm">POST /api/logs</button>
+      <span class="ml-3 text-xs text-slate-400">last response: {{ lastWriteId || '—' }}</span>
+    </div>
+  </div>
+  <script>
+    const { createApp, reactive, onMounted, computed } = Vue;
+    createApp({
+      setup() {
+        const state = reactive({ snapshot: { regions: [], overall_status: '', current_primary: null }, wsConnected: false, lastWriteId: '' });
+        let pollTimer = null, ws = null;
+        const overallClass = computed(() => {
+          const s = state.snapshot.overall_status;
+          return s === 'healthy' ? 'text-emerald-400' : s === 'degraded' ? 'text-amber-400' : s === 'down' ? 'text-rose-400' : 'text-slate-400';
+        });
+        async function pollOnce() {
+          try {
+            const res = await fetch('/api/status');
+            if (res.ok) state.snapshot = await res.json();
+          } catch (e) { /* keep last good */ }
+        }
+        function startPolling() {
+          if (pollTimer) return;
+          pollTimer = setInterval(pollOnce, 2000);
+        }
+        function stopPolling() {
+          if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+        }
+        function connectWS() {
+          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+          ws = new WebSocket(`${proto}://${location.host}/ws`);
+          ws.onopen = () => { state.wsConnected = true; stopPolling(); };
+          ws.onmessage = (ev) => { try { state.snapshot = JSON.parse(ev.data); } catch {} };
+          ws.onclose = () => { state.wsConnected = false; ws = null; startPolling(); setTimeout(connectWS, 2000); };
+          ws.onerror = () => { state.wsConnected = false; };
+        }
+        async function postSampleLog() {
+          const res = await fetch('/api/logs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'hello from dashboard', level: 'info', service: 'dashboard' }) });
+          if (res.ok) { const j = await res.json(); state.lastWriteId = j.log_id; }
+        }
+        function formatNum(v) { return (v == null) ? '—' : Number(v).toFixed(1); }
+        function formatPct(v) { return (v == null) ? '—' : (Number(v) * 100).toFixed(1) + '%'; }
+        onMounted(() => { pollOnce(); startPolling(); connectWS(); });
+        return { snapshot: computed(() => state.snapshot), wsConnected: computed(() => state.wsConnected), lastWriteId: computed(() => state.lastWriteId), overallClass, postSampleLog, formatNum, formatPct, JSON };
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
