@@ -250,6 +250,59 @@ def create_app(config: AppConfig) -> FastAPI:
         return [e.model_dump() for e in entries]
 
     # =====================================================================
+    # POST /api/regions/{region_id}/kill — simulate a region failure.
+    # =====================================================================
+    # Gated by ``config.allow_kill_endpoint`` so production deployments can
+    # disable it. Used by the E2E driver and the dashboard's "Kill" button.
+    @app.post("/api/regions/{region_id}/kill")
+    async def kill_region(region_id: str) -> dict:
+        if not config.allow_kill_endpoint:
+            raise HTTPException(
+                status_code=403, detail="kill endpoint disabled"
+            )
+        region = regions.get(region_id)
+        if region is None:
+            raise HTTPException(
+                status_code=404, detail=f"region {region_id} not found"
+            )
+        region.mark_offline()
+        return {"region_id": region_id, "is_healthy": False}
+
+    # =====================================================================
+    # POST /api/regions/{region_id}/heal — recover a previously-killed region.
+    # =====================================================================
+    # Heal is intentionally ungated — the failover behaviour we want is
+    # one-way (heal does NOT auto-promote), so heal alone is harmless.
+    @app.post("/api/regions/{region_id}/heal")
+    async def heal_region(region_id: str) -> dict:
+        region = regions.get(region_id)
+        if region is None:
+            raise HTTPException(
+                status_code=404, detail=f"region {region_id} not found"
+            )
+        region.mark_online()
+        return {"region_id": region_id, "is_healthy": True}
+
+    # =====================================================================
+    # GET /api/regions/{region_id}/logs — read logs from a specific region.
+    # =====================================================================
+    # Proves that secondary reads still work after a primary failure
+    # (used by the verify_replication.py E2E script).
+    @app.get("/api/regions/{region_id}/logs")
+    async def list_region_logs(
+        region_id: str,
+        limit: int = Query(default=None, ge=1, le=10_000),
+    ) -> list:
+        region = regions.get(region_id)
+        if region is None:
+            raise HTTPException(
+                status_code=404, detail=f"region {region_id} not found"
+            )
+        n = limit if limit is not None else config.max_logs_returned
+        entries = region.get_logs(limit=n)
+        return [e.model_dump() for e in entries]
+
+    # =====================================================================
     # WS /ws — broadcaster connect endpoint.
     # =====================================================================
     @app.websocket("/ws")

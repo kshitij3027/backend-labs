@@ -24,16 +24,17 @@ logs:
 	docker compose logs -f
 
 # End-to-end driver — boots the stack, waits for the app to be ready, runs
-# the verifier, and tears down on success or failure. ``verify_replication.py``
-# lands in commit 5; until then this target is a placeholder that just checks
-# the placeholder app responds.
+# the multi-region replication + failover verifier, and tears down regardless
+# of result.
 e2e:
 	docker compose up --build -d
 	sleep 15
 	@if [ -f scripts/verify_replication.py ]; then \
 		python3 scripts/verify_replication.py || (docker compose down && exit 1); \
 	else \
-		echo "scripts/verify_replication.py not yet implemented (lands in commit 5)"; \
+		echo "scripts/verify_replication.py missing — expected at project root"; \
+		docker compose down; \
+		exit 1; \
 	fi
 	docker compose down
 

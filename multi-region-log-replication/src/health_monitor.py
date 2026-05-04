@@ -1,39 +1,45 @@
-"""Periodic health snapshotter.
+"""Periodic health snapshotter + automatic failover.
 
 The :class:`HealthMonitor` is the bridge between the live cluster state
 (``Region`` objects + :class:`ReplicationController` + replication stats)
 and the wire format consumed by ``GET /api/health``, ``GET /api/status``,
 and the ``/ws`` broadcaster — a :class:`HealthSnapshot`.
 
-Responsibilities (commit 4 — failover detection lands in commit 5):
+Responsibilities:
 
 * Run a background asyncio task that calls :meth:`compute_snapshot`
   every ``health_check_interval_sec`` seconds, caching the latest
   result on ``_last_snapshot`` for cheap debugging access.
+* Detect primary failure: if the elected primary reports ``is_healthy
+  is False`` for **two consecutive ticks**, we re-elect a new primary
+  (excluding the current one) and append a structured event to the
+  bounded ``failover_history`` deque.
 * Expose :meth:`get_snapshot` for synchronous callers (the HTTP routes
   and the WS broadcaster) — always returns a fresh snapshot so even if
   the background task hasn't ticked yet (e.g. during the very first
   request after startup) the caller still gets up-to-date numbers.
 
-Why we re-compute on every ``get_snapshot``:
-  The cost is tiny (three regions × one stats dict lookup), and it
-  removes a subtle staleness window where the dashboard would render
-  values up to ``health_check_interval_sec`` old. Commit 5 will keep
-  the cached ``_last_snapshot`` for failover decisions which need to
-  observe state changes between ticks.
+Why two ticks (not one):
+  A single missed tick could be a transient hiccup or a race with a
+  partial mark_offline that gets reverted. Two consecutive ticks
+  with the default 1-second cadence trips failover within ~2s of a
+  real outage — comfortably inside the project's 5s recovery budget
+  while still smoothing out a brief blip.
 
-Why all exceptions in ``_run`` are swallowed:
-  The monitor must never crash — if ``compute_snapshot`` raises (e.g.
-  during a bad transition between commits), the background task should
-  log + continue, not exit. Commit 5 will replace the bare ``pass``
-  with structured logging.
+Why all exceptions in ``_run`` are swallowed (and logged):
+  The monitor must never crash — if ``compute_snapshot`` or the
+  failover branch raises, the background task should log + continue,
+  not exit. We use ``logger.exception`` so the stack trace is
+  preserved in the logs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from typing import Dict, List, Optional
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional
 
 from .models import HealthSnapshot, RegionStatus
 from .region import Region
@@ -42,7 +48,15 @@ from .replication_stats import ReplicationStatsTracker
 
 
 class HealthMonitor:
-    """Periodically snapshot cluster health for the dashboard + API."""
+    """Periodically snapshot cluster health + drive automatic failover."""
+
+    # How many consecutive unhealthy ticks the primary must show before we
+    # re-elect. Two ticks at the default 1s cadence means failover fires
+    # within ~2s of the simulated outage — well inside the 5s budget.
+    UNHEALTHY_THRESHOLD: int = 2
+
+    # Maximum number of past failover events to keep on the snapshot.
+    FAILOVER_HISTORY_MAXLEN: int = 10
 
     def __init__(
         self,
@@ -57,8 +71,15 @@ class HealthMonitor:
         self._interval: float = check_interval_sec
         self._task: Optional[asyncio.Task[None]] = None
         self._last_snapshot: Optional[HealthSnapshot] = None
-        # Failover bookkeeping (used in commit 5):
+        # Failover bookkeeping. ``_unhealthy_streak`` lives on the
+        # instance (rather than a local in ``_run``) so tests can poke
+        # at it during diagnostic failures, and so a future feature
+        # could surface it on the snapshot if needed.
         self._unhealthy_streak: int = 0
+        self._failover_history: Deque[Dict[str, Any]] = deque(
+            maxlen=self.FAILOVER_HISTORY_MAXLEN
+        )
+        self._logger = logging.getLogger(__name__)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -79,19 +100,76 @@ class HealthMonitor:
                 pass
 
     async def _run(self) -> None:
-        """The polling loop — never crashes, sleeps between iterations."""
+        """The polling loop — never crashes, sleeps between iterations.
+
+        Each tick:
+
+        1. Inspect the elected primary. If it's unhealthy, bump the
+           consecutive-unhealthy counter; once that counter reaches
+           ``UNHEALTHY_THRESHOLD`` we trigger ``_do_failover`` and reset.
+        2. Recompute the snapshot for cheap debugging access.
+        """
         while True:
             try:
+                current_primary_id = self._controller.primary_id
+                if current_primary_id is not None:
+                    primary_region = self._regions.get(current_primary_id)
+                    if primary_region is not None and not primary_region.is_healthy:
+                        self._unhealthy_streak += 1
+                        if self._unhealthy_streak >= self.UNHEALTHY_THRESHOLD:
+                            await self._do_failover(current_primary_id)
+                            self._unhealthy_streak = 0
+                    else:
+                        # Primary is healthy — clear the streak so a
+                        # transient blip doesn't accumulate.
+                        self._unhealthy_streak = 0
                 self._last_snapshot = self.compute_snapshot()
-            except Exception:
-                # Never let the monitor task die. Commit 5 swaps this
-                # bare ``pass`` for a structured log.
-                pass
+            except Exception as exc:  # noqa: BLE001 — monitor must never die
+                self._logger.exception("health monitor tick failed: %s", exc)
             await asyncio.sleep(self._interval)
+
+    async def _do_failover(self, old_primary_id: str) -> None:
+        """Re-elect a primary excluding the failed one; record the event.
+
+        Emits a structured warning log line and appends a dict to
+        ``_failover_history``. If election raises (no healthy region
+        available) we log an error and leave the stale primary id in
+        place — the next tick will retry once a region recovers.
+        """
+        start = time.perf_counter()
+        try:
+            new_primary_id = self._controller.elect_primary(
+                exclude={old_primary_id}
+            )
+        except RuntimeError:
+            self._logger.error(
+                "failover: no healthy region available, leaving %s as primary",
+                old_primary_id,
+            )
+            return
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        self._logger.warning(
+            "failover: %s -> %s in %.2fms",
+            old_primary_id,
+            new_primary_id,
+            elapsed_ms,
+        )
+        self._failover_history.append(
+            {
+                "at": time.time(),
+                "old_primary": old_primary_id,
+                "new_primary": new_primary_id,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Snapshot construction
     # ------------------------------------------------------------------
+
+    def failover_events(self) -> List[Dict[str, Any]]:
+        """Return a list copy of recent failover events (oldest first)."""
+        return list(self._failover_history)
 
     def compute_snapshot(self) -> HealthSnapshot:
         """Build a :class:`HealthSnapshot` from live cluster state.
@@ -145,6 +223,7 @@ class HealthMonitor:
             regions=regions_out,
             taken_at=time.time(),
             current_primary=primary_id,
+            recent_failovers=self.failover_events(),
         )
 
     def get_snapshot(self) -> HealthSnapshot:
@@ -152,8 +231,8 @@ class HealthMonitor:
 
         Always recomputes — see module docstring. The cached
         ``_last_snapshot`` is kept around as a debugging aid (and for
-        commit 5's failover heuristics) but is *not* what gets returned
-        here.
+        the failover heuristics in :meth:`_run`) but is *not* what gets
+        returned here.
         """
         snap = self.compute_snapshot()
         self._last_snapshot = snap

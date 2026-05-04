@@ -62,9 +62,17 @@ class RegionStatus(BaseModel):
 
 
 class HealthSnapshot(BaseModel):
-    """Top-level snapshot pushed over the WebSocket and returned by /api/health."""
+    """Top-level snapshot pushed over the WebSocket and returned by /api/health.
+
+    ``recent_failovers`` is a bounded list of recent failover events (most
+    recent ten), each a dict with ``at`` (epoch seconds), ``old_primary``,
+    ``new_primary``, and ``elapsed_ms``. Surfaced on the snapshot so the
+    dashboard can render a "time since last failover" pill without an
+    extra round-trip.
+    """
 
     overall_status: str
     regions: List[RegionStatus] = Field(default_factory=list)
     taken_at: float = Field(default_factory=time.time)
     current_primary: Optional[str] = None
+    recent_failovers: List[Dict[str, Any]] = Field(default_factory=list)
