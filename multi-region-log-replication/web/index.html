@@ -5,15 +5,37 @@
   <title>Multi-Region Log Replication</title>
   <script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.js"></script>
 </head>
 <body class="bg-slate-900 text-slate-100">
   <div id="app" class="p-6 max-w-6xl mx-auto">
     <h1 class="text-2xl font-bold mb-2">Multi-Region Log Replication</h1>
-    <p class="text-sm text-slate-400 mb-6">
+    <p class="text-sm text-slate-400 mb-4">
       Overall: <span :class="overallClass">{{ snapshot.overall_status || 'connecting…' }}</span>
-      &nbsp;·&nbsp; Primary: <span class="font-mono">{{ snapshot.current_primary || '—' }}</span>
       &nbsp;·&nbsp; WS: <span :class="wsConnected ? 'text-emerald-400' : 'text-amber-400'">{{ wsConnected ? 'live' : 'polling' }}</span>
     </p>
+
+    <!-- Top metrics row: total writes, primary, lag p95, time since last failover -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      <div class="rounded-lg border border-slate-700 p-3 bg-slate-800">
+        <p class="text-xs text-slate-400 uppercase tracking-wide">Total writes</p>
+        <p class="text-xl font-mono mt-1">{{ totalWrites }}</p>
+      </div>
+      <div class="rounded-lg border border-slate-700 p-3 bg-slate-800">
+        <p class="text-xs text-slate-400 uppercase tracking-wide">Primary</p>
+        <p class="text-xl font-mono mt-1 text-emerald-300">{{ snapshot.current_primary || '—' }}</p>
+      </div>
+      <div class="rounded-lg border border-slate-700 p-3 bg-slate-800">
+        <p class="text-xs text-slate-400 uppercase tracking-wide">Lag p95 (ms)</p>
+        <p class="text-xl font-mono mt-1">{{ overallLagP95 }}</p>
+      </div>
+      <div class="rounded-lg border border-slate-700 p-3 bg-slate-800">
+        <p class="text-xs text-slate-400 uppercase tracking-wide">Last failover</p>
+        <p class="text-xl font-mono mt-1">{{ lastFailoverLabel }}</p>
+      </div>
+    </div>
+
+    <!-- Per-region cards with Kill / Heal buttons -->
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
       <div v-for="r in snapshot.regions" :key="r.region_id" class="rounded-lg border border-slate-700 p-4 bg-slate-800">
         <div class="flex items-center justify-between mb-2">
@@ -28,27 +50,111 @@
         <p class="text-xs text-slate-400">vc: <span class="font-mono text-slate-200">{{ JSON.stringify(r.vector_clock) }}</span></p>
         <p class="text-xs text-slate-400">lag p95 ms: <span class="text-slate-100">{{ formatNum(r.replication_lag_ms) }}</span></p>
         <p class="text-xs text-slate-400">success: <span class="text-slate-100">{{ formatPct(r.replication_success_rate) }}</span></p>
+        <div class="mt-3 flex gap-2">
+          <button @click="killRegion(r.region_id)"
+                  :disabled="!r.is_healthy"
+                  :class="r.is_healthy ? 'bg-rose-600 hover:bg-rose-500' : 'bg-slate-700 cursor-not-allowed opacity-50'"
+                  class="px-3 py-1 rounded text-xs transition">Kill</button>
+          <button @click="healRegion(r.region_id)"
+                  :disabled="r.is_healthy"
+                  :class="!r.is_healthy ? 'bg-emerald-600 hover:bg-emerald-500' : 'bg-slate-700 cursor-not-allowed opacity-50'"
+                  class="px-3 py-1 rounded text-xs transition">Heal</button>
+        </div>
       </div>
     </div>
+
+    <!-- Manual write trigger (kept from commit 4 for parity) -->
     <div class="mt-6">
       <button @click="postSampleLog" class="bg-blue-600 hover:bg-blue-500 px-3 py-1.5 rounded text-sm">POST /api/logs</button>
       <span class="ml-3 text-xs text-slate-400">last response: {{ lastWriteId || '—' }}</span>
     </div>
+
+    <!-- Replication-lag chart (one line per secondary, 60-sample rolling window) -->
+    <div class="mt-8 rounded-lg border border-slate-700 p-4 bg-slate-800">
+      <h2 class="text-sm font-semibold mb-2 text-slate-300">Replication lag (p95 ms) — last 60 samples</h2>
+      <canvas id="lagChart" height="80"></canvas>
+    </div>
   </div>
+
   <script>
     const { createApp, reactive, onMounted, computed } = Vue;
     createApp({
       setup() {
-        const state = reactive({ snapshot: { regions: [], overall_status: '', current_primary: null }, wsConnected: false, lastWriteId: '' });
-        let pollTimer = null, ws = null;
+        const state = reactive({
+          snapshot: { regions: [], overall_status: '', current_primary: null, recent_failovers: [] },
+          wsConnected: false,
+          lastWriteId: '',
+          lagSeries: { 'us-east': [], 'europe': [], 'asia': [] },
+        });
+        let pollTimer = null, ws = null, chart = null;
+
         const overallClass = computed(() => {
           const s = state.snapshot.overall_status;
-          return s === 'healthy' ? 'text-emerald-400' : s === 'degraded' ? 'text-amber-400' : s === 'down' ? 'text-rose-400' : 'text-slate-400';
+          return s === 'healthy' ? 'text-emerald-400'
+            : s === 'degraded' ? 'text-amber-400'
+            : s === 'down' ? 'text-rose-400'
+            : 'text-slate-400';
         });
+
+        const totalWrites = computed(() => {
+          const regs = state.snapshot.regions || [];
+          // Total *unique* writes is well-approximated by the primary's
+          // log_count (every write hits the primary first); fall back to
+          // max log_count across all regions if no primary is elected.
+          if (state.snapshot.current_primary) {
+            const p = regs.find(r => r.region_id === state.snapshot.current_primary);
+            if (p) return p.log_count;
+          }
+          return regs.reduce((m, r) => Math.max(m, r.log_count || 0), 0);
+        });
+
+        const overallLagP95 = computed(() => {
+          // Headline lag: max p95 across secondaries (worst-case view).
+          // Skip the primary — its "lag to itself" is meaningless.
+          const regs = state.snapshot.regions || [];
+          const lags = regs
+            .filter(r => !r.is_primary && r.replication_lag_ms != null)
+            .map(r => r.replication_lag_ms);
+          if (!lags.length) return '—';
+          return Math.max(...lags).toFixed(1);
+        });
+
+        const lastFailoverLabel = computed(() => {
+          const events = state.snapshot.recent_failovers || [];
+          if (!events.length) return 'never';
+          const latest = events[events.length - 1];
+          const ageSec = Math.max(0, (Date.now() / 1000) - latest.at);
+          if (ageSec < 60) return `${ageSec.toFixed(0)}s ago`;
+          if (ageSec < 3600) return `${(ageSec / 60).toFixed(1)} min ago`;
+          return `${(ageSec / 3600).toFixed(1)} h ago`;
+        });
+
+        function setSnapshot(snap) {
+          state.snapshot = snap;
+          // Push the latest p95 onto each secondary's series; cap at 60.
+          const ts = (snap.taken_at || Date.now() / 1000);
+          for (const r of (snap.regions || [])) {
+            if (r.is_primary) continue;
+            const series = state.lagSeries[r.region_id];
+            if (!series) continue;
+            series.push({ x: ts, y: r.replication_lag_ms == null ? 0 : r.replication_lag_ms });
+            if (series.length > 60) series.shift();
+          }
+          if (chart) {
+            chart.data.datasets.forEach(ds => {
+              const series = state.lagSeries[ds.label];
+              if (series) {
+                ds.data = series.map((p, i) => ({ x: i, y: p.y }));
+              }
+            });
+            chart.update('none');
+          }
+        }
+
         async function pollOnce() {
           try {
             const res = await fetch('/api/status');
-            if (res.ok) state.snapshot = await res.json();
+            if (res.ok) setSnapshot(await res.json());
           } catch (e) { /* keep last good */ }
         }
         function startPolling() {
@@ -62,19 +168,82 @@
           const proto = location.protocol === 'https:' ? 'wss' : 'ws';
           ws = new WebSocket(`${proto}://${location.host}/ws`);
           ws.onopen = () => { state.wsConnected = true; stopPolling(); };
-          ws.onmessage = (ev) => { try { state.snapshot = JSON.parse(ev.data); } catch {} };
+          ws.onmessage = (ev) => { try { setSnapshot(JSON.parse(ev.data)); } catch {} };
           ws.onclose = () => { state.wsConnected = false; ws = null; startPolling(); setTimeout(connectWS, 2000); };
           ws.onerror = () => { state.wsConnected = false; };
         }
         async function postSampleLog() {
-          const res = await fetch('/api/logs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: 'hello from dashboard', level: 'info', service: 'dashboard' }) });
+          const res = await fetch('/api/logs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: 'hello from dashboard', level: 'info', service: 'dashboard' }),
+          });
           if (res.ok) { const j = await res.json(); state.lastWriteId = j.log_id; }
+        }
+        async function killRegion(rid) {
+          try {
+            await fetch(`/api/regions/${rid}/kill`, { method: 'POST' });
+            // Force an immediate poll so the UI updates without waiting
+            // for the next WS tick.
+            pollOnce();
+          } catch {}
+        }
+        async function healRegion(rid) {
+          try {
+            await fetch(`/api/regions/${rid}/heal`, { method: 'POST' });
+            pollOnce();
+          } catch {}
         }
         function formatNum(v) { return (v == null) ? '—' : Number(v).toFixed(1); }
         function formatPct(v) { return (v == null) ? '—' : (Number(v) * 100).toFixed(1) + '%'; }
-        onMounted(() => { pollOnce(); startPolling(); connectWS(); });
-        return { snapshot: computed(() => state.snapshot), wsConnected: computed(() => state.wsConnected), lastWriteId: computed(() => state.lastWriteId), overallClass, postSampleLog, formatNum, formatPct, JSON };
-      }
+
+        function initChart() {
+          const ctx = document.getElementById('lagChart').getContext('2d');
+          chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels: Array.from({ length: 60 }, (_, i) => i),
+              datasets: [
+                { label: 'us-east', data: [], borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.1)', tension: 0.25, pointRadius: 0 },
+                { label: 'europe',  data: [], borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,0.1)', tension: 0.25, pointRadius: 0 },
+                { label: 'asia',    data: [], borderColor: '#f472b6', backgroundColor: 'rgba(244,114,182,0.1)', tension: 0.25, pointRadius: 0 },
+              ],
+            },
+            options: {
+              responsive: true,
+              animation: false,
+              plugins: { legend: { labels: { color: '#cbd5e1' } } },
+              scales: {
+                x: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.1)' } },
+                y: { ticks: { color: '#94a3b8' }, grid: { color: 'rgba(148,163,184,0.1)' }, beginAtZero: true },
+              },
+            },
+          });
+        }
+
+        onMounted(() => {
+          initChart();
+          pollOnce();
+          startPolling();
+          connectWS();
+        });
+
+        return {
+          snapshot: computed(() => state.snapshot),
+          wsConnected: computed(() => state.wsConnected),
+          lastWriteId: computed(() => state.lastWriteId),
+          totalWrites,
+          overallLagP95,
+          lastFailoverLabel,
+          overallClass,
+          postSampleLog,
+          killRegion,
+          healRegion,
+          formatNum,
+          formatPct,
+          JSON,
+        };
+      },
     }).mount('#app');
   </script>
 </body>

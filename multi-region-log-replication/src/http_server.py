@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Dict, Optional, Set
+from typing import Any, AsyncIterator, Dict, Optional, Set
 
 from fastapi import (
     FastAPI,
@@ -44,13 +44,29 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 from .config import AppConfig
 from .health_monitor import HealthMonitor
 from .models import LogWriteRequest
 from .region import Region
+from .region_ring import RegionRing
 from .replication_controller import ReplicationController
 from .replication_stats import ReplicationStatsTracker
+
+
+class CartUpdate(BaseModel):
+    """Body of ``POST /api/carts/{cart_id}``.
+
+    Kept deliberately loose (``items`` is ``list[dict]``, not a
+    typed ``CartItem`` model) because Feature B is about the
+    consistent-hash routing + conflict-resolution path, not
+    schema validation of e-commerce carts.
+    """
+
+    items: list[dict[str, Any]]
+    user: str
+
 
 # The dashboard HTML lives next to ``src/`` at ``<repo>/web/index.html``.
 # Resolve once at import time so we don't repeatedly join paths per
@@ -167,6 +183,12 @@ def create_app(config: AppConfig) -> FastAPI:
         monitor=monitor,
         push_interval_sec=config.websocket_push_interval_sec,
     )
+    # Consistent-hash ring for cart_id → home region (Feature B).
+    # 64 vnodes per region — enough for ±15% even-distribution at 1000
+    # sample keys (verified by ``tests/test_region_ring.py``). The ring
+    # is built once at startup; no churn at runtime so we never need
+    # ``add_region`` / ``remove_region``.
+    region_ring = RegionRing(regions=list(regions.keys()), virtual_nodes=64)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -189,6 +211,7 @@ def create_app(config: AppConfig) -> FastAPI:
     app.state.stats = stats
     app.state.monitor = monitor
     app.state.broadcaster = broadcaster
+    app.state.region_ring = region_ring
 
     # =====================================================================
     # GET / — raw HTML so Vue's ``{{ }}`` template syntax works.
@@ -301,6 +324,47 @@ def create_app(config: AppConfig) -> FastAPI:
         n = limit if limit is not None else config.max_logs_returned
         entries = region.get_logs(limit=n)
         return [e.model_dump() for e in entries]
+
+    # =====================================================================
+    # POST /api/carts/{cart_id} — cart update routed via consistent hashing.
+    # =====================================================================
+    # The cart_id deterministically maps to a "home region" via the
+    # consistent-hash ring. The ``region_hint`` query param lets the
+    # demo script (``scripts/demo.py``) override the ring assignment to
+    # provoke deterministic conflicts — useful for showing the resolver
+    # picks a winner consistently across replicas. Even with a hint
+    # the write still goes through the elected primary; we are *not*
+    # routing per-region writes here, just stamping the home region
+    # into the payload so the resolver has a stable tie-breaker.
+    @app.post("/api/carts/{cart_id}")
+    async def update_cart(
+        cart_id: str,
+        body: CartUpdate,
+        region_hint: Optional[str] = Query(default=None),
+    ) -> dict:
+        if region_hint is not None and region_hint in regions:
+            home = region_hint
+        else:
+            home = region_ring.get_home_region(cart_id)
+        payload = {
+            "cart_id": cart_id,
+            "home_region": home,
+            "items": body.items,
+            "user": body.user,
+        }
+        try:
+            entry = await controller.write(payload)
+        except RuntimeError as e:
+            # Same 503 semantics as ``POST /api/logs`` when the cluster
+            # has no healthy primary.
+            raise HTTPException(status_code=503, detail=str(e))
+        return {
+            "log_id": entry.log_id,
+            "cart_id": cart_id,
+            "home_region": home,
+            "vector_clock": entry.vector_clock,
+            "logical_ts": entry.logical_ts,
+        }
 
     # =====================================================================
     # WS /ws — broadcaster connect endpoint.
