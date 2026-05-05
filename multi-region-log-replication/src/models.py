@@ -69,6 +69,14 @@ class HealthSnapshot(BaseModel):
     ``new_primary``, and ``elapsed_ms``. Surfaced on the snapshot so the
     dashboard can render a "time since last failover" pill without an
     extra round-trip.
+
+    ``total_writes`` is the count of distinct writes accepted by the
+    cluster — sourced from the **current primary's** ``log_count`` (not
+    summed across regions, which would triple-count every replicated
+    entry). When no primary is elected (e.g. all regions unhealthy) it
+    falls back to 0. The dashboard's "Total writes" tile reads this
+    field directly so it never needs to do client-side division by the
+    region count.
     """
 
     overall_status: str
@@ -76,3 +84,4 @@ class HealthSnapshot(BaseModel):
     taken_at: float = Field(default_factory=time.time)
     current_primary: Optional[str] = None
     recent_failovers: List[Dict[str, Any]] = Field(default_factory=list)
+    total_writes: int = 0

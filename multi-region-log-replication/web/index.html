@@ -97,10 +97,15 @@
         });
 
         const totalWrites = computed(() => {
+          // Server-side authoritative count: the snapshot exposes
+          // ``total_writes`` (sourced from the primary's log_count, not
+          // summed across regions — see ``HealthSnapshot`` docstring).
+          // Fall back to max log_count across regions when an older
+          // server omits the field, so the dashboard degrades gracefully.
+          if (typeof state.snapshot.total_writes === 'number') {
+            return state.snapshot.total_writes;
+          }
           const regs = state.snapshot.regions || [];
-          // Total *unique* writes is well-approximated by the primary's
-          // log_count (every write hits the primary first); fall back to
-          // max log_count across all regions if no primary is elected.
           if (state.snapshot.current_primary) {
             const p = regs.find(r => r.region_id === state.snapshot.current_primary);
             if (p) return p.log_count;

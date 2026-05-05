@@ -218,12 +218,24 @@ class HealthMonitor:
         else:
             overall = "healthy"
 
+        # ``total_writes`` is sourced from the **current primary's**
+        # ``log_count`` rather than summed across all regions because
+        # every write is replicated to every region — naive summing
+        # would triple-count under a 3-region cluster. The primary's
+        # store is the source of truth for "writes accepted" since
+        # every write hits it first.
+        if primary_id is not None and primary_id in self._regions:
+            total_writes = len(self._regions[primary_id].log_store)
+        else:
+            total_writes = 0
+
         return HealthSnapshot(
             overall_status=overall,
             regions=regions_out,
             taken_at=time.time(),
             current_primary=primary_id,
             recent_failovers=self.failover_events(),
+            total_writes=total_writes,
         )
 
     def get_snapshot(self) -> HealthSnapshot:
