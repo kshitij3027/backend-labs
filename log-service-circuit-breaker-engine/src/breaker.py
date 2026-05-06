@@ -198,6 +198,8 @@ class CircuitBreaker:
                         CircuitState.CLOSED,
                         "half-open recovery succeeded",
                     )
+            elif self._state == CircuitState.CLOSED and self._should_open():
+                await self._transition(CircuitState.OPEN, self._open_reason())
 
     async def _on_failure(self, latency: float, is_timeout: bool) -> None:
         """Record a failure and possibly trip the breaker OPEN."""
@@ -230,12 +232,44 @@ class CircuitBreaker:
         return sum(1 for r in self._window._records if not r.success)
 
     def _should_open(self) -> bool:
-        """Basic Commit-4 rule: trip OPEN once failure count meets threshold."""
-        return self._failed_in_window() >= self.config.failure_threshold
+        """Decide whether to trip from CLOSED to OPEN.
+
+        Returns True when ANY of these is true AND volume threshold is met:
+        - error rate over the monitoring window >= error_rate_threshold
+        - avg latency over the window >= slow_call_duration_threshold
+        - consecutive failures >= consecutive_failures_threshold
+        - failed calls in window >= failure_threshold
+
+        When volume is below min_volume_threshold the only firing rule is the
+        consecutive_failures rule (so a small burst of failures still trips,
+        but probabilistic noise on a low-volume sample doesn't).
+        """
+        cfg = self.config
+        volume = self._window.volume()
+        if volume < cfg.min_volume_threshold:
+            return self._consecutive_failures >= cfg.consecutive_failures_threshold
+        return (
+            self._window.error_rate() >= cfg.error_rate_threshold
+            or self._window.avg_latency() >= cfg.slow_call_duration_threshold
+            or self._consecutive_failures >= cfg.consecutive_failures_threshold
+            or self._failed_in_window() >= cfg.failure_threshold
+        )
 
     def _open_reason(self) -> str:
-        """Human-readable reason string used in state transitions."""
-        return f"{self.config.failure_threshold} failures in window"
+        cfg = self.config
+        volume = self._window.volume()
+        if volume < cfg.min_volume_threshold:
+            return f"{self._consecutive_failures} consecutive failures (low-volume mode)"
+        reasons = []
+        if self._window.error_rate() >= cfg.error_rate_threshold:
+            reasons.append(f"error_rate={self._window.error_rate():.2%}")
+        if self._window.avg_latency() >= cfg.slow_call_duration_threshold:
+            reasons.append(f"avg_latency={self._window.avg_latency():.3f}s")
+        if self._consecutive_failures >= cfg.consecutive_failures_threshold:
+            reasons.append(f"consecutive_failures={self._consecutive_failures}")
+        if self._failed_in_window() >= cfg.failure_threshold:
+            reasons.append(f"failed_in_window={self._failed_in_window()}")
+        return "; ".join(reasons) or "threshold reached"
 
     # ------------------------------------------------------------------ #
     # State transition primitive                                         #

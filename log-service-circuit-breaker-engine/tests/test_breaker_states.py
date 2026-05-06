@@ -43,6 +43,8 @@ def make_breaker(**overrides) -> CircuitBreaker:
         timeout_duration=0.5,
         half_open_max_calls=2,
         monitoring_window=10.0,
+        consecutive_failures_threshold=3,
+        min_volume_threshold=3,
     )
     cfg_kwargs.update(overrides)
     return CircuitBreaker(CircuitBreakerConfig(**cfg_kwargs))
