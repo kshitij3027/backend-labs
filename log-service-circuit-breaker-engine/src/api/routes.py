@@ -1,11 +1,17 @@
 """REST endpoints (GET only in this commit; POSTs land in Commit 11)."""
 from __future__ import annotations
+import asyncio
 import time
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
-from src.api.models import HealthResponse, MetricsResponse
+from src.api.models import (
+    HealthResponse,
+    MetricsResponse,
+    ProcessLogsRequest,
+    SimulateFailuresRequest,
+)
 
 router = APIRouter()
 
@@ -43,3 +49,51 @@ async def metrics(request: Request):
 async def metrics_history(request: Request):
     history = request.app.state.history
     return {"history": history.list()}
+
+
+@router.post("/api/process/logs")
+async def process_logs(payload: ProcessLogsRequest, request: Request):
+    processor = request.app.state.processor
+    result = await processor.process_batch(payload.count)
+    return result
+
+
+async def _failure_simulation(service, failure_rate: float, duration: int):
+    """Background task: enable injector for ``duration`` seconds, then reset."""
+    service.injector.set_failure_rate(failure_rate)
+    try:
+        await asyncio.sleep(duration)
+    finally:
+        service.injector.set_failure_rate(0.0)
+
+
+@router.post("/api/simulate/failures")
+async def simulate_failures(
+    payload: SimulateFailuresRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    services = request.app.state.services
+    if payload.target not in services:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown target '{payload.target}'. valid: {sorted(services.keys())}",
+        )
+    background_tasks.add_task(
+        _failure_simulation, services[payload.target], payload.failure_rate, payload.duration,
+    )
+    return {
+        "simulating": payload.target,
+        "duration": payload.duration,
+        "failure_rate": payload.failure_rate,
+    }
+
+
+@router.post("/api/reset")
+async def reset_breakers(request: Request):
+    registry = request.app.state.registry
+    services = request.app.state.services
+    await registry.reset_all()
+    for svc in services.values():
+        svc.injector.reset()
+    return {"reset": True, "circuits": sorted(registry.names())}
