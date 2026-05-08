@@ -41,11 +41,15 @@ def test_metrics_processing_initial_zeroes(client):
     assert processing["fallback_responses"] == 0
 
 
-def test_metrics_history_initially_empty(client):
+def test_metrics_history_endpoint_shape(client):
+    # The broadcaster (Commit 12) appends a snapshot on its first iteration,
+    # so the buffer may have 0+ entries by the time this test reads it.
+    # We just verify the endpoint shape is correct.
     resp = client.get("/api/metrics/history")
     assert resp.status_code == 200
     body = resp.json()
-    assert body == {"history": []}
+    assert "history" in body
+    assert isinstance(body["history"], list)
 
 
 def test_root_returns_html(client):

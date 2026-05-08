@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from src.api.models import (
@@ -97,3 +97,21 @@ async def reset_breakers(request: Request):
     for svc in services.values():
         svc.injector.reset()
     return {"reset": True, "circuits": sorted(registry.names())}
+
+
+@router.websocket("/ws/metrics")
+async def ws_metrics(websocket: WebSocket):
+    manager = websocket.app.state.manager
+    await manager.connect(websocket)
+    try:
+        # Push an immediate snapshot so a freshly-connected client doesn't wait 2s.
+        from src.api.websocket import build_metrics_snapshot
+        snapshot = build_metrics_snapshot(websocket.app.state.registry, websocket.app.state.processor)
+        await websocket.send_json(snapshot)
+        # Wait for client disconnect.
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await manager.disconnect(websocket)

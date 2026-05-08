@@ -1,9 +1,10 @@
 """FastAPI app factory and lifespan."""
 from __future__ import annotations
+import asyncio
 import os
 import time
 from collections import deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Deque, Optional
 
@@ -26,6 +27,7 @@ from src.services.external_api import ExternalAPIService
 from src.services.log_processor import LogProcessorService
 from src.services.queue import MessageQueueService
 from src.api.routes import router
+from src.api.websocket import ConnectionManager, get_broadcast_interval, metrics_broadcaster
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
@@ -91,8 +93,15 @@ async def lifespan(app: FastAPI):
     app.state.services = services
     app.state.history = MetricsHistory()
     app.state.start_time = time.time()
-    # Broadcaster task is added in Commit 12.
-    yield
+    app.state.manager = ConnectionManager()
+    interval = get_broadcast_interval()
+    task = asyncio.create_task(metrics_broadcaster(app, interval=interval))
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
 
 def create_app() -> FastAPI:
