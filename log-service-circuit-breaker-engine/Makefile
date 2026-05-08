@@ -24,4 +24,4 @@ e2e:
 	@echo "E2E will be added in Commit 17"
 
 demo:
-	@echo "Demo will be added in Commit 13"
+	docker compose run --rm app python -m src.demo --logs 15 --simulate-duration 2 --no-wait-recovery
