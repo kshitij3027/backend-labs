@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Circuit Breaker Engine — Live Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css">
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+    <header>
+        <h1>⚡ Circuit Breaker Engine</h1>
+        <div class="meta">
+            <span id="uptime">uptime: …</span>
+            <span class="dot" id="connection-dot" title="WebSocket connection"></span>
+            <span id="connection-text">connecting…</span>
+        </div>
+    </header>
+
+    <section class="cards" id="cards">
+        <!-- circuit cards rendered by dashboard.js -->
+    </section>
+
+    <section class="chart">
+        <h2>Success rate over time</h2>
+        <div id="chart" style="width:100%;height:340px;"></div>
+    </section>
+
+    <section class="controls">
+        <h2>Controls</h2>
+        <div class="button-row">
+            <button id="btn-process">Process 100 logs</button>
+            <button id="btn-simulate">Simulate DB failure 30s</button>
+            <button id="btn-reset">Reset breakers</button>
+        </div>
+        <div id="status-line">Ready.</div>
+    </section>
+
+    <section class="processing">
+        <h2>Processing summary</h2>
+        <ul id="processing-list">
+            <li><b>total_processed</b>: <span id="p-total">0</span></li>
+            <li><b>successful_processed</b>: <span id="p-success">0</span></li>
+            <li><b>failed_processed</b>: <span id="p-failed">0</span></li>
+            <li><b>fallback_responses</b>: <span id="p-fallback">0</span></li>
+        </ul>
+    </section>
+
+    <script>
+        // Build a WebSocket URL from window.location so it works behind any host/port.
+        window.__CB_WS_URL__ = (window.location.protocol === "https:" ? "wss://" : "ws://") + window.location.host + "/ws/metrics";
+    </script>
+    <script src="/static/dashboard.js"></script>
+</body>
+</html>

@@ -18,9 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # expected to be COPY'd in once they exist on disk.
 RUN mkdir -p ./web/static ./templates ./scripts
 
-# Copy the application source. ``web/``, ``templates/``, ``scripts/`` will be
-# added in later commits — for Commit 1 only ``src/`` is real.
+# Copy the application source plus the dashboard template/static assets.
 COPY src/ ./src/
+COPY templates/ ./templates/
+COPY web/ ./web/
 
 # Ownership + non-root drop.
 RUN chown -R app:app /app
