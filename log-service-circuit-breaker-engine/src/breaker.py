@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import Any, Awaitable, Callable, TypeVar
 
 from src.config import CircuitBreakerConfig
@@ -55,6 +56,8 @@ class CircuitBreaker:
         self._half_open_successes: int = 0
         self._consecutive_failures: int = 0
         self._listeners: list[Callable[..., Any]] = []
+        # Rolling history of completed open->close cycle durations (capped at 10).
+        self._recovery_durations: deque[float] = deque(maxlen=10)
 
     # ------------------------------------------------------------------ #
     # Public properties / introspection                                  #
@@ -65,6 +68,18 @@ class CircuitBreaker:
         """Live circuit state. Mirrors ``self._stats.current_state``."""
         return self._state
 
+    @property
+    def last_recovery_duration(self) -> float | None:
+        """Duration (seconds) of the most recently completed OPEN->CLOSED cycle."""
+        return self._recovery_durations[-1] if self._recovery_durations else None
+
+    @property
+    def avg_recovery_duration(self) -> float | None:
+        """Rolling average duration over the last <=10 completed OPEN->CLOSED cycles."""
+        if not self._recovery_durations:
+            return None
+        return sum(self._recovery_durations) / len(self._recovery_durations)
+
     def get_stats(self) -> dict:
         """Return a JSON-friendly snapshot of all stats for this breaker."""
         return {
@@ -74,6 +89,8 @@ class CircuitBreaker:
             **self._stats.to_dict(),
             "consecutive_failures": self._consecutive_failures,
             "window_volume": self._window.volume(),
+            "last_recovery_duration": self.last_recovery_duration,
+            "avg_recovery_duration": self.avg_recovery_duration,
         }
 
     def to_dict(self) -> dict:
@@ -290,11 +307,13 @@ class CircuitBreaker:
         if old_state == new_state:
             return
 
-        # Update cumulative OPEN duration when leaving OPEN.
+        # Update cumulative OPEN duration AND recovery-duration history when
+        # leaving OPEN (whether to HALF_OPEN or directly to CLOSED).
         if old_state == CircuitState.OPEN and self._stats.opened_at is not None:
-            self._stats.cumulative_open_duration += (
-                time.time() - self._stats.opened_at
-            )
+            duration = time.time() - self._stats.opened_at
+            self._stats.cumulative_open_duration += duration
+            self._recovery_durations.append(duration)
+            self._stats.opened_at = None
 
         self._state = new_state
         self._stats.current_state = new_state

@@ -48,6 +48,30 @@ class LogProcessorService:
         self.queue = queue
         self.ext_api = ext_api
         self.stats = ProcessingStats()
+        # Cache of last successful sub-step responses, keyed by step_key
+        # ("db_primary", "db_backup", "queue", "enrich"). When a sub-step
+        # falls back, we enrich the static fallback dict with this cached
+        # payload (tagged ``from_cache: True``) so downstream consumers see a
+        # realistic shape rather than the bare static fallback.
+        self._last_good: dict[str, dict] = {}
+
+    def _apply_cached_fallback(self, step_key: str, result: dict) -> dict:
+        """If ``result`` is a static fallback and we have a cached good payload
+        for ``step_key``, merge the cached payload into the fallback so callers
+        see a realistic response shape tagged ``from_cache: True``.
+        """
+        if result.get("status") != "fallback":
+            return result
+        cached = self._last_good.get(step_key)
+        if cached is None:
+            return result
+        # Cached payload wins so nested real data (e.g. enrichment fields)
+        # is preserved. Only the fallback's service identifier and the
+        # explicit status/from_cache markers override the cache.
+        merged = {**cached, "status": "fallback", "from_cache": True}
+        if "service" in result:
+            merged["service"] = result["service"]
+        return merged
 
     async def process_log(self, log_entry: dict) -> dict:
         """Run a single log through the pipeline. Never raises."""
@@ -58,13 +82,32 @@ class LogProcessorService:
         # 1. Database — failover from primary to backup if primary breaker is OPEN.
         try:
             if self.primary_db.breaker.state == CircuitState.OPEN:
-                result["db"] = await self.backup_db.insert_log(log_entry)
+                db_result = await self.backup_db.insert_log(log_entry)
+                step_key = "db_backup"
                 result["used_backup"] = True
             else:
-                result["db"] = await self.primary_db.insert_log(log_entry)
+                db_result = await self.primary_db.insert_log(log_entry)
+                step_key = "db_primary"
                 result["used_backup"] = False
-            if result["db"].get("status") == "fallback":
+
+            if db_result.get("status") == "ok":
+                # Cache by the path we actually took. Also mirror into the
+                # "other" key so a subsequent failover can hand back a
+                # sensible cached response too.
+                self._last_good[step_key] = db_result
+                if step_key == "db_primary":
+                    self._last_good.setdefault("db_backup", db_result)
+                else:
+                    self._last_good.setdefault("db_primary", db_result)
+            elif db_result.get("status") == "fallback":
+                # Try to enrich with cache from either db key.
+                cache_key = step_key if step_key in self._last_good else (
+                    "db_primary" if "db_primary" in self._last_good else "db_backup"
+                )
+                db_result = self._apply_cached_fallback(cache_key, db_result)
                 had_fallback = True
+
+            result["db"] = db_result
         except Exception as exc:
             logger.warning("processor: db sub-step failed: %s", exc)
             had_failure = True
@@ -72,9 +115,13 @@ class LogProcessorService:
 
         # 2. Queue.
         try:
-            result["queue"] = await self.queue.publish(log_entry)
-            if result["queue"].get("status") == "fallback":
+            queue_result = await self.queue.publish(log_entry)
+            if queue_result.get("status") == "ok":
+                self._last_good["queue"] = queue_result
+            elif queue_result.get("status") == "fallback":
+                queue_result = self._apply_cached_fallback("queue", queue_result)
                 had_fallback = True
+            result["queue"] = queue_result
         except Exception as exc:
             logger.warning("processor: queue sub-step failed: %s", exc)
             had_failure = True
@@ -82,9 +129,13 @@ class LogProcessorService:
 
         # 3. External API enrichment.
         try:
-            result["enrich"] = await self.ext_api.enrich(log_entry)
-            if result["enrich"].get("status") == "fallback":
+            enrich_result = await self.ext_api.enrich(log_entry)
+            if enrich_result.get("status") == "ok":
+                self._last_good["enrich"] = enrich_result
+            elif enrich_result.get("status") == "fallback":
+                enrich_result = self._apply_cached_fallback("enrich", enrich_result)
                 had_fallback = True
+            result["enrich"] = enrich_result
         except Exception as exc:
             logger.warning("processor: enrich sub-step failed: %s", exc)
             had_failure = True
