@@ -4,7 +4,7 @@ import asyncio
 import time
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
 from src.api.models import (
     HealthResponse,
@@ -12,6 +12,7 @@ from src.api.models import (
     ProcessLogsRequest,
     SimulateFailuresRequest,
 )
+from src.api.prometheus import CONTENT_TYPE_LATEST
 
 router = APIRouter()
 
@@ -115,3 +116,19 @@ async def ws_metrics(websocket: WebSocket):
         pass
     finally:
         await manager.disconnect(websocket)
+
+
+@router.get("/metrics")
+async def prometheus_metrics(request: Request):
+    """Prometheus exposition. Refresh gauges from registry snapshot, then emit."""
+    registry = request.app.state.registry
+    processor = request.app.state.processor
+    prom = request.app.state.prometheus
+    prom.update_from_snapshot(registry.metrics_snapshot(), processor.get_processing_stats())
+    return Response(content=prom.render(), media_type=CONTENT_TYPE_LATEST)
+
+
+@router.get("/api/alerts")
+async def alerts(request: Request):
+    alerter = request.app.state.alerter
+    return {"events": alerter.events()}

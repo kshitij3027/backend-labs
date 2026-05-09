@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from src.alerts import StateChangeAlerter
 from src.breaker import CircuitBreaker
 from src.config import (
     CircuitBreakerConfig,
@@ -26,6 +27,7 @@ from src.services.database import DatabaseService
 from src.services.external_api import ExternalAPIService
 from src.services.log_processor import LogProcessorService
 from src.services.queue import MessageQueueService
+from src.api.prometheus import PrometheusMetrics, state_change_metric_listener
 from src.api.routes import router
 from src.api.websocket import ConnectionManager, get_broadcast_interval, metrics_broadcaster
 
@@ -94,6 +96,10 @@ async def lifespan(app: FastAPI):
     app.state.history = MetricsHistory()
     app.state.start_time = time.time()
     app.state.manager = ConnectionManager()
+    app.state.alerter = StateChangeAlerter()
+    app.state.prometheus = PrometheusMetrics()
+    registry.add_global_listener(app.state.alerter)
+    registry.add_global_listener(state_change_metric_listener(app.state.prometheus))
     interval = get_broadcast_interval()
     task = asyncio.create_task(metrics_broadcaster(app, interval=interval))
     try:
