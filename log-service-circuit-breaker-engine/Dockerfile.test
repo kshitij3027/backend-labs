@@ -17,4 +17,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app
 
+COPY scripts/ ./scripts/
+
 CMD ["pytest", "-v", "--tb=short"]

@@ -10,7 +10,6 @@ from typing import Optional
 from src.services.database import DatabaseService
 from src.services.queue import MessageQueueService
 from src.services.external_api import ExternalAPIService
-from src.state import CircuitState
 
 logger = logging.getLogger(__name__)
 
@@ -79,16 +78,20 @@ class LogProcessorService:
         had_failure = False
         had_fallback = False
 
-        # 1. Database — failover from primary to backup if primary breaker is OPEN.
+        # 1. Database — always try primary first so the breaker itself can
+        # transition OPEN → HALF_OPEN → CLOSED via traffic. If primary's breaker
+        # is open it returns a static fallback dict (BaseService catches the
+        # CircuitBreakerOpenException), and we then failover to backup.
         try:
-            if self.primary_db.breaker.state == CircuitState.OPEN:
+            db_result = await self.primary_db.insert_log(log_entry)
+            step_key = "db_primary"
+            result["used_backup"] = False
+
+            if db_result.get("status") == "fallback":
+                # Primary breaker rejected (or timed out) — failover to backup.
                 db_result = await self.backup_db.insert_log(log_entry)
                 step_key = "db_backup"
                 result["used_backup"] = True
-            else:
-                db_result = await self.primary_db.insert_log(log_entry)
-                step_key = "db_primary"
-                result["used_backup"] = False
 
             if db_result.get("status") == "ok":
                 # Cache by the path we actually took. Also mirror into the

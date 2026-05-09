@@ -1,81 +1,107 @@
 # Log Service Circuit Breaker Engine
 
-A three-state circuit breaker system that wraps downstream service calls (database, message queue, external API) to prevent cascading failures by failing fast when services are unhealthy and providing graceful fallbacks.
+A production-style three-state circuit breaker engine that wraps downstream service calls (database, message queue, external API) for a log-processing pipeline. Includes a FastAPI server, real-time WebSocket dashboard, CLI demo, Prometheus metrics, and state-change alerting.
+
+## What this project demonstrates
+
+- **Three-state circuit breaker** (CLOSED -> OPEN -> HALF_OPEN -> CLOSED) with smart detection: error-rate threshold, slow-call latency threshold, consecutive failures, and a low-volume gate.
+- **Per-service breakers** with primary/backup database failover and fallback responses.
+- **Cached fallback** — services return the last good payload (tagged `from_cache=True`) when their breaker is OPEN.
+- **Recovery duration tracking** — rolling avg over last 10 cycles.
+- **Failure injection** — toggleable `failure_rate`, `is_down`, `response_delay` per service.
+- **Live dashboard** via WebSocket broadcasting metrics every 2s, with Plotly charts and interactive controls.
+- **Observability** — Prometheus `/metrics` endpoint and `/api/alerts` state-change log.
 
 ## Tech Stack
-
-- **Language:** Python 3.11+
-- **Framework:** FastAPI (REST + WebSocket)
-- **Server:** Uvicorn (ASGI)
-- **Concurrency:** asyncio
-- **Frontend:** Vanilla HTML/JS dashboard (real-time via WebSocket)
-- **Testing:** pytest, pytest-asyncio, httpx
-- **Containerization:** Docker + docker-compose
-
-## What It Does
-
-Implements the classic **three-state circuit breaker** pattern around downstream dependencies:
-
-| State        | Behavior                                                                 |
-|--------------|--------------------------------------------------------------------------|
-| `CLOSED`     | All calls pass through. Failures are counted against a sliding window.   |
-| `OPEN`       | Calls fail fast (no downstream contact). Fallback is returned instead.   |
-| `HALF_OPEN`  | A limited number of probe calls are allowed to test recovery.            |
-
-Transitions:
-- `CLOSED → OPEN` when failure rate / consecutive failures cross a threshold.
-- `OPEN → HALF_OPEN` after a cooldown timer elapses.
-- `HALF_OPEN → CLOSED` after N consecutive successful probes.
-- `HALF_OPEN → OPEN` if any probe fails.
-
-The engine wraps three simulated downstream services:
-1. **Database** — log persistence
-2. **Message Queue** — log fan-out
-3. **External API** — enrichment / forwarding
-
-Each wrapped call exposes hooks for: timeouts, error classification, fallback handlers, and metrics emission.
-
-## How It Runs
-
-Two modes:
-
-### 1. Long-lived FastAPI server (primary)
-- REST endpoints to **submit logs**, **simulate failures**, **inspect breaker state**, and **trigger forced transitions**.
-- WebSocket channel that streams real-time state changes, request outcomes, and metrics to the browser dashboard.
-- Browser dashboard at `/` renders per-breaker state, failure rates, latency histograms, and a live event log.
-
-### 2. One-shot CLI demo
-- Single command runs a scripted scenario (healthy → degraded → outage → recovery) against the in-process engine and prints transitions to stdout. Useful for quick verification without spinning up the full server stack.
+- **Language:** Python 3.11
+- **Web:** FastAPI 0.115 + uvicorn + WebSockets + Jinja2
+- **Validation:** pydantic 2
+- **Logging:** structlog (JSON output)
+- **Observability:** prometheus-client
+- **Frontend:** vanilla JS + Plotly.js (CDN)
+- **Infra:** Docker + docker-compose, Redis sidecar (reserved for future use)
+- **Testing:** pytest + pytest-asyncio (130+ tests, all run inside Docker)
 
 ## How to Run
 
-> _Filled in once implementation begins._
+```bash
+# Build and start the stack
+make build
+make run            # http://localhost:8000/
 
-## API (planned)
+# CLI demo (3 phases: happy path, failure storm, recovery)
+make demo
 
-| Method | Path                              | Purpose                                     |
-|--------|-----------------------------------|---------------------------------------------|
-| POST   | `/logs`                           | Submit a log; routed through breakers       |
-| GET    | `/breakers`                       | List all breakers and their current state   |
-| GET    | `/breakers/{name}`                | Detailed metrics for one breaker            |
-| POST   | `/breakers/{name}/trip`           | Force trip (testing)                        |
-| POST   | `/breakers/{name}/reset`          | Force reset to CLOSED                       |
-| POST   | `/simulate/{service}/fail`        | Inject failures into a downstream           |
-| POST   | `/simulate/{service}/recover`     | Restore healthy behavior                    |
-| WS     | `/ws/events`                      | Live stream of state changes & metrics      |
-| GET    | `/`                               | Monitoring dashboard (HTML)                 |
+# Run the unit + integration test suite (inside Docker)
+make test
 
-## Configuration (planned)
+# End-to-end verification — boots stack, runs scripts/verify_e2e.py, tears down
+make e2e
 
-Per-breaker tunables:
-- `failure_threshold` — trip after N failures (or % rate)
-- `rolling_window_seconds` — sliding window for failure counting
-- `open_cooldown_seconds` — time in OPEN before HALF_OPEN
-- `half_open_max_calls` — concurrent probes allowed
-- `half_open_success_threshold` — successes needed to close
-- `request_timeout_seconds` — per-call deadline
-- `fallback` — function returning a degraded response
+# Tail logs
+make logs
+
+# Stop and clean up
+make stop
+make clean
+```
+
+## API
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Plotly dashboard |
+| GET | `/health` | `{"status":"ok","uptime_seconds":N}` |
+| GET | `/api/metrics` | Combined registry snapshot + processing stats |
+| GET | `/api/metrics/history` | Last ~300 metric snapshots from broadcaster |
+| POST | `/api/process/logs` | Body `{"count": N}` — process N synthetic logs |
+| POST | `/api/simulate/failures` | Body `{"target":"database_primary","duration":N,"failure_rate":0.8}` — toggle injector |
+| POST | `/api/reset` | Reset all breakers + clear failure injectors |
+| GET | `/api/alerts` | List of recent state-change events |
+| GET | `/metrics` | Prometheus exposition (text/plain) |
+| WS | `/ws/metrics` | Live JSON metrics, pushed every 2s |
+
+## Environment Variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PORT` | 8000 | HTTP listen port |
+| `WEBSOCKET_BROADCAST_INTERVAL` | 2.0 | Seconds between WS broadcasts |
+| `LOG_LEVEL` | INFO | structlog level |
+| `CB_DEFAULT_FAILURE_THRESHOLD` | 5 | Default `failure_threshold` for env-loaded configs |
+| `CB_DEFAULT_RECOVERY_TIMEOUT` | 60 | Default `recovery_timeout` (seconds) |
+| `CB_DEFAULT_TIMEOUT_DURATION` | 10 | Default per-call timeout |
+| `CB_DEFAULT_HALF_OPEN_MAX_CALLS` | 3 | Probes admitted in HALF_OPEN |
+| `CB_DEFAULT_MONITORING_WINDOW` | 60 | Sliding-window seconds |
+
+See `.env.example` for the full set.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Client[HTTP / WS Client] -->|/api/*, /ws/metrics| FastAPI
+    FastAPI -->|process_log| Processor[LogProcessorService]
+    Processor -->|breaker.call| Primary[DatabaseService primary]
+    Processor -->|failover| Backup[DatabaseService backup]
+    Processor -->|breaker.call| Queue[MessageQueueService]
+    Processor -->|breaker.call| API[ExternalAPIService]
+    Primary -.guarded by.-> CB1[CircuitBreaker]
+    Backup -.guarded by.-> CB2[CircuitBreaker]
+    Queue -.guarded by.-> CB3[CircuitBreaker]
+    API -.guarded by.-> CB4[CircuitBreaker]
+    CB1 -.listener.-> Alerter[StateChangeAlerter]
+    CB1 -.listener.-> Prom[Prometheus]
+    Broadcaster[2s broadcaster] -->|push| Client
+```
+
+Each `CircuitBreaker` holds an `asyncio.Lock`-protected state machine, a sliding `CallWindow` for smart detection, and a `CircuitStats` snapshot that the dashboard and Prometheus exporter read from.
 
 ## What I Learned
 
-> _Filled in as the project evolves._
+- **Lock scope matters.** The `asyncio.Lock` only guards state mutation, not the awaited downstream call — otherwise a slow service blocks every concurrent caller.
+- **Smart detection needs a volume gate.** Probabilistic noise on a low-volume sample shouldn't trip a breaker. The `min_volume_threshold` keeps the error-rate rule honest.
+- **Listeners run inside the lock by design.** They must not re-enter the breaker, but this keeps event ordering deterministic for Prometheus counters.
+- **Cached fallback >> static fallback.** Returning the last good payload tagged `from_cache=True` keeps the dashboard meaningful even during outages.
+- **WebSocket + Plotly.react is fast.** Pushing a snapshot every 2s and re-rendering 4 traces of 150 points keeps the browser idle, no flicker.
+- **Failure injection should live OUTSIDE the breaker.** Keeping `FailureInjector` as a separate component meant the breaker stayed deterministic in tests — no random seeds inside the state machine.
