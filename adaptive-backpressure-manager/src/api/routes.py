@@ -165,5 +165,6 @@ async def admin_config(req: AdminConfigUpdate, request: Request) -> AdminConfigR
         "processing_latency_seconds": c.settings.processing_latency_seconds,
         "sampling_interval": c.settings.sampling_interval,
         "aimd_beta": c.settings.aimd_beta,
+        "max_queue_size": c.settings.max_queue_size,
     }
     return AdminConfigResponse(updated_fields=updated, current=current)

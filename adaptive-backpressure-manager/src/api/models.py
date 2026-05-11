@@ -69,6 +69,7 @@ class AdminConfigUpdate(BaseModel):
     processing_latency_seconds: float | None = Field(default=None, ge=0.0, le=10.0)
     sampling_interval: float | None = Field(default=None, ge=0.05, le=60.0)
     aimd_beta: float | None = Field(default=None, ge=0.05, le=0.99)
+    max_queue_size: int | None = Field(default=None, ge=1, le=1_000_000)
 
 
 class AdminConfigResponse(BaseModel):
