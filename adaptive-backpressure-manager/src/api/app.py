@@ -9,6 +9,7 @@ from src.admission import Admission
 from src.aimd import AIMDLimiter
 from src.breaker import CircuitBreaker
 from src.config import Settings, get_settings
+from src.load_tester import InternalLoadTester
 from src.logging_setup import configure_logging, get_logger
 from src.metrics_core import PressureFuser
 from src.pressure_sensor import PressureSensor
@@ -38,6 +39,7 @@ class AppState:
         self.breaker = CircuitBreaker(name="downstream-sim", failure_threshold=5, recovery_timeout=30.0)
         self.sensor = PressureSensor(self.queues, self.fuser, self.manager, self.aimd, self.upstream, settings)
         self.workers = WorkerPool(self.queues, self.breaker, settings)
+        self.load_tester = InternalLoadTester(self.admission, self.queues, self.manager, settings)
         self._bumper_task: asyncio.Task | None = None
 
     def start(self) -> None:
@@ -50,6 +52,10 @@ class AppState:
         )
 
     async def stop(self) -> None:
+        try:
+            await self.load_tester.stop()
+        except Exception:
+            pass
         if self._bumper_task is not None:
             self._bumper_task.cancel()
             try:

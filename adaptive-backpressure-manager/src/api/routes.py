@@ -7,6 +7,8 @@ from src.api.models import (
     CircuitBreakerBlock,
     IngestRequest,
     IngestResponse,
+    LoadTestStartRequest,
+    LoadTestStatusResponse,
     ProcessorBlock,
     SystemStatus,
 )
@@ -103,3 +105,29 @@ async def metrics_prometheus(request: Request) -> Response:
     for p in Priority:
         _metrics.queue_size.labels(priority=p.value).set(c.queues.qsize(p))
     return PlainTextResponse(_metrics.text(), media_type="text/plain; version=0.0.4")
+
+
+@router.post("/loadtest/start", response_model=LoadTestStatusResponse)
+async def loadtest_start(req: LoadTestStartRequest, request: Request) -> LoadTestStatusResponse:
+    c = _state(request)
+    status = await c.load_tester.start(
+        profile=req.profile,
+        rps=req.rps,
+        duration_seconds=req.duration_seconds,
+        spike_multiplier=req.spike_multiplier,
+    )
+    return LoadTestStatusResponse(**status.__dict__)
+
+
+@router.post("/loadtest/stop", response_model=LoadTestStatusResponse)
+async def loadtest_stop(request: Request) -> LoadTestStatusResponse:
+    c = _state(request)
+    status = await c.load_tester.stop()
+    return LoadTestStatusResponse(**status.__dict__)
+
+
+@router.get("/loadtest/status", response_model=LoadTestStatusResponse)
+async def loadtest_status(request: Request) -> LoadTestStatusResponse:
+    c = _state(request)
+    status = c.load_tester.status()
+    return LoadTestStatusResponse(**status.__dict__)
