@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 
 from src.admission import AdmissionVerdict
 from src.api.models import (
+    AdminConfigResponse,
+    AdminConfigUpdate,
     BackpressureBlock,
     CircuitBreakerBlock,
     IngestRequest,
@@ -13,7 +15,7 @@ from src.api.models import (
     SystemStatus,
 )
 from src.api.prometheus import Metrics
-from src.logging_setup import get_logger
+from src.logging_setup import TAG_CONFIG_UPDATE, get_logger
 
 router = APIRouter()
 _metrics = Metrics()
@@ -131,3 +133,37 @@ async def loadtest_status(request: Request) -> LoadTestStatusResponse:
     c = _state(request)
     status = c.load_tester.status()
     return LoadTestStatusResponse(**status.__dict__)
+
+
+@router.post("/admin/config", response_model=AdminConfigResponse)
+async def admin_config(req: AdminConfigUpdate, request: Request) -> AdminConfigResponse:
+    c = _state(request)
+    updated = []
+    payload = req.model_dump(exclude_none=True)
+    for key, value in payload.items():
+        try:
+            setattr(c.settings, key, value)
+        except Exception:
+            c.settings.__dict__[key] = value
+        updated.append(key)
+    if "ewma_alpha" in payload:
+        c.fuser.alpha = c.settings.ewma_alpha
+    _log.info(
+        "admin_config_update",
+        tag=TAG_CONFIG_UPDATE,
+        updated_fields=updated,
+    )
+    current = {
+        "ewma_alpha": c.settings.ewma_alpha,
+        "up_normal_to_pressure": c.settings.up_normal_to_pressure,
+        "up_pressure_to_overload": c.settings.up_pressure_to_overload,
+        "up_overload_to_emergency": c.settings.up_overload_to_emergency,
+        "down_overload_to_pressure": c.settings.down_overload_to_pressure,
+        "down_pressure_to_normal": c.settings.down_pressure_to_normal,
+        "down_recovery_to_normal": c.settings.down_recovery_to_normal,
+        "min_dwell_seconds": c.settings.min_dwell_seconds,
+        "processing_latency_seconds": c.settings.processing_latency_seconds,
+        "sampling_interval": c.settings.sampling_interval,
+        "aimd_beta": c.settings.aimd_beta,
+    }
+    return AdminConfigResponse(updated_fields=updated, current=current)

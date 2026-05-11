@@ -55,3 +55,22 @@ class LoadTestStatusResponse(BaseModel):
     throttled: int
     dropped: int
     rejected: int
+
+
+class AdminConfigUpdate(BaseModel):
+    ewma_alpha: float | None = Field(default=None, ge=0.0, le=1.0)
+    up_normal_to_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    up_pressure_to_overload: float | None = Field(default=None, ge=0.0, le=1.0)
+    up_overload_to_emergency: float | None = Field(default=None, ge=0.0, le=1.0)
+    down_overload_to_pressure: float | None = Field(default=None, ge=0.0, le=1.0)
+    down_pressure_to_normal: float | None = Field(default=None, ge=0.0, le=1.0)
+    down_recovery_to_normal: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_dwell_seconds: float | None = Field(default=None, ge=0.0, le=300.0)
+    processing_latency_seconds: float | None = Field(default=None, ge=0.0, le=10.0)
+    sampling_interval: float | None = Field(default=None, ge=0.05, le=60.0)
+    aimd_beta: float | None = Field(default=None, ge=0.05, le=0.99)
+
+
+class AdminConfigResponse(BaseModel):
+    updated_fields: list[str]
+    current: dict
