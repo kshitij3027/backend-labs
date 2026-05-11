@@ -28,16 +28,30 @@ class Admission:
         self._aimd = aimd
         self._upstream = upstream_breaker
         self._log = get_logger("admission")
+        from src.state import Priority
         self._counters = {
             "accepted": 0,
             "throttled": 0,
             "dropped": 0,
             "rejected": 0,
         }
+        self._dropped_per_priority = {p: 0 for p in Priority}
+        self._rejected_per_priority = {p: 0 for p in Priority}
+        self._throttled_per_priority = {p: 0 for p in Priority}
+        self._accepted_per_priority = {p: 0 for p in Priority}
 
     @property
     def counters(self) -> dict:
-        return dict(self._counters)
+        return {
+            "accepted": self._counters["accepted"],
+            "throttled": self._counters["throttled"],
+            "dropped": self._counters["dropped"],
+            "rejected": self._counters["rejected"],
+            "accepted_per_priority": {p.value: v for p, v in self._accepted_per_priority.items()},
+            "dropped_per_priority": {p.value: v for p, v in self._dropped_per_priority.items()},
+            "rejected_per_priority": {p.value: v for p, v in self._rejected_per_priority.items()},
+            "throttled_per_priority": {p.value: v for p, v in self._throttled_per_priority.items()},
+        }
 
     def decide(self, priority: Priority, level: PressureLevel) -> AdmissionVerdict:
         # Upstream breaker forces 503 on non-CRITICAL while tripped.
@@ -96,6 +110,7 @@ class Admission:
     ) -> AdmissionVerdict:
         if verdict == AdmissionVerdict.ACCEPT:
             self._counters["accepted"] += 1
+            self._accepted_per_priority[priority] += 1
             self._log.info(
                 "admit",
                 tag=TAG_ADMIT,
@@ -104,6 +119,7 @@ class Admission:
             )
         elif verdict == AdmissionVerdict.THROTTLE_429:
             self._counters["throttled"] += 1
+            self._throttled_per_priority[priority] += 1
             self._log.info(
                 "throttle",
                 tag=TAG_THROTTLE,
@@ -113,6 +129,7 @@ class Admission:
             )
         elif verdict == AdmissionVerdict.DROP_SILENT:
             self._counters["dropped"] += 1
+            self._dropped_per_priority[priority] += 1
             self._log.info(
                 "drop",
                 tag=TAG_DROP,
@@ -122,6 +139,7 @@ class Admission:
             )
         else:  # REJECT_503
             self._counters["rejected"] += 1
+            self._rejected_per_priority[priority] += 1
             self._log.info(
                 "reject",
                 tag=TAG_DROP,
