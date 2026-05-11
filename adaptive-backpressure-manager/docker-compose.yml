@@ -18,6 +18,22 @@ services:
     networks:
       - abpm-net
 
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: abpm-dashboard
+    ports:
+      - "8050:8050"
+    environment:
+      - APP_BASE_URL=http://app:8000
+      - PORT=8050
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - abpm-net
+
   test:
     build:
       context: .
