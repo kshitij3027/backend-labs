@@ -64,8 +64,68 @@ Exact shapes will be locked in during the planning step.
 
 ## How to Run
 
-_To be filled in once implementation begins._
+Everything runs in Docker — no Python venv required on the host.
+
+### Quickstart
+
+```bash
+make build      # build app, dashboard, and test images
+make run        # start app (:8000) and dashboard (:8050) in the background
+```
+
+- **API:** `http://localhost:8000`
+- **Dashboard:** `http://localhost:8050`
+- **Stop:** `make stop`
+- **Tail logs:** `make logs`
+- **Clean up images:** `make clean`
+
+### Running the test suites
+
+```bash
+make test       # unit tests inside the test container
+make e2e        # spins up the app, runs scripts/verify_e2e.py, tears down
+```
+
+The e2e target drives the system through PRESSURE → OVERLOAD → RECOVERY → NORMAL in about 35 seconds. To run the slow pytest invariant suite as well:
+
+```bash
+docker compose up -d app
+docker compose --profile test run --rm -e ABPM_BASE_URL=http://app:8000 test pytest -m e2e -v
+docker compose down
+```
+
+### Driving a load test by hand
+
+```bash
+# 30-second smoke at 200 RPS, then watch the status endpoint
+curl -X POST http://localhost:8000/api/v1/loadtest/start \
+  -H 'Content-Type: application/json' \
+  -d '{"profile":"smoke","rps":200,"duration_seconds":30}'
+
+watch -n 1 'curl -fsS http://localhost:8000/api/v1/system/status | jq .'
+```
+
+The dashboard's **10× SPIKE** button does the same thing visually and is the fastest way to see the four-state transition.
+
+### Endpoint cheat-sheet
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/system/health` | Liveness (used by the docker healthcheck) |
+| GET | `/api/v1/system/health` | Same, namespaced |
+| GET | `/api/v1/system/status` | Pressure level, throttle rate, queue size, score |
+| POST | `/api/v1/ingest` | Submit a log message with priority — 202/429/204/503 by admission verdict |
+| POST | `/api/v1/loadtest/start` | Start the in-process load generator (smoke/ramp/spike/soak/recovery/full) |
+| POST | `/api/v1/loadtest/stop` | Stop the load generator |
+| GET | `/api/v1/loadtest/status` | Emitted/accepted/throttled/dropped/rejected counters |
+| POST | `/api/v1/admin/config` | Live tuning (thresholds, EWMA alpha, AIMD beta, etc.) |
+| GET | `/api/v1/metrics/json` | JSON snapshot for the dashboard |
+| GET | `/metrics` | Prometheus text exposition |
 
 ## What I Learned
 
-_To be filled in as the project evolves._
+- **Multi-dimensional pressure beats any single signal.** Queue depth alone is a lagging indicator; CPU alone is jumpy; lag alone is undefined when the queue is empty. Fusing all three under `max(weighted_sum, peak)` and EWMA-smoothing it (α = 0.3) gives the controller something stable to act on at the edges without lagging when one dimension actually spikes.
+- **Hysteresis + minimum dwell beat thresholds alone.** Even with a >=0.1 gap between up- and down-thresholds, the controller flapped near boundary scores until I added a 3-second minimum dwell per state. The dwell guard is what makes the OVERLOAD → RECOVERY → NORMAL path stable.
+- **Drops belong at admission, not in the worker.** Once a message is dequeued, the work cost is already sunk. Per-state drop policies live in `Admission.decide()` — workers honor deadlines but never silently drop.
+- **AIMD recovery needs a slow-start clamp.** Letting the AIMD limit recover at +1/3s without clamping after OVERLOAD lets a second wave of work flood in before the queue has fully drained. Halving `prev_limit` on the OVERLOAD → RECOVERY edge cleanly prevents that "second wave" overload.
+- **Live tuning is essential for E2E testing.** The verifier shrinks `max_queue_size` and bumps `processing_latency_seconds` via `/admin/config` so the spike actually produces backpressure within a 30-second test window — without runtime tuning the test would have to run for minutes against the default settings.
