@@ -28,6 +28,24 @@ services:
     networks:
       - chaos-net
 
+  test:
+    build:
+      context: .
+    image: chaos-framework:dev
+    container_name: chaos-framework-test
+    profiles: ["test"]
+    user: "root"
+    working_dir: /app
+    environment:
+      PYTHONPATH: /app
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./config:/app/config
+      - ./pytest.ini:/app/pytest.ini:ro
+    command: ["pytest", "tests/", "-v"]
+
 networks:
   chaos-net:
     driver: bridge

@@ -30,8 +30,7 @@ ps:
 	docker compose ps
 
 test:
-	@echo "test target wired up in C2+"
-	@exit 0
+	docker compose --profile test run --rm test pytest tests/unit -v
 
 e2e:
 	@echo "e2e target wired up in C7+"
