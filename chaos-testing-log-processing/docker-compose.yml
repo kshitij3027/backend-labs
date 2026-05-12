@@ -28,6 +28,77 @@ services:
     networks:
       - chaos-net
 
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - chaos-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 2s
+      retries: 5
+      start_period: 2s
+
+  log-producer:
+    build:
+      context: ./targets/producer
+    image: log-producer:dev
+    container_name: log-producer
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    labels:
+      chaos.target: "true"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOGS_KEY: logs
+      PRODUCE_HZ: 10
+    ports:
+      - "9001:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - chaos-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  log-consumer:
+    build:
+      context: ./targets/consumer
+    image: log-consumer:dev
+    container_name: log-consumer
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    labels:
+      chaos.target: "true"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      LOGS_KEY: logs
+      BLPOP_TIMEOUT_S: 1
+    ports:
+      - "9002:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - chaos-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
   test:
     build:
       context: .
