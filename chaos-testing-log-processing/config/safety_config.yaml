@@ -1,0 +1,38 @@
+# Safety configuration for the chaos testing framework.
+# Loaded at startup by src.config.settings.Settings.load().
+# Any value here can be overridden by the corresponding CHAOS_* env var.
+
+# --- Concurrency + blast-radius caps ---
+max_concurrent_scenarios: 3
+
+# --- Emergency thresholds (host-level) ---
+# If a SystemMonitor sample crosses these, the SafetySupervisor (C15) fires
+# an emergency stop on all active scenarios.
+cpu_emergency_threshold_pct: 90.0
+mem_emergency_threshold_pct: 90.0
+
+# --- Allowlist ---
+# Only containers whose names appear here (AND that carry the
+# label `chaos.target=true`) may be touched by the FailureInjector.
+target_allowlist:
+  - log-producer
+  - log-consumer
+  - redis
+
+# --- Monitoring cadence ---
+metrics_collection_interval_seconds: 5
+metrics_history_size: 1000
+
+# --- Recovery validation ---
+recovery_test_timeout_seconds: 30
+recovery_grace_period_seconds: 5
+
+# --- Experiment defaults (used when API payload omits the field) ---
+default_experiment_duration: 300
+default_severity: 2
+
+# --- Docker socket override (auto-detected if unset; env var wins) ---
+docker_socket_path: /var/run/docker.sock
+
+# --- Network ---
+chaos_network_name: chaos-net

@@ -19,6 +19,9 @@ tenacity==9.0.0
 SQLAlchemy==2.0.36
 aiosqlite==0.20.0
 
+# --- YAML config ---
+pyyaml==6.0.2
+
 # --- Observability ---
 prometheus-client==0.21.1
 structlog==24.4.0
