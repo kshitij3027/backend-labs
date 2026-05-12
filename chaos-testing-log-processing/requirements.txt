@@ -26,6 +26,9 @@ pyyaml==6.0.2
 prometheus-client==0.21.1
 structlog==24.4.0
 
+# --- System metrics ---
+psutil==6.1.0
+
 # --- HTTP client (for target health probes) ---
 httpx==0.28.1
 
