@@ -1,0 +1,33 @@
+# Chaos framework only in C1; target stack (redis + producer + consumer)
+# lands in C4. The `chaos-net` network is declared here so later commits
+# can attach target containers to it without churning this scaffold.
+
+services:
+  chaos-framework:
+    build: .
+    image: chaos-framework:dev
+    container_name: chaos-framework
+    ports:
+      - "8000:8000"
+    volumes:
+      # Read-write socket so the framework can exec/pause/kill/disconnect
+      # target containers via the Docker SDK (gated by the allowlist in C3).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistence for SQLite + experiment artifacts (lands in C12).
+      - ./data:/app/data
+    environment:
+      LOG_LEVEL: INFO
+      CHAOS_API_PORT: 8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - chaos-net
+
+networks:
+  chaos-net:
+    driver: bridge

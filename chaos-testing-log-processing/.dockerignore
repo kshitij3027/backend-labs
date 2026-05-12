@@ -1,0 +1,40 @@
+# --- VCS ---
+.git
+.gitignore
+
+# --- Python build artifacts ---
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# --- Virtual envs ---
+.venv
+venv
+
+# --- Env files (keep the example) ---
+.env
+.env.*
+!.env.example
+
+# --- Tests (built/exec separately, not baked into runtime image) ---
+tests/
+
+# --- Local runtime / state ---
+*.log
+*.db
+*.sqlite*
+data/
+runs/
+
+# --- Front-end / IDE noise ---
+node_modules/
+.idea/
+.vscode/
+.DS_Store
+
+# --- Local-only docs (gitignored) ---
+plan.md
+project_requirements.md
+docs/

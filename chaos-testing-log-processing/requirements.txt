@@ -1,0 +1,37 @@
+# --- Web framework / API ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+websockets==13.1
+python-multipart==0.0.20
+
+# --- Models / validation ---
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# --- Container orchestration ---
+docker==7.1.0
+
+# --- Async / concurrency helpers ---
+anyio==4.7.0
+tenacity==9.0.0
+
+# --- Persistence (experiment history) ---
+SQLAlchemy==2.0.36
+aiosqlite==0.20.0
+
+# --- Observability ---
+prometheus-client==0.21.1
+structlog==24.4.0
+
+# --- HTTP client (for target health probes) ---
+httpx==0.28.1
+
+# --- Time / scheduling ---
+APScheduler==3.10.4
+
+# --- Testing ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+testcontainers==4.9.0
+respx==0.22.0
