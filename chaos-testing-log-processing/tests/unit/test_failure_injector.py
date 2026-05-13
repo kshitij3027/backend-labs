@@ -319,42 +319,13 @@ class TestRouting:
         assert scenario.status == ScenarioStatus.ACTIVE
         assert active.rollback is rollback_sentinel
 
-    # --- NotImplementedError surfaces for every per-type stub ------------- #
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "failure_type, milestone",
-        [
-            # C7 wired LATENCY_INJECTION + PACKET_LOSS; C8 wired
-            # NETWORK_PARTITION. Only resource/component still stub here.
-            (FailureType.RESOURCE_EXHAUSTION, "C9"),
-            (FailureType.COMPONENT_FAILURE, "C9"),
-        ],
-    )
-    async def test_stub_raises_not_implemented_with_milestone(
-        self, failure_type: FailureType, milestone: str
-    ) -> None:
-        """Without ``_test_handlers``, the remaining stubs cite the future commit."""
-        injector = make_injector()
-        scenario = make_scenario(failure_type=failure_type)
-
-        with pytest.raises(NotImplementedError) as excinfo:
-            await injector.inject(scenario)
-
-        assert milestone in str(excinfo.value)
-
-    @pytest.mark.asyncio
-    async def test_not_implemented_clears_active_registration(self) -> None:
-        """A failing stub handler must unregister so concurrency counts stay honest."""
-        injector = make_injector()
-        # RESOURCE_EXHAUSTION still raises NotImplementedError at C8.
-        scenario = make_scenario(failure_type=FailureType.RESOURCE_EXHAUSTION)
-
-        with pytest.raises(NotImplementedError):
-            await injector.inject(scenario)
-
-        assert injector.active_count == 0
-        assert scenario.id not in injector.active_ids()
+    # --- All per-type handlers are now real (C7/C8/C9) -------------------- #
+    # The previous ``test_stub_raises_not_implemented_with_milestone`` and
+    # ``test_not_implemented_clears_active_registration`` cases lived here
+    # while RESOURCE_EXHAUSTION + COMPONENT_FAILURE were still stubs. C9
+    # wired both, so there are no remaining NotImplementedError stubs to
+    # assert on. Delegation coverage for the two new handlers lives in
+    # ``TestRealHandlersC9`` below.
 
 
 # ===========================================================================
@@ -518,6 +489,125 @@ class TestRealHandlersC7:
         assert rb_client is docker_client
         assert rb_target == "log-consumer"
         assert rb_network == "chaos-net"
+        assert rb_state is captured_state
+
+
+# ===========================================================================
+# B.3 Real-handler delegation (C9) — RESOURCE_EXHAUSTION + COMPONENT_FAILURE
+# ===========================================================================
+
+
+class TestRealHandlersC9:
+    """The wired handlers call into ``src.injection.resource`` /
+    ``src.injection.component`` with the right argv, and the returned
+    rollback callable defers to the module's own ``rollback`` when awaited."""
+
+    @pytest.mark.asyncio
+    async def test_resource_cpu_delegates_to_resource_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import src.injection.resource as resource_mod
+
+        inject_calls: list[tuple] = []
+        rollback_calls: list[tuple] = []
+
+        def fake_inject_cpu(client, container, cores, load_pct, duration_s) -> None:
+            inject_calls.append((client, container, cores, load_pct, duration_s))
+
+        def fake_rollback(client, container) -> None:
+            rollback_calls.append((client, container))
+
+        monkeypatch.setattr(resource_mod, "inject_cpu_pressure", fake_inject_cpu)
+        monkeypatch.setattr(resource_mod, "rollback", fake_rollback)
+
+        docker_client = MagicMock(name="docker_client")
+        injector = make_injector(docker_client=docker_client)
+
+        scenario = make_scenario(
+            failure_type=FailureType.RESOURCE_EXHAUSTION,
+            target="log-consumer",
+            parameters={
+                "pressure": "cpu",
+                "cores": 2,
+                "load_pct": 80,
+                "duration_s": 10,
+            },
+        )
+
+        active = await injector.inject(scenario)
+
+        # inject_cpu_pressure called exactly once with our args.
+        assert len(inject_calls) == 1
+        called_client, called_target, called_cores, called_load, called_dur = (
+            inject_calls[0]
+        )
+        assert called_client is docker_client
+        assert called_target == "log-consumer"
+        assert called_cores == 2
+        assert called_load == 80
+        assert called_dur == 10
+
+        # Rollback callable is registered and not yet invoked.
+        assert active.rollback is not None
+        assert rollback_calls == []
+
+        # Awaiting the rollback invokes resource.rollback once with the same target.
+        await active.rollback()
+        assert len(rollback_calls) == 1
+        rb_client, rb_target = rollback_calls[0]
+        assert rb_client is docker_client
+        assert rb_target == "log-consumer"
+
+    @pytest.mark.asyncio
+    async def test_component_pause_delegates_to_component_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import src.injection.component as component_mod
+
+        apply_calls: list[tuple] = []
+        rollback_calls: list[tuple] = []
+        captured_state = {"action": "pause"}
+
+        def fake_apply(client, container, action):
+            apply_calls.append((client, container, action))
+            return captured_state
+
+        def fake_rollback(client, container, state) -> None:
+            rollback_calls.append((client, container, state))
+
+        monkeypatch.setattr(component_mod, "apply_component_action", fake_apply)
+        monkeypatch.setattr(component_mod, "rollback", fake_rollback)
+
+        docker_client = MagicMock(name="docker_client")
+        injector = make_injector(docker_client=docker_client)
+
+        scenario = FailureScenario(
+            type=FailureType.COMPONENT_FAILURE,
+            target="log-consumer",
+            parameters={"action": "pause"},
+            duration=5,
+            severity=3,
+        )
+
+        active = await injector.inject(scenario)
+
+        # apply_component_action called exactly once with action="pause".
+        assert len(apply_calls) == 1
+        called_client, called_target, called_action = apply_calls[0]
+        assert called_client is docker_client
+        assert called_target == "log-consumer"
+        assert called_action == "pause"
+
+        # Rollback registered, not yet invoked.
+        assert active.rollback is not None
+        assert rollback_calls == []
+
+        # Awaiting rollback invokes component.rollback once with the captured state.
+        await active.rollback()
+        assert len(rollback_calls) == 1
+        rb_client, rb_target, rb_state = rollback_calls[0]
+        assert rb_client is docker_client
+        assert rb_target == "log-consumer"
         assert rb_state is captured_state
 
 

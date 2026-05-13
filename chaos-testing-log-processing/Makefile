@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help build up down logs ps test e2e e2e-partition load clean rebuild
+.PHONY: help build up down logs ps test e2e e2e-partition e2e-resource load clean rebuild
 
 help:
 	@echo "build    - Build all images via docker compose"
@@ -39,6 +39,10 @@ e2e:
 e2e-partition:
 	chmod +x scripts/e2e_partition.sh
 	./scripts/e2e_partition.sh
+
+e2e-resource:
+	chmod +x scripts/e2e_resource_pressure.sh
+	./scripts/e2e_resource_pressure.sh
 
 load:
 	@echo "load target wired up in C18"

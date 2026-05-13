@@ -432,15 +432,73 @@ class FailureInjector:
     async def _inject_resource(
         self, scenario: FailureScenario
     ) -> RollbackCallable:
-        """Stub — RESOURCE_EXHAUSTION is implemented in commit C9."""
-        raise NotImplementedError(
-            "RESOURCE_EXHAUSTION will be implemented in commit C9"
-        )
+        """Launch stress-ng inside the target; rollback pkills it early.
+
+        Parameters consumed from ``scenario.parameters``:
+            - ``pressure`` (str, default ``"cpu"``): ``"cpu"`` or ``"memory"``.
+            - ``duration_s`` (int, default ``scenario.duration``): how long
+              stress-ng's own ``--timeout`` runs for. The worker is
+              self-terminating; rollback only matters if the engine aborts
+              before the timeout elapses.
+            - CPU mode: ``cores`` (int, default 1), ``load_pct`` (int, default 100).
+            - Memory mode: ``bytes_per_worker`` (str, default ``"256M"``),
+              ``workers`` (int, default 1).
+
+        Both the launch and the rollback go through :func:`asyncio.to_thread`
+        to keep the engine event loop responsive.
+        """
+        from .resource import inject_cpu_pressure, inject_memory_pressure, rollback as _rb
+
+        pressure_type = str(scenario.parameters.get("pressure", "cpu")).lower()
+        duration_s = int(scenario.parameters.get("duration_s", scenario.duration))
+        target = scenario.target
+        docker_client = self._docker
+
+        if pressure_type == "cpu":
+            cores = int(scenario.parameters.get("cores", 1))
+            load_pct = int(scenario.parameters.get("load_pct", 100))
+            await asyncio.to_thread(
+                inject_cpu_pressure, docker_client, target, cores, load_pct, duration_s
+            )
+        elif pressure_type in ("memory", "mem", "vm"):
+            bytes_per_worker = str(scenario.parameters.get("bytes_per_worker", "256M"))
+            workers = int(scenario.parameters.get("workers", 1))
+            await asyncio.to_thread(
+                inject_memory_pressure, docker_client, target, bytes_per_worker, workers, duration_s
+            )
+        else:
+            raise InjectorError(f"unknown resource pressure type: {pressure_type}")
+
+        async def _rollback() -> None:
+            await asyncio.to_thread(_rb, docker_client, target)
+
+        return _rollback
 
     async def _inject_component(
         self, scenario: FailureScenario
     ) -> RollbackCallable:
-        """Stub — COMPONENT_FAILURE is implemented in commit C9."""
-        raise NotImplementedError(
-            "COMPONENT_FAILURE will be implemented in commit C9"
+        """Apply a docker lifecycle action (pause/kill/restart); rollback undoes it.
+
+        Parameters consumed from ``scenario.parameters``:
+            - ``action`` (str, default ``"pause"``): one of ``pause``, ``kill``,
+              or ``restart``. ``pause`` is the default because it is fully
+              reversible and does not lose container state.
+
+        The captured action is closed over by the rollback callable so we
+        always undo what we actually did. Both apply and rollback go
+        through :func:`asyncio.to_thread`.
+        """
+        from .component import apply_component_action, rollback as _rb
+
+        action = str(scenario.parameters.get("action", "pause")).lower()
+        target = scenario.target
+        docker_client = self._docker
+
+        state = await asyncio.to_thread(
+            apply_component_action, docker_client, target, action
         )
+
+        async def _rollback() -> None:
+            await asyncio.to_thread(_rb, docker_client, target, state)
+
+        return _rollback

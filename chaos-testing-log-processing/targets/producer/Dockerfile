@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 \
         stress-ng \
         iptables \
+        procps \
         ca-certificates \
         curl \
     && rm -rf /var/lib/apt/lists/*
