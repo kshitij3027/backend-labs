@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -12,6 +13,12 @@ from .api.routes_experiments import router as experiments_router
 from .api.routes_health import router as health_router
 from .api.routes_runs import router as runs_router
 from .api.routes_targets import router as targets_router
+from .api.ws import (
+    ConnectionManager,
+    broadcaster_task,
+    record_snapshot,
+    router as ws_router,
+)
 from .config.settings import get_settings
 from .docker_client.client import DockerClient
 from .engine.experiment_engine import (
@@ -54,7 +61,13 @@ async def lifespan(app: FastAPI):
         },
     )
     set_monitor(monitor)
+    monitor.add_listener(record_snapshot)
     await monitor.start()
+
+    # --- ws broadcaster scaffolding ---
+    event_queue: asyncio.Queue = asyncio.Queue(maxsize=1024)
+    ws_manager = ConnectionManager()
+    ws_stop_event = asyncio.Event()
 
     # --- injector + engine + run manager ---
     injector = FailureInjector(
@@ -69,11 +82,17 @@ async def lifespan(app: FastAPI):
         injector=injector,
         monitor=monitor,
         probes_factory=default_probes_for_latency,
+        event_queue=event_queue,
     )
     run_manager = RunManager(
         engine=engine,
         injector=injector,
         sessionmaker=db_sessionmaker,
+    )
+
+    bcast_task = asyncio.create_task(
+        broadcaster_task(ws_manager, event_queue, stop_event=ws_stop_event),
+        name="chaos.ws-broadcaster",
     )
 
     # --- expose on app.state ---
@@ -85,6 +104,8 @@ async def lifespan(app: FastAPI):
     app.state.run_manager = run_manager
     app.state.db_engine = db_engine
     app.state.db_sessionmaker = db_sessionmaker
+    app.state.ws_manager = ws_manager
+    app.state.event_queue = event_queue
 
     logger.info(
         "framework lifespan started (interval=%ss history=%s)",
@@ -94,6 +115,10 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        ws_stop_event.set()
+        bcast_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await bcast_task
         try:
             await run_manager.abort_all()
         except Exception:  # noqa: BLE001
@@ -116,6 +141,7 @@ def create_app() -> FastAPI:
     app.include_router(runs_router)
     app.include_router(targets_router)
     app.include_router(admin_router)
+    app.include_router(ws_router)
     return app
 
 
