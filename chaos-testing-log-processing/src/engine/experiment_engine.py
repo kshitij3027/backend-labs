@@ -90,11 +90,20 @@ class ExperimentEngine:
         except asyncio.QueueFull:
             logger.warning("event queue full; dropping event=%s", event_type)
 
-    async def run(self, definition: ExperimentDefinition) -> RunOutcome:
-        run = ExperimentRun(
-            experiment_id=definition.id,
-            status=RunStatus.PENDING,
-        )
+    async def run(
+        self,
+        definition: ExperimentDefinition,
+        run: ExperimentRun | None = None,
+    ) -> RunOutcome:
+        if run is None:
+            run = ExperimentRun(
+                experiment_id=definition.id,
+                status=RunStatus.PENDING,
+            )
+        # NOTE: previously this method always allocated a fresh run; pre-allocated
+        # runs are now supported so the RunManager and engine share the same run_id
+        # (otherwise WS event routing by run_id silently fails for late-connecting
+        # clients — see commit C20).
         scenario: Optional[FailureScenario] = None
 
         run.started_at = datetime.now(timezone.utc)

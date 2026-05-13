@@ -448,6 +448,38 @@ def test_default_probes_for_latency_with_baseline() -> None:
     assert probes[1]._baseline_ms == 20.0
 
 
+@pytest.mark.asyncio
+async def test_engine_uses_caller_provided_run_so_run_id_is_preserved():
+    """RunManager pre-allocates an ExperimentRun and the engine must use it,
+    not silently allocate a fresh one with a different run_id. Otherwise WS
+    event routing by run_id breaks (see C20)."""
+    from unittest.mock import AsyncMock
+    from src.engine.experiment_engine import ExperimentEngine
+    from src.models.experiments import ExperimentDefinition, ExperimentRun, RunStatus
+    from src.models.scenarios import FailureType
+
+    injector = AsyncMock()
+    engine = ExperimentEngine(injector=injector)
+    definition = ExperimentDefinition(
+        name="caller-supplied",
+        type=FailureType.LATENCY_INJECTION,
+        target="log-consumer",
+        parameters={"latency_ms": 100},
+        duration=1,
+        severity=2,
+    )
+    pre_run = ExperimentRun(experiment_id=definition.id, status=RunStatus.PENDING)
+    pre_run_id = pre_run.run_id
+
+    outcome = await engine.run(definition, run=pre_run)
+
+    # The engine returned the SAME run object the caller passed in.
+    assert outcome.run is pre_run
+    assert outcome.run.run_id == pre_run_id
+    # And the engine actually progressed it through the lifecycle:
+    assert outcome.run.status == RunStatus.COMPLETED
+
+
 def test_default_probes_for_latency_without_baseline() -> None:
     """When no baseline data is available, the factory uses a 50ms default."""
     definition = make_definition()

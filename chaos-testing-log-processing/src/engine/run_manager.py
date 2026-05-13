@@ -83,9 +83,11 @@ class RunManager:
         self, definition: ExperimentDefinition, run: ExperimentRun
     ) -> RunOutcome:
         try:
-            outcome = await self._engine.run(definition)
-            # Engine produced a fresh ExperimentRun object — copy its fields
-            # back into ours so the caller's reference is current.
+            outcome = await self._engine.run(definition, run=run)
+            # Engine now mutates the SAME run object we pre-allocated, so this
+            # copy loop is effectively a no-op. Kept as defensive belt-and-
+            # suspenders against future engine changes that might rebind
+            # outcome.run; removal is a separate cleanup (see C20).
             for f in (
                 "status", "started_at", "ended_at", "baseline_metrics",
                 "post_metrics", "scenario_id", "recovery_report_id",
