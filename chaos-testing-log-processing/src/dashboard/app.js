@@ -183,6 +183,16 @@
     if (!frame || !frame.type) return;
     if (frame.type === "snapshot") {
       if (frame.data && frame.data.metrics) pushMetrics(frame.data.metrics);
+      if (frame.data && frame.data.run && currentRunId) {
+        // Late-connect backfill: pull the current run state into the report
+        // panel immediately, and surface a replayed marker in the events log
+        // when the run already reached a terminal status.
+        fetchRecovery(currentRunId);
+        const status = frame.data.run.status;
+        if (status === "completed" || status === "failed" || status === "aborted") {
+          pushEvent("(replayed) run_completed", { run_id: currentRunId, status });
+        }
+      }
       return;
     }
     if (frame.type === "metrics") {

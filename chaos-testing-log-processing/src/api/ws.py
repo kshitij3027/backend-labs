@@ -147,9 +147,36 @@ async def ws_run_channel(websocket: WebSocket, run_id: str) -> None:
     snap_data = snap.model_dump(mode="json") if snap is not None else None
     monitor = getattr(websocket.app.state, "monitor", None)
     history_size = monitor.history_size() if monitor is not None else 0
+
+    # Late-connect backfill: when this WS is scoped to a specific run id
+    # (not the "*" wildcard), include the current ExperimentRun state in
+    # the snapshot frame so the dashboard can populate its Recovery
+    # report panel immediately — even if it connected after the engine
+    # already emitted run_completed.
+    run_data = None
+    if run_id != "*":
+        run_manager = getattr(websocket.app.state, "run_manager", None)
+        if run_manager is not None:
+            try:
+                run_obj = run_manager.get_run(run_id)
+            except Exception:
+                run_obj = None
+            if run_obj is not None:
+                try:
+                    run_data = run_obj.model_dump(mode="json")
+                except Exception:
+                    run_data = None
+
     await manager.send_to(
         websocket,
-        {"type": "snapshot", "data": {"metrics": snap_data, "history_size": history_size}},
+        {
+            "type": "snapshot",
+            "data": {
+                "metrics": snap_data,
+                "history_size": history_size,
+                "run": run_data,
+            },
+        },
     )
 
     try:

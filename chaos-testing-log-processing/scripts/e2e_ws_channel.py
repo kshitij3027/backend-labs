@@ -108,7 +108,8 @@ async def main() -> int:
     enough_frames = len(typed) >= 10
     no_errors = len(errors) == 0
 
-    result = "pass" if (has_snapshot and has_heartbeat and enough_frames and no_errors) else "fail"
+    primary_ok = has_snapshot and has_heartbeat and enough_frames and no_errors
+    result = "pass" if primary_ok else "fail"
 
     summary = {
         "result": result,
@@ -125,7 +126,75 @@ async def main() -> int:
     }
     print("--- ws e2e summary ---", flush=True)
     print(json.dumps(summary, indent=2), flush=True)
-    return 0 if result == "pass" else 1
+
+    # --- Late-connect verification: open WS AFTER the run completes ---
+    # This validates the C19 fix: the snapshot frame must carry the
+    # current ExperimentRun under data.run when scoped to a real run id,
+    # so dashboards that connect after the engine has already drained
+    # its event queue can still backfill the Recovery report panel.
+    print("--- late-connect test ---", flush=True)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{API}/experiments",
+            json={
+                "name": "ws-late-smoke",
+                "type": "latency_injection",
+                "target": "log-consumer",
+                "parameters": {"latency_ms": 100},
+                "duration": 3,
+                "severity": 2,
+            },
+        )
+        r.raise_for_status()
+        late_exp_id = r.json()["id"]
+        r = await client.post(f"{API}/experiments/{late_exp_id}/run")
+        r.raise_for_status()
+        late_run_id = r.json()["run_id"]
+        print(f"late_run_id={late_run_id}", flush=True)
+
+        # Give the run plenty of time to complete (3s duration + ~3s validate)
+        await asyncio.sleep(8.0)
+
+    # Now open the WS — the run is done; the snapshot frame must carry it.
+    late_frames: list = []
+    try:
+        async with websockets.connect(f"{WS_BASE}/ws/runs/{late_run_id}") as ws:
+            raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
+            late_frames.append(json.loads(raw))
+    except Exception as exc:
+        late_frames.append({"_error": repr(exc)})
+
+    late_summary: dict = {"frames": len(late_frames)}
+    if late_frames and late_frames[0].get("type") == "snapshot":
+        snap = late_frames[0].get("data", {})
+        run_obj = snap.get("run")
+        late_summary.update({
+            "snapshot_present": True,
+            "run_present": run_obj is not None,
+            "run_status": run_obj.get("status") if isinstance(run_obj, dict) else None,
+        })
+    else:
+        late_summary.update({
+            "snapshot_present": False,
+            "run_present": False,
+            "run_status": None,
+            "first_frame": late_frames[0] if late_frames else None,
+        })
+
+    print("--- late-connect summary ---", flush=True)
+    print(json.dumps(late_summary, indent=2), flush=True)
+
+    # Aggregate result: original WS flow must have passed AND the
+    # late-connect block must show snapshot+run+status=="completed".
+    late_ok = (
+        late_summary.get("snapshot_present")
+        and late_summary.get("run_present")
+        and late_summary.get("run_status") == "completed"
+    )
+    if not (primary_ok and late_ok):
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

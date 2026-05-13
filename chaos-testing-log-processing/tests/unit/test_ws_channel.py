@@ -42,6 +42,7 @@ from src.api.ws import (
     record_snapshot,
     router as ws_router,
 )
+from src.models.experiments import ExperimentRun, RunStatus
 from src.models.metrics import SystemMetrics
 
 
@@ -404,6 +405,8 @@ class TestWebSocketRoute:
         assert frame["data"]["metrics"]["cpu_pct"] == 5.0
         assert frame["data"]["metrics"]["mem_pct"] == 10.0
         assert frame["data"]["metrics"]["disk_pct"] == 20.0
+        # No run_manager wired on app.state -> run field is None.
+        assert frame["data"]["run"] is None
 
     def test_snapshot_on_connect_when_no_metrics_yet(self) -> None:
         _reset_latest_snapshot()
@@ -411,7 +414,10 @@ class TestWebSocketRoute:
         client = TestClient(app)
         with client.websocket_connect("/ws/runs/abc") as ws:
             frame = ws.receive_json()
-        assert frame == {"type": "snapshot", "data": {"metrics": None, "history_size": 0}}
+        assert frame == {
+            "type": "snapshot",
+            "data": {"metrics": None, "history_size": 0, "run": None},
+        }
 
     def test_snapshot_on_connect_for_star_run_id(self) -> None:
         """The handler does not special-case "*" -- a client subscribing
@@ -425,6 +431,8 @@ class TestWebSocketRoute:
         assert frame["type"] == "snapshot"
         assert frame["data"]["history_size"] == 3
         assert frame["data"]["metrics"]["cpu_pct"] == 1.5
+        # Wildcard subscription must never carry a per-run object.
+        assert frame["data"]["run"] is None
 
     def test_connect_registers_client_in_manager(self) -> None:
         """Connecting a TestClient should bump connection_count to 1, and
@@ -456,6 +464,74 @@ class TestWebSocketRoute:
         assert frame["type"] == "snapshot"
         assert frame["data"]["history_size"] == 0
         assert frame["data"]["metrics"]["cpu_pct"] == 4.0
+        # Still no run_manager on this minimal app.
+        assert frame["data"]["run"] is None
+
+    def test_snapshot_carries_run_state_when_run_manager_resolves_run(self) -> None:
+        """When app.state.run_manager.get_run(run_id) returns an
+        ExperimentRun, the snapshot frame's data["run"] is the
+        model_dump(mode="json") of that run.
+        """
+        record_snapshot(_make_metrics(cpu=4.0, mem=5.0, disk=6.0))
+        app = _make_ws_only_app(history_size=2)
+        run = ExperimentRun(
+            experiment_id="exp-1",
+            status=RunStatus.COMPLETED,
+            recovery_report_id="rr-42",
+        )
+        run_manager = MagicMock(name="run_manager")
+        run_manager.get_run = MagicMock(return_value=run)
+        app.state.run_manager = run_manager
+
+        client = TestClient(app)
+        with client.websocket_connect(f"/ws/runs/{run.run_id}") as ws:
+            frame = ws.receive_json()
+
+        assert frame["type"] == "snapshot"
+        run_payload = frame["data"]["run"]
+        assert isinstance(run_payload, dict)
+        assert run_payload["status"] == "completed"
+        assert run_payload["recovery_report_id"] == "rr-42"
+        assert run_payload["experiment_id"] == "exp-1"
+        run_manager.get_run.assert_called_once_with(run.run_id)
+
+    def test_snapshot_run_is_none_when_run_manager_returns_none(self) -> None:
+        """If get_run(...) returns None (unknown run id), data["run"]
+        gracefully degrades to None — no exception leaks to the client.
+        """
+        record_snapshot(_make_metrics(cpu=2.0, mem=3.0, disk=4.0))
+        app = _make_ws_only_app(history_size=0)
+        run_manager = MagicMock(name="run_manager")
+        run_manager.get_run = MagicMock(return_value=None)
+        app.state.run_manager = run_manager
+
+        client = TestClient(app)
+        with client.websocket_connect("/ws/runs/missing") as ws:
+            frame = ws.receive_json()
+
+        assert frame["type"] == "snapshot"
+        assert frame["data"]["run"] is None
+        run_manager.get_run.assert_called_once_with("missing")
+
+    def test_snapshot_run_is_none_for_wildcard_even_with_run_manager(self) -> None:
+        """A wildcard "*" subscription must never trigger a get_run lookup
+        and must always carry data["run"] is None.
+        """
+        record_snapshot(_make_metrics(cpu=1.0, mem=2.0, disk=3.0))
+        app = _make_ws_only_app(history_size=1)
+        run_manager = MagicMock(name="run_manager")
+        run_manager.get_run = MagicMock(
+            side_effect=AssertionError("get_run must not be called for wildcard"),
+        )
+        app.state.run_manager = run_manager
+
+        client = TestClient(app)
+        with client.websocket_connect("/ws/runs/*") as ws:
+            frame = ws.receive_json()
+
+        assert frame["type"] == "snapshot"
+        assert frame["data"]["run"] is None
+        run_manager.get_run.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
