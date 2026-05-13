@@ -39,7 +39,26 @@ Scaffold only. Implementation has not started.
 
 ## How to Run
 
-_To be filled in once implementation begins._
+```bash
+docker compose up -d         # framework + redis + producer + consumer
+curl http://localhost:8000/health
+open http://localhost:8000/dashboard
+```
+
+Tear down:
+
+```bash
+docker compose down --remove-orphans
+```
+
+## Dashboard
+
+The dashboard is served as static HTML+JS at `http://localhost:8000/dashboard` (no separate Node build). It lets you:
+
+- Create new experiments via a form (POST `/experiments`).
+- Run any experiment (POST `/experiments/{id}/run`) and watch a live chart of CPU/memory/latency over a WebSocket (`/ws/runs/{run_id}`).
+- Toggle the global kill switch (POST `/admin/abort`).
+- See the circuit-breaker status (polled every 5s from `/admin/circuit-breaker-state`).
 
 ## What I Learned
 

@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .api.routes_admin import router as admin_router
 from .api.routes_experiments import router as experiments_router
@@ -178,6 +181,22 @@ def create_app() -> FastAPI:
     app.include_router(admin_router)
     app.include_router(ws_router)
     app.include_router(metrics_router)
+
+    # Static dashboard: vanilla HTML+JS+CSS, no build step. ``index.html``
+    # references ``/dashboard-static/{styles.css,app.js}`` so we mount the
+    # directory under that prefix and serve the index from a top-level
+    # ``/dashboard`` route.
+    dashboard_dir = Path(__file__).parent / "dashboard"
+    app.mount(
+        "/dashboard-static",
+        StaticFiles(directory=str(dashboard_dir)),
+        name="dashboard-static",
+    )
+
+    @app.get("/dashboard", include_in_schema=False)
+    async def dashboard_index() -> FileResponse:
+        return FileResponse(dashboard_dir / "index.html")
+
     return app
 
 

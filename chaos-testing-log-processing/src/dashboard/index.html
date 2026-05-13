@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chaos Testing Framework — Dashboard</title>
+  <link rel="stylesheet" href="/dashboard-static/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Chaos Testing Framework</h1>
+    <div class="status-cluster">
+      <span id="cb-indicator" class="dot" data-tripped="false" title="Circuit breaker"></span>
+      <span id="cb-text">Circuit breaker: …</span>
+      <button id="kill-switch" class="danger" type="button">Kill switch</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>Create experiment</h2>
+      <form id="create-form">
+        <label>Name <input name="name" required minlength="1" /></label>
+        <label>Type
+          <select name="type" required>
+            <option value="latency_injection">latency_injection</option>
+            <option value="packet_loss">packet_loss</option>
+            <option value="network_partition">network_partition</option>
+            <option value="resource_exhaustion">resource_exhaustion</option>
+            <option value="component_failure">component_failure</option>
+          </select>
+        </label>
+        <label>Target <input name="target" required value="log-consumer" /></label>
+        <label>Duration (s) <input name="duration" type="number" min="1" max="3600" value="10" required /></label>
+        <label>Severity <input name="severity" type="number" min="1" max="5" value="2" required /></label>
+        <label class="full">Parameters (JSON)
+          <textarea name="parameters" rows="3">{"latency_ms": 200}</textarea>
+        </label>
+        <button type="submit" class="primary">Create</button>
+      </form>
+      <div id="create-message" class="message"></div>
+    </section>
+
+    <section class="card">
+      <h2>Experiments</h2>
+      <button id="refresh-list" type="button">Refresh</button>
+      <table id="experiments-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Type</th>
+            <th>Target</th>
+            <th>Duration</th>
+            <th>Severity</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card live" id="live-panel" hidden>
+      <h2>Live run: <span id="active-run-id"></span></h2>
+      <div class="chart-wrap"><canvas id="live-chart"></canvas></div>
+      <div class="grid-2">
+        <div>
+          <h3>Events</h3>
+          <ul id="events-log" class="event-log"></ul>
+        </div>
+        <div>
+          <h3>Recovery report</h3>
+          <pre id="recovery-report" class="report">(pending)</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/dashboard-static/app.js"></script>
+</body>
+</html>
