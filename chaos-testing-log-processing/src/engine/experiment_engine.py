@@ -36,6 +36,7 @@ from ..models.metrics import SystemMetrics
 from ..models.scenarios import FailureScenario
 from ..models.validation import RecoveryReport
 from ..monitoring.system_monitor import SystemMonitor
+from ..observability.prom import RECOVERY_DURATION_SECONDS, RECOVERY_FAILURES_TOTAL
 from ..validation.tests import RecoveryProbe
 from ..validation.validator import RecoveryValidator
 
@@ -152,6 +153,16 @@ class ExperimentEngine:
                 validator = RecoveryValidator(probes)
                 report = await validator.run(scenario.id)
                 run.recovery_report_id = report.report_id
+
+            if report is not None:
+                # Histogram captures the wall-clock cost of running the
+                # full validator suite; counters bump once per non-success
+                # test_result so dashboards can break down which probe
+                # actually failed.
+                RECOVERY_DURATION_SECONDS.observe(report.validation_duration)
+                for tr in report.test_results:
+                    if tr.status.value in ("failed", "timeout"):
+                        RECOVERY_FAILURES_TOTAL.labels(test_name=tr.name).inc()
 
             if self._monitor is not None:
                 run.post_metrics = self._monitor.snapshot()

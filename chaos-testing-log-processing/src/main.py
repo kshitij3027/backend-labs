@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from .api.routes_admin import router as admin_router
 from .api.routes_experiments import router as experiments_router
 from .api.routes_health import router as health_router
+from .api.routes_metrics import router as metrics_router
 from .api.routes_runs import router as runs_router
 from .api.routes_targets import router as targets_router
 from .api.ws import (
@@ -29,6 +30,7 @@ from .engine.run_manager import RunManager
 from .engine.supervisor import SafetySupervisor
 from .injection.injector import FailureInjector
 from .monitoring.system_monitor import SystemMonitor, set_monitor
+from .observability import configure_logging, request_id_middleware
 from .persistence.repo import create_all_tables, make_engine, make_sessionmaker
 
 logger = logging.getLogger("chaos.framework")
@@ -154,17 +156,28 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    # Configure structlog with the log level from settings BEFORE the app
+    # is instantiated so any import-time logger acquisition picks up the
+    # JSON renderer / wrapper class we want.
+    settings = get_settings()
+    configure_logging(settings.log_level)
+
     app = FastAPI(
         title="Chaos Testing Framework",
         version="0.1.0",
         lifespan=lifespan,
     )
+    # Stamp every request with a UUID + structlog-bound contextvars so
+    # log lines emitted during the request carry ``request_id`` for
+    # cross-line correlation.
+    app.middleware("http")(request_id_middleware)
     app.include_router(health_router)
     app.include_router(experiments_router)
     app.include_router(runs_router)
     app.include_router(targets_router)
     app.include_router(admin_router)
     app.include_router(ws_router)
+    app.include_router(metrics_router)
     return app
 
 

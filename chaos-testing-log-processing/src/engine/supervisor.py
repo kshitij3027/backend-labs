@@ -22,6 +22,7 @@ from typing import Optional
 
 from ..injection.injector import FailureInjector
 from ..models.metrics import SystemMetrics
+from ..observability.prom import EMERGENCY_STOPS_TOTAL
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,9 @@ class SafetySupervisor:
 
         try:
             count = await self._abort()
+            # Bump the prom counter ONCE per transition tick (gated by
+            # ``just_tripped`` above) so dashboards see a clean trip rate.
+            EMERGENCY_STOPS_TOTAL.inc()
             logger.warning(
                 "emergency stop fired: aborted=%s reason=%s",
                 count,

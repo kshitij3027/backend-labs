@@ -28,11 +28,13 @@ import time
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import Awaitable, Callable, Optional
 
 from ..docker_client.client import DockerClient
 from ..models.metrics import SystemMetrics
 from ..models.scenarios import FailureScenario, FailureType, ScenarioStatus
+from ..observability.prom import FAULTS_ACTIVE, INJECTION_LATENCY_SECONDS
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +164,14 @@ class FailureInjector:
         """Snapshot of the currently in-flight scenario IDs (insertion order)."""
         return list(self._active.keys())
 
+    def _update_faults_gauge(self) -> None:
+        """Sync the ``chaos_faults_active`` Prometheus gauge with internal state.
+
+        Called from inject/rollback/rollback_all so the gauge always
+        reflects ``len(self._active)`` whenever active membership changes.
+        """
+        FAULTS_ACTIVE.set(len(self._active))
+
     # ------------------------------------------------------------------ #
     # Pre-flight safety checks
     # ------------------------------------------------------------------ #
@@ -258,17 +268,27 @@ class FailureInjector:
         active = ActiveScenario(scenario=scenario)
         self._active[scenario.id] = active
 
+        # Time the full dispatch so the ``chaos_injection_latency_seconds``
+        # histogram records both the success path (handler returns a
+        # rollback) and the failure path (handler raises, we unregister).
+        started = perf_counter()
         try:
-            result = handler(scenario)
-            if inspect.isawaitable(result):
-                rollback = await result
-            else:
-                rollback = result
-        except Exception:
-            # Roll back tracking; handler will not have side effects
-            # registered against us.
-            self._active.pop(scenario.id, None)
-            raise
+            try:
+                result = handler(scenario)
+                if inspect.isawaitable(result):
+                    rollback = await result
+                else:
+                    rollback = result
+            except Exception:
+                # Roll back tracking; handler will not have side effects
+                # registered against us.
+                self._active.pop(scenario.id, None)
+                raise
+        finally:
+            INJECTION_LATENCY_SECONDS.labels(
+                type=scenario.type.value
+            ).observe(perf_counter() - started)
+            self._update_faults_gauge()
 
         active.rollback = rollback
         scenario.status = ScenarioStatus.ACTIVE
@@ -309,6 +329,7 @@ class FailureInjector:
                 )
 
         active.scenario.status = ScenarioStatus.COMPLETED
+        self._update_faults_gauge()
         logger.info(
             "rolled back scenario=%s active_count=%d",
             scenario_id,
@@ -327,6 +348,10 @@ class FailureInjector:
         scenario_ids = list(reversed(list(self._active.keys())))
         for sid in scenario_ids:
             await self.rollback(sid)
+        # Defensive: even if `rollback` mid-loop fails and bypasses the
+        # per-scenario gauge update, force the gauge to zero on the way
+        # out so dashboards do not show a phantom active count.
+        self._update_faults_gauge()
 
     # ------------------------------------------------------------------ #
     # Routing — production stubs (filled in C7/C8/C9)

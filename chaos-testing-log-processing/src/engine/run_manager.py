@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 from ..injection.injector import FailureInjector
 from ..models.experiments import ExperimentDefinition, ExperimentRun, RunStatus
+from ..observability.prom import EXPERIMENTS_TOTAL
 from .experiment_engine import ExperimentEngine, RunOutcome
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class RunManager:
             async with self._sessionmaker() as session:
                 from ..persistence.repo import ExperimentRunRepo
                 await ExperimentRunRepo(session).upsert(run)
+            EXPERIMENTS_TOTAL.labels(verdict="completed").inc()
             return run
 
         task = asyncio.create_task(self._run_and_persist(definition, run))
@@ -98,6 +100,10 @@ class RunManager:
                 if outcome.report is not None:
                     await RecoveryReportRepo(session).create(outcome.report)
                 await ExperimentRunRepo(session).upsert(run)
+            # Verdict counter reflects the final RunStatus the engine set
+            # (completed / failed). The cancellation path below handles
+            # the aborted verdict separately.
+            EXPERIMENTS_TOTAL.labels(verdict=run.status.value).inc()
             return outcome
         except asyncio.CancelledError:
             run.status = RunStatus.ABORTED
@@ -105,6 +111,7 @@ class RunManager:
             async with self._sessionmaker() as session:
                 from ..persistence.repo import ExperimentRunRepo
                 await ExperimentRunRepo(session).upsert(run)
+            EXPERIMENTS_TOTAL.labels(verdict="aborted").inc()
             # Best-effort rollback if a scenario is still active.
             try:
                 if run.scenario_id is not None:
