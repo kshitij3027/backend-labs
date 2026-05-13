@@ -22,6 +22,7 @@ Every settable field is exposed as an env var of the form ``CHAOS_<UPPER_CASE_FI
     - ``CHAOS_DEFAULT_SEVERITY``                   -> ``default_severity``
     - ``CHAOS_DOCKER_SOCKET_PATH``                 -> ``docker_socket_path``
     - ``CHAOS_CHAOS_NETWORK_NAME``                 -> ``chaos_network_name``
+    - ``CHAOS_DATABASE_URL``                       -> ``database_url``
     - ``CHAOS_API_HOST``                           -> ``api_host``
     - ``CHAOS_API_PORT``                           -> ``api_port``
     - ``CHAOS_LOG_LEVEL``                          -> ``log_level``
@@ -174,6 +175,7 @@ class Settings(BaseSettings):
     # --- Infra ---
     docker_socket_path: str = Field(default="/var/run/docker.sock")
     chaos_network_name: str = Field(default="chaos-net")
+    database_url: str = Field(default="sqlite+aiosqlite:////app/data/chaos.db")
 
     # --- API ---
     api_host: str = Field(default="0.0.0.0")

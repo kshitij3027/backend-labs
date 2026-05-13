@@ -31,6 +31,7 @@ from .monitoring.system_monitor import (
     get_monitor,
     set_monitor,
 )
+from .persistence.repo import create_all_tables, make_engine, make_sessionmaker
 
 
 logger = logging.getLogger("chaos.framework")
@@ -48,6 +49,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         allowlist=settings.target_allowlist,
         socket_path=settings.docker_socket_path,
     )
+
+    db_engine = make_engine(settings.database_url)
+    await create_all_tables(db_engine)
+    db_sessionmaker = make_sessionmaker(db_engine)
+    app.state.db_engine = db_engine
+    app.state.db_sessionmaker = db_sessionmaker
+
     # Probe ``/health`` on every allowlisted target except redis (no HTTP).
     monitor = SystemMonitor(
         docker_client=docker_client,
@@ -77,6 +85,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         await monitor.stop()
         docker_client.close()
+        await db_engine.dispose()
         set_monitor(None)
         logger.info("framework lifespan stopped")
 
