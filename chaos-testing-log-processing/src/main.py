@@ -26,6 +26,7 @@ from .engine.experiment_engine import (
     default_probes_for_latency,
 )
 from .engine.run_manager import RunManager
+from .engine.supervisor import SafetySupervisor
 from .injection.injector import FailureInjector
 from .monitoring.system_monitor import SystemMonitor, set_monitor
 from .persistence.repo import create_all_tables, make_engine, make_sessionmaker
@@ -90,6 +91,27 @@ async def lifespan(app: FastAPI):
         sessionmaker=db_sessionmaker,
     )
 
+    # --- safety supervisor (kill switch + circuit breaker) ---
+    def _emit_supervisor_event(event_dict: dict) -> None:
+        # Push the emergency_stop event into the engine event queue so
+        # the WS broadcaster relays it to dashboards. Non-blocking enqueue
+        # — under sustained overload we drop rather than block the monitor
+        # listener fanout.
+        try:
+            event_queue.put_nowait(event_dict)
+        except asyncio.QueueFull:
+            logger.warning("event queue full; dropping supervisor event")
+
+    supervisor = SafetySupervisor(
+        injector=injector,
+        cpu_emergency_threshold_pct=settings.cpu_emergency_threshold_pct,
+        mem_emergency_threshold_pct=settings.mem_emergency_threshold_pct,
+        max_concurrent_scenarios=settings.max_concurrent_scenarios,
+        abort_callback=run_manager.abort_all,
+        event_callback=_emit_supervisor_event,
+    )
+    monitor.add_listener(supervisor.on_snapshot)
+
     bcast_task = asyncio.create_task(
         broadcaster_task(ws_manager, event_queue, stop_event=ws_stop_event),
         name="chaos.ws-broadcaster",
@@ -102,6 +124,7 @@ async def lifespan(app: FastAPI):
     app.state.injector = injector
     app.state.engine = engine
     app.state.run_manager = run_manager
+    app.state.supervisor = supervisor
     app.state.db_engine = db_engine
     app.state.db_sessionmaker = db_sessionmaker
     app.state.ws_manager = ws_manager
