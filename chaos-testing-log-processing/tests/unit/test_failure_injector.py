@@ -325,9 +325,8 @@ class TestRouting:
     @pytest.mark.parametrize(
         "failure_type, milestone",
         [
-            # C7 wired LATENCY_INJECTION and PACKET_LOSS to network.py;
-            # only the remaining three are still stubs at this commit.
-            (FailureType.NETWORK_PARTITION, "C8"),
+            # C7 wired LATENCY_INJECTION + PACKET_LOSS; C8 wired
+            # NETWORK_PARTITION. Only resource/component still stub here.
             (FailureType.RESOURCE_EXHAUSTION, "C9"),
             (FailureType.COMPONENT_FAILURE, "C9"),
         ],
@@ -348,8 +347,8 @@ class TestRouting:
     async def test_not_implemented_clears_active_registration(self) -> None:
         """A failing stub handler must unregister so concurrency counts stay honest."""
         injector = make_injector()
-        # NETWORK_PARTITION still raises NotImplementedError at C7.
-        scenario = make_scenario(failure_type=FailureType.NETWORK_PARTITION)
+        # RESOURCE_EXHAUSTION still raises NotImplementedError at C8.
+        scenario = make_scenario(failure_type=FailureType.RESOURCE_EXHAUSTION)
 
         with pytest.raises(NotImplementedError):
             await injector.inject(scenario)
@@ -460,6 +459,66 @@ class TestRealHandlersC7:
         rb_client, rb_target = rollback_calls[0]
         assert rb_client is docker_client
         assert rb_target == scenario.target
+
+    @pytest.mark.asyncio
+    async def test_network_partition_delegates_to_network_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """C8: ``_inject_partition`` calls into network.inject_partition and
+        the returned rollback closes over the captured state."""
+        import src.injection.network as network_mod
+
+        inject_calls: list[tuple] = []
+        rollback_calls: list[tuple] = []
+        captured_state = {"aliases": ["log-consumer"], "ipv4": "172.20.0.5"}
+
+        def fake_inject_partition(client, container, network):
+            inject_calls.append((client, container, network))
+            return captured_state
+
+        def fake_rollback_partition(client, container, network, state) -> None:
+            rollback_calls.append((client, container, network, state))
+
+        monkeypatch.setattr(
+            network_mod, "inject_partition", fake_inject_partition
+        )
+        monkeypatch.setattr(
+            network_mod, "rollback_partition", fake_rollback_partition
+        )
+
+        docker_client = MagicMock(name="docker_client")
+        injector = make_injector(docker_client=docker_client)
+
+        scenario = FailureScenario(
+            type=FailureType.NETWORK_PARTITION,
+            target="log-consumer",
+            parameters={"network": "chaos-net"},
+            duration=5,
+            severity=3,
+        )
+
+        active = await injector.inject(scenario)
+
+        # inject_partition called exactly once with the right args.
+        assert len(inject_calls) == 1
+        called_client, called_target, called_network = inject_calls[0]
+        assert called_client is docker_client
+        assert called_target == "log-consumer"
+        assert called_network == "chaos-net"
+
+        # Rollback callable registered but not yet invoked.
+        assert active.rollback is not None
+        assert rollback_calls == []
+
+        # Awaiting the rollback invokes rollback_partition exactly once with
+        # the captured state.
+        await active.rollback()
+        assert len(rollback_calls) == 1
+        rb_client, rb_target, rb_network, rb_state = rollback_calls[0]
+        assert rb_client is docker_client
+        assert rb_target == "log-consumer"
+        assert rb_network == "chaos-net"
+        assert rb_state is captured_state
 
 
 # ===========================================================================

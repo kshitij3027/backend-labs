@@ -397,10 +397,37 @@ class FailureInjector:
     async def _inject_partition(
         self, scenario: FailureScenario
     ) -> RollbackCallable:
-        """Stub — NETWORK_PARTITION is implemented in commit C8."""
-        raise NotImplementedError(
-            "NETWORK_PARTITION will be implemented in commit C8"
+        """Disconnect the target from a docker network; rollback reconnects it.
+
+        Parameters consumed from ``scenario.parameters``:
+            - ``network`` (str, default ``"chaos-net"``): the docker network
+              the target should be disconnected from. Defaulting here matches
+              :attr:`Settings.chaos_network_name` so a scenario with no
+              parameters still does the obvious thing.
+
+        The captured state (aliases + IPv4) is closed over by the rollback
+        callable so reconnecting fully restores the original wiring — other
+        services can still resolve the target by its container name once it
+        rejoins the network.
+
+        Both the disconnect and the reconnect happen via
+        :func:`asyncio.to_thread` to keep the engine event loop responsive.
+        """
+        network_name = str(scenario.parameters.get("network", "chaos-net"))
+        from .network import inject_partition, rollback_partition
+
+        state = await asyncio.to_thread(
+            inject_partition, self._docker, scenario.target, network_name
         )
+        target = scenario.target
+        docker_client = self._docker
+
+        async def _rollback() -> None:
+            await asyncio.to_thread(
+                rollback_partition, docker_client, target, network_name, state
+            )
+
+        return _rollback
 
     async def _inject_resource(
         self, scenario: FailureScenario

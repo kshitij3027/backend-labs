@@ -118,3 +118,42 @@ def rollback(client: DockerClient, container: str) -> None:
     logger.warning(
         "tc qdisc del returned non-zero on %s: %s", container, msg
     )
+
+
+# ---------- Network partition (docker network disconnect/connect) ----------
+
+
+def inject_partition(
+    client: DockerClient, container: str, network: str
+) -> dict:
+    """Disconnect a target from a docker network.
+
+    Returns a state dict so :func:`rollback_partition` can restore the
+    original aliases/ipv4 when the experiment ends.
+    """
+    state = client.disconnect_network(container, network)
+    logger.info(
+        "partitioned %s from network %s (aliases=%s ipv4=%s)",
+        container,
+        network,
+        state.get("aliases"),
+        state.get("ipv4"),
+    )
+    return state
+
+
+def rollback_partition(
+    client: DockerClient,
+    container: str,
+    network: str,
+    state: dict | None,
+) -> None:
+    """Reconnect a target to a docker network, restoring its previous aliases."""
+    aliases = (state or {}).get("aliases") or None
+    ipv4 = (state or {}).get("ipv4") or None
+    try:
+        client.connect_network(container, network, aliases=aliases, ipv4=ipv4)
+        logger.info("rejoined %s to %s (aliases=%s)", container, network, aliases)
+    except Exception:
+        # Best-effort; rollback must not raise into the engine.
+        logger.exception("rejoin failed for %s on %s", container, network)

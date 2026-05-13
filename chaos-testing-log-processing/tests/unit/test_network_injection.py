@@ -17,7 +17,9 @@ from src.injection.network import (
     NetworkInjectionError,
     inject_latency,
     inject_packet_loss,
+    inject_partition,
     rollback,
+    rollback_partition,
 )
 
 
@@ -210,3 +212,66 @@ class TestRollback:
         rollback(client, "log-producer")
 
         client.exec.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# inject_partition / rollback_partition
+# --------------------------------------------------------------------------- #
+
+
+class TestInjectPartition:
+    """``inject_partition`` defers to ``DockerClient.disconnect_network``."""
+
+    def test_happy_path_returns_state_and_delegates(self) -> None:
+        """Returns the dict from ``disconnect_network`` verbatim and calls it once."""
+        client = MagicMock(name="docker_client")
+        expected_state = {"aliases": ["log-consumer"], "ipv4": None}
+        client.disconnect_network.return_value = expected_state
+
+        result = inject_partition(client, "log-consumer", "chaos-net")
+
+        assert result == expected_state
+        client.disconnect_network.assert_called_once_with(
+            "log-consumer", "chaos-net"
+        )
+
+
+class TestRollbackPartition:
+    """``rollback_partition`` is best-effort: never re-raises into the engine."""
+
+    def test_happy_path_restores_aliases_and_ipv4(self) -> None:
+        client = MagicMock(name="docker_client")
+        state = {"aliases": ["log-consumer"], "ipv4": "172.20.0.5"}
+
+        rollback_partition(client, "log-consumer", "chaos-net", state)
+
+        client.connect_network.assert_called_once_with(
+            "log-consumer",
+            "chaos-net",
+            aliases=["log-consumer"],
+            ipv4="172.20.0.5",
+        )
+
+    def test_state_none_passes_none_defaults(self) -> None:
+        """Defensive: ``state=None`` -> both kwargs default to None."""
+        client = MagicMock(name="docker_client")
+
+        rollback_partition(client, "log-consumer", "chaos-net", None)
+
+        client.connect_network.assert_called_once_with(
+            "log-consumer",
+            "chaos-net",
+            aliases=None,
+            ipv4=None,
+        )
+
+    def test_swallows_connect_network_exception(self) -> None:
+        """Best-effort: ``client.connect_network`` raising MUST NOT propagate."""
+        client = MagicMock(name="docker_client")
+        client.connect_network.side_effect = RuntimeError("network gone")
+        state = {"aliases": ["log-consumer"], "ipv4": "172.20.0.5"}
+
+        # Must not raise.
+        rollback_partition(client, "log-consumer", "chaos-net", state)
+
+        client.connect_network.assert_called_once()
