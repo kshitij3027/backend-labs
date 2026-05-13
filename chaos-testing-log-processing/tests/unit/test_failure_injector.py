@@ -325,8 +325,8 @@ class TestRouting:
     @pytest.mark.parametrize(
         "failure_type, milestone",
         [
-            (FailureType.LATENCY_INJECTION, "C7"),
-            (FailureType.PACKET_LOSS, "C7"),
+            # C7 wired LATENCY_INJECTION and PACKET_LOSS to network.py;
+            # only the remaining three are still stubs at this commit.
             (FailureType.NETWORK_PARTITION, "C8"),
             (FailureType.RESOURCE_EXHAUSTION, "C9"),
             (FailureType.COMPONENT_FAILURE, "C9"),
@@ -335,7 +335,7 @@ class TestRouting:
     async def test_stub_raises_not_implemented_with_milestone(
         self, failure_type: FailureType, milestone: str
     ) -> None:
-        """Without ``_test_handlers``, the stubs cite the future commit."""
+        """Without ``_test_handlers``, the remaining stubs cite the future commit."""
         injector = make_injector()
         scenario = make_scenario(failure_type=failure_type)
 
@@ -346,15 +346,120 @@ class TestRouting:
 
     @pytest.mark.asyncio
     async def test_not_implemented_clears_active_registration(self) -> None:
-        """A failing handler must unregister so concurrency counts stay honest."""
+        """A failing stub handler must unregister so concurrency counts stay honest."""
         injector = make_injector()
-        scenario = make_scenario(failure_type=FailureType.LATENCY_INJECTION)
+        # NETWORK_PARTITION still raises NotImplementedError at C7.
+        scenario = make_scenario(failure_type=FailureType.NETWORK_PARTITION)
 
         with pytest.raises(NotImplementedError):
             await injector.inject(scenario)
 
         assert injector.active_count == 0
         assert scenario.id not in injector.active_ids()
+
+
+# ===========================================================================
+# B.2 Real-handler delegation (C7) — LATENCY_INJECTION + PACKET_LOSS
+# ===========================================================================
+
+
+class TestRealHandlersC7:
+    """The wired handlers call into ``src.injection.network`` with the
+    right argv and hand back a rollback callable that defers to
+    ``network.rollback`` when awaited."""
+
+    @pytest.mark.asyncio
+    async def test_latency_injection_delegates_to_network_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import src.injection.network as network_mod
+
+        inject_calls: list[tuple] = []
+        rollback_calls: list[tuple] = []
+
+        def fake_inject_latency(
+            client, container, latency_ms, jitter_ms=0
+        ) -> None:
+            inject_calls.append((client, container, latency_ms, jitter_ms))
+
+        def fake_rollback(client, container) -> None:
+            rollback_calls.append((client, container))
+
+        monkeypatch.setattr(network_mod, "inject_latency", fake_inject_latency)
+        monkeypatch.setattr(network_mod, "rollback", fake_rollback)
+
+        docker_client = MagicMock(name="docker_client")
+        injector = make_injector(docker_client=docker_client)
+
+        scenario = make_scenario(
+            failure_type=FailureType.LATENCY_INJECTION,
+            parameters={"latency_ms": 250, "jitter_ms": 25},
+        )
+
+        active = await injector.inject(scenario)
+
+        # inject_latency called exactly once with the docker client + target.
+        assert len(inject_calls) == 1
+        called_client, called_target, called_latency, called_jitter = inject_calls[0]
+        assert called_client is docker_client
+        assert called_target == scenario.target
+        assert called_latency == 250
+        assert called_jitter == 25
+
+        # Rollback callable is registered and not yet invoked.
+        assert active.rollback is not None
+        assert rollback_calls == []
+
+        # Awaiting the rollback invokes network.rollback once with the same target.
+        await active.rollback()
+        assert len(rollback_calls) == 1
+        rb_client, rb_target = rollback_calls[0]
+        assert rb_client is docker_client
+        assert rb_target == scenario.target
+
+    @pytest.mark.asyncio
+    async def test_packet_loss_delegates_to_network_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import src.injection.network as network_mod
+
+        inject_calls: list[tuple] = []
+        rollback_calls: list[tuple] = []
+
+        def fake_inject_loss(client, container, loss_pct) -> None:
+            inject_calls.append((client, container, loss_pct))
+
+        def fake_rollback(client, container) -> None:
+            rollback_calls.append((client, container))
+
+        monkeypatch.setattr(network_mod, "inject_packet_loss", fake_inject_loss)
+        monkeypatch.setattr(network_mod, "rollback", fake_rollback)
+
+        docker_client = MagicMock(name="docker_client")
+        injector = make_injector(docker_client=docker_client)
+
+        scenario = make_scenario(
+            failure_type=FailureType.PACKET_LOSS,
+            parameters={"loss_pct": 12.5},
+        )
+
+        active = await injector.inject(scenario)
+
+        # inject_packet_loss called exactly once with the parameters.
+        assert len(inject_calls) == 1
+        called_client, called_target, called_loss = inject_calls[0]
+        assert called_client is docker_client
+        assert called_target == scenario.target
+        assert called_loss == 12.5
+
+        assert active.rollback is not None
+        assert rollback_calls == []
+
+        await active.rollback()
+        assert len(rollback_calls) == 1
+        rb_client, rb_target = rollback_calls[0]
+        assert rb_client is docker_client
+        assert rb_target == scenario.target
 
 
 # ===========================================================================

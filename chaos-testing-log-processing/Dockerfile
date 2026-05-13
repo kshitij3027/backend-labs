@@ -44,6 +44,7 @@ COPY --from=builder /opt/venv /opt/venv
 # Source + config. config/ is intentionally empty in C1 — populated in C3.
 RUN mkdir -p /app/config /app/data
 COPY src/ /app/src/
+COPY scripts/ /app/scripts/
 COPY config/ /app/config/
 
 EXPOSE 8000

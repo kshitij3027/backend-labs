@@ -33,8 +33,8 @@ test:
 	docker compose --profile test run --rm test pytest tests/unit -v
 
 e2e:
-	@echo "e2e target wired up in C7+"
-	@exit 0
+	chmod +x scripts/e2e_latency_injection.sh
+	./scripts/e2e_latency_injection.sh
 
 load:
 	@echo "load target wired up in C18"

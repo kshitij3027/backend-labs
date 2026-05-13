@@ -21,6 +21,7 @@ methods. Production code never sets it.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import time
@@ -343,18 +344,55 @@ class FailureInjector:
         return route.get(failure_type)
 
     async def _inject_latency(self, scenario: FailureScenario) -> RollbackCallable:
-        """Stub — LATENCY_INJECTION is implemented in commit C7."""
-        raise NotImplementedError(
-            "LATENCY_INJECTION will be implemented in commit C7"
+        """Apply tc-netem ``delay`` on the target's eth0; return idempotent rollback.
+
+        Parameters consumed from ``scenario.parameters``:
+            - ``latency_ms`` (int, default 200): one-way delay added to egress.
+            - ``jitter_ms`` (int, default 0): netem ``delay`` jitter component.
+
+        The blocking ``DockerClient.exec`` call is wrapped in
+        :func:`asyncio.to_thread` so the engine's event loop stays
+        responsive during dispatch.
+        """
+        latency_ms = int(scenario.parameters.get("latency_ms", 200))
+        jitter_ms = int(scenario.parameters.get("jitter_ms", 0))
+        from .network import inject_latency as _do_inject, rollback as _do_rollback
+
+        await asyncio.to_thread(
+            _do_inject, self._docker, scenario.target, latency_ms, jitter_ms
         )
+        target = scenario.target
+        docker_client = self._docker
+
+        async def _rollback() -> None:
+            await asyncio.to_thread(_do_rollback, docker_client, target)
+
+        return _rollback
 
     async def _inject_packet_loss(
         self, scenario: FailureScenario
     ) -> RollbackCallable:
-        """Stub — PACKET_LOSS is implemented in commit C7."""
-        raise NotImplementedError(
-            "PACKET_LOSS will be implemented in commit C7"
+        """Apply tc-netem ``loss`` on the target's eth0; return idempotent rollback.
+
+        Parameters consumed from ``scenario.parameters``:
+            - ``loss_pct`` (float, default 10.0): drop probability in ``(0, 100]``.
+
+        The blocking ``DockerClient.exec`` call is wrapped in
+        :func:`asyncio.to_thread`.
+        """
+        loss_pct = float(scenario.parameters.get("loss_pct", 10.0))
+        from .network import inject_packet_loss as _do_inject, rollback as _do_rollback
+
+        await asyncio.to_thread(
+            _do_inject, self._docker, scenario.target, loss_pct
         )
+        target = scenario.target
+        docker_client = self._docker
+
+        async def _rollback() -> None:
+            await asyncio.to_thread(_do_rollback, docker_client, target)
+
+        return _rollback
 
     async def _inject_partition(
         self, scenario: FailureScenario
