@@ -10,7 +10,7 @@ help:
 	@echo "ps       - Show running compose services"
 	@echo "test     - Run unit tests inside Docker (wired up in C2+)"
 	@echo "e2e      - Run end-to-end scenarios inside Docker (wired up in C7+)"
-	@echo "load     - Run load / overhead tests inside Docker (wired up in C18)"
+	@echo "load     - Run load / overhead tests inside Docker"
 	@echo "clean    - Tear down volumes and remove local SQLite / cache artifacts"
 	@echo "rebuild  - down + build + up"
 
@@ -45,8 +45,7 @@ e2e-resource:
 	./scripts/e2e_resource_pressure.sh
 
 load:
-	@echo "load target wired up in C18"
-	@exit 0
+	docker compose --profile test run --rm test pytest tests/load -v -m load
 
 clean:
 	docker compose down -v --remove-orphans

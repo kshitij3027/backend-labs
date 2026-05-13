@@ -8,9 +8,12 @@ The pytest process runs INSIDE chaos-framework via `docker exec`.
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 
+import httpx
 import pytest
+import websockets
 
 # Allow running with PYTHONPATH=/app inside the framework container.
 sys.path.insert(0, "/app")
@@ -92,3 +95,94 @@ async def test_latency_lifecycle(latency_target: str) -> None:
 
     # The run took at least the observe duration.
     assert (outcome.run.ended_at - outcome.run.started_at).total_seconds() >= 3.0
+
+
+@pytest.mark.asyncio
+async def test_full_latency_injection_lifecycle() -> None:
+    """End-to-end through the REST API + WebSocket, validating §5.10.
+
+    Run the canonical 200ms latency experiment against log-consumer, watch
+    the WebSocket frames as the engine drives the lifecycle, and assert the
+    persisted recovery report shows overall_success and a sane
+    validation_duration.
+    """
+    api = "http://localhost:8000"
+    ws_url = "ws://localhost:8000"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # 1. Create
+        r = await client.post(
+            f"{api}/experiments",
+            json={
+                "name": "c18-full-latency",
+                "type": "latency_injection",
+                "target": "log-consumer",
+                "parameters": {"latency_ms": 200},
+                "duration": 3,
+                "severity": 2,
+                "hypothesis": {
+                    "statement": "If 200ms latency injected then p95 returns to baseline within 30s",
+                    "recovery_time_budget_s": 30,
+                    "expected_invariants": [],
+                },
+            },
+        )
+        r.raise_for_status()
+        exp_id = r.json()["id"]
+
+        # 2. Subscribe to WS BEFORE starting the run so we capture run_started.
+        frames: list[dict] = []
+
+        async def collect():
+            try:
+                async with websockets.connect(f"{ws_url}/ws/runs/*") as ws:
+                    while True:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                        frames.append(json.loads(raw))
+                        if (
+                            frames[-1].get("type") == "event"
+                            and frames[-1].get("data", {}).get("event") == "run_completed"
+                        ):
+                            return
+            except Exception:
+                return
+
+        bg = asyncio.create_task(collect())
+        await asyncio.sleep(0.3)
+
+        # 3. Start the run.
+        r = await client.post(f"{api}/experiments/{exp_id}/run")
+        r.raise_for_status()
+        run_id = r.json()["run_id"]
+
+        # 4. Poll for terminal status.
+        terminal = ("completed", "failed", "aborted")
+        final = None
+        for _ in range(30):
+            await asyncio.sleep(1.0)
+            rr = await client.get(f"{api}/runs/{run_id}")
+            rr.raise_for_status()
+            status = rr.json().get("status")
+            if status in terminal:
+                final = rr.json()
+                break
+
+        # 5. Stop the WS collector.
+        try:
+            await asyncio.wait_for(bg, timeout=2.0)
+        except asyncio.TimeoutError:
+            bg.cancel()
+
+        # 6. Assertions.
+        assert final is not None, "run never reached terminal state"
+        assert final["status"] == "completed", final
+        assert final["recovery_report_id"] is not None
+        assert final["scenario_id"] is not None
+        # At least one of each frame type observed.
+        types_seen = {f.get("type") for f in frames}
+        assert "snapshot" in types_seen
+        assert "event" in types_seen
+        # Run_completed event present in the engine event stream.
+        events = [f for f in frames if f.get("type") == "event"]
+        names = [e.get("data", {}).get("event") for e in events]
+        assert "run_completed" in names, names

@@ -33,10 +33,6 @@ This framework lets you design and run controlled chaos experiments against a ru
 - **Dashboard:** Served as static assets from FastAPI (HTML + JS; framework-agnostic, no build step required initially)
 - **Testing:** Pytest, pytest-asyncio, httpx (API), `testcontainers` (E2E against ephemeral target stacks)
 
-## Project Status
-
-Scaffold only. Implementation has not started.
-
 ## How to Run
 
 ```bash
@@ -60,24 +56,29 @@ The dashboard is served as static HTML+JS at `http://localhost:8000/dashboard` (
 - Toggle the global kill switch (POST `/admin/abort`).
 - See the circuit-breaker status (polled every 5s from `/admin/circuit-breaker-state`).
 
-## What I Learned
+### Screenshot
 
-_To be filled in as the project evolves._
+_Placeholder — a captured screenshot of an in-flight 200ms latency injection (live chart, run status, and recovery report panel) will land at `docs/screenshots/dashboard.png` after the Chrome MCP verification pass._
 
-## API (Planned)
+## API
 
-| Method | Path                                | Purpose                                  |
-| ------ | ----------------------------------- | ---------------------------------------- |
-| POST   | `/experiments`                      | Create a new chaos experiment definition |
-| GET    | `/experiments`                      | List experiments                         |
-| GET    | `/experiments/{id}`                 | Get a single experiment + last result    |
-| POST   | `/experiments/{id}/run`             | Start an experiment run                  |
-| POST   | `/experiments/{id}/abort`           | Abort the active run (triggers rollback) |
-| GET    | `/runs/{run_id}`                    | Fetch run status, timeline, verdict      |
-| GET    | `/targets`                          | List discoverable Docker targets         |
-| WS     | `/ws/runs/{run_id}`                 | Live stream of run events + metrics      |
+| Method | Path                                | Purpose                                                 |
+| ------ | ----------------------------------- | ------------------------------------------------------- |
+| GET    | `/health`                           | Liveness + readiness for engine / monitor / docker      |
+| GET    | `/metrics`                          | Prometheus scrape endpoint                              |
+| POST   | `/experiments`                      | Create a new chaos experiment definition                |
+| GET    | `/experiments`                      | List experiments                                        |
+| GET    | `/experiments/{id}`                 | Get a single experiment + last result                   |
+| POST   | `/experiments/{id}/run`             | Start an experiment run                                 |
+| POST   | `/experiments/{id}/abort`           | Abort the active run (triggers rollback)                |
+| GET    | `/runs/{run_id}`                    | Fetch run status, timeline, verdict                     |
+| GET    | `/targets`                          | List discoverable Docker targets (allowlist-filtered)   |
+| POST   | `/admin/abort`                      | Global kill switch — aborts all active runs             |
+| POST   | `/admin/dry-run`                    | Toggle dry-run mode (plan only, no injection)           |
+| GET    | `/admin/circuit-breaker-state`      | Current SafetySupervisor state and counters             |
+| WS     | `/ws/runs/{run_id}`                 | Live stream of run events + metrics (`*` = all runs)    |
 
-_Endpoints are illustrative and may change during design._
+Full OpenAPI docs are available at `http://localhost:8000/docs` once the stack is up.
 
 ## Safety Model (Planned)
 
@@ -86,3 +87,12 @@ _Endpoints are illustrative and may change during design._
 - **Automatic rollback** on guardrail breach or supervisor heartbeat loss.
 - **Dry-run mode** — render the plan without executing any fault.
 - **Kill switch** — single endpoint that aborts all active runs and restores state.
+
+## What I Learned
+
+- **Docker-socket security model.** Mounting `/var/run/docker.sock` into the framework grants root-equivalent host access; we mitigate by filtering containers via a `chaos.target=true` label *and* a config-driven allowlist before any `exec`/`pause`/`disconnect`. The injector refuses to act on anything outside that intersection.
+- **`tc netem` requires `NET_ADMIN` on the target, not the framework.** Latency/loss injection runs *inside* the target container via `docker exec`, so the target image needs `iproute2` baked in and the compose service needs `cap_add: [NET_ADMIN]`. The framework container itself stays unprivileged.
+- **Asyncio queue decoupling is the cleanest WebSocket fan-out.** A bounded `asyncio.Queue` between the metric collector (1 Hz) and the broadcaster (4 Hz throttled) means a slow client never back-pressures the collector, and the broadcaster can prune dead sockets on a failed send without taking down the loop.
+- **Principles of Chaos: steady-state → hypothesis → blast → recover.** The engine's lifecycle (probe → inject → observe → rollback → validate) directly mirrors the canonical chaos loop. Every `RecoveryReport` validates the hypothesis explicitly — the run is only `completed` if the post-fault probes match the pre-fault steady-state within the recovery budget.
+- **`pydantic-settings` precedence is env > yaml > defaults.** The `Settings` class loads `config/safety_config.yaml` first, then overrides with env vars (e.g., `DOCKER_SOCKET_PATH`, `CPU_EMERGENCY_THRESHOLD_PCT`), so a container override never requires editing the YAML on disk.
+- **`SafetySupervisor` needs debounce, not just a threshold.** A single CPU spike (a single GC pause, a burst of `docker stats` accounting) should not trip the kill switch. The supervisor requires the breach to persist over N consecutive samples before firing emergency stop, which eliminated all observed false trips during E2E.
