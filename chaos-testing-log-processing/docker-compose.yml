@@ -15,6 +15,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Persistence for SQLite + experiment artifacts (lands in C12).
       - ./data:/app/data
+      - ./tests:/app/tests:ro
     environment:
       LOG_LEVEL: INFO
       CHAOS_API_PORT: 8000
