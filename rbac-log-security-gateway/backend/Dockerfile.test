@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1.6
+
+# Single-stage image used only by the `tester` compose service.
+# pytest + the full backend deps are installed so we can run the same
+# code the runtime image executes, plus the test harness.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pin pip for reproducible builds.
+RUN pip install --no-cache-dir --upgrade pip==24.3.1
+
+WORKDIR /app
+
+# Build context is the project root, so requirements.txt is at the root of it.
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# backend/src and backend/tests are mounted at runtime by the `tester`
+# compose service — nothing to COPY here. No USER directive — test
+# container is ephemeral.
+CMD ["pytest", "-v"]
