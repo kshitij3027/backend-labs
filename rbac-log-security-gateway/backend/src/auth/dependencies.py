@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
+from src.audit.service import AuditService
 from src.auth.jwt import InvalidTokenError, decode_token
 from src.auth.service import AuthService
 from src.auth.users import User, default_store
@@ -69,6 +70,6 @@ def get_rbac() -> "RBACEngine":
     return _shared_rbac
 
 
-def get_audit():
-    """Return the shared AuditService singleton (stub until C8)."""
+def get_audit() -> "AuditService":
+    """Return the shared AuditService singleton."""
     return _shared_audit

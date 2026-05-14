@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.auth import router as auth_router
 from src.config import get_settings
+from src.middleware.audit import AuditMiddleware
+from src.shared import audit_service
 
 
 def _configure_logging(level: str) -> None:
@@ -56,6 +58,11 @@ def build_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # AuditMiddleware is added LAST so it wraps the rest of the stack (Starlette adds
+    # middleware in LIFO order — last `add_middleware` runs FIRST per request).
+    # This ensures every request, including CORS preflights, is recorded.
+    app.add_middleware(AuditMiddleware, audit_service=audit_service)
 
     app.include_router(auth_router)
 
