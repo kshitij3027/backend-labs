@@ -1,0 +1,28 @@
+# --- VCS / docs ---
+.git
+.gitignore
+README.md
+plan.md
+project_requirements.md
+# --- Python build ---
+__pycache__
+*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+.venv
+venv
+# --- Env / secrets ---
+.env
+.env.*
+!.env.example
+# --- Frontend build ---
+frontend/node_modules
+frontend/dist
+frontend/.vite
+# --- IDE / OS ---
+.vscode
+.idea
+.DS_Store
