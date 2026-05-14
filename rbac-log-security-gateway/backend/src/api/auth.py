@@ -4,13 +4,11 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, status
 
 from src.auth.dependencies import CurrentUser
-from src.auth.service import AuthService, AuthenticationError
+from src.auth.service import AuthenticationError
 from src.schemas.auth import LoginRequest, LoginResponse, UserInfo
+from src.shared import auth_service as _auth_service  # noqa: E402
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
-
-# Module-level singleton — replaced by shared.py in C7. Until then, this is fine.
-_auth_service = AuthService()
 
 
 @router.post("/login", response_model=LoginResponse)

@@ -7,7 +7,9 @@ from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 
 from src.auth.jwt import InvalidTokenError, decode_token
+from src.auth.service import AuthService
 from src.auth.users import User, default_store
+from src.rbac.engine import RBACEngine
 
 # `auto_error=False` is critical — we want the route handler to decide 401 vs anonymous, and we
 # want the audit middleware to be able to peek for an optional user without raising.
@@ -50,3 +52,23 @@ def get_current_user(
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+
+
+# --- C7 additions: shared-singleton dependency providers --- #
+
+from src.shared import auth_service as _shared_auth, audit_service as _shared_audit, rbac_engine as _shared_rbac
+
+
+def get_auth() -> "AuthService":
+    """Return the shared AuthService singleton."""
+    return _shared_auth
+
+
+def get_rbac() -> "RBACEngine":
+    """Return the shared RBACEngine singleton."""
+    return _shared_rbac
+
+
+def get_audit():
+    """Return the shared AuditService singleton (stub until C8)."""
+    return _shared_audit
