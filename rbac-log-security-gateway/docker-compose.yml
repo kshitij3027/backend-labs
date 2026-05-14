@@ -16,6 +16,11 @@ services:
         required: false
     environment:
       PYTHONUNBUFFERED: "1"
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRY_MINUTES: ${JWT_EXPIRY_MINUTES:-60}
+      APP_LOG_LEVEL: ${APP_LOG_LEVEL:-info}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
@@ -42,7 +47,6 @@ services:
     volumes:
       - ./backend/src:/app/src:ro
       - ./backend/tests:/app/tests:ro
-      # pytest.ini mount added in C3 once the file exists:
-      # - ./backend/pytest.ini:/app/pytest.ini:ro
+      - ./backend/pytest.ini:/app/pytest.ini:ro
     working_dir: /app
     command: ["pytest", "-v"]
