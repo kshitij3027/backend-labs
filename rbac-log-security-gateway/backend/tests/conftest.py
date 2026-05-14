@@ -28,3 +28,31 @@ async def async_client(app_instance: FastAPI) -> AsyncClient:
     transport = ASGITransport(app=app_instance)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+@pytest.fixture(scope="session")
+def admin_token(app_instance: FastAPI) -> str:
+    from src.auth.service import AuthService
+    token, _exp, _user = AuthService().login("alice", "admin123")
+    return token
+
+
+@pytest.fixture(scope="session")
+def dev_token(app_instance: FastAPI) -> str:
+    from src.auth.service import AuthService
+    token, _exp, _user = AuthService().login("bob", "dev123")
+    return token
+
+
+@pytest.fixture(scope="session")
+def analyst_token(app_instance: FastAPI) -> str:
+    from src.auth.service import AuthService
+    token, _exp, _user = AuthService().login("carol", "analyst123")
+    return token
+
+
+@pytest.fixture(scope="session")
+def support_token(app_instance: FastAPI) -> str:
+    from src.auth.service import AuthService
+    token, _exp, _user = AuthService().login("dave", "support123")
+    return token
