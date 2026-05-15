@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import useAuth from "../hooks/useAuth";
 
 export default function Login() {
@@ -6,12 +7,16 @@ export default function Login() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const redirectTo = (location.state && location.state.from) || "/dashboard";
 
   async function onSubmit(e) {
     e.preventDefault();
     setSubmitting(true);
     try {
       await login(username, password);
+      navigate(redirectTo, { replace: true });
     } catch (_err) {
       // error surfaced by context.loginError
     } finally {
