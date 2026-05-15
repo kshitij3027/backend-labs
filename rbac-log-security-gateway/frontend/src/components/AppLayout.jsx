@@ -11,6 +11,7 @@ export default function AppLayout() {
           <Link to="/dashboard" className="brand">RBAC Gateway</Link>
           <nav data-testid="primary-nav">
             <Link to="/dashboard" data-testid="nav-dashboard">Dashboard</Link>
+            <Link to="/logs" data-testid="nav-logs">Logs</Link>
             {user && user.roles.includes("administrator") && (
               <Link to="/admin" data-testid="nav-admin">Admin</Link>
             )}
