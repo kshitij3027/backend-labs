@@ -1,97 +1,194 @@
 # RBAC Log Security Gateway
 
-A security middleware that controls who can access what log data in a distributed log processing system, using JWT authentication, role-based authorization, and full audit logging.
+A security middleware that controls **who can access what log data** in a distributed log processing system, using **JWT authentication**, **role-based authorization** with a deny-overrides permission DSL, and full **audit logging**.
 
-## Overview
+Built as a learning exercise in the `backend-labs` mono-repo. The point is to internalize the **auth → authz → audit** pattern as it appears in real log/observability pipelines.
 
-This gateway sits in front of a log query backend and enforces:
+## How it runs
 
-- **Authentication** — every request must carry a valid JWT (issued by the gateway's `/auth/login` endpoint or a trusted external IdP).
-- **Authorization** — each principal (user or service) is bound to one or more **roles**, and each role grants a scoped set of **permissions** on log resources (e.g., `logs:read:app=billing`, `logs:read:env=prod`, `logs:admin:*`).
-- **Audit** — every authentication attempt, authorization decision (allow / deny), and log query is recorded to an immutable audit log with the caller identity, requested resource, decision, and reason.
+| Service | URL | What it is |
+|---|---|---|
+| Backend | http://localhost:8000 | FastAPI + uvicorn. JWT auth, RBAC engine, audit middleware. |
+| Backend API docs | http://localhost:8000/docs | Auto-generated OpenAPI / Swagger. |
+| Frontend | http://localhost:3000 | React + Vite SPA served by nginx; `/api/*` reverse-proxied to the backend. |
+| Tester | (no port) | One-shot container that runs the pytest suite (`docker compose run --rm tester pytest`). |
 
-It is intended to be deployed in front of any log query API (Elasticsearch, Loki, an in-house service, etc.) so that no consumer talks to the log backend directly.
+The whole stack is **in-memory and single-host** — no database, no Redis, no external IdP. The 4 demo users live in the source code and bcrypt hashes are computed at import time. The audit log is an append-only Python list shared across requests via module-level singletons in `backend/src/shared.py`.
 
-## How It Runs
+## Quick start
 
-- A **long-lived FastAPI server** on **port 8000** exposes:
-  - The auth endpoints (`/auth/login`, `/auth/refresh`, `/auth/logout`).
-  - The admin endpoints for managing users, roles, and permissions.
-  - The protected log query endpoints (`/logs/search`, `/logs/{id}`, `/logs/stream`), which the gateway authorizes and then proxies to the configured log backend.
-  - The audit query endpoints (`/audit/events`, `/audit/events/{id}`) for compliance / forensic review.
-- An **optional React frontend** on **port 3000** provides:
-  - A login screen.
-  - An admin UI for users / roles / permissions.
-  - A log explorer that calls the gateway's protected endpoints.
-  - An audit timeline view.
-- Users and services authenticate over HTTP, receive a short-lived JWT, and then make authorized log queries through the same API. The gateway evaluates every request against the caller's role bindings before it touches the backend.
+```bash
+# Optional: pre-set a JWT secret; otherwise start.sh generates one.
+export JWT_SECRET_KEY="any-long-random-string"
 
-## Tech Stack
+# Bring up the stack (auto-generates .env if missing, then docker compose up --wait).
+make demo
 
-- **Language:** Python 3.11+
-- **Backend:** FastAPI + Uvicorn
-- **AuthN:** JWT (HS256 for dev, RS256 for prod), `python-jose`
-- **Password hashing:** `passlib[bcrypt]`
-- **AuthZ:** In-process policy engine (role → permission rules), pluggable
-- **Persistence:** SQLite (via SQLAlchemy + `aiosqlite`) for users, roles, permissions, refresh tokens, and audit events
-- **Validation / config:** Pydantic v2 + `pydantic-settings`
-- **Observability:** `prometheus-client` + `structlog` (JSON logs)
-- **HTTP client (backend proxy):** `httpx`
-- **Frontend (optional):** React (Vite) on port 3000
-- **Testing:** Pytest, pytest-asyncio, httpx test client
+# Open http://localhost:3000 and log in as any demo user (see below).
+# When done:
+make down
+```
 
-## How to Run
+The first build is slow (~3-5 minutes — pip install + npm install + vite build). Subsequent builds are cached.
 
-_TBD — implementation not started yet. This README documents the intended shape of the project; runnable instructions will be filled in once the scaffold lands._
+## Demo users
 
-## Planned API
+| Username | Password    | Role          | Default scope    | What's interesting |
+|----------|-------------|---------------|------------------|--------------------|
+| `alice`  | `admin123`  | administrator | `*`              | Reads everything; the single deny `!logs:export:business.financial` shows up as 403 on the export endpoint. |
+| `bob`    | `dev123`    | developer     | `application`    | Application-scoped; business reads return 403 via `!logs:read:business.*`. |
+| `carol`  | `analyst123`| analyst       | `business`       | Sees only **aggregated** counts on `business.*` reads (the `aggregated_only` permission tag). |
+| `dave`   | `support123`| support       | `application.auth` | Sees individual records but with **PII masked** to `***` (the `mask_pii` tag). |
 
-| Method | Path                              | Auth required | Purpose                                                                 |
-| ------ | --------------------------------- | ------------- | ----------------------------------------------------------------------- |
-| POST   | `/auth/login`                     | No            | Exchange username + password for an access + refresh JWT                |
-| POST   | `/auth/refresh`                   | Refresh JWT   | Mint a new access token from a refresh token                            |
-| POST   | `/auth/logout`                    | Access JWT    | Revoke the current refresh token                                        |
-| GET    | `/auth/me`                        | Access JWT    | Return the caller's identity, roles, and effective permissions          |
-| POST   | `/admin/users`                    | `admin:users` | Create a user / service principal                                       |
-| GET    | `/admin/users`                    | `admin:users` | List principals                                                         |
-| POST   | `/admin/roles`                    | `admin:roles` | Create a role                                                           |
-| POST   | `/admin/roles/{role}/permissions` | `admin:roles` | Attach permissions to a role                                            |
-| POST   | `/admin/users/{user}/roles`       | `admin:users` | Bind a role to a user                                                   |
-| POST   | `/logs/search`                    | `logs:read`   | Authorized search against the log backend (gateway filters by scope)    |
-| GET    | `/logs/{id}`                      | `logs:read`   | Fetch a single log record (subject to per-resource scope)               |
-| GET    | `/logs/stream`                    | `logs:read`   | Server-sent stream of newly indexed logs the caller is permitted to see |
-| GET    | `/audit/events`                   | `audit:read`  | Query the audit log (filters: principal, decision, resource, time)      |
-| GET    | `/audit/events/{id}`              | `audit:read`  | Fetch a single audit event                                              |
-| GET    | `/health`                         | No            | Liveness / readiness                                                    |
-| GET    | `/metrics`                        | No            | Prometheus scrape endpoint                                              |
+## Tech stack
 
-Full OpenAPI docs will be available at `http://localhost:8000/docs` once the stack is up.
+- **Backend:** Python 3.11, FastAPI, uvicorn, pydantic-settings, python-jose (JWT, HS256), passlib[bcrypt], structlog, pytest + pytest-asyncio + httpx.
+- **Frontend:** React 18, Vite, react-router-dom v6, axios. Served in production by nginx with `/api` reverse-proxied to the backend.
+- **Containers:** multi-stage Dockerfiles for backend (python:3.11-slim) and frontend (node:20-alpine builder → nginx:1.27-alpine serve). Compose orchestrates `backend`, `frontend`, and `tester` services.
 
-## Authorization Model (Planned)
+## Architecture
 
-- **Principal** — a user or service account, identified by a stable subject (`sub`) claim in the JWT.
-- **Role** — a named bundle of permissions (e.g., `viewer-billing`, `oncall-prod`, `auditor`).
-- **Permission** — a tuple of `(action, resource_pattern)`, where:
-  - `action` is one of `logs:read`, `logs:admin`, `audit:read`, `admin:users`, `admin:roles`.
-  - `resource_pattern` is a constrained selector over log attributes (`app`, `env`, `region`, `tenant`, etc.) with `*` wildcards.
-- **Decision** — for each request, the policy engine evaluates the caller's effective permissions against the requested resource. Both the decision (`allow` / `deny`) and the matching rule (or the lack of one) are persisted to the audit log.
-- **Deny by default** — no permission, no access.
+```
+┌────────────────────────────────────────────────────────────┐
+│  Browser → http://localhost:3000  (React via nginx)        │
+│      │                                                      │
+│      │   /api/* and /health proxied to backend:8000         │
+│      ▼                                                      │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │  FastAPI on backend:8000                           │    │
+│  │                                                     │    │
+│  │   AuditMiddleware  ← runs first, captures every    │    │
+│  │     │                request + 401/403 event       │    │
+│  │   Routers:                                          │    │
+│  │     /api/auth/{login,profile}                       │    │
+│  │     /api/logs/{search,export}      (RBAC-gated)    │    │
+│  │     /api/admin/*                   (admin-only)    │    │
+│  │     /health, /docs                                  │    │
+│  │                                                     │    │
+│  │   Module-level singletons in shared.py:            │    │
+│  │     auth_service  (bcrypt verify + JWT)            │    │
+│  │     rbac_engine   (matcher + role policies)        │    │
+│  │     audit_service (append-only list)               │    │
+│  └────────────────────────────────────────────────────┘    │
+└────────────────────────────────────────────────────────────┘
+```
 
-## Audit Model (Planned)
+## Permission DSL
 
-Every event records:
+Permissions look like `logs:<action>:<resource>` (locked — not the generic `read:resource` of most RBAC tutorials).
 
-- `event_id` (UUID), `timestamp` (UTC, monotonic-clock corroborated)
-- `principal_sub`, `principal_kind` (`user` / `service`)
-- `action` (e.g., `auth.login`, `authz.decision`, `logs.search`)
-- `resource` (the requested resource pattern, when applicable)
-- `decision` (`allow` / `deny` / `n/a`)
-- `reason` (matched rule, missing permission, expired token, bad signature, …)
-- `request_id`, `source_ip`, `user_agent`
-- `latency_ms`
+- **Actions:** `read`, `export`, `audit`, `admin`.
+- **Resources (8 leaves):** `application.{auth,api,worker}`, `business.{metrics,financial,customer}`, `system.{kernel,audit}`.
+- **Wildcards:** `*` and `?` via `fnmatch.fnmatchcase`.
+- **Deny rules:** prefix with `!`. Denies are **evaluated first** and any match short-circuits the decision.
 
-Audit events are append-only and queryable via `/audit/events`. They are **never** mutated or deleted by the API.
+Examples:
 
-## What I Learned
+```
+logs:read:application.*       # allow reading any application.* resource
+!logs:export:business.financial  # deny export of business.financial (overrides admin's logs:export:*)
+logs:read:business.*          # with tag "aggregated_only" → analyst-style reduced view
+```
 
-_To be filled in as the project evolves._
+Each role's full permission list (administrator / developer / analyst / support) lives in `backend/src/rbac/roles.py`, and the matcher is in `backend/src/rbac/permissions.py`. The 64-cell parametrized regression test in `backend/tests/integration/test_rbac_matrix.py` locks the role table — break a string in `roles.py` and that test will tell you exactly which cell flipped.
+
+## API endpoints
+
+| Method | Path                                | Auth          | Purpose |
+|--------|-------------------------------------|---------------|---------|
+| POST   | `/api/auth/login`                   | none          | Username + password → JWT access token + user info. |
+| GET    | `/api/auth/profile`                 | bearer JWT    | Caller's identity, roles, display name. |
+| GET    | `/api/logs/search?resource=&limit=` | bearer JWT    | Search logs; RBAC-gated on `logs:read:<resource>`. Honors `aggregated_only` and `mask_pii` tags. |
+| GET    | `/api/logs/export?resource=&limit=` | bearer JWT    | Export logs; RBAC-gated on `logs:export:<resource>`. |
+| GET    | `/api/admin/audit-summary`          | admin role    | Aggregate counts of audit entries. |
+| GET    | `/api/admin/audit-entries`          | admin role    | Recent audit entries (newest first). |
+| GET    | `/api/admin/security-events`        | admin role    | Recent 401/403 / auth-failure events. |
+| GET    | `/api/admin/rbac-policies`          | admin role    | Role → permission strings + default scopes. |
+| GET    | `/api/admin/system-status`          | admin role    | Uptime, counts, known roles, known resources. |
+| GET    | `/health`                           | none          | `{"status":"ok"}` (also bypassed by nginx proxy). |
+| GET    | `/docs`                             | none          | Auto-generated OpenAPI / Swagger. |
+
+## Make targets
+
+```
+make build              # build the backend image
+make build-test         # build the tester image
+make up                 # start backend (detached + wait)
+make down               # stop the stack
+make logs               # tail logs from all services
+make test               # full pytest suite in Docker (218 tests)
+make test-unit          # unit tests only (~85 tests)
+make test-integration   # integration tests only (~133 tests)
+make e2e                # run scripts/e2e.sh — full curl matrix + pytest + frontend probe
+make demo               # auto-generate .env if needed, then start both backend + frontend
+make ui-e2e             # reminder: Chrome MCP UI tests are main-thread only
+make clean              # docker compose down -v + image prune
+```
+
+## Demo flow
+
+After `make demo`, open http://localhost:3000:
+
+1. **Log in as alice** (`admin123`). Dashboard shows role chip `administrator`, default scope `*`, plus admin tiles "Audit dashboard" and "RBAC policies".
+2. Navigate to **Logs**, pick `business.financial`, click Search. Records appear unmasked. Try `business.financial` again on the **export** path via curl — you'll get 403 because of the symbolic `!logs:export:business.financial` deny.
+3. Open **Admin**. The four sections (System status, Audit summary, Recent security events, RBAC policies) hydrate from `/api/admin/*`. Audit counts are non-zero because the lifespan startup seeds three demo entries + one security event.
+4. **Log out**, log in as **bob** (`dev123`). Dashboard scope shows `application`. The Admin nav link is missing; visiting `/admin` shows a friendly Forbidden message. Searching `business.metrics` returns a 403 with the matched rule `!logs:read:business.*`.
+5. Log in as **carol** (`analyst123`). Searching `business.metrics` returns an **aggregated view** (count + by-level breakdown, no individual rows).
+6. Log in as **dave** (`support123`). Searching `business.customer` returns rows with PII fields (email, ip, phone, user_id) replaced by `***` and a "PII fields are masked for your role" banner.
+
+## Test suite
+
+- **218 tests** total, all run inside Docker (`docker compose run --rm tester pytest`).
+- **Unit tests** (~85): password hashing, user store, JWT encode/decode, permission DSL matcher (incl. deny precedence + wildcards), role policy table, RBAC engine, shared singletons, audit service.
+- **Integration tests** (~133): `/health`, full auth flow (login/profile), audit middleware behavior, log search across all 4 roles, log export across all 4 roles, the **64-cell RBAC matrix** (`test_rbac_matrix.py`), all 5 admin endpoints × 4 roles.
+
+The pytest `conftest.py` injects `JWT_SECRET_KEY` via `os.environ.setdefault` at module-top, BEFORE any `src.*` import — this is the same pattern the original article emphasized. Without it, `Settings()` raises `RuntimeError`.
+
+## Configuration
+
+All settings come from environment variables, loaded by `pydantic-settings`. The `.env` file is auto-generated by `scripts/start.sh` on first run with a fresh random `JWT_SECRET_KEY` (and is in `.gitignore` — never committed).
+
+| Variable | Default | Required? |
+|----------|---------|-----------|
+| `JWT_SECRET_KEY` | (none) | **yes** — service fails fast on startup if missing |
+| `JWT_ALGORITHM` | `HS256` | no |
+| `JWT_EXPIRY_MINUTES` | `60` | no |
+| `APP_HOST` | `0.0.0.0` | no |
+| `APP_PORT` | `8000` | no |
+| `APP_LOG_LEVEL` | `info` | no |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:3000` | no |
+
+## What I learned
+
+- **The permission DSL string shape (`domain:action:resource`) is the load-bearing contract.** Tutorials default to a generic `read:resource` pattern; using a three-segment string with a stable `logs:` prefix made the wildcard semantics (`logs:read:application.*`) much cleaner and let the audit log surface the exact matched rule for free.
+- **Deny rules need to run first, before allows.** Concatenating role permissions in declaration order works fine because the matcher does two passes: deny first (short-circuit), allow second. The 64-cell parametrized matrix test was the cheapest way to lock the table.
+- **Singletons must live in one module.** I caught myself nearly instantiating a second `AuditService()` inside the audit router. The requirement doc's explicit "singletons live in `shared.py`" was load-bearing — without it, admin endpoints would show an empty audit log while middleware was writing to a different one.
+- **Fail-fast on missing JWT secret is a real pattern.** `config.py` raises `RuntimeError` if `JWT_SECRET_KEY` is missing, and the autouse pytest fixture injects a test secret via `os.environ.setdefault` BEFORE any `src.*` import. Both halves of that contract matter.
+- **Permission tags (`aggregated_only`, `mask_pii`) are nicer than separate response shapes.** The matcher carries tags through the `Decision`, and the route handler turns them into post-filters (aggregate / mask). Adding a new tag is a one-line change to the role table — no new endpoint, no new schema.
+- **nginx + Vite both proxy `/api` so the frontend code never knows the backend URL.** This made the dev/prod story cheap — same JS in both modes, just two different proxies in front of the same backend.
+- **The Docker healthcheck must use `127.0.0.1`, not `localhost`** when busybox-wget runs inside an alpine container — busybox prefers IPv6 and silently fails when the server only binds IPv4. Caught this during C11a.
+
+## Layout
+
+```
+rbac-log-security-gateway/
+├── backend/
+│   ├── Dockerfile, Dockerfile.test, pytest.ini
+│   ├── src/{main,config,shared}.py
+│   ├── src/auth/{passwords,users,jwt,service,dependencies}.py
+│   ├── src/rbac/{permissions,roles,engine}.py
+│   ├── src/audit/{models,service}.py
+│   ├── src/middleware/audit.py
+│   ├── src/api/{auth,logs,admin}.py
+│   ├── src/schemas/{auth,logs,admin}.py
+│   ├── src/data/mock_logs.py
+│   └── tests/{conftest,unit/*,integration/*}.py
+├── frontend/
+│   ├── Dockerfile, nginx.conf
+│   ├── package.json, vite.config.js, index.html
+│   └── src/{main,App,router,styles}.jsx + api/, contexts/, hooks/, components/, pages/
+├── scripts/{start,stop,cleanup,e2e}.sh
+├── docker-compose.yml, Makefile
+├── .env.example, .dockerignore, .gitignore
+├── README.md, project_requirements.md, requirements.txt
+```

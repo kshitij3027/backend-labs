@@ -35,7 +35,7 @@ export default function Dashboard() {
         </div>
         <div className="tile">
           <h3>Log search</h3>
-          <p>Query logs constrained by your role policies (lands in C13).</p>
+          <p>Query logs constrained by your role policies. Visit <Link to="/logs">Logs</Link>.</p>
         </div>
         {isAdmin && (
           <div className="tile admin-tile" data-testid="admin-tile-audit">
