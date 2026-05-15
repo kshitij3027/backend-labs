@@ -47,8 +47,9 @@ jwt_keys/
 *.db
 *.sqlite
 *.sqlite3
-data/
+/data/
 audit-exports/
+# (source-of-truth data fixtures live in backend/src/data and are tracked)
 
 # --- Logs ---
 *.log
