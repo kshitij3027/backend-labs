@@ -1,4 +1,4 @@
-# Compose stack for the RBAC Log Security Gateway. Backend on :8000, tester runs the pytest suite. Frontend service is added in C11a.
+# Compose stack for the RBAC Log Security Gateway. Backend on :8000, frontend on :3000, tester runs the pytest suite.
 
 services:
   backend:
@@ -23,6 +23,25 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    image: rbac-gateway-frontend:dev
+    container_name: rbac-gateway-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ > /dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
