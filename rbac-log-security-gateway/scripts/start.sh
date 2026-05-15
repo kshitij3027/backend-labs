@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Project root is the directory above scripts/
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
@@ -26,6 +25,7 @@ else
   echo "[start.sh] using existing .env"
 fi
 
-echo "[start.sh] building and starting backend"
-docker compose up -d --wait backend
-echo "[start.sh] backend ready on http://localhost:8000 (docs at /docs)"
+echo "[start.sh] building and starting backend + frontend"
+docker compose up -d --wait backend frontend
+echo "[start.sh] backend ready at http://localhost:8000  (docs at /docs)"
+echo "[start.sh] frontend ready at http://localhost:3000"

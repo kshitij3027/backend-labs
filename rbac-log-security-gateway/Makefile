@@ -1,4 +1,4 @@
-.PHONY: help build build-test up down logs test test-unit test-integration e2e ui-e2e clean
+.PHONY: help build build-test up down logs test test-unit test-integration e2e ui-e2e demo clean
 
 help:
 	@echo "Targets:"
@@ -10,8 +10,9 @@ help:
 	@echo "  test               - run full pytest suite in Docker (unit + integration)"
 	@echo "  test-unit          - run only unit tests"
 	@echo "  test-integration   - run only integration tests"
-	@echo "  e2e                - run end-to-end script (filled in C14)"
+	@echo "  e2e                - run end-to-end script (host)"
 	@echo "  ui-e2e             - reminder: Chrome MCP walkthrough is main-thread only"
+	@echo "  demo               - start the stack and print demo URLs"
 	@echo "  clean              - stop stack, remove volumes, prune images"
 
 build:
@@ -39,7 +40,11 @@ test-integration: build-test
 	docker compose run --rm tester pytest tests/integration -v
 
 e2e:
-	@echo "[TODO] scripts/e2e.sh (filled in C14)"
+	./scripts/e2e.sh
+
+demo:
+	./scripts/start.sh
+	@echo "Demo running. Visit http://localhost:3000 — login as alice/admin123 (or bob/dev123, carol/analyst123, dave/support123)."
 
 ui-e2e:
 	@echo "Run the Chrome MCP UI walkthrough from the main Claude thread (see plan.md Final Verification step 6)."
