@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.auth import router as auth_router
+from src.api.logs import router as logs_router
 from src.config import get_settings
 from src.middleware.audit import AuditMiddleware
 from src.shared import audit_service
@@ -65,6 +66,7 @@ def build_app() -> FastAPI:
     app.add_middleware(AuditMiddleware, audit_service=audit_service)
 
     app.include_router(auth_router)
+    app.include_router(logs_router)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:
