@@ -1,33 +1,53 @@
-import { useEffect, useState } from "react";
+import { AuthProvider } from "./contexts/AuthContext";
+import Login from "./pages/Login";
+import useAuth from "./hooks/useAuth";
 
-export default function App() {
-  const [healthy, setHealthy] = useState(null);
-  const [healthError, setHealthError] = useState(null);
+function LandingShell() {
+  const { user, loading, logout } = useAuth();
 
-  useEffect(() => {
-    // Backend exposes /health (not /api/health). Both nginx (prod) and vite (dev)
-    // proxy this path through to backend:8000, so it works in either environment.
-    fetch("/health")
-      .then((r) => (r.ok ? r.json() : Promise.reject(`status ${r.status}`)))
-      .then((data) => setHealthy(data.status === "ok"))
-      .catch((err) => setHealthError(String(err)));
-  }, []);
+  if (loading) {
+    return (
+      <main className="container">
+        <p>Loading…</p>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return <Login />;
+  }
 
   return (
     <main className="container">
-      <h1>RBAC Log Security Gateway</h1>
-      <p>JWT auth + role-based authorization + audit logging for log queries.</p>
+      <header className="row" data-testid="logged-in-header">
+        <h1>RBAC Log Security Gateway</h1>
+        <button onClick={logout} data-testid="logout-button">
+          Log out
+        </button>
+      </header>
       <section>
-        <h2>Backend health</h2>
-        {healthError && <p className="error">unreachable: {healthError}</p>}
-        {!healthError && healthy === null && <p>checking…</p>}
-        {healthy === true && <p className="ok">backend is healthy ✓</p>}
-        {healthy === false && <p className="error">backend reported a non-ok status</p>}
-      </section>
-      <section>
-        <h2>Scaffold note</h2>
-        <p>Login, dashboard, log search, and admin pages are wired up in subsequent commits.</p>
+        <h2>Welcome, {user.display_name || user.username}!</h2>
+        <p data-testid="logged-in-username">Signed in as <strong>{user.username}</strong></p>
+        <p>
+          Roles:{" "}
+          {user.roles.map((r) => (
+            <span key={r} className="role-chip" data-testid={`role-${r}`}>
+              {r}
+            </span>
+          ))}
+        </p>
+        <p className="note">
+          Protected dashboard + log search + admin pages land in subsequent commits.
+        </p>
       </section>
     </main>
+  );
+}
+
+export default function App() {
+  return (
+    <AuthProvider>
+      <LandingShell />
+    </AuthProvider>
   );
 }

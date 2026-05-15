@@ -36,3 +36,48 @@ input {
   border-radius: 4px;
   font: inherit;
 }
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 320px;
+}
+
+.login-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-weight: 500;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+}
+
+.role-chip {
+  display: inline-block;
+  margin-right: 0.5rem;
+  padding: 0.15rem 0.6rem;
+  background: #e0e7ff;
+  color: #1e3a8a;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.note {
+  color: #64748b;
+  font-style: italic;
+  font-size: 0.95rem;
+}
+
+code {
+  background: #f1f5f9;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  font-size: 0.9rem;
+}
