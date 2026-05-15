@@ -9,6 +9,7 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from src.api.admin import router as admin_router
 from src.api.auth import router as auth_router
 from src.api.logs import router as logs_router
 from src.config import get_settings
@@ -31,10 +32,52 @@ def _configure_logging(level: str) -> None:
     )
 
 
+def _seed_demo_audit() -> None:
+    """Pre-populate a few audit entries + one security event so the admin dashboard isn't empty on first load."""
+    from datetime import datetime, timezone, timedelta
+
+    from src.audit.models import AuditEntry, SecurityEvent
+    from src.shared import audit_service
+
+    now = datetime.now(timezone.utc)
+    seeds = [
+        AuditEntry(
+            timestamp=now - timedelta(minutes=10), user_id="seed", username="alice",
+            method="POST", path="/api/auth/login", status=200, duration_ms=12.3,
+            source_ip="10.0.0.4", user_agent="seed/1.0", decision="n/a",
+        ),
+        AuditEntry(
+            timestamp=now - timedelta(minutes=8), user_id="seed", username="bob",
+            method="GET", path="/api/logs/search", status=200, duration_ms=4.1,
+            source_ip="10.0.0.5", user_agent="seed/1.0", decision="allow",
+            rule="logs:read:application.*", reason="allow match",
+        ),
+        AuditEntry(
+            timestamp=now - timedelta(minutes=5), user_id="seed", username="bob",
+            method="GET", path="/api/logs/search", status=403, duration_ms=2.4,
+            source_ip="10.0.0.5", user_agent="seed/1.0", decision="deny",
+            rule="!logs:read:business.*", reason="explicit deny",
+        ),
+    ]
+    for entry in seeds:
+        audit_service.append(entry)
+
+    audit_service.append_security_event(SecurityEvent(
+        timestamp=now - timedelta(minutes=3),
+        event_type="auth_failure",
+        username=None,
+        path="/api/auth/login",
+        status=401,
+        source_ip="10.0.0.99",
+        reason="bad password",
+    ))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     _configure_logging(settings.app_log_level)
+    _seed_demo_audit()
     log = structlog.get_logger("rbac-gateway")
     log.info("startup", host=settings.app_host, port=settings.app_port)
     yield
@@ -67,6 +110,7 @@ def build_app() -> FastAPI:
 
     app.include_router(auth_router)
     app.include_router(logs_router)
+    app.include_router(admin_router)
 
     @app.get("/health", tags=["meta"])
     async def health() -> dict[str, str]:
