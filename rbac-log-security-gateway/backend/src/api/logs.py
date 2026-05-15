@@ -80,3 +80,62 @@ async def search_logs(
         masked=False,
         rbac_rule=decision.rule,
     )
+
+
+@router.get("/export", response_model=LogSearchResponse)
+async def export_logs(
+    request: Request,
+    user: CurrentUser,
+    rbac: Annotated[RBACEngine, Depends(get_rbac)],
+    resource: str = Query(..., description="Resource leaf, e.g. application.auth"),
+    limit: int = Query(500, ge=1, le=5000),
+) -> LogSearchResponse:
+    """Export records for a resource. RBAC-gated on `logs:export:<resource>`. Same tag semantics as /search."""
+    if resource not in KNOWN_RESOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"unknown resource {resource!r}; known: {sorted(KNOWN_RESOURCES)}",
+        )
+
+    requested = f"logs:export:{resource}"
+    decision = rbac.check(user, requested)
+    request.state.decision = decision  # picked up by AuditMiddleware
+
+    if not decision.allow:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "forbidden",
+                "rule": decision.rule,
+                "reason": decision.reason,
+            },
+        )
+
+    records = search(resource, limit=limit)
+
+    if "aggregated_only" in decision.tags:
+        return LogSearchResponse(
+            resource=resource,
+            count=len(records),
+            aggregated=aggregate(records),
+            masked=False,
+            rbac_rule=decision.rule,
+        )
+
+    if "mask_pii" in decision.tags:
+        records = [mask_pii(r) for r in records]
+        return LogSearchResponse(
+            resource=resource,
+            count=len(records),
+            records=[_to_out(r) for r in records],
+            masked=True,
+            rbac_rule=decision.rule,
+        )
+
+    return LogSearchResponse(
+        resource=resource,
+        count=len(records),
+        records=[_to_out(r) for r in records],
+        masked=False,
+        rbac_rule=decision.rule,
+    )
