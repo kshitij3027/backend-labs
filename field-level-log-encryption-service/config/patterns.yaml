@@ -1,0 +1,55 @@
+# Regex patterns used by `src/detection/patterns.py` to scan field VALUES for
+# sensitive content. Each entry compiles once at PatternMatcher construction.
+#
+# Schema (per entry):
+#   name             : human-readable id (used in `Detection.reason` as "regex:<name>")
+#   field_type       : canonical PII type (email, phone, ssn, credit_card, jwt, ipv4, ipv6)
+#   regex            : Python `re` pattern, compiled at startup
+#   confidence_base  : float in [0, 1]; the score assigned on a raw regex hit
+#   requires_luhn    : (optional, default false) — if true, the matched digits must
+#                      pass the Luhn checksum to keep the score; otherwise the
+#                      detection is dropped.
+- name: email
+  field_type: email
+  regex: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+  confidence_base: 0.90
+
+- name: us_ssn
+  field_type: ssn
+  # Negative lookaheads reject reserved area numbers (000, 666, 9xx),
+  # group "00", and serial "0000" per the SSA structure.
+  regex: '\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b'
+  confidence_base: 0.95
+
+- name: us_phone
+  field_type: phone
+  regex: '\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b'
+  confidence_base: 0.80
+
+- name: credit_card
+  field_type: credit_card
+  # Coarse digit-run match (13-19 digits with optional spaces/dashes).
+  # Confidence stays low until Luhn confirms; on success the matcher
+  # promotes the score to 0.95.
+  regex: '\b(?:\d[ -]*?){13,19}\b'
+  confidence_base: 0.50
+  requires_luhn: true
+
+- name: jwt
+  field_type: jwt
+  # Three b64url segments separated by dots, header+payload must start with `eyJ`
+  # (b64 of `{"`) — drastically reduces false positives.
+  regex: '\beyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b'
+  confidence_base: 0.95
+
+- name: ipv4
+  field_type: ipv4
+  regex: '\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b'
+  confidence_base: 0.80
+
+- name: ipv6
+  field_type: ipv6
+  # Permissive group-match — actual validity is confirmed by the matcher
+  # via `ipaddress.ip_address()` (see `patterns.py`).
+  regex: '\b(?:[0-9A-Fa-f]{1,4}:){2,7}[0-9A-Fa-f]{1,4}\b'
+  confidence_base: 0.70

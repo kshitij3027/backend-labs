@@ -1,0 +1,62 @@
+# Substrings of field NAMES that flag a value as sensitive regardless of the
+# value's content (case-insensitive). The `FieldNameMatcher` in
+# `src/detection/field_names.py` runs a substring containment check —
+# e.g. "email" matches both `email` and `customer_email`.
+#
+# A field-name hit OUTRANKS any value-regex hit (confidence 0.95) — this is
+# intentional: if the schema author labelled a field `password`, the value is
+# sensitive even when it happens to look innocuous (e.g. "hunter2").
+sensitive_names:
+  # --- Auth / credentials ---
+  - password
+  - passwd
+  - pwd
+  - secret
+  - token
+  - api_key
+  - apikey
+  - access_key
+  - auth
+  - authorization
+  - credential
+
+  # --- Identity / contact ---
+  - email
+  - e_mail
+  - mail
+  - phone
+  - mobile
+
+  # --- Government / national IDs ---
+  - ssn
+  - social_security
+  - national_id
+  - tax_id
+
+  # --- Payment ---
+  - credit_card
+  - card_number
+  - card_no
+  - cvv
+  - cvc
+  - pan
+  - iban
+  - account_number
+  - routing_number
+
+  # --- Personal / demographic ---
+  - dob
+  - date_of_birth
+  - birthday
+  - address
+  - street
+  - postal
+  - zip
+
+  # --- Network / session ---
+  - ip
+  - ip_address
+  - session_id
+  - cookie
+  - jwt
+  - bearer

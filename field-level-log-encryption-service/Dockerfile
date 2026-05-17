@@ -45,11 +45,9 @@ WORKDIR /app
 # Bring the prebuilt venv across.
 COPY --from=builder /opt/venv /opt/venv
 
-# Source tree. `config/` is added in C2 — copy with --chown when it exists.
+# Source tree + YAML config (detection patterns + sensitive field names).
 COPY --chown=app:app src/ /app/src/
-
-# Placeholder for config files mounted/copied in later commits.
-RUN mkdir -p /app/config && chown -R app:app /app/config
+COPY --chown=app:app config/ /app/config/
 
 EXPOSE 8000
 
