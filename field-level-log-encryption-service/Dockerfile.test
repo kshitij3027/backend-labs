@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.6
+
+# Single-stage tester image. Installs the full runtime deps plus pytest-cov
+# so the same code that ships in the runtime image can be exercised under test.
+# Source and tests are bind-mounted at runtime by docker-compose so iteration
+# does not require a rebuild.
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip==24.3.1
+
+WORKDIR /app
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-cache-dir pytest-cov==5.0.0
+
+# src/ and tests/ are bind-mounted by the `tester` compose service.
+# No USER directive — the tester container is ephemeral.
+CMD ["pytest", "-v", "--tb=short", "--cov=src", "--cov-report=term-missing"]
