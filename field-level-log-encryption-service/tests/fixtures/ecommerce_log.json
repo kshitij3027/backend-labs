@@ -1,0 +1,12 @@
+{
+  "customer_email": "alice@example.com",
+  "phone": "555-867-5309",
+  "order_id": "ORD-2026-05-16-001",
+  "amount": 129.99,
+  "currency": "USD",
+  "timestamp": "2026-05-16T10:30:00Z",
+  "shipping": {
+    "city": "Seattle",
+    "postal_code": "98101"
+  }
+}

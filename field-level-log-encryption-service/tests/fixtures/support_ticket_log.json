@@ -1,0 +1,8 @@
+{
+  "user_email": "bob@example.com",
+  "customer_ssn": "123-45-6789",
+  "ticket_id": "TKT-9001",
+  "priority": "P2",
+  "created_at": "2026-05-16T12:00:00Z",
+  "agent": "alice@example.com"
+}

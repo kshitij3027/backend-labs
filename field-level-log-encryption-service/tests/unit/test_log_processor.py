@@ -1,0 +1,562 @@
+"""Unit tests for the C5 log processor pipeline.
+
+Coverage targets:
+
+* :class:`TestEncryptDecryptRoundTrip` — golden e-commerce + support-ticket
+  fixtures exercise the happy path: detection picks the right leaves, the
+  active key is stamped, and a decrypt re-produces the original values
+  (modulo string-coercion of non-string types).
+* :class:`TestParallelEncryptor` — the threshold gate: serial vs
+  parallel branches fire predictably, and order is preserved across
+  both paths.
+* :class:`TestLogProcessor` — edge cases: empty log, deeply-nested PII,
+  record_id precedence, missing-envelope errors.
+
+All tests use the zero-byte test KEK injected by :mod:`tests.conftest`.
+"""
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path
+
+import pytest
+
+from src.crypto import AESGCMEncryptor, EncryptedField, EnvKeyProvider
+from src.detection import Detector
+from src.keystore import KeyNotFoundError, KeyStore
+from src.processor import LogProcessor, ParallelEncryptor, ProcessorError
+from src.processor.parallel import _EncItem
+
+
+# ---------------------------------------------------------------------------
+# Shared fixtures
+# ---------------------------------------------------------------------------
+
+
+_FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures"
+
+
+@pytest.fixture
+def ecommerce_log() -> dict:
+    """Fresh deep copy of the e-commerce fixture per-test.
+
+    We re-read from disk (rather than caching at module scope) so that
+    a test which mutates the dict can't poison the next test.
+    """
+    return json.loads((_FIXTURE_DIR / "ecommerce_log.json").read_text())
+
+
+@pytest.fixture
+def support_ticket_log() -> dict:
+    """Fresh deep copy of the support-ticket fixture per-test."""
+    return json.loads((_FIXTURE_DIR / "support_ticket_log.json").read_text())
+
+
+@pytest.fixture
+def keystore() -> KeyStore:
+    """Bootstrapped keystore with one active DEK.
+
+    Constructed per-test so encrypt-time `key_id` is deterministic
+    within the test but does not leak across tests.
+    """
+    store = KeyStore(EnvKeyProvider())
+    store.create_initial_active()
+    return store
+
+
+@pytest.fixture
+def parallel() -> ParallelEncryptor:
+    """Default-size parallel encryptor matching the production settings.
+
+    Counters reset to zero per test (fresh instance). We close the
+    pool at teardown via finalizer so the thread pool doesn't leak
+    across the test session.
+    """
+    enc = ParallelEncryptor(
+        thread_pool_size=4,
+        threshold_fields=4,
+        threshold_bytes=4096,
+    )
+    yield enc
+    enc.close()
+
+
+@pytest.fixture
+def processor(keystore: KeyStore, parallel: ParallelEncryptor) -> LogProcessor:
+    """Wire the detector + keystore + parallel encryptor into a LogProcessor."""
+    return LogProcessor(
+        detector=Detector(),
+        keystore=keystore,
+        parallel=parallel,
+    )
+
+
+# ---------------------------------------------------------------------------
+# TestEncryptDecryptRoundTrip — golden fixtures
+# ---------------------------------------------------------------------------
+
+
+class TestEncryptDecryptRoundTrip:
+    """Verify the encrypt/decrypt pair against realistic log fixtures."""
+
+    # ---- e-commerce ----------------------------------------------------
+
+    def test_ecommerce_sensitive_fields_are_encrypted(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # The three detected leaves must become EncryptedField dicts
+        # (algorithm/encrypted_value/key_id all present).
+        out = processor.encrypt(ecommerce_log)
+        for path in ("customer_email", "phone"):
+            assert isinstance(out[path], dict), path
+            assert out[path]["algorithm"] == "AES-256-GCM"
+            assert out[path]["encrypted_value"]
+            assert out[path]["key_id"]
+
+        # postal_code is nested under shipping/.
+        assert out["shipping"]["postal_code"]["algorithm"] == "AES-256-GCM"
+
+    def test_ecommerce_operational_fields_unchanged(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Operational fields must pass through untouched — this is the
+        # whole reason we do FIELD-level rather than message-level
+        # encryption.
+        out = processor.encrypt(ecommerce_log)
+        assert out["order_id"] == "ORD-2026-05-16-001"
+        assert out["amount"] == 129.99  # NUMBER, not encrypted
+        assert isinstance(out["amount"], float)
+        assert out["timestamp"] == "2026-05-16T10:30:00Z"
+        assert out["currency"] == "USD"
+        assert out["shipping"]["city"] == "Seattle"
+
+    def test_ecommerce_processing_envelope_lists_encrypted_paths(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # `_processing.encrypted_fields` is the authoritative manifest of
+        # which paths were transformed. Compare as a set so any
+        # incidental re-ordering doesn't break the assertion.
+        out = processor.encrypt(ecommerce_log)
+        assert set(out["_processing"]["encrypted_fields"]) == {
+            "customer_email",
+            "phone",
+            "shipping.postal_code",
+        }
+
+    def test_ecommerce_processing_envelope_carries_active_key_id(
+        self,
+        processor: LogProcessor,
+        keystore: KeyStore,
+        ecommerce_log: dict,
+    ) -> None:
+        # The stamped `key_id` must equal the keystore's CURRENT active
+        # key (proves we resolved active inside encrypt() and didn't
+        # pick up some stale reference).
+        out = processor.encrypt(ecommerce_log)
+        assert out["_processing"]["key_id"] == keystore.get_active().key_id
+
+    def test_ecommerce_decrypt_round_trip(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Encrypt → decrypt → strip _processing. The decrypted dict
+        # must equal the original on every plaintext field; numeric
+        # fields come back as strings (documented behaviour).
+        encrypted = processor.encrypt(ecommerce_log)
+        decrypted = processor.decrypt(encrypted)
+
+        assert decrypted["customer_email"] == "alice@example.com"
+        assert decrypted["phone"] == "555-867-5309"
+        assert decrypted["shipping"]["postal_code"] == "98101"
+        # _processing must be stripped from the decrypted output.
+        assert "_processing" not in decrypted
+        # Operational fields preserved exactly (same types as input).
+        assert decrypted["order_id"] == "ORD-2026-05-16-001"
+        assert decrypted["amount"] == 129.99
+        assert decrypted["shipping"]["city"] == "Seattle"
+
+    def test_ecommerce_input_dict_not_mutated(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Defensive copy: the caller's dict must remain pristine even
+        # after a successful encrypt. Snapshot before, compare after.
+        before = json.dumps(ecommerce_log, sort_keys=True)
+        _ = processor.encrypt(ecommerce_log)
+        after = json.dumps(ecommerce_log, sort_keys=True)
+        assert before == after
+
+    # ---- support ticket -----------------------------------------------
+
+    def test_support_ticket_sensitive_fields_encrypted(
+        self, processor: LogProcessor, support_ticket_log: dict
+    ) -> None:
+        # `user_email` and `customer_ssn` hit field-name; `agent` hits
+        # via value regex (the email pattern). All three must end up
+        # as EncryptedField dicts.
+        out = processor.encrypt(support_ticket_log)
+        for path in ("user_email", "customer_ssn", "agent"):
+            assert isinstance(out[path], dict), path
+            assert out[path]["algorithm"] == "AES-256-GCM"
+
+    def test_support_ticket_operational_fields_unchanged(
+        self, processor: LogProcessor, support_ticket_log: dict
+    ) -> None:
+        # ticket_id, priority, and created_at must remain plaintext —
+        # those drive triage and routing.
+        out = processor.encrypt(support_ticket_log)
+        assert out["ticket_id"] == "TKT-9001"
+        assert out["priority"] == "P2"
+        assert out["created_at"] == "2026-05-16T12:00:00Z"
+
+    def test_support_ticket_decrypt_round_trip(
+        self, processor: LogProcessor, support_ticket_log: dict
+    ) -> None:
+        # Full encrypt → decrypt → verify all values, including the
+        # regex-detected `agent` field.
+        encrypted = processor.encrypt(support_ticket_log)
+        decrypted = processor.decrypt(encrypted)
+
+        assert decrypted["user_email"] == "bob@example.com"
+        assert decrypted["customer_ssn"] == "123-45-6789"
+        assert decrypted["agent"] == "alice@example.com"
+        assert decrypted["ticket_id"] == "TKT-9001"
+        assert decrypted["priority"] == "P2"
+        assert decrypted["created_at"] == "2026-05-16T12:00:00Z"
+        assert "_processing" not in decrypted
+
+    # ---- crypto-level invariants --------------------------------------
+
+    def test_two_encrypts_produce_different_ciphertexts(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Random 12-byte nonce per encrypt means same plaintext +
+        # same key → DIFFERENT ciphertext. This protects against
+        # equality-leak attacks where an observer sees that two
+        # records had the same email.
+        out_a = processor.encrypt(ecommerce_log)
+        out_b = processor.encrypt(ecommerce_log)
+        assert (
+            out_a["customer_email"]["encrypted_value"]
+            != out_b["customer_email"]["encrypted_value"]
+        )
+        assert out_a["customer_email"]["iv"] != out_b["customer_email"]["iv"]
+
+    def test_decrypt_with_unknown_key_raises_keynotfound(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # Encrypt with one keystore, then attempt to decrypt with a
+        # FRESH keystore that has never seen that key_id. The lookup
+        # must surface `KeyNotFoundError` so callers can return 404
+        # (rather than an opaque crypto failure).
+        proc_a = LogProcessor(
+            detector=Detector(), keystore=keystore, parallel=parallel
+        )
+        encrypted = proc_a.encrypt(ecommerce_log)
+
+        # New, empty keystore — bootstraps a totally unrelated active key.
+        other_store = KeyStore(EnvKeyProvider())
+        other_store.create_initial_active()
+        proc_b = LogProcessor(
+            detector=Detector(), keystore=other_store, parallel=parallel
+        )
+        with pytest.raises(KeyNotFoundError):
+            proc_b.decrypt(encrypted)
+
+
+# ---------------------------------------------------------------------------
+# TestParallelEncryptor — branch selection + ordering
+# ---------------------------------------------------------------------------
+
+
+def _fake_encryptor(key_id: str = "test-key") -> AESGCMEncryptor:
+    """Build a deterministic encryptor so tests can decode ciphertext back."""
+    return AESGCMEncryptor(dek=b"\x33" * 32, key_id=key_id)
+
+
+def _make_items(n: int, *, payload_size: int = 10) -> list[_EncItem]:
+    """Build ``n`` items whose plaintexts are predictable + ordered.
+
+    We use the index as a left-zero-padded prefix so each plaintext is
+    unique AND we can recover the original ordering from a decrypted
+    output — that's how `test_parallel_preserves_input_order` confirms
+    `pool.map` didn't rearrange the batch.
+    """
+    items: list[_EncItem] = []
+    for i in range(n):
+        prefix = f"item-{i:04d}-"
+        # Pad with 'x' to reach the desired payload size.
+        payload = (prefix + "x" * max(0, payload_size - len(prefix))).encode("utf-8")
+        items.append(
+            _EncItem(field_path=f"path.{i}", plaintext=payload, field_type="test")
+        )
+    return items
+
+
+class TestParallelEncryptor:
+    """Threshold-gated dispatcher selects the right branch."""
+
+    def test_serial_branch_for_below_field_threshold(self) -> None:
+        # 1 item, fields_threshold=2 → serial regardless of bytes.
+        # Counters: 1 serial, 0 parallel.
+        enc = ParallelEncryptor(
+            thread_pool_size=4, threshold_fields=2, threshold_bytes=1
+        )
+        try:
+            aes = _fake_encryptor()
+            items = _make_items(1)
+            results = enc.encrypt_many(
+                items,
+                lambda it: aes.encrypt(
+                    it.plaintext,
+                    record_id="r",
+                    field_path=it.field_path,
+                    field_type=it.field_type,
+                ),
+            )
+            assert len(results) == 1
+            assert enc.serial_calls == 1
+            assert enc.parallel_calls == 0
+            assert enc.is_parallel_pool_active is False
+        finally:
+            enc.close()
+
+    def test_parallel_branch_for_above_thresholds(self) -> None:
+        # 3 items × 10B = 30B with thresholds 2 / 1 → both exceeded →
+        # parallel branch fires.
+        enc = ParallelEncryptor(
+            thread_pool_size=4, threshold_fields=2, threshold_bytes=1
+        )
+        try:
+            aes = _fake_encryptor()
+            items = _make_items(3, payload_size=10)
+            _ = enc.encrypt_many(
+                items,
+                lambda it: aes.encrypt(
+                    it.plaintext,
+                    record_id="r",
+                    field_path=it.field_path,
+                    field_type=it.field_type,
+                ),
+            )
+            assert enc.serial_calls == 0
+            assert enc.parallel_calls == 1
+            assert enc.is_parallel_pool_active is True
+        finally:
+            enc.close()
+
+    def test_serial_branch_when_only_bytes_threshold_unmet(self) -> None:
+        # 3 items of 10B each = 30B; bytes_threshold=1024 → bytes
+        # condition fails → serial path (even though field count is
+        # over the field threshold).
+        enc = ParallelEncryptor(
+            thread_pool_size=4, threshold_fields=2, threshold_bytes=1024
+        )
+        try:
+            aes = _fake_encryptor()
+            items = _make_items(3, payload_size=10)
+            _ = enc.encrypt_many(
+                items,
+                lambda it: aes.encrypt(
+                    it.plaintext,
+                    record_id="r",
+                    field_path=it.field_path,
+                    field_type=it.field_type,
+                ),
+            )
+            assert enc.serial_calls == 1
+            assert enc.parallel_calls == 0
+        finally:
+            enc.close()
+
+    def test_parallel_preserves_input_order(self) -> None:
+        # 5 items with predictable plaintexts; decrypt the results in
+        # order to confirm pool.map matched output[i] ↔ items[i].
+        enc = ParallelEncryptor(
+            thread_pool_size=4, threshold_fields=2, threshold_bytes=1
+        )
+        try:
+            aes = _fake_encryptor("ord-key")
+            items = _make_items(5, payload_size=30)
+            results = enc.encrypt_many(
+                items,
+                lambda it: aes.encrypt(
+                    it.plaintext,
+                    record_id="ord-rec",
+                    field_path=it.field_path,
+                    field_type=it.field_type,
+                ),
+            )
+            assert enc.parallel_calls == 1
+            assert len(results) == 5
+            # Decrypt each result with the AAD of the matching input
+            # index. A mis-ordered batch would fail the AAD check
+            # (InvalidTag), so this is a strong order-preservation
+            # assertion, not just a "string-equal" one.
+            for original, ef in zip(items, results):
+                plaintext = aes.decrypt(
+                    ef,
+                    record_id="ord-rec",
+                    field_path=original.field_path,
+                )
+                assert plaintext == original.plaintext
+        finally:
+            enc.close()
+
+    def test_empty_batch_returns_empty_list(self) -> None:
+        # Zero items is a valid input — should run the serial branch
+        # (cheaper than dispatch) and return an empty list.
+        enc = ParallelEncryptor(
+            thread_pool_size=4, threshold_fields=2, threshold_bytes=1
+        )
+        try:
+            results = enc.encrypt_many([], lambda it: None)  # type: ignore[arg-type]
+            assert results == []
+            assert enc.serial_calls == 1
+        finally:
+            enc.close()
+
+
+# ---------------------------------------------------------------------------
+# TestLogProcessor — edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestLogProcessor:
+    """Non-fixture edge cases that the round-trip class doesn't cover."""
+
+    def test_log_with_no_sensitive_fields(
+        self, processor: LogProcessor
+    ) -> None:
+        # All-operational log: encrypted_fields must be empty and the
+        # rest of the dict must pass through verbatim. _processing is
+        # still attached so consumers know the log was processed.
+        log = {
+            "order_id": "X1",
+            "status": "shipped",
+            "count": 7,
+            "currency": "USD",
+        }
+        out = processor.encrypt(log)
+        assert out["_processing"]["encrypted_fields"] == []
+        assert out["order_id"] == "X1"
+        assert out["status"] == "shipped"
+        assert out["count"] == 7
+        assert out["currency"] == "USD"
+
+    def test_deeply_nested_pii_is_detected(
+        self, processor: LogProcessor
+    ) -> None:
+        # Three-level nesting: the detector must walk all the way down.
+        # We also confirm the encrypted leaf appears at the right
+        # deep path (not flattened to a top-level key).
+        log = {
+            "request": {
+                "user": {
+                    "profile": {
+                        "email": "deep@example.com",
+                        "country": "US",
+                    }
+                }
+            }
+        }
+        out = processor.encrypt(log)
+        assert (
+            out["request"]["user"]["profile"]["email"]["algorithm"]
+            == "AES-256-GCM"
+        )
+        # Sibling at the same depth stays plaintext.
+        assert out["request"]["user"]["profile"]["country"] == "US"
+        # Manifest carries the full dotted path.
+        assert "request.user.profile.email" in out["_processing"]["encrypted_fields"]
+
+    def test_explicit_record_id_is_honored_on_encrypt(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Passing record_id explicitly must override auto-generation
+        # and appear verbatim in the _processing envelope. (Decrypt
+        # uses it to reconstruct the AAD; mismatching it would
+        # InvalidTag.)
+        out = processor.encrypt(ecommerce_log, record_id="custom-record-42")
+        assert out["_processing"]["record_id"] == "custom-record-42"
+
+    def test_auto_generated_record_id_is_hex_uuid(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # No explicit id → uuid4().hex (32 lowercase hex chars).
+        out = processor.encrypt(ecommerce_log)
+        rec_id = out["_processing"]["record_id"]
+        assert isinstance(rec_id, str)
+        assert len(rec_id) == 32
+        # All chars are hex.
+        int(rec_id, 16)
+
+    def test_decrypt_explicit_record_id_overrides_envelope(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Encrypt under id "X"; modify the envelope to claim "Y" but
+        # pass the correct "X" explicitly — explicit must win and the
+        # decrypt must succeed (AAD matches).
+        out = processor.encrypt(ecommerce_log, record_id="correct-id")
+        out["_processing"]["record_id"] = "wrong-id-in-envelope"
+        decrypted = processor.decrypt(out, record_id="correct-id")
+        assert decrypted["customer_email"] == "alice@example.com"
+
+    def test_decrypt_uses_envelope_record_id_when_arg_missing(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # No explicit id on decrypt → fall back to envelope. The
+        # round-trip must succeed because the envelope id is what
+        # was used at encrypt time.
+        out = processor.encrypt(ecommerce_log)
+        decrypted = processor.decrypt(out)
+        assert decrypted["customer_email"] == "alice@example.com"
+
+    def test_decrypt_without_envelope_and_no_arg_raises(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Drop the _processing envelope; with no explicit record_id
+        # there's no way to reconstruct AAD → ProcessorError.
+        out = processor.encrypt(ecommerce_log)
+        del out["_processing"]
+        with pytest.raises(ProcessorError):
+            processor.decrypt(out)
+
+    def test_decrypt_with_explicit_record_id_no_envelope_succeeds(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # Envelope-stripped log + explicit id MUST still decrypt —
+        # this is the path callers will use when they carry the
+        # record id out-of-band (e.g. HTTP request id).
+        out = processor.encrypt(ecommerce_log, record_id="oob-id")
+        del out["_processing"]
+        decrypted = processor.decrypt(out, record_id="oob-id")
+        assert decrypted["customer_email"] == "alice@example.com"
+
+    def test_log_processor_does_not_touch_lists(
+        self, processor: LogProcessor
+    ) -> None:
+        # Detector v1 treats lists as opaque scalars; the processor
+        # inherits that behaviour. A list of strings that LOOK like
+        # emails must survive encrypt unchanged.
+        log = {
+            "tags": ["customer@example.com", "vip"],
+            "order_id": "X1",
+        }
+        out = processor.encrypt(log)
+        assert out["tags"] == ["customer@example.com", "vip"]
+        assert out["_processing"]["encrypted_fields"] == []
+
+    def test_encrypted_field_dict_is_pydantic_parseable(
+        self, processor: LogProcessor, ecommerce_log: dict
+    ) -> None:
+        # The dict written into the log must be `EncryptedField`-shaped
+        # — i.e. EncryptedField.model_validate must accept it without
+        # raising. This guards against schema drift.
+        out = processor.encrypt(ecommerce_log)
+        ef = EncryptedField.model_validate(out["customer_email"])
+        # base64 round-trips on both binary fields.
+        assert base64.b64decode(ef.encrypted_value)
+        assert len(base64.b64decode(ef.iv)) == 12  # 96-bit nonce
