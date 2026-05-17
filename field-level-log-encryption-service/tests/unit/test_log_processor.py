@@ -560,3 +560,211 @@ class TestLogProcessor:
         # base64 round-trips on both binary fields.
         assert base64.b64decode(ef.encrypted_value)
         assert len(base64.b64decode(ef.iv)) == 12  # 96-bit nonce
+
+
+# ---------------------------------------------------------------------------
+# TestLogProcessorWithAuditAndStats — C6 wiring
+# ---------------------------------------------------------------------------
+
+
+class TestLogProcessorWithAuditAndStats:
+    """C6: when an :class:`AuditLogger` and :class:`StatsCounters` are
+    supplied, the processor emits per-field audit events and bumps the
+    standard counters. With both defaulted to ``None`` (the C5 contract,
+    tested above) the processor behaves identically to C5 — those tests
+    still pass unmodified."""
+
+    def _build_processor(
+        self, keystore: KeyStore, parallel: ParallelEncryptor
+    ) -> tuple[LogProcessor, StatsCounters, AuditLogger, RingBuffer]:
+        """Build a processor wired with fresh audit + stats.
+
+        Returns the live audit logger and ring buffer so individual
+        tests can introspect what the processor recorded. The buffer
+        is kept small (size 100) to keep snapshots bounded under any
+        future test that runs many encrypts.
+        """
+        from src.audit import AuditEvent, AuditLogger, RingBuffer
+        from src.stats import StatsCounters
+
+        stats = StatsCounters()
+        buf: RingBuffer[AuditEvent] = RingBuffer(maxlen=100)
+        audit = AuditLogger(buf)
+        proc = LogProcessor(
+            detector=Detector(),
+            keystore=keystore,
+            parallel=parallel,
+            audit_logger=audit,
+            stats=stats,
+        )
+        return proc, stats, audit, buf
+
+    def test_encrypt_updates_stats_counters(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # e-commerce fixture has 3 sensitive leaves:
+        # customer_email, phone, shipping.postal_code. After one
+        # successful encrypt: fields_detected == fields_encrypted == 3
+        # and logs_processed == 1.
+        proc, stats, _, _ = self._build_processor(keystore, parallel)
+        _ = proc.encrypt(ecommerce_log)
+
+        snap = stats.snapshot()
+        assert snap["logs_processed"] == 1
+        assert snap["fields_detected"] == 3
+        assert snap["fields_encrypted"] == 3
+        # No errors on the happy path.
+        assert snap["errors"] == 0
+
+    def test_encrypt_emits_one_audit_event_per_field(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # One success "encrypt" audit event per detected field. Each
+        # carries the active key_id and the same record_id (so a future
+        # decrypt-trail join works).
+        proc, _, audit, _ = self._build_processor(keystore, parallel)
+        out = proc.encrypt(ecommerce_log)
+        record_id = out["_processing"]["record_id"]
+        active_key_id = keystore.get_active().key_id
+
+        events = audit.recent()
+        # Filter to encrypt success events; should be exactly the 3
+        # detected fields.
+        enc_events = [
+            e
+            for e in events
+            if e.event_type == "encrypt" and e.outcome == "success"
+        ]
+        assert len(enc_events) == 3
+
+        observed_paths = sorted(e.field_path for e in enc_events)
+        assert observed_paths == [
+            "customer_email",
+            "phone",
+            "shipping.postal_code",
+        ]
+        # All events share the same record_id and key_id.
+        for e in enc_events:
+            assert e.record_id == record_id
+            assert e.key_id == active_key_id
+            # byte_count must be populated (str-coerced plaintext length).
+            assert e.byte_count is not None and e.byte_count > 0
+
+    def test_decrypt_updates_stats_and_audit(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # Round trip: after encrypt + decrypt, fields_decrypted ==
+        # fields_encrypted, and the audit log contains matching
+        # decrypt events alongside the encrypt events.
+        proc, stats, audit, _ = self._build_processor(keystore, parallel)
+        encrypted = proc.encrypt(ecommerce_log)
+        _ = proc.decrypt(encrypted)
+
+        snap = stats.snapshot()
+        assert snap["fields_encrypted"] == 3
+        assert snap["fields_decrypted"] == 3
+        assert snap["errors"] == 0
+
+        events = audit.recent()
+        dec_events = [
+            e
+            for e in events
+            if e.event_type == "decrypt" and e.outcome == "success"
+        ]
+        assert len(dec_events) == 3
+        observed_paths = sorted(e.field_path for e in dec_events)
+        assert observed_paths == [
+            "customer_email",
+            "phone",
+            "shipping.postal_code",
+        ]
+
+    def test_decrypt_against_destroyed_key_records_failure(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # Crypto-shred path: encrypt → rotate (so the encrypting key is
+        # now retired) → destroy_key on the retired key → decrypt the
+        # original ciphertext. Expected:
+        #   1. errors counter >= 1
+        #   2. audit has a failure event with failure_reason set
+        #   3. the exception propagates to the caller
+        from src.keystore.store import KeyDestroyedError
+
+        proc, stats, audit, _ = self._build_processor(keystore, parallel)
+        encrypted = proc.encrypt(ecommerce_log)
+        original_key_id = encrypted["_processing"]["key_id"]
+
+        # Rotate to put the original key into "retired", then destroy it.
+        # destroy_key refuses to act on an active key, hence the
+        # rotation step.
+        keystore.rotate()
+        keystore.destroy_key(original_key_id)
+
+        # Decrypt should now blow up — the key is shredded.
+        with pytest.raises(KeyDestroyedError):
+            proc.decrypt(encrypted)
+
+        # Errors counter incremented.
+        assert stats.snapshot()["errors"] >= 1
+
+        # Audit log carries a single failure event with the reason set.
+        events = audit.recent()
+        failures = [
+            e
+            for e in events
+            if e.event_type == "decrypt" and e.outcome == "failure"
+        ]
+        assert len(failures) == 1
+        assert failures[0].failure_reason is not None
+        assert failures[0].failure_reason != ""
+        # The record_id propagates from the input log so operators can
+        # join the failure event back to the source.
+        assert failures[0].record_id == encrypted["_processing"]["record_id"]
+
+    def test_encrypt_failure_records_audit_event_and_propagates(
+        self,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # Force encrypt failure by giving the processor a keystore that
+        # has no active key — get_active() raises KeyNotFoundError
+        # under the hood. Expected:
+        #   - exception propagates
+        #   - errors counter incremented
+        #   - a single failure audit event with failure_reason set
+        from src.crypto import EnvKeyProvider
+        from src.keystore import KeyNotFoundError, KeyStore
+
+        empty_store = KeyStore(EnvKeyProvider())  # never bootstrapped
+        proc, stats, audit, _ = self._build_processor(empty_store, parallel)
+
+        with pytest.raises(KeyNotFoundError):
+            proc.encrypt(ecommerce_log)
+
+        assert stats.snapshot()["errors"] >= 1
+        events = audit.recent()
+        failures = [
+            e
+            for e in events
+            if e.event_type == "encrypt" and e.outcome == "failure"
+        ]
+        assert len(failures) == 1
+        assert failures[0].failure_reason is not None
+        # No successful encrypt was completed → fields_encrypted stays at 0.
+        assert stats.snapshot()["fields_encrypted"] == 0
+        # fields_detected was incremented (detection ran before the
+        # keystore lookup failed) — confirms the partial-progress
+        # counter contract.
+        assert stats.snapshot()["fields_detected"] == 3
