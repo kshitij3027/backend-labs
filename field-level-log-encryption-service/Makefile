@@ -26,7 +26,7 @@ help:
 	@echo "  clean       - down + remove locally-built images"
 
 build:
-	docker compose build
+	docker compose --profile test build
 
 up:
 	docker compose up -d app
@@ -38,7 +38,7 @@ logs:
 	docker compose logs -f app
 
 test:
-	docker compose --profile test run --rm tester
+	docker compose --profile test run --build --rm tester
 
 test-unit:
 	docker compose --profile test run --rm tester pytest -v -k "not integration"
