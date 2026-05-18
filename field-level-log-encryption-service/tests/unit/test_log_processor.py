@@ -768,3 +768,107 @@ class TestLogProcessorWithAuditAndStats:
         # keystore lookup failed) — confirms the partial-progress
         # counter contract.
         assert stats.snapshot()["fields_detected"] == 3
+
+
+# ---------------------------------------------------------------------------
+# TestLogProcessorWithCache — C9 wiring
+# ---------------------------------------------------------------------------
+
+
+class TestLogProcessorWithCache:
+    """C9: when a :class:`CacheProvider` is injected, the processor
+    bumps per-key-id usage counters on every encrypt/decrypt.
+
+    With ``cache=None`` (the existing default), behaviour is identical
+    to C5/C6 — the 26+5 prior processor tests still pass unmodified,
+    which is the load-bearing property of the optional-arg design.
+    """
+
+    def test_encrypt_increments_per_key_encrypt_counter(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # One encrypt call → counter bumped exactly once per call
+        # (NOT per field). The key is ``key_usage:<key_id>:encrypt``
+        # — same shape used by ``GET /v1/keys``.
+        from src.cache import InMemoryCache
+
+        cache = InMemoryCache()
+        proc = LogProcessor(
+            detector=Detector(),
+            keystore=keystore,
+            parallel=parallel,
+            cache=cache,
+        )
+
+        active_key_id = keystore.get_active().key_id
+        # Sanity: counter starts at 0.
+        assert cache.get_counter(f"key_usage:{active_key_id}:encrypt") == 0
+
+        _ = proc.encrypt(ecommerce_log)
+
+        # After one encrypt: counter == 1.
+        assert cache.get_counter(f"key_usage:{active_key_id}:encrypt") == 1
+
+        # A second encrypt bumps to 2 — confirms idempotency of the
+        # one-bump-per-call contract.
+        _ = proc.encrypt(ecommerce_log)
+        assert cache.get_counter(f"key_usage:{active_key_id}:encrypt") == 2
+
+    def test_decrypt_increments_per_key_decrypt_counter(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # One decrypt call with N encrypted fields → counter bumps N
+        # times (per-field, not per-call — see the LogProcessor
+        # docstring for the rationale). The e-commerce fixture has 3
+        # sensitive leaves so the counter ends at 3.
+        from src.cache import InMemoryCache
+
+        cache = InMemoryCache()
+        proc = LogProcessor(
+            detector=Detector(),
+            keystore=keystore,
+            parallel=parallel,
+            cache=cache,
+        )
+
+        active_key_id = keystore.get_active().key_id
+        # Encrypt first so we have something to decrypt.
+        encrypted = proc.encrypt(ecommerce_log)
+
+        # Reset the decrypt counter expectation: zero before decrypt.
+        # (encrypt counter is 1 at this point but that's a separate
+        # namespace.)
+        assert cache.get_counter(f"key_usage:{active_key_id}:decrypt") == 0
+
+        _ = proc.decrypt(encrypted)
+
+        # 3 fields decrypted → counter at 3.
+        assert cache.get_counter(f"key_usage:{active_key_id}:decrypt") == 3
+
+    def test_no_cache_preserves_pre_c9_behavior(
+        self,
+        keystore: KeyStore,
+        parallel: ParallelEncryptor,
+        ecommerce_log: dict,
+    ) -> None:
+        # The original ``cache=None`` (default) path must remain a
+        # no-op. This is the load-bearing property that lets the
+        # pre-C9 tests pass unmodified: constructing a processor
+        # without a cache still works, and encrypt/decrypt succeed
+        # without any cache interaction.
+        proc = LogProcessor(
+            detector=Detector(),
+            keystore=keystore,
+            parallel=parallel,
+        )
+        # Both directions complete without raising; the result is
+        # round-trip-equal on the encrypted fields.
+        encrypted = proc.encrypt(ecommerce_log)
+        decrypted = proc.decrypt(encrypted)
+        assert decrypted["customer_email"] == "alice@example.com"

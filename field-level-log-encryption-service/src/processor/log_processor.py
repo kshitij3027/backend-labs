@@ -50,6 +50,7 @@ from typing import Any
 from uuid import uuid4
 
 from src.audit import AuditLogger
+from src.cache import CacheProvider
 from src.crypto.schema import EncryptedField
 from src.detection.detector import Detector
 from src.keystore.store import KeyStore
@@ -116,6 +117,14 @@ class LogProcessor:
         Optional counter store. ``None`` (default) disables stats
         bumping. Same rationale as ``audit_logger`` — zero overhead
         when omitted.
+    cache : CacheProvider | None
+        Optional cache used to track per-key-id usage frequency
+        (Feature Area D: "Track key usage frequency for security
+        analysis"). When supplied, every encrypt/decrypt increments
+        ``key_usage:<key_id>:encrypt`` or ``key_usage:<key_id>:decrypt``
+        respectively. ``None`` (default) skips the increments —
+        preserves the pre-C9 contract so the 26+5 existing processor
+        tests keep passing without modification.
     """
 
     def __init__(
@@ -125,6 +134,7 @@ class LogProcessor:
         parallel: ParallelEncryptor,
         audit_logger: AuditLogger | None = None,
         stats: StatsCounters | None = None,
+        cache: CacheProvider | None = None,
     ) -> None:
         self._detector = detector
         self._keystore = keystore
@@ -134,6 +144,12 @@ class LogProcessor:
         # checks in the hot path concise and the call sites readable.
         self._audit = audit_logger
         self._stats = stats
+        # Cache is optional (C9). When set, encrypt() and decrypt()
+        # call .incr() per active key id to populate the per-key usage
+        # counters surfaced by ``GET /v1/keys``. Failures are swallowed
+        # (logged at warning) — a cache hiccup must NEVER fail an
+        # encrypt operation that's already produced ciphertext.
+        self._cache = cache
 
     # -- public API ------------------------------------------------------
 
@@ -167,7 +183,7 @@ class LogProcessor:
         # Audit / stats are optional collaborators (C6). Capture a start
         # timestamp only when we have something to record against — saves
         # the syscall otherwise.
-        observe = self._audit is not None or self._stats is not None
+        observe = self._audit is not None or self._stats is not None or self._cache is not None
         t0 = time.perf_counter_ns() if observe else 0
 
         try:
@@ -203,6 +219,22 @@ class LogProcessor:
             #    it — if rotation fires mid-process, this still produces a
             #    coherent batch under one DEK.
             active = self._keystore.get_active()
+            # Cache: bump the per-key encrypt counter exactly once per
+            # encrypt CALL (not per field). The counter answers "how
+            # many encrypt operations used this DEK" — a per-field
+            # increment would inflate the number into "fields touched"
+            # which we already track via stats.fields_encrypted.
+            if self._cache is not None:
+                try:
+                    self._cache.incr(f"key_usage:{active.key_id}:encrypt")
+                except Exception as exc:  # pragma: no cover - defensive
+                    # Never fail an encrypt because the counter cache is
+                    # unreachable. Log + continue.
+                    logger.warning(
+                        "cache incr failed for key %s (ignored): %s",
+                        active.key_id,
+                        exc,
+                    )
             active_encryptor = active.encryptor
             if active_encryptor is None:
                 # Defensive: get_active() returns active records whose
@@ -340,7 +372,7 @@ class LogProcessor:
         # per-field success events into a list and only flush them once
         # the entire walk completes successfully; a mid-walk failure
         # produces a single batch-level failure event instead.
-        observe = self._audit is not None or self._stats is not None
+        observe = self._audit is not None or self._stats is not None or self._cache is not None
         t0 = time.perf_counter_ns() if observe else 0
         decrypted_events: list[dict[str, Any]] = []
 
@@ -366,6 +398,29 @@ class LogProcessor:
             # in decrypted_events) counts as one fields_decrypted.
             if self._stats is not None:
                 self._stats.incr("fields_decrypted", len(decrypted_events))
+
+            # Cache: per-field key-usage counter for decrypts. Unlike
+            # encrypt (which bumps once per call), decrypt bumps once
+            # per field because a single decrypt call can touch
+            # multiple key ids (the input log may have been encrypted
+            # across two rotation epochs). Each ev["key_id"] is the
+            # key that actually decrypted the field.
+            if self._cache is not None:
+                for ev in decrypted_events:
+                    kid = ev.get("key_id")
+                    if not kid:
+                        continue
+                    try:
+                        self._cache.incr(f"key_usage:{kid}:decrypt")
+                    except Exception as exc:  # pragma: no cover - defensive
+                        # Same robustness contract as the encrypt path:
+                        # a cache miss must never poison a successful
+                        # decrypt.
+                        logger.warning(
+                            "cache incr failed for key %s (ignored): %s",
+                            kid,
+                            exc,
+                        )
 
             # Audit: emit per-field success events. Duration is whole-
             # batch divided across events (same rationale as encrypt).

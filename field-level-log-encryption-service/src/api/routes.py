@@ -48,6 +48,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
 from src.audit import AuditLogger
+from src.cache import CacheProvider
 from src.detection.detector import Detector
 from src.keystore.store import (
     KeyDestroyedError,
@@ -171,6 +172,17 @@ def _stats(request: Request) -> StatsCounters:
 
 def _audit(request: Request) -> AuditLogger:
     return request.app.state.audit_logger
+
+
+def _cache(request: Request) -> CacheProvider | None:
+    """Return the cache provider, or ``None`` if not configured.
+
+    The cache is built in ``src.main``'s lifespan handler; tests that
+    spin up a stripped-down app may not set it. Returning ``None``
+    instead of raising lets the consumer treat "no cache" as "no
+    usage counters" without bloating its error path.
+    """
+    return getattr(request.app.state, "cache", None)
 
 
 # ---------------------------------------------------------------------------
@@ -474,11 +486,46 @@ async def list_keys(request: Request) -> KeysResponse:
     KEK id — never the DEK material itself. ``active_key_id`` is a
     convenience field for clients that only want the current key without
     iterating.
+
+    C9: each row now carries a small ``usage`` map populated from the
+    :class:`~src.cache.CacheProvider`. The processor increments
+    ``key_usage:{key_id}:encrypt`` and ``key_usage:{key_id}:decrypt``
+    counters; we surface them here as ``{"encrypts": N, "decrypts": M}``
+    so operators can see at-a-glance which DEKs are heavily used (and
+    therefore high-value rotation candidates).
     """
     keystore = _keystore(request)
+    cache = _cache(request)
 
     rows = keystore.list_keys()
-    keys = [KeyInfo(**row) for row in rows]
+
+    # Build KeyInfo objects, layering in the per-key usage counters
+    # from the cache when available. If the cache is absent (tests
+    # that don't wire one) the ``usage`` field stays empty — clients
+    # see the empty dict default and treat it as "no usage data".
+    keys: list[KeyInfo] = []
+    for row in rows:
+        usage: dict[str, int] = {}
+        if cache is not None:
+            kid = row["key_id"]
+            try:
+                # Two counter reads per key. At list_keys time the key
+                # count is small (one active + retired set), so even
+                # against Redis this is O(2 × |keys|) round-trips —
+                # negligible at this endpoint's typical traffic rate.
+                usage = {
+                    "encrypts": cache.get_counter(f"key_usage:{kid}:encrypt"),
+                    "decrypts": cache.get_counter(f"key_usage:{kid}:decrypt"),
+                }
+            except Exception as exc:  # pragma: no cover - defensive
+                # Cache failure must NEVER blank out a key listing.
+                # Log + continue with an empty usage map for this row.
+                logger.warning(
+                    "cache get_counter failed for key %s (ignored): %s",
+                    kid,
+                    exc,
+                )
+        keys.append(KeyInfo(**row, usage=usage))
 
     # Try to identify the active key; if no active key has been minted
     # yet (impossible after startup, but defensive), leave None.

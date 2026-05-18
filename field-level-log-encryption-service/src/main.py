@@ -50,6 +50,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.api import router as api_router
 from src.audit import AuditLogger, RingBuffer
+from src.cache import build_cache
 from src.crypto.key_provider import EnvKeyProvider
 from src.detection.detector import Detector
 from src.keystore.rotator import RotationManager
@@ -111,8 +112,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     3. Detector — loads YAML config on construction.
     4. ParallelEncryptor — owns its own ThreadPoolExecutor.
     5. AuditLogger + StatsCounters — observers.
-    6. LogProcessor — composes the above five.
-    7. RotationManager + background poll task.
+    6. CacheProvider (C9) — Redis if reachable, in-memory otherwise.
+       Used for per-key-id usage frequency tracking.
+    7. LogProcessor — composes the above six.
+    8. RotationManager + background poll task.
 
     Shutdown sequence (under ``finally``)
     -------------------------------------
@@ -122,6 +125,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     2. Shut down the parallel pool (``parallel.close()``). ``wait=False``
        inside that helper means in-flight encrypts finish on their
        own thread without blocking the response cycle.
+    3. Close the cache backend so Redis sockets are released cleanly.
     """
     logger.info("startup: building service singletons")
 
@@ -147,16 +151,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     audit_logger = AuditLogger(RingBuffer(maxlen=1000))
     stats = StatsCounters()
 
-    # 6) Processor (composes 1-5).
+    # 6) Cache (C9). Try Redis first; fall back to InMemoryCache on
+    #    failure so the app is robust to a Redis outage at boot. The
+    #    factory logs a warning if it falls back — operators see it
+    #    in ``docker compose logs app`` and can investigate.
+    cache = build_cache(
+        settings.redis_host,
+        settings.redis_port,
+        fallback_to_memory=True,
+    )
+    logger.info(
+        "startup: cache backend ready (type=%s)", type(cache).__name__
+    )
+
+    # 7) Processor (composes 1-6).
     processor = LogProcessor(
         detector=detector,
         keystore=keystore,
         parallel=parallel,
         audit_logger=audit_logger,
         stats=stats,
+        cache=cache,
     )
 
-    # 7) Rotation policy.
+    # 8) Rotation policy.
     rotation = RotationManager(keystore, interval_days=settings.key_rotation_days)
 
     # Publish.
@@ -166,10 +184,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.parallel = parallel
     app.state.audit_logger = audit_logger
     app.state.stats = stats
+    app.state.cache = cache
     app.state.processor = processor
     app.state.rotation = rotation
 
-    # 8) Background rotation poll. Wrapped in a try/finally so we can
+    # 9) Background rotation poll. Wrapped in a try/finally so we can
     #    cancel it cleanly on shutdown without leaving the asyncio
     #    loop with a dangling task.
     async def _rotation_loop() -> None:
@@ -238,6 +257,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         logger.info("shutdown: closing parallel encryptor pool")
         parallel.close()
+
+        # Close the cache last — it might be a Redis client holding a
+        # live socket. Wrap in a try/except for the same reason we
+        # wrap the rotation cancel: shutdown is best-effort and a
+        # cache close failure must not mask the actual reason we're
+        # shutting down.
+        try:
+            logger.info("shutdown: closing cache backend")
+            cache.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("cache close failed (ignored): %s", exc)
 
 
 # ---------------------------------------------------------------------------

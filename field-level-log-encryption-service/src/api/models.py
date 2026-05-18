@@ -121,6 +121,12 @@ class KeyInfo(BaseModel):
 
     Mirrors :meth:`src.keystore.store.KeyStore.list_keys` — no DEK
     bytes and no encryptor reference, only lifecycle metadata.
+
+    ``usage`` (added in C9) is a small ``{"encrypts": N, "decrypts": M}``
+    map populated from the C9 :class:`~src.cache.CacheProvider`
+    per-key counters. It defaults to an empty dict so existing tests
+    that build :class:`KeyInfo` straight from ``KeyStore.list_keys``
+    rows (no cache lookup) continue to work without modification.
     """
 
     key_id: str
@@ -129,6 +135,11 @@ class KeyInfo(BaseModel):
     retired_at: datetime | None = None
     destroyed_at: datetime | None = None
     kek_id: str
+    # Per-key usage frequency surfaced from the cache. Always a
+    # ``dict[str, int]`` so downstream consumers can rely on the shape;
+    # when no counter has been recorded yet, individual keys may be
+    # absent (the cache returns 0 in that case).
+    usage: dict[str, int] = Field(default_factory=dict)
 
 
 class KeysResponse(BaseModel):

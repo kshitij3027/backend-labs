@@ -25,6 +25,9 @@ python-dotenv==1.0.1
 # --- Config ---
 pyyaml==6.0.2
 
+# --- Cache (C9: Redis-backed key-usage frequency tracking) ---
+redis==5.0.8
+
 # --- HTTP client (for forwarding logs to sinks, and tests) ---
 httpx==0.27.2
 
