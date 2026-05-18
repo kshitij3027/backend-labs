@@ -468,3 +468,168 @@ class TestStats:
             "logs_processed"
         ]
         assert after == before + 1
+
+
+# ---------------------------------------------------------------------------
+# Tests — Dashboard (C8)
+# ---------------------------------------------------------------------------
+
+
+class TestDashboard:
+    """C8 dashboard surface — ``GET /``, the HTMX stats partial, the
+    static-asset mount, and the form-encoded encrypt/decrypt endpoints.
+
+    These tests share the same ``client`` fixture as the rest of the
+    file: the FastAPI lifespan runs per test, so the keystore mints a
+    fresh active DEK for every dashboard call. That makes the form-
+    submission round-trip self-contained — encrypt and decrypt see the
+    same key in the same process.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dashboard_page_returns_html(
+        self, client: AsyncClient
+    ) -> None:
+        """``GET /`` returns a 200 HTML page with the expected sections."""
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        # Jinja2Templates returns ``text/html; charset=utf-8`` by default.
+        assert resp.headers["content-type"].startswith("text/html")
+        body = resp.text
+        # Sanity-check that the rendered template carries the page title
+        # and each of the three card headings the brief specified.
+        assert "Field-Level Log Encryption" in body
+        assert "Encrypt" in body
+        assert "Decrypt" in body
+        assert "Live Stats" in body
+
+    @pytest.mark.asyncio
+    async def test_stats_partial_returns_html_with_counters(
+        self, client: AsyncClient
+    ) -> None:
+        """``GET /api/stats/html`` returns the partial with the dt labels."""
+        resp = await client.get("/api/stats/html")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        body = resp.text
+        # The well-known counter labels render as ``<dt>`` entries; the
+        # poll is what powers the dashboard's auto-refresh so those
+        # labels MUST be present on every response.
+        assert "Logs processed" in body
+        assert "Errors" in body
+
+    @pytest.mark.asyncio
+    async def test_static_htmx_js_is_served(
+        self, client: AsyncClient
+    ) -> None:
+        """``GET /static/htmx.min.js`` returns the vendored placeholder."""
+        resp = await client.get("/static/htmx.min.js")
+        assert resp.status_code == 200
+        # The marker check is case-insensitive so a future drop-in of
+        # the full minified bundle (which may title-case the banner)
+        # still satisfies the assertion.
+        assert "htmx" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_static_css_is_served(self, client: AsyncClient) -> None:
+        """``GET /static/dashboard.css`` returns CSS with the stats class."""
+        resp = await client.get("/static/dashboard.css")
+        assert resp.status_code == 200
+        # Starlette serves ``.css`` as ``text/css``; we just assert the
+        # family rather than the exact charset suffix.
+        assert resp.headers["content-type"].startswith("text/css")
+        # ``stats-list`` is the class name the partial relies on for
+        # the two-column layout — a regression in either side would
+        # surface here.
+        assert "stats-list" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_encrypt_form_returns_encrypted_html(
+        self, client: AsyncClient
+    ) -> None:
+        """Form-encoded ``raw_log`` -> HTML containing ``encrypted_value``."""
+        # ``httpx.AsyncClient.post(data=...)`` form-encodes the body and
+        # sets ``Content-Type: application/x-www-form-urlencoded``, which
+        # is what FastAPI's ``Form(...)`` parameter parses.
+        raw = '{"customer_email":"a@b.com","order_id":"o1"}'
+        resp = await client.post(
+            "/api/dashboard/encrypt",
+            data={"raw_log": raw},
+        )
+        assert resp.status_code == 200
+        body = resp.text
+        # The encrypted payload is JSON-pretty-printed inside a <pre>;
+        # the ``encrypted_value`` key is part of the EncryptedField dump
+        # and is the load-bearing assertion that detection + encrypt
+        # both fired.
+        assert "encrypted_value" in body
+        # The ``<pre>`` shell preserves the id so subsequent submissions
+        # still find their HTMX target.
+        assert 'id="encrypt-output"' in body
+
+    @pytest.mark.asyncio
+    async def test_dashboard_round_trip_recovers_email(
+        self, client: AsyncClient
+    ) -> None:
+        """Encrypt via the form, then decrypt the result, gets the email back.
+
+        The encrypt response is HTML-escaped JSON inside a ``<pre>``. We
+        unescape and parse it back out to drive the decrypt form, which
+        mirrors what the browser does when a user copies one output into
+        the other textarea.
+        """
+        original_email = "alice@example.com"
+        raw = f'{{"customer_email":"{original_email}","order_id":"o1"}}'
+
+        # 1) Encrypt via the dashboard endpoint.
+        enc_resp = await client.post(
+            "/api/dashboard/encrypt",
+            data={"raw_log": raw},
+        )
+        assert enc_resp.status_code == 200
+
+        # 2) Extract the JSON payload from the ``<pre>``. The body is
+        #    HTML-escaped JSON; ``html.unescape`` reverses the escape
+        #    so we can ``json.loads`` it.
+        import html as _html  # local import: tests aren't on a hot path
+
+        body = enc_resp.text
+        start = body.index(">") + 1
+        end = body.rindex("</pre>")
+        encrypted_json = json.loads(_html.unescape(body[start:end]))
+
+        # 3) Decrypt via the dashboard endpoint with the same JSON
+        #    re-serialized into the textarea.
+        dec_resp = await client.post(
+            "/api/dashboard/decrypt",
+            data={"raw_log": json.dumps(encrypted_json)},
+        )
+        assert dec_resp.status_code == 200
+        # The decrypted plaintext email appears as a substring of the
+        # rendered HTML <pre>. We don't need to round-trip-parse it
+        # again — the substring assertion is sufficient and resilient
+        # to whitespace changes in the pretty-printer.
+        assert original_email in dec_resp.text
+
+    @pytest.mark.asyncio
+    async def test_dashboard_encrypt_invalid_json_returns_error_html(
+        self, client: AsyncClient
+    ) -> None:
+        """Malformed JSON returns 200 HTML with the ``error`` class, not 5xx.
+
+        HTMX swaps responses regardless of status code (in our default
+        config), but a 5xx would block the swap on most htmx setups.
+        Returning a 200 with an inline error <pre> keeps the UX
+        consistent — the user sees the error in the same target slot.
+        """
+        resp = await client.post(
+            "/api/dashboard/encrypt",
+            data={"raw_log": "{not json"},
+        )
+        # 200, NOT 5xx — the failure is surfaced inline as HTML.
+        assert resp.status_code == 200
+        body = resp.text
+        # The error styling hook is the ``error`` class on the <pre>;
+        # the substring assertion lets us evolve the exact message
+        # text without breaking the test.
+        assert "error" in body.lower()

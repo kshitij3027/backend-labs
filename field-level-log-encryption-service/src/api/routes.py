@@ -34,13 +34,17 @@ Error mapping
 """
 from __future__ import annotations
 
+import html
+import json
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from cryptography.exceptions import InvalidTag
-from fastapi import APIRouter, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
 
 from src.audit import AuditLogger
@@ -77,6 +81,65 @@ logger = logging.getLogger(__name__)
 # ``router`` is the single export. The application wires it via
 # ``app.include_router(router)`` in :mod:`src.main`.
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Dashboard wiring (C8)
+# ---------------------------------------------------------------------------
+#
+# ``Jinja2Templates`` resolves template paths relative to the current
+# working directory at request time. In the runtime container that is
+# ``/app`` (set by ``WORKDIR /app`` in the Dockerfile), so the ``templates/``
+# directory copied in by the Dockerfile is found at ``/app/templates``.
+# Under pytest the working dir is the project root, where ``templates/``
+# also lives — so the same path works in both contexts.
+templates = Jinja2Templates(directory="templates")
+
+
+# Small inline sample used to pre-fill the encrypt form's textarea on
+# first load. We embed it as a literal rather than reading from
+# ``tests/fixtures/ecommerce_log.json`` because the runtime container
+# deliberately does NOT ship the test tree — copying ``tests/`` into the
+# image just to read one fixture would bloat the layer and blur the
+# runtime/test boundary. The two payloads happen to be near-identical
+# but are independent by design.
+_ENCRYPT_SAMPLE: dict[str, Any] = {
+    "customer_email": "alice@example.com",
+    "phone": "555-867-5309",
+    "order_id": "ORD-2026-05-16-001",
+    "amount": 129.99,
+    "timestamp": "2026-05-16T10:30:00Z",
+}
+
+
+# Service version surfaced in the dashboard footer. Hard-coded here so
+# we don't import :mod:`src.main` (which would cause a circular import
+# at module-load time — ``main`` imports this module).
+_SERVICE_VERSION: str = "0.1.0"
+
+
+def _utcnow_iso() -> str:
+    """Return current UTC time in ISO-8601 with second precision.
+
+    Used by the dashboard stats partial so each HTMX poll visibly
+    changes the rendered HTML (gives the operator a free "is the
+    auto-refresh working?" signal without having to mutate counters).
+    """
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _active_key_id_or_none(keystore: KeyStore) -> str:
+    """Return the active key id as a display string.
+
+    Returns the literal ``"(none)"`` string (not None) when no active
+    key has been minted yet, because Jinja's auto-escape would render
+    ``None`` as the four-character string ``"None"`` which is uglier
+    and less explicit than ``"(none)"``.
+    """
+    try:
+        return keystore.get_active().key_id
+    except KeyNotFoundError:
+        return "(none)"
 
 
 # ---------------------------------------------------------------------------
@@ -446,3 +509,231 @@ async def get_stats(request: Request) -> StatsResponse:
     """
     stats = _stats(request)
     return StatsResponse(counters=stats.snapshot())
+
+
+# ---------------------------------------------------------------------------
+# Dashboard (C8) — HTML + HTMX partial endpoints
+# ---------------------------------------------------------------------------
+#
+# The dashboard at ``GET /`` renders ``templates/dashboard.html`` server-side
+# on first load. HTMX then drives three live behaviours from the page:
+#
+#   1. ``GET /api/stats/html`` — polled every 5s by the stats card; returns
+#      the ``_stats_card.html`` partial (a small HTML fragment, NOT JSON).
+#   2. ``POST /api/dashboard/encrypt`` — submits the encrypt textarea as
+#      form-encoded ``raw_log``; returns an HTML ``<pre>`` block containing
+#      either the JSON-pretty-printed encrypted log or an error message.
+#   3. ``POST /api/dashboard/decrypt`` — symmetric to (2) for decrypt.
+#
+# These endpoints intentionally return raw HTML (not JSON) so the browser
+# can swap the response straight into the DOM via ``hx-swap``. ``html.escape``
+# is used everywhere we render user-supplied text to keep XSS off the table
+# even in this local-only dashboard.
+
+
+def _render_error_pre(message: str) -> str:
+    """Render a small ``<pre class="output error">`` snippet.
+
+    Used by the encrypt/decrypt partial endpoints to surface validation
+    or runtime failures inline without bumping the HTTP status (HTMX
+    targets the body regardless; a 4xx would block the swap).
+
+    Parameters
+    ----------
+    message : str
+        The error message to display. Always passed through
+        :func:`html.escape` so a hostile payload reflected in the
+        error text cannot inject script tags into the dashboard.
+    """
+    safe = html.escape(message)
+    return f'<pre id="encrypt-output" class="output error">{safe}</pre>'
+
+
+def _render_result_pre(target_id: str, payload: dict[str, Any]) -> str:
+    """Render the success ``<pre>`` for an encrypt/decrypt response.
+
+    The element id is preserved across swaps so subsequent HTMX
+    submissions still find their target. We JSON-pretty-print with a
+    2-space indent for readability, then ``html.escape`` the result
+    even though it's already-rendered JSON — the encrypted ciphertext
+    is base64 and the operational fields could contain anything, so a
+    user-supplied log with a literal ``</pre>`` substring would
+    otherwise break out of the block.
+    """
+    pretty = json.dumps(payload, indent=2, default=str)
+    safe = html.escape(pretty)
+    return f'<pre id="{target_id}" class="output">{safe}</pre>'
+
+
+@router.get(
+    "/",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    tags=["dashboard"],
+)
+async def dashboard(request: Request) -> HTMLResponse:
+    """Render the live HTMX dashboard page.
+
+    Single server-rendered HTML response — no SPA, no build step. The
+    stats card is pre-rendered server-side via the
+    ``{% include "_stats_card.html" %}`` partial so the page is useful
+    even before the first HTMX poll fires (5 seconds later).
+    """
+    stats = _stats(request)
+    keystore = _keystore(request)
+
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "stats": stats.snapshot(),
+            "active_key_id": _active_key_id_or_none(keystore),
+            "encrypt_sample": _ENCRYPT_SAMPLE,
+            "now_iso": _utcnow_iso(),
+            "version": _SERVICE_VERSION,
+        },
+    )
+
+
+@router.get(
+    "/api/stats/html",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    tags=["dashboard"],
+)
+async def stats_html(request: Request) -> HTMLResponse:
+    """Render the live stats partial for the HTMX poll.
+
+    HTMX swaps the response straight into ``#stats-card``'s
+    ``innerHTML`` via ``hx-swap="innerHTML"``. We return the same
+    partial template that the full dashboard page includes inline so
+    the markup is identical across the first server-render and every
+    subsequent poll.
+    """
+    stats = _stats(request)
+
+    return templates.TemplateResponse(
+        "_stats_card.html",
+        {
+            "request": request,
+            "stats": stats.snapshot(),
+            "now_iso": _utcnow_iso(),
+        },
+    )
+
+
+@router.post(
+    "/api/dashboard/encrypt",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    tags=["dashboard"],
+)
+async def dashboard_encrypt(
+    request: Request, raw_log: str = Form(...)
+) -> HTMLResponse:
+    """Encrypt a form-submitted log and return an HTML ``<pre>`` snippet.
+
+    HTMX submits the form as ``application/x-www-form-urlencoded`` with
+    a single ``raw_log`` field carrying the textarea contents (raw JSON
+    text). We:
+
+    1. Parse ``raw_log`` as JSON. On failure return a
+       ``<pre class="output error">`` snippet (200 OK; HTMX will swap
+       it in like a regular response).
+    2. Reject non-dict top-level payloads — the processor expects an
+       object, not an array or scalar.
+    3. Call :meth:`LogProcessor.encrypt`. On failure return another
+       error snippet.
+    4. Pretty-print the result and return as a ``<pre>``.
+
+    Returning HTML (not JSON) lets the browser swap the response
+    straight into ``#encrypt-output`` without any client-side JS.
+    """
+    proc = _proc(request)
+
+    try:
+        parsed = json.loads(raw_log)
+    except json.JSONDecodeError as exc:
+        return HTMLResponse(
+            _render_error_pre(f"Invalid JSON: {exc}"),
+            status_code=200,
+        )
+
+    if not isinstance(parsed, dict):
+        return HTMLResponse(
+            _render_error_pre(
+                "Top-level JSON must be an object (dict), "
+                f"got {type(parsed).__name__}."
+            ),
+            status_code=200,
+        )
+
+    try:
+        result = proc.encrypt(parsed)
+    except Exception as exc:  # noqa: BLE001 - surface message to dashboard
+        logger.warning("dashboard encrypt failed: %s", exc)
+        return HTMLResponse(
+            _render_error_pre(f"Encrypt failed: {exc}"),
+            status_code=200,
+        )
+
+    return HTMLResponse(
+        _render_result_pre("encrypt-output", result),
+        status_code=200,
+    )
+
+
+@router.post(
+    "/api/dashboard/decrypt",
+    response_class=HTMLResponse,
+    include_in_schema=False,
+    tags=["dashboard"],
+)
+async def dashboard_decrypt(
+    request: Request, raw_log: str = Form(...)
+) -> HTMLResponse:
+    """Decrypt a form-submitted log and return an HTML ``<pre>`` snippet.
+
+    Symmetric to :func:`dashboard_encrypt`. The same error-handling
+    shape applies: JSON parse failures, non-dict top-level payloads,
+    and processor exceptions all return a 200 with a ``<pre
+    class="output error">`` snippet rather than a 4xx/5xx — HTMX swaps
+    those into ``#decrypt-output`` so the user sees the failure inline
+    without losing their textarea contents.
+    """
+    proc = _proc(request)
+
+    try:
+        parsed = json.loads(raw_log)
+    except json.JSONDecodeError as exc:
+        return HTMLResponse(
+            _render_error_pre(f"Invalid JSON: {exc}").replace(
+                'id="encrypt-output"', 'id="decrypt-output"'
+            ),
+            status_code=200,
+        )
+
+    if not isinstance(parsed, dict):
+        return HTMLResponse(
+            _render_error_pre(
+                "Top-level JSON must be an object (dict), "
+                f"got {type(parsed).__name__}."
+            ).replace('id="encrypt-output"', 'id="decrypt-output"'),
+            status_code=200,
+        )
+
+    try:
+        result = proc.decrypt(parsed)
+    except Exception as exc:  # noqa: BLE001 - surface message to dashboard
+        logger.warning("dashboard decrypt failed: %s", exc)
+        return HTMLResponse(
+            _render_error_pre(f"Decrypt failed: {exc}").replace(
+                'id="encrypt-output"', 'id="decrypt-output"'
+            ),
+            status_code=200,
+        )
+
+    return HTMLResponse(
+        _render_result_pre("decrypt-output", result),
+        status_code=200,
+    )

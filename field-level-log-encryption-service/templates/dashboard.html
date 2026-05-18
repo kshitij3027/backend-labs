@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Field-Level Log Encryption Service — Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css" />
+    <script src="/static/htmx.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Field-Level Log Encryption Service</h1>
+      <p class="subtitle">AES-256-GCM field-level PII encryption</p>
+      <p class="key-badge">
+        active key:
+        <span class="key-pill">{{ active_key_id }}</span>
+      </p>
+    </header>
+
+    <main>
+      <!--
+        Live stats card. Polls /api/stats/html every 5 seconds via HTMX
+        and swaps the inner HTML in place. The initial body is rendered
+        server-side via the included partial so the page is useful even
+        before the first poll fires.
+      -->
+      <section
+        id="stats-card"
+        hx-get="/api/stats/html"
+        hx-trigger="every 5s"
+        hx-swap="innerHTML"
+        hx-target="this"
+      >
+        {% include "_stats_card.html" %}
+      </section>
+
+      <!--
+        Encrypt log card. Submits the textarea contents as form-encoded
+        data to /api/dashboard/encrypt, which parses it as JSON, runs
+        the processor, and returns a small HTML <pre> snippet.
+      -->
+      <section id="encrypt-card">
+        <h2>Encrypt log</h2>
+        <p class="hint">
+          Paste or edit a JSON log entry. PII fields will be encrypted in
+          place; operational fields stay readable.
+        </p>
+        <form
+          hx-post="/api/dashboard/encrypt"
+          hx-include="closest form"
+          hx-target="#encrypt-output"
+          hx-swap="innerHTML"
+        >
+          <label for="encrypt-input" class="visually-hidden">Raw log JSON</label>
+          <textarea
+            name="raw_log"
+            id="encrypt-input"
+            spellcheck="false"
+          >{{ encrypt_sample | tojson(indent=2) }}</textarea>
+          <button type="submit">Encrypt</button>
+        </form>
+        <pre id="encrypt-output" class="output">(submit to see encrypted log)</pre>
+      </section>
+
+      <!--
+        Decrypt log card. Symmetric to the encrypt card: paste the JSON
+        output of an Encrypt call to round-trip back to the original
+        plaintext values.
+      -->
+      <section id="decrypt-card">
+        <h2>Decrypt log</h2>
+        <p class="hint">
+          Paste the JSON output of an Encrypt call here to round-trip.
+        </p>
+        <form
+          hx-post="/api/dashboard/decrypt"
+          hx-include="closest form"
+          hx-target="#decrypt-output"
+          hx-swap="innerHTML"
+        >
+          <label for="decrypt-input" class="visually-hidden">Raw log JSON</label>
+          <textarea
+            name="raw_log"
+            id="decrypt-input"
+            spellcheck="false"
+            placeholder='{"customer_email": {"encrypted_value": "...", "algorithm": "AES-256-GCM", ...}, ...}'
+          ></textarea>
+          <button type="submit">Decrypt</button>
+        </form>
+        <pre id="decrypt-output" class="output">(submit to see decrypted log)</pre>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Field-Level Log Encryption Service v{{ version }} ·
+        <a href="/metrics">/metrics</a> ·
+        <a href="/v1/keys">/v1/keys</a> ·
+        <a href="/api/stats">/api/stats</a>
+      </p>
+    </footer>
+  </body>
+</html>

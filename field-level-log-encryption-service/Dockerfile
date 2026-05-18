@@ -49,6 +49,11 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=app:app src/ /app/src/
 COPY --chown=app:app config/ /app/config/
 
+# Dashboard assets (C8). Jinja2 templates are resolved relative to
+# WORKDIR (/app), and static files are served by the /static mount.
+COPY --chown=app:app templates/ /app/templates/
+COPY --chown=app:app static/ /app/static/
+
 EXPOSE 8000
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=10s \

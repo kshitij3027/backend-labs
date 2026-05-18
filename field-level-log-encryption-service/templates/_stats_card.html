@@ -1,0 +1,10 @@
+<h2>Live Stats</h2>
+<dl class="stats-list">
+  <dt>Logs processed</dt><dd>{{ stats.logs_processed }}</dd>
+  <dt>Fields detected</dt><dd>{{ stats.fields_detected }}</dd>
+  <dt>Fields encrypted</dt><dd>{{ stats.fields_encrypted }}</dd>
+  <dt>Fields decrypted</dt><dd>{{ stats.fields_decrypted }}</dd>
+  <dt>Errors</dt><dd>{{ stats.errors }}</dd>
+  <dt>Keys rotated</dt><dd>{{ stats.keys_rotated }}</dd>
+</dl>
+<small class="updated">updated: {{ now_iso }}</small>

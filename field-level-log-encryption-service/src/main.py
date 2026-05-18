@@ -45,6 +45,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.api import router as api_router
@@ -264,3 +265,10 @@ Instrumentator().instrument(app).expose(app)
 # only in that the router is mounted after the instrumentator has already
 # registered the ``/metrics`` route — they don't collide.
 app.include_router(api_router)
+
+# Mount the static asset directory (C8 dashboard). Paths under ``/static``
+# are served straight from the on-disk ``static/`` directory copied into
+# the image by the Dockerfile (and present in the project root during
+# tests). The mount lives at module scope — not inside the lifespan —
+# because ``StaticFiles`` does not need any of the runtime singletons.
+app.mount("/static", StaticFiles(directory="static"), name="static")
