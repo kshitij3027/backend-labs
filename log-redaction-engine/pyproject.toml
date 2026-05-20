@@ -1,0 +1,14 @@
+# Tool configuration only - no build system declared. The project is run
+# directly from source inside a container; we do not package it as a wheel.
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "UP"]
+ignore = ["E501"]  # line length is handled by the formatter
