@@ -1,0 +1,12 @@
+[
+  {"message": "user SSN 123-45-6789 logged in", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Notify alice@example.com about update", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Refund to card 4111-1111-1111-1111", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Contact (415) 555-1234 for help", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Patient MRN-654321 admitted", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Patient MRN-111222 has SSN 234-56-7890", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "alice@example.com phone (212) 555-9876", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Alice Smith sent email to bob@example.com", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "system startup complete", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"},
+  {"message": "Card 5555-5555-5555-4444 declined", "timestamp": "2026-05-19T10:00:00Z", "level": "INFO"}
+]
