@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "fields_to_redact": ["message", "user_data", "details"],
+  "audit_all_redactions": true,
+  "active_compliance_sets": ["PCI_DSS", "GDPR"],
+  "rules": {
+    "credit_card": {
+      "pattern_name": "credit_card",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["PCI_DSS"]
+    },
+    "ssn": {
+      "pattern_name": "ssn",
+      "strategy": "hash",
+      "confidence_min": 0.9,
+      "compliance_tags": ["PCI_DSS"]
+    },
+    "email": {
+      "pattern_name": "email",
+      "strategy": "tokenize",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    },
+    "us_phone": {
+      "pattern_name": "us_phone",
+      "strategy": "partial",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    },
+    "mrn": {
+      "pattern_name": "mrn",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["PCI_DSS"]
+    },
+    "person": {
+      "pattern_name": "person",
+      "strategy": "tokenize",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    },
+    "org": {
+      "pattern_name": "org",
+      "strategy": "tokenize",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    }
+  }
+}

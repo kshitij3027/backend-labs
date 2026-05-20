@@ -1,0 +1,50 @@
+{
+  "version": "1.0",
+  "fields_to_redact": ["message", "user_data", "details"],
+  "audit_all_redactions": true,
+  "active_compliance_sets": ["GDPR", "HIPAA", "PCI_DSS"],
+  "rules": {
+    "ssn": {
+      "pattern_name": "ssn",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["HIPAA", "PCI_DSS"]
+    },
+    "credit_card": {
+      "pattern_name": "credit_card",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["PCI_DSS"]
+    },
+    "email": {
+      "pattern_name": "email",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    },
+    "us_phone": {
+      "pattern_name": "us_phone",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    },
+    "mrn": {
+      "pattern_name": "mrn",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["HIPAA"]
+    },
+    "person": {
+      "pattern_name": "person",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR", "HIPAA"]
+    },
+    "org": {
+      "pattern_name": "org",
+      "strategy": "mask",
+      "confidence_min": 0.9,
+      "compliance_tags": ["GDPR"]
+    }
+  }
+}
