@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any, List
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -88,6 +89,8 @@ def _build_processor(
     detector: Detector | None = None,
     audit_logger: Any | None = None,
     stats: Any | None = None,
+    batch_parallel_threshold: int | None = None,
+    thread_pool_size: int | None = None,
 ) -> RedactionProcessor:
     """Convenience constructor for the per-test :class:`RedactionProcessor`.
 
@@ -95,6 +98,11 @@ def _build_processor(
     one axis (e.g., "the audit_logger is invoked") doesn't have to spell
     out the other four. Detector is built with ``ner_detector=None`` so
     we never load spaCy from a unit test.
+
+    The C11 parallel-batch knobs (``batch_parallel_threshold``,
+    ``thread_pool_size``) default to ``None`` — the processor reads them
+    from :class:`Settings` when unset. Tests that need to exercise the
+    parallel branch on small fixtures override the threshold (e.g. ``10``).
     """
     if detector is None:
         # ``ner_detector=None`` skips spaCy entirely — regex is the only
@@ -108,6 +116,8 @@ def _build_processor(
         config_manager=config_manager,
         audit_logger=audit_logger,
         stats=stats,
+        batch_parallel_threshold=batch_parallel_threshold,
+        thread_pool_size=thread_pool_size,
     )
 
 
@@ -716,3 +726,127 @@ class TestProcessor:
         assert dumped["service"] == "auth"
         # And the redaction still occurred.
         assert "123-45-6789" not in result.message
+
+    # -- C11 parallel-batch threshold gating ----------------------------
+
+    def test_redact_batch_below_threshold_takes_serial_path(self) -> None:
+        """A batch smaller than the threshold MUST NOT construct a ThreadPoolExecutor.
+
+        We patch the symbol the processor imported (``redaction_processor.
+        ThreadPoolExecutor``) and assert it was never called. If the
+        serial branch accidentally short-circuits into the parallel one
+        (or vice versa) this catches it without depending on timing.
+        """
+        # threshold=50, batch=5 -> serial path.
+        proc = _build_processor(batch_parallel_threshold=50)
+        entries = [
+            {
+                "message": f"SSN 123-45-67{i:02d}",
+                "timestamp": "2026-05-19T10:00:00Z",
+                "level": "INFO",
+            }
+            for i in range(5)
+        ]
+        with patch(
+            "src.processor.redaction_processor.ThreadPoolExecutor"
+        ) as mock_pool:
+            results = proc.redact_batch(entries)
+        # Pool must NOT have been constructed — serial branch only.
+        mock_pool.assert_not_called()
+        # And the results are still correct.
+        assert len(results) == 5
+        for r in results:
+            assert len(r.redactions) == 1
+
+    def test_redact_batch_at_threshold_takes_parallel_path(self) -> None:
+        """A batch >= threshold MUST construct a ThreadPoolExecutor.
+
+        Mirror image of the serial-path test. We patch the executor
+        symbol and assert it was called exactly once with the configured
+        ``max_workers``. We do NOT replace the executor's behavior
+        because doing so reliably would require also mocking ``.map``;
+        instead we verify the construction call alone.
+        """
+        # threshold=10, batch=10 -> parallel path.
+        proc = _build_processor(
+            batch_parallel_threshold=10, thread_pool_size=4
+        )
+        entries = [
+            {
+                "message": f"SSN 123-45-67{i:02d}",
+                "timestamp": "2026-05-19T10:00:00Z",
+                "level": "INFO",
+            }
+            for i in range(10)
+        ]
+        # Track that the pool was constructed; let the real executor
+        # run by side-effecting through the import path. We use
+        # ``wraps`` so the actual ThreadPoolExecutor is invoked while
+        # we still get a Mock-style call record.
+        from concurrent.futures import ThreadPoolExecutor as RealPool
+
+        with patch(
+            "src.processor.redaction_processor.ThreadPoolExecutor",
+            wraps=RealPool,
+        ) as mock_pool:
+            results = proc.redact_batch(entries)
+        # Constructed exactly once with the configured pool size.
+        mock_pool.assert_called_once_with(max_workers=4)
+        # Outputs still complete + correct.
+        assert len(results) == 10
+        for r in results:
+            assert len(r.redactions) == 1
+
+    def test_serial_and_parallel_results_are_identical(self) -> None:
+        """For the same batch, serial and parallel paths produce identical output.
+
+        Build a 60-entry batch mixing PHI (SSN/MRN) and PII (email).
+        Run it through one processor with a high threshold (forces
+        serial) and another with a low threshold (forces parallel).
+        Compare ``model_dump()`` lists for equality — the message
+        contents, redaction metadata, offsets, and order must all
+        match exactly.
+        """
+        # 60 entries — half SSN+MRN (PHI), half email (PII). The mix
+        # exercises multiple patterns + the right-to-left splice in the
+        # PHI half, so any threading-related ordering bug would surface
+        # as a model_dump mismatch.
+        entries: list[dict[str, Any]] = []
+        for i in range(60):
+            if i % 2 == 0:
+                entries.append(
+                    {
+                        "message": f"SSN 123-45-67{i % 100:02d} and MRN-1112{i:02d}",
+                        "timestamp": "2026-05-19T10:00:00Z",
+                        "level": "INFO",
+                    }
+                )
+            else:
+                entries.append(
+                    {
+                        "message": f"contact user{i}@example.com today",
+                        "timestamp": "2026-05-19T10:00:00Z",
+                        "level": "INFO",
+                    }
+                )
+
+        # Serial: threshold larger than batch.
+        serial_proc = _build_processor(batch_parallel_threshold=1000)
+        # Parallel: threshold below batch + small pool.
+        parallel_proc = _build_processor(
+            batch_parallel_threshold=10, thread_pool_size=4
+        )
+
+        serial_results = serial_proc.redact_batch(entries)
+        parallel_results = parallel_proc.redact_batch(entries)
+
+        # Lengths match the input cardinality.
+        assert len(serial_results) == len(parallel_results) == len(entries)
+
+        # Compare via model_dump — pydantic v2 equality on BaseModel
+        # would also work, but model_dump gives clearer diffs when a
+        # mismatch occurs and is what the HTTP layer ultimately
+        # serializes.
+        serial_dumps = [r.model_dump() for r in serial_results]
+        parallel_dumps = [r.model_dump() for r in parallel_results]
+        assert serial_dumps == parallel_dumps

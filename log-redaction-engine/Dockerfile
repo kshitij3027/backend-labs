@@ -65,6 +65,7 @@ COPY --chown=app:app src/ /app/src/
 COPY --chown=app:app config/ /app/config/
 COPY --chown=app:app templates/ /app/templates/
 COPY --chown=app:app static/ /app/static/
+COPY --chown=app:app scripts/ /app/scripts/
 
 EXPOSE 8000
 

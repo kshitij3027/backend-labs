@@ -42,6 +42,7 @@ caller can derive from the redacted message itself.
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
@@ -50,6 +51,7 @@ from src.config.manager import ConfigurationManager
 from src.detection.detector import Detector
 from src.detection.patterns import Detection
 from src.redaction.strategies import StrategyRegistry
+from src.settings import get_settings
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +164,19 @@ class RedactionProcessor:
         Optional stats facade with ``counters.incr(name)``,
         ``throughput.record()``, and ``latency.record(latency_ms)``.
         ``None`` (default) disables all stats updates.
+    batch_parallel_threshold : int | None
+        Minimum batch size at which :meth:`redact_batch` switches from
+        the serial path to a :class:`ThreadPoolExecutor`-backed fan-out.
+        ``None`` (default) reads :attr:`Settings.BATCH_PARALLEL_THRESHOLD`
+        so production wiring picks up the env-configured value without
+        any extra plumbing. Tests pass explicit ints (often very low,
+        e.g. 10) to exercise the parallel branch on small fixtures.
+    thread_pool_size : int | None
+        Worker count for the per-call :class:`ThreadPoolExecutor`.
+        ``None`` (default) reads :attr:`Settings.THREAD_POOL_SIZE`. The
+        pool is built and shut down inside each :meth:`redact_batch`
+        invocation that takes the parallel branch — see that method's
+        docstring for the rationale.
     """
 
     def __init__(
@@ -171,6 +186,8 @@ class RedactionProcessor:
         config_manager: ConfigurationManager,
         audit_logger: Optional[Any] = None,
         stats: Optional[Any] = None,
+        batch_parallel_threshold: int | None = None,
+        thread_pool_size: int | None = None,
     ) -> None:
         # All five collaborators stored as private attributes; the hot
         # path reads them per call. We keep them named after their roles
@@ -181,6 +198,21 @@ class RedactionProcessor:
         self._config_manager = config_manager
         self._audit_logger = audit_logger
         self._stats = stats
+
+        # Resolve parallel-batch knobs from Settings when the caller
+        # didn't override. We read once at construction so a settings
+        # mutation mid-lifetime doesn't affect an existing processor —
+        # consistent with how the rest of the engine treats config (a
+        # snapshot is captured per redact_entry call, but the pool
+        # tuning is process-lifetime).
+        if batch_parallel_threshold is None or thread_pool_size is None:
+            _settings = get_settings()
+            if batch_parallel_threshold is None:
+                batch_parallel_threshold = _settings.BATCH_PARALLEL_THRESHOLD
+            if thread_pool_size is None:
+                thread_pool_size = _settings.THREAD_POOL_SIZE
+        self._batch_parallel_threshold = batch_parallel_threshold
+        self._thread_pool_size = thread_pool_size
 
     # -- public API ------------------------------------------------------
 
@@ -350,17 +382,57 @@ class RedactionProcessor:
         return RedactedEntry(**payload)
 
     def redact_batch(self, entries: list[dict]) -> list[RedactedEntry]:
-        """Serial batch redaction; one ``RedactedEntry`` per input entry.
+        """Batch redaction with a threshold-gated parallel path.
 
-        C11 will add a parallel path that fans out across a thread pool
-        when ``len(entries) >= BATCH_PARALLEL_THRESHOLD``. For C5 we
-        keep this trivial — a list comprehension over :meth:`redact_entry`
-        — so the per-batch semantics are obviously identical to a loop
-        of single-entry calls.
+        Dispatch:
+
+        * **Serial** — when ``len(entries) < self._batch_parallel_threshold``.
+          A trivial list comprehension over :meth:`redact_entry`, identical
+          in semantics to a loop of single-entry calls. Cheaper than the
+          parallel path for small batches because no thread-pool setup
+          cost is paid.
+        * **Parallel** — when ``len(entries) >= self._batch_parallel_threshold``.
+          We fan out across a fresh :class:`ThreadPoolExecutor` sized at
+          ``self._thread_pool_size``. ``ex.map`` preserves input order,
+          so the contract ("one output per input, same order") matches
+          the serial branch exactly.
+
+        Pool lifecycle
+        --------------
+        The :class:`ThreadPoolExecutor` is built and shut down per call
+        (via the ``with`` context manager). That's acceptable for v1:
+        the per-entry work — regex scan, optional NER, strategy splice,
+        audit/stats fan-out — dominates the dispatch cost. A future
+        optimization could hoist the pool to ``self._pool`` to amortize
+        the thread-creation overhead across calls; the public contract
+        of :meth:`redact_batch` would not change.
+
+        Thread safety
+        -------------
+        :meth:`redact_entry` only reads from this processor instance and
+        from the per-call config snapshot it pulls from
+        :class:`ConfigurationManager`. It does NOT mutate any shared
+        state besides the optional ``audit_logger`` / ``stats`` sinks,
+        which are expected to be internally thread-safe (the C6
+        :class:`~src.audit.audit_logger.AuditLogger` ring buffer and the
+        :class:`~src.stats.stats.Stats` counters both serialize their
+        writes). That makes the parallel path safe without any extra
+        locking here.
         """
-        # No special-case for empty input: the comprehension already
-        # returns ``[]`` for an empty list.
-        return [self.redact_entry(e) for e in entries]
+        # No special-case for empty input: the serial path's
+        # comprehension already returns ``[]`` for an empty list, and
+        # the parallel branch's threshold check naturally falls through
+        # to it (0 < threshold for any sensible threshold).
+        if len(entries) < self._batch_parallel_threshold:
+            return [self.redact_entry(e) for e in entries]
+
+        # Parallel branch: ``ThreadPoolExecutor.map`` preserves input
+        # order, so the returned list aligns 1:1 with ``entries``.
+        # ``with`` ensures the pool is shut down even if a worker
+        # raises — the exception propagates up to the caller naturally.
+        with ThreadPoolExecutor(max_workers=self._thread_pool_size) as ex:
+            results = list(ex.map(self.redact_entry, entries))
+        return results
 
     def detect_entry(self, entry: dict) -> list[Detection]:
         """Detect PII in every configured field of ``entry`` WITHOUT redacting.
