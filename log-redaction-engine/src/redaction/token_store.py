@@ -34,7 +34,14 @@ from __future__ import annotations
 import logging
 import secrets
 import threading
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    # Type-only import to avoid creating a runtime dependency on the
+    # cache package from the redaction layer. The Backend Protocol is
+    # purely a static-typing aid here; the constructor accepts any
+    # duck-typed object that walks the Backend shape.
+    from src.cache.backend import Backend
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +84,24 @@ class TokenStore:
         Reaching the cap causes :meth:`tokenize` to raise
         :class:`TokenStoreFullError` — but only for *new* plaintexts;
         re-tokenizing an already-stored value continues to work.
+    backend : :class:`~src.cache.backend.Backend`, optional
+        Cross-process cache backend. When provided, the store keeps its
+        in-process dicts authoritative for fast lookups but the C10
+        scope only requires acceptance of the parameter — actual mirror
+        writes are deferred to a follow-up commit so the change stays
+        bounded to "introduce the abstraction, wire Redis through the
+        lifespan". See ``plan.md`` C10 deviations note.
 
     The two dicts (`_forward`, `_reverse`) are kept in lock-step: every
     `tokenize` either inserts into BOTH or NEITHER. We assert this via the
     lock — there is no path that updates only one direction.
     """
 
-    def __init__(self, max_size: int = 100_000) -> None:
+    def __init__(
+        self,
+        max_size: int = 100_000,
+        backend: Optional["Backend"] = None,
+    ) -> None:
         # plaintext → token. Used by tokenize() for dedup ("have I seen
         # this plaintext before?"). Lookups here are also why repeated
         # tokenize() calls are O(1) and deterministic.
@@ -92,6 +110,11 @@ class TokenStore:
         # A second dict is cheaper than scanning _forward for the value.
         self._reverse: dict[str, str] = {}
         self._max_size: int = max_size
+        # Optional cross-process backend. C10 introduces the abstraction
+        # and threads it through the lifespan; mirror writes happen in a
+        # follow-up commit. Stored on the instance so future commits
+        # don't have to touch __init__ again.
+        self._backend: Optional["Backend"] = backend
         # RLock so an audit callback that (hypothetically) introspects the
         # store via size() doesn't deadlock. Plain Lock would be enough
         # for the current code but the extra cost is negligible.

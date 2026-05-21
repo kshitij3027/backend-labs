@@ -17,6 +17,14 @@ a coarse lock is faster than a striped lock at small dict sizes.
 from __future__ import annotations
 
 import threading
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    # Type-only import keeps the stats package free of a runtime
+    # dependency on the cache package. The Backend Protocol is a
+    # static-typing aid; the constructor accepts any duck-typed
+    # object that satisfies the shape.
+    from src.cache.backend import Backend
 
 
 class PatternCounters:
@@ -37,8 +45,13 @@ class PatternCounters:
     component.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, backend: Optional["Backend"] = None) -> None:
         self._counts: dict[str, int] = {}
+        # Optional cross-process backend. C10 introduces the abstraction
+        # and threads it through the lifespan; per-incr mirror writes
+        # happen in a follow-up commit so the diff stays bounded. See
+        # plan.md C10 deviations.
+        self._backend: Optional["Backend"] = backend
         self._lock = threading.Lock()
 
     def incr(self, pattern: str, n: int = 1) -> None:

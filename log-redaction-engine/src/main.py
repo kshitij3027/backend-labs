@@ -51,6 +51,8 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from src.api.routes import router as api_router
 from src.audit.audit_logger import AuditLogger
 from src.audit.ring_buffer import RingBuffer
+from src.cache.in_memory import InMemoryBackend
+from src.cache.redis_backend import RedisBackend
 from src.config.loader import load_preset
 from src.config.manager import ConfigurationManager
 from src.detection.detector import Detector
@@ -141,10 +143,36 @@ async def lifespan(app: FastAPI):
         regex_timeout=settings.REGEX_TIMEOUT_SEC,
     )
 
+    # ---- Cache backend (C10): try Redis, fall back to in-memory --------
+    # The backend is the shared point of cross-process consistency for
+    # the token store and pattern counters. We try Redis first because
+    # that's the production path; if the ping fails (Redis down, DNS
+    # failure, auth mismatch, anything) we log a warning and continue
+    # with an in-memory backend so the service stays up. The catch is
+    # intentionally broad — every failure mode triggers the same
+    # fallback, and we don't want to depend on a redis-py exception
+    # hierarchy that may shift between minor versions.
+    backend = None
+    try:
+        backend = RedisBackend(
+            host=settings.REDIS_HOST,
+            port=settings.REDIS_PORT,
+            socket_connect_timeout=1.0,
+        )
+        logger.info("lifespan: using Redis backend (%s:%s)", settings.REDIS_HOST, settings.REDIS_PORT)
+    except Exception as exc:
+        logger.warning(
+            "lifespan: Redis unreachable (%s), falling back to InMemoryBackend",
+            exc,
+        )
+        backend = InMemoryBackend()
+
     # ---- Tokenization + strategy registry ------------------------------
-    # TokenStore is process-local (in-memory dict + RLock); replaced with
-    # a Redis-backed implementation in C10 for cross-process consistency.
-    token_store = TokenStore(max_size=settings.MAX_TOKEN_COUNT)
+    # TokenStore is process-local (in-memory dict + RLock); the optional
+    # ``backend`` argument introduced in C10 lets the store mirror to a
+    # shared backend for cross-process consistency. Actual mirror writes
+    # ship in a follow-up commit — C10 wires the abstraction end-to-end.
+    token_store = TokenStore(max_size=settings.MAX_TOKEN_COUNT, backend=backend)
     strategy_registry = StrategyRegistry(salt=salt, token_store=token_store)
 
     # ---- Initial config + manager --------------------------------------
@@ -163,9 +191,11 @@ async def lifespan(app: FastAPI):
     audit_logger = AuditLogger(ring_buffer=ring_buffer)
 
     # ---- Stats facade (throughput / latency / counters) ----------------
+    # PatternCounters also accepts the C10 backend so per-pattern hit
+    # counts can be aggregated across processes in a follow-up commit.
     throughput = ThroughputCounter(window_seconds=settings.STATS_WINDOW_SECONDS)
     latency = LatencyHistogram()
-    counters = PatternCounters()
+    counters = PatternCounters(backend=backend)
     stats = Stats(throughput=throughput, latency=latency, counters=counters)
 
     # ---- Processor: ties everything together ---------------------------
@@ -189,8 +219,12 @@ async def lifespan(app: FastAPI):
     app.state.token_store = token_store
     app.state.detector = detector
     app.state.strategy_registry = strategy_registry
+    # Backend is exposed so tests + future endpoints (e.g. a /debug/backend
+    # introspection probe) can identify which implementation is live
+    # without re-trying the Redis ping.
+    app.state.backend = backend
 
-    logger.info("lifespan: ready")
+    logger.info("lifespan: ready (backend=%s)", backend.name)
 
     try:
         # Yield control to the application. FastAPI keeps the context
@@ -199,9 +233,14 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info("lifespan: shutting down")
-        # No explicit teardown yet — every singleton is in-memory and
-        # the GC reclaims them when the process exits. C10 (Redis) and
-        # C11 (thread pool) will add their close() calls here.
+        # Release the Redis connection pool (no-op for InMemoryBackend).
+        # Wrapped in try/except so a network blip on shutdown can't
+        # cascade into a noisy traceback — the process is going away
+        # anyway. C11 (thread pool) will add its own close() here.
+        try:
+            backend.close()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("lifespan: backend close failed (ignored): %s", exc)
 
 
 # ---------------------------------------------------------------------------

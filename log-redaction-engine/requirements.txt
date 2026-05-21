@@ -16,6 +16,12 @@ python-multipart==0.0.12
 prometheus-client==0.20.0
 prometheus_fastapi_instrumentator==7.0.0
 
+# --- Cache / persistence ---
+# Wired in C10 — Redis is used as a cross-process backend for the token
+# store and pattern counters. The app gracefully falls back to an
+# in-memory backend if Redis is unreachable at startup.
+redis==5.0.8
+
 # --- Config / env ---
 python-dotenv==1.0.1
 pyyaml==6.0.2
