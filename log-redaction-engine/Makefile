@@ -12,7 +12,7 @@
 #   logs        Tail logs from the ``app`` service.
 #   test        Run the full pytest suite (with coverage) in the tester container.
 #   test-unit   Run only ``tests/unit`` with verbose output.
-#   e2e         Placeholder - wired in C12.
+#   e2e         Run scripts/e2e.sh inside the tester container against the live `app` service (requires `make up` first).
 #   throughput  Run scripts/throughput.py against the live `app` service (asserts >= 1000 logs/sec).
 #   demo        Build + start + print dashboard URL.
 #   clean       Stop the stack, remove volumes, prune local images.
@@ -27,7 +27,7 @@ help:
 	@echo "  logs        - tail app logs"
 	@echo "  test        - run the full test suite in Docker"
 	@echo "  test-unit   - run only tests/unit with verbose output"
-	@echo "  e2e         - end-to-end probe (wired in C12)"
+	@echo "  e2e         - end-to-end probe inside tester container (requires 'make up' first)"
 	@echo "  throughput  - throughput probe inside tester container (>=1000 logs/sec; requires 'make up' first)"
 	@echo "  demo        - build + start; open http://localhost:8000/"
 	@echo "  clean       - down + remove locally-built images"
@@ -50,9 +50,15 @@ test:
 test-unit:
 	docker compose --profile test run --rm tester pytest tests/unit -v
 
-# E2E placeholder is wired in C12 (scripts/e2e.sh).
-e2e:
-	@echo "e2e - wired in C12"
+# E2E probe runs scripts/e2e.sh from inside the `tester` compose service
+# so the script talks to the app over the compose network DNS name
+# (``http://app:8000``). Like the throughput target, the operator must
+# bring the stack up first via ``make up`` — the target deliberately
+# does NOT manage up/down so a flaky run never tears down a stack the
+# operator wanted to keep inspecting.
+.PHONY: e2e
+e2e: ## Run the full E2E script against the live app (requires `make up` first)
+	docker compose --profile test run --rm -e BASE_URL=http://app:8000 tester bash scripts/e2e.sh
 
 # Throughput probe runs scripts/throughput.py inside the `tester`
 # container so the request travels via the compose network
