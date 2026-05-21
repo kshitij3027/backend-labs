@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Log Redaction Engine — Dashboard</title>
+    <link rel="stylesheet" href="/static/dashboard.css" />
+    <script src="/static/htmx.min.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Log Redaction Engine</h1>
+      <p class="subtitle">
+        Real-time PII / PHI / payment redaction · active preset:
+        <span class="preset-pill">{{ preset_name }}</span>
+        · {{ rule_count }} active rule{{ '' if rule_count == 1 else 's' }} ·
+        <a class="config-link" href="/api/config">view config</a>
+      </p>
+    </header>
+
+    <main>
+      <!--
+        Live stats card. Polls /api/stats/html every 5 seconds via HTMX
+        and swaps the inner HTML in place. The initial body is the
+        plain "Loading stats..." string; the first ``load`` trigger
+        replaces it immediately on page load.
+      -->
+      <section
+        id="live-stats"
+        hx-get="/api/stats/html"
+        hx-trigger="load, every 5s"
+        hx-swap="innerHTML"
+      >
+        Loading stats...
+      </section>
+
+      <!--
+        Paste-a-log demo. The form uses a custom submit handler (NOT
+        ``hx-post``) so we can POST the textarea content as a proper
+        JSON body to /api/redact (the endpoint expects a structured
+        ``log_entries`` array, not form-encoded data).
+      -->
+      <section class="demo">
+        <h2>Try a redaction</h2>
+        <p class="hint">
+          Paste a JSON log entry below. Detected PII/PHI is redacted in
+          place using the active preset's strategies.
+        </p>
+        <form id="redact-form">
+          <label for="log-input" class="visually-hidden">Log JSON</label>
+          <textarea
+            id="log-input"
+            spellcheck="false"
+            placeholder='Paste a log JSON entry...'
+          >{"message":"User SSN 123-45-6789 logged in","timestamp":"2026-05-21T10:00:00Z","level":"INFO"}</textarea>
+          <button type="submit" id="redact-btn">Redact</button>
+        </form>
+        <div class="side-by-side">
+          <pre id="input-preview">(input will appear here)</pre>
+          <pre id="output-preview">(redacted output will appear here)</pre>
+        </div>
+      </section>
+
+      <!--
+        Pattern hits table. Polls /api/pattern_hits/html every 10 s; same
+        ``load, every 10s`` pattern as the stats card so the initial
+        body ("Loading hits...") is replaced on first paint.
+      -->
+      <section
+        id="pattern-hits"
+        hx-get="/api/pattern_hits/html"
+        hx-trigger="load, every 10s"
+        hx-swap="innerHTML"
+      >
+        Loading hits...
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        Built with FastAPI + HTMX ·
+        <a href="https://github.com/placeholder/log-redaction-engine">repo</a>
+        · <a href="/metrics">/metrics</a> ·
+        <a href="/api/stats">/api/stats</a>
+      </p>
+    </footer>
+
+    <script>
+      // Custom submit handler. We POST JSON (not form-encoded data) so
+      // /api/redact gets a body shaped like ``{"log_entries": [...]}``.
+      // The textarea content is parsed as JSON client-side; a parse
+      // error is surfaced in the output pane rather than going to the
+      // server (saves a round trip and gives the user a clearer error).
+      document
+        .getElementById("redact-form")
+        .addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const raw = document.getElementById("log-input").value;
+          document.getElementById("input-preview").textContent = raw;
+          let parsed;
+          try {
+            parsed = JSON.parse(raw);
+          } catch (err) {
+            document.getElementById("output-preview").textContent =
+              "Invalid JSON: " + err.message;
+            return;
+          }
+          const body = JSON.stringify({ log_entries: [parsed] });
+          const resp = await fetch("/api/redact", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body,
+          });
+          const data = await resp.json();
+          document.getElementById("output-preview").textContent =
+            JSON.stringify(data, null, 2);
+        });
+    </script>
+  </body>
+</html>

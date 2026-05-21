@@ -63,6 +63,8 @@ COPY --from=builder /opt/venv /opt/venv
 # diff small and lets each commit be reviewed independently.
 COPY --chown=app:app src/ /app/src/
 COPY --chown=app:app config/ /app/config/
+COPY --chown=app:app templates/ /app/templates/
+COPY --chown=app:app static/ /app/static/
 
 EXPOSE 8000
 

@@ -1,0 +1,15 @@
+<h3>Pattern Hits</h3>
+{% if pattern_hits %}
+<table class="pattern-hits-table">
+  <thead>
+    <tr><th>Pattern</th><th>Count</th></tr>
+  </thead>
+  <tbody>
+    {% for pattern, count in pattern_hits.items() %}
+    <tr><td>{{ pattern }}</td><td>{{ count }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No redactions yet.</p>
+{% endif %}

@@ -42,7 +42,10 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.api.routes import router as api_router
@@ -236,6 +239,104 @@ async def health() -> dict[str, str]:
     container unhealthy and cause a restart loop.
     """
     return {"status": "healthy", "service": "log-redaction-engine"}
+
+
+# ---------------------------------------------------------------------------
+# Static assets + Jinja2 templates (C9 dashboard)
+# ---------------------------------------------------------------------------
+#
+# Both directories live at the project root (alongside ``src/``). In
+# Docker they're copied to ``/app/templates`` and ``/app/static`` by the
+# new ``COPY`` lines in the Dockerfile; in a dev checkout they resolve
+# relative to this file.
+
+templates_dir = Path(__file__).parent.parent / "templates"
+static_dir = Path(__file__).parent.parent / "static"
+
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+# Module-level templates singleton. The three dashboard routes below
+# reach in directly; we don't bother re-publishing onto ``app.state``
+# because the routes live in this same module.
+templates = Jinja2Templates(directory=str(templates_dir))
+
+
+# ---------------------------------------------------------------------------
+# Dashboard routes (C9)
+# ---------------------------------------------------------------------------
+#
+# Three routes:
+#   GET /                       full HTML page
+#   GET /api/stats/html         HTMX partial (live stats card, 5 s poll)
+#   GET /api/pattern_hits/html  HTMX partial (pattern-hits table, 10 s poll)
+#
+# All three live in main.py (not src/api/routes.py) so the
+# module-local ``templates`` singleton is reachable without an extra
+# import dance.
+
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request) -> HTMLResponse:
+    """Serve the live HTML dashboard at the project root.
+
+    Renders ``templates/dashboard.html`` with the active preset name and
+    rule count baked into the header. The two HTMX-driven partials
+    inside the page (``/api/stats/html`` and ``/api/pattern_hits/html``)
+    refresh on their own polling cadence; this route only renders the
+    chrome.
+    """
+    settings = get_settings()
+    cfg = request.app.state.config_manager.get()
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {
+            "request": request,
+            "preset_name": settings.REDACTION_PRESET,
+            "rule_count": len(cfg.rules),
+        },
+    )
+
+
+@app.get("/api/stats/html", response_class=HTMLResponse)
+async def stats_html(request: Request) -> HTMLResponse:
+    """Render the ``_stats_card.html`` partial for HTMX polling.
+
+    Same numbers as ``GET /api/stats`` (the JSON sibling), shaped for
+    direct HTML insertion rather than client-side rendering. The
+    ``data-logs-processed`` attribute on the stats-grid lets the
+    Chrome MCP test scrape the value without parsing the formatted
+    cell text.
+    """
+    stats = request.app.state.stats
+    lat = stats.latency.snapshot()
+    return templates.TemplateResponse(
+        "_stats_card.html",
+        {
+            "request": request,
+            "logs_processed": stats.throughput.total_count(),
+            "ops_per_second": stats.throughput.ops_per_second(),
+            "avg_latency_ms": lat["mean_ms"],
+            "p95_latency_ms": lat["p95_ms"],
+        },
+    )
+
+
+@app.get("/api/pattern_hits/html", response_class=HTMLResponse)
+async def pattern_hits_html(request: Request) -> HTMLResponse:
+    """Render the ``_pattern_hits.html`` partial for HTMX polling.
+
+    Returns the same per-pattern hit counts surfaced by
+    ``GET /api/stats``, projected into a small ``<table>`` (or the
+    "No redactions yet." paragraph when the counter map is empty).
+    """
+    stats = request.app.state.stats
+    return templates.TemplateResponse(
+        "_pattern_hits.html",
+        {
+            "request": request,
+            "pattern_hits": stats.counters.snapshot(),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

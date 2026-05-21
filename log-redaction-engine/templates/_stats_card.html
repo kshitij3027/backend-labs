@@ -1,0 +1,19 @@
+<h2>Live Stats</h2>
+<div class="stats-grid" data-logs-processed="{{ logs_processed }}">
+  <div class="stat">
+    <span class="stat-label">Logs Processed</span>
+    <span class="stat-value">{{ logs_processed }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Ops/sec</span>
+    <span class="stat-value">{{ '%.2f'|format(ops_per_second) }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Avg Latency</span>
+    <span class="stat-value">{{ '%.2f'|format(avg_latency_ms) }} ms</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">p95 Latency</span>
+    <span class="stat-value">{{ '%.2f'|format(p95_latency_ms) }} ms</span>
+  </div>
+</div>
