@@ -35,9 +35,10 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Path, Request, status
 from pydantic import ValidationError
 
+from src.compliance.reports import ComplianceReport, ComplianceRuleSet, generate_report
 from src.config.models import RedactionConfig
 
 from .metrics import DETECTIONS_TOTAL, REDACTIONS_TOTAL
@@ -356,3 +357,46 @@ async def post_config(request: Request) -> dict:
     # return. Clients can use this to confirm the swap took effect
     # without a follow-up GET.
     return new_config.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# /api/compliance/{rule_set} — per-regime redaction report (C8)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/api/compliance/{rule_set}",
+    response_model=ComplianceReport,
+    tags=["compliance"],
+)
+async def compliance_endpoint(
+    rule_set: ComplianceRuleSet = Path(
+        ..., description="Compliance regime: GDPR, HIPAA, or PCI_DSS"
+    ),
+    request: Request = None,
+) -> ComplianceReport:
+    """Return a redaction summary for the given compliance regime.
+
+    The path parameter ``rule_set`` is constrained to the closed
+    :data:`~src.compliance.reports.ComplianceRuleSet` Literal so
+    FastAPI surfaces a 422 for any value outside ``{"GDPR", "HIPAA",
+    "PCI_DSS"}`` without entering this handler.
+
+    The aggregation walks the audit ring buffer (singleton built at
+    startup, available on ``app.state.ring_buffer``) and returns the
+    immutable :class:`ComplianceReport` directly — FastAPI's pydantic
+    encoder handles the JSON projection.
+
+    Performance
+    -----------
+    Designed to handle 100 k events in under 30 s (single O(n) pass
+    over the filtered list). The reported ``report_generation_time_ms``
+    on the response lets ops verify the budget is being met under
+    real traffic.
+    """
+    # Pull the singleton off app.state — built once at startup in
+    # src.main.lifespan and shared across every request. Matches the
+    # access pattern used by /api/stats and /api/redact for consistency.
+    ring_buffer = request.app.state.ring_buffer
+    report = generate_report(ring_buffer=ring_buffer, rule_set=rule_set)
+    return report
