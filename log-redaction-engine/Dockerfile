@@ -62,6 +62,7 @@ COPY --from=builder /opt/venv /opt/venv
 # dashboard assets). Splitting the COPYs across commits keeps the layer
 # diff small and lets each commit be reviewed independently.
 COPY --chown=app:app src/ /app/src/
+COPY --chown=app:app config/ /app/config/
 
 EXPOSE 8000
 
