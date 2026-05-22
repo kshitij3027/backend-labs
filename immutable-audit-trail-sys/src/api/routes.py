@@ -13,6 +13,8 @@ from src.persistence.models import AuditRecord as AuditRecordORM
 from src.reports.base import ReportBundle
 from src.reports.gdpr import render_gdpr_report
 from src.reports.hipaa import render_hipaa_report
+from src.reports.soc2 import render_soc2_report
+from src.reports.pci_dss import render_pci_dss_report
 from src.settings import get_settings
 from src.stats.counters import get_counters
 
@@ -235,6 +237,22 @@ async def reports(
         )
     if fw == "hipaa":
         return await render_hipaa_report(
+            session_factory=session_factory,
+            chain_verifier=chain_verifier,
+            signer=signer,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+    if fw == "soc2":
+        return await render_soc2_report(
+            session_factory=session_factory,
+            chain_verifier=chain_verifier,
+            signer=signer,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+    if fw == "pci_dss":
+        return await render_pci_dss_report(
             session_factory=session_factory,
             chain_verifier=chain_verifier,
             signer=signer,

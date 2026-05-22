@@ -79,3 +79,28 @@ async def test_default_time_range_used_when_no_query(app_and_client):
     # Time range should be non-empty strings.
     assert len(body["time_range"]) == 2
     assert all(isinstance(x, str) and len(x) > 10 for x in body["time_range"])
+
+
+@pytest.mark.asyncio
+async def test_soc2_report_endpoint(app_and_client):
+    _app, client = app_and_client
+    r = await client.get(
+        "/v1/reports/soc2?from=2024-01-01T00:00:00%2B00:00&to=2030-01-01T00:00:00%2B00:00"
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["framework"] == "soc2"
+    assert "anomaly_indicators" in body["extras"]
+    assert "SOC 2" in body["extras"]["regulation_reference"]
+
+
+@pytest.mark.asyncio
+async def test_pci_dss_report_endpoint(app_and_client):
+    _app, client = app_and_client
+    r = await client.get(
+        "/v1/reports/pci_dss?from=2024-01-01T00:00:00%2B00:00&to=2030-01-01T00:00:00%2B00:00"
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["framework"] == "pci_dss"
+    assert "PCI DSS" in body["extras"]["regulation_reference"]
