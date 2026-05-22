@@ -141,6 +141,8 @@ async def _safe_append(
     error_message: Optional[str],
 ) -> None:
     """Call ChainAppender.append. Swallow any audit-side error."""
+    from src.stats.counters import get_counters
+    get_counters().incr_decorator_invocations()
     appender = get_appender()
     if appender is None:
         log.warning("audit_access invoked but no appender registered")
@@ -195,6 +197,8 @@ def audit_access(
                     result = await fn(*args, **kwargs)
                 except Exception as exc:
                     processing_ms = (time.perf_counter() - start) * 1000.0
+                    from src.stats.counters import get_counters
+                    get_counters().incr_decorator_failures()
                     await _safe_append(
                         actor=actor, action=action, resource=resource,
                         success=False, args_d=a_dig, result_d="",
@@ -210,6 +214,8 @@ def audit_access(
                     processing_ms=processing_ms,
                     error_message=None,
                 )
+                from src.stats.counters import get_counters
+                get_counters().observe_decorator_overhead_ms(processing_ms)
                 return result
 
             return async_wrapper
@@ -224,6 +230,8 @@ def audit_access(
                 result = fn(*args, **kwargs)
             except Exception as exc:
                 processing_ms = (time.perf_counter() - start) * 1000.0
+                from src.stats.counters import get_counters
+                get_counters().incr_decorator_failures()
                 # Sync caller can still record via asyncio.run; if we're
                 # already inside a running loop, schedule via a task.
                 _schedule_audit(
@@ -241,6 +249,8 @@ def audit_access(
                 processing_ms=processing_ms,
                 error_message=None,
             )
+            from src.stats.counters import get_counters
+            get_counters().observe_decorator_overhead_ms(processing_ms)
             return result
 
         return sync_wrapper

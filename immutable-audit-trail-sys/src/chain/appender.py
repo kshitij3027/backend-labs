@@ -110,6 +110,12 @@ class ChainAppender:
             session.add(row)
             await session.commit()
 
+        # Stats hook: only increment after a successful commit so failed
+        # appends don't pollute the count. The session context manager has
+        # already committed by the time we reach here.
+        from src.stats.counters import get_counters
+        get_counters().incr_records_appended()
+
         return AuditRecord(
             **payload.model_dump(),
             self_hash=self_hash,

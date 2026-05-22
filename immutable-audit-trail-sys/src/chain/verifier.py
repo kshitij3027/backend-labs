@@ -185,6 +185,12 @@ class ChainVerifier:
             and not seq_gaps
         )
 
+        from src.stats.counters import get_counters
+        counters = get_counters()
+        counters.incr_verifications_run()
+        if not ok:
+            counters.incr_integrity_breaks()
+
         return VerifyResult(
             ok=ok,
             integrity_status="VALID" if ok else "BROKEN",

@@ -11,6 +11,7 @@ from src.api.models import AppendRequest, RecordResponse, RecordsList
 from src.chain.verifier import VerifyResult
 from src.persistence.models import AuditRecord as AuditRecordORM
 from src.settings import get_settings
+from src.stats.counters import get_counters
 
 router = APIRouter()
 
@@ -175,3 +176,9 @@ async def verify_chain(
             detail=f"to ({to_seq}) must be >= from ({from_seq})",
         )
     return await chain_verifier.verify_range(from_seq, to_seq)
+
+
+@router.get("/api/stats", tags=["observability"])
+async def stats() -> dict[str, int]:
+    """JSON snapshot of process-local counters. Prometheus exposition at /metrics."""
+    return get_counters().snapshot()
