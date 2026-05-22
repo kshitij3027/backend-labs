@@ -1,21 +1,17 @@
-"""FastAPI app with lifespan that wires the audit chain components.
-
-C4 brings up: engine (WAL) -> init_db (schema + triggers + genesis) ->
-Ed25519Signer attached to app.state. Later commits attach ChainAppender,
-ChainVerifier, stats counters, etc.
-"""
+"""FastAPI app with lifespan that wires the audit chain components."""
 from __future__ import annotations
 
 import logging
-import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
 
+from src.api.routes import router as api_router
 from src.chain.appender import ChainAppender
 from src.chain.verifier import ChainVerifier
 from src.crypto.signer import Ed25519Signer, Ed25519Verifier
+from src.interceptor.decorator import set_appender
 from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
 
@@ -32,15 +28,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_db(engine, signer, settings.chain_genesis_note)
 
     appender = ChainAppender(session_factory, signer)
+    chain_verifier = ChainVerifier(
+        session_factory,
+        Ed25519Verifier(signer.public_key_b64()),
+    )
 
-    # The verifier shares the signer's keypair (read-side: derive the public
-    # key from the same seed the appender signs with). In a deployment with
-    # rotated keys you'd pass a list of trusted public keys here instead.
-    verifier_signer = Ed25519Verifier(signer.public_key_b64())
-    chain_verifier = ChainVerifier(session_factory, verifier_signer)
+    # Register the appender so @audit_access decorators can find it.
+    set_appender(appender)
 
-    # Stash on app.state so route handlers (added in later commits) can pull
-    # the dependencies without re-reading settings or rebuilding objects.
     app.state.settings = settings
     app.state.signer = signer
     app.state.engine = engine
@@ -60,7 +55,4 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
-@app.get("/api/health")
-async def health() -> dict[str, int | str]:
-    return {"status": "healthy", "timestamp": int(time.time())}
+app.include_router(api_router)
