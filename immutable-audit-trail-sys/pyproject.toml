@@ -1,0 +1,8 @@
+[project]
+name = "immutable-audit-trail-sys"
+version = "0.1.0"
+description = "Tamper-evident audit trail for log access with SHA-256 hash chain + Ed25519 signatures"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["src"]
