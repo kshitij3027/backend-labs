@@ -8,6 +8,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 
 from src.api.models import AppendRequest, RecordResponse, RecordsList
+from src.chain.verifier import VerifyResult
 from src.persistence.models import AuditRecord as AuditRecordORM
 from src.settings import get_settings
 
@@ -140,3 +141,37 @@ async def get_record(request: Request, seq: int) -> RecordResponse:
     if row is None:
         raise HTTPException(status_code=404, detail=f"record seq={seq} not found")
     return _orm_to_response(row)
+
+
+# --- Chain integrity verification ---------------------------------------
+
+@router.get(
+    "/v1/verify",
+    response_model=VerifyResult,
+    tags=["audit"],
+)
+async def verify_chain(
+    request: Request,
+    from_seq: Optional[int] = Query(default=None, alias="from", ge=0),
+    to_seq: Optional[int] = Query(default=None, alias="to", ge=0),
+) -> VerifyResult:
+    """Verify chain integrity.
+
+    Both ``from`` and ``to`` optional. With neither: full chain. With both:
+    inclusive range [from, to]. With one but not the other: 422 (we don't
+    want to silently expand a half-specified range).
+    """
+    chain_verifier = request.app.state.chain_verifier
+    if from_seq is None and to_seq is None:
+        return await chain_verifier.verify_full()
+    if from_seq is None or to_seq is None:
+        raise HTTPException(
+            status_code=422,
+            detail="from and to must be specified together",
+        )
+    if to_seq < from_seq:
+        raise HTTPException(
+            status_code=422,
+            detail=f"to ({to_seq}) must be >= from ({from_seq})",
+        )
+    return await chain_verifier.verify_range(from_seq, to_seq)
