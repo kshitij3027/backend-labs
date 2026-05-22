@@ -10,6 +10,9 @@ from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from src.api.models import AppendRequest, RecordResponse, RecordsList
 from src.chain.verifier import VerifyResult
 from src.persistence.models import AuditRecord as AuditRecordORM
+from src.reports.base import ReportBundle
+from src.reports.gdpr import render_gdpr_report
+from src.reports.hipaa import render_hipaa_report
 from src.settings import get_settings
 from src.stats.counters import get_counters
 
@@ -182,3 +185,60 @@ async def verify_chain(
 async def stats() -> dict[str, int]:
     """JSON snapshot of process-local counters. Prometheus exposition at /metrics."""
     return get_counters().snapshot()
+
+
+# --- Compliance reports ---------------------------------------------------
+
+from datetime import datetime, timedelta, timezone
+
+
+@router.get(
+    "/v1/reports/{framework}",
+    response_model=ReportBundle,
+    tags=["compliance"],
+)
+async def reports(
+    request: Request,
+    framework: str,
+    from_ts: Optional[str] = Query(default=None, alias="from"),
+    to_ts: Optional[str] = Query(default=None, alias="to"),
+    actor: Optional[str] = Query(default=None),
+    resource: Optional[str] = Query(default=None),
+) -> ReportBundle:
+    """Generate a compliance report for the given framework.
+
+    Frameworks wired in C13: ``gdpr``, ``hipaa``. ``soc2``/``pci_dss`` land in C14.
+    Time range defaults to ``[now - REPORT_DEFAULT_RANGE_DAYS, now]`` if unset.
+    """
+    settings = request.app.state.settings
+    chain_verifier = request.app.state.chain_verifier
+    signer = request.app.state.signer
+    session_factory = request.app.state.session_factory
+
+    if to_ts is None:
+        to_ts = datetime.now(timezone.utc).isoformat()
+    if from_ts is None:
+        from_ts = (
+            datetime.now(timezone.utc) - timedelta(days=settings.report_default_range_days)
+        ).isoformat()
+
+    fw = framework.lower()
+    if fw == "gdpr":
+        return await render_gdpr_report(
+            session_factory=session_factory,
+            chain_verifier=chain_verifier,
+            signer=signer,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            actor=actor,
+            resource=resource,
+        )
+    if fw == "hipaa":
+        return await render_hipaa_report(
+            session_factory=session_factory,
+            chain_verifier=chain_verifier,
+            signer=signer,
+            from_ts=from_ts,
+            to_ts=to_ts,
+        )
+    raise HTTPException(status_code=400, detail=f"unknown framework: {framework}")
