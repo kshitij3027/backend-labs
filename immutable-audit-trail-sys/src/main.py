@@ -14,7 +14,8 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from src.chain.appender import ChainAppender
-from src.crypto.signer import Ed25519Signer
+from src.chain.verifier import ChainVerifier
+from src.crypto.signer import Ed25519Signer, Ed25519Verifier
 from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
 
@@ -32,6 +33,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     appender = ChainAppender(session_factory, signer)
 
+    # The verifier shares the signer's keypair (read-side: derive the public
+    # key from the same seed the appender signs with). In a deployment with
+    # rotated keys you'd pass a list of trusted public keys here instead.
+    verifier_signer = Ed25519Verifier(signer.public_key_b64())
+    chain_verifier = ChainVerifier(session_factory, verifier_signer)
+
     # Stash on app.state so route handlers (added in later commits) can pull
     # the dependencies without re-reading settings or rebuilding objects.
     app.state.settings = settings
@@ -39,6 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.session_factory = session_factory
     app.state.appender = appender
+    app.state.chain_verifier = chain_verifier
 
     try:
         yield
