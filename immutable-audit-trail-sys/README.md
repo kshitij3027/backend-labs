@@ -144,7 +144,98 @@ Each report bundles: filtered records, the verification result for the spanning 
 
 ## How to Run
 
-> The implementation has not been started. Once it is, the standard backend-labs flow applies: `make demo` to bring the stack up, `make test` for the full pytest suite inside Docker, `make e2e` for the curl-driven end-to-end check.
+All operations run in Docker. There are no host-side dependencies beyond Docker
+Desktop.
+
+### Quick start
+
+```bash
+# 1. Generate a signing key into .env (one-time, on a fresh clone)
+cp .env.example .env
+python -c "import os, base64; print('SIGNING_KEY_B64=' + base64.b64encode(os.urandom(32)).decode())" >> .env
+
+# 2. Bring up the stack
+make demo
+# -> http://localhost:8000
+
+# 3. Seed some demo data
+docker compose --profile test run --rm tester python scripts/seed_demo.py
+
+# 4. Open the dashboard
+open http://localhost:8000
+```
+
+### Make targets
+
+| Target | What it does |
+|--------|-------------|
+| `make build` | Build the app + tester images. |
+| `make up` | Start the `app` container in the background. |
+| `make demo` | `build` + `up`; print dashboard URL. |
+| `make down` | Stop and remove the stack. |
+| `make logs` | Tail app logs. |
+| `make test` | Run the full pytest suite in the tester container. |
+| `make test-unit` | Run only unit tests. |
+| `make test-int` | Run only integration tests. |
+| `make e2e` | Run scripts/e2e.sh against the live `app` (requires `make up` first). |
+| `make throughput` | Run the throughput harness; asserts >=100 RPS at <=100ms p50. |
+| `make clean` | Tear down + remove locally-built images. |
+
+### Hash Chain Verification Walkthrough
+
+A full integrity check is just one HTTP call:
+
+```bash
+curl -s http://localhost:8000/v1/verify | jq
+```
+
+A clean chain returns:
+
+```json
+{
+  "ok": true,
+  "integrity_status": "VALID",
+  "head_seq": 30,
+  "total_records": 31,
+  "verified_records": 31,
+  "failed_records": 0,
+  "first_break_seq": null,
+  "signature_failures": [],
+  "seq_gaps": []
+}
+```
+
+To **demonstrate tamper detection**: open the SQLite file (mounted at
+`./data/audit.db`), drop the immutability triggers temporarily, mutate a row,
+then re-verify. The next `/v1/verify` reports the exact `first_break_seq` and
+reason (`hash_mismatch` / `signature_invalid` / `seq_gap`). The decorator-side
+counters and dashboard will also surface an `integrity_break` alert on the
+next poll.
+
+> Production code never drops the triggers — this is only for the
+> tamper-evidence demo. In normal operation, the triggers are engine-enforced
+> and any UPDATE or DELETE on `audit_records` returns
+> `audit_records is append-only` from SQLite directly.
+
+### Compliance reports
+
+Four framework-specific report shapes are exposed at `/v1/reports/{framework}`:
+
+| Framework | Endpoint | Filters |
+|-----------|----------|---------|
+| GDPR Art. 30 | `/v1/reports/gdpr` | optional actor / resource |
+| HIPAA §164.312(b) | `/v1/reports/hipaa` | resource startswith `PATIENT_`, action in {read,search,export} |
+| SOC 2 CC7.2 | `/v1/reports/soc2` | none; reports anomaly indicators |
+| PCI DSS 10.2 | `/v1/reports/pci_dss` | resource startswith `CARDHOLDER_` |
+
+Each report includes an Ed25519 attestation signature over the canonical
+bundle bytes so downstream auditors can re-verify out-of-band.
+
+### Observability
+
+- `/api/stats` — JSON snapshot of process-local counters.
+- `/metrics` — Prometheus exposition (auto-scrape ready).
+- Dashboard at `/` — live cards refreshed via HTMX every 10s.
 
 ---
 
