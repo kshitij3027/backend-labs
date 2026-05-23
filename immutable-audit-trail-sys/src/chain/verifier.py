@@ -191,6 +191,13 @@ class ChainVerifier:
         if not ok:
             counters.incr_integrity_breaks()
 
+        if not ok and first_break_seq is not None:
+            from src.anomaly.detector import emit_integrity_break_alert
+            emit_integrity_break_alert(
+                first_break_seq=first_break_seq,
+                reason=first_break_reason or "unknown",
+            )
+
         return VerifyResult(
             ok=ok,
             integrity_status="VALID" if ok else "BROKEN",

@@ -1,8 +1,10 @@
 """FastAPI app with lifespan that wires the audit chain components."""
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI
@@ -10,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from prometheus_fastapi_instrumentator import Instrumentator
 
+from src.anomaly.alerts import AlertSink, set_sink
+from src.anomaly.detector import AnomalyDetector, run_detector_periodically
 from src.api.routes import router as api_router
 from src.chain.appender import ChainAppender
 from src.chain.verifier import ChainVerifier
@@ -54,9 +58,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.chain_verifier = chain_verifier
     app.state.templates = _TEMPLATES
 
+    sink = AlertSink(capacity=100)
+    set_sink(sink)
+    app.state.alert_sink = sink
+
+    known_actors_path = Path("config/known_actors.txt")
+    detector = AnomalyDetector(session_factory, sink, known_actors_path=known_actors_path)
+    app.state.detector = detector
+    detector_task = asyncio.create_task(run_detector_periodically(detector, interval_sec=30.0))
+    app.state.detector_task = detector_task
+
     try:
         yield
     finally:
+        detector_task.cancel()
+        try:
+            await detector_task
+        except asyncio.CancelledError:
+            pass
         await engine.dispose()
 
 

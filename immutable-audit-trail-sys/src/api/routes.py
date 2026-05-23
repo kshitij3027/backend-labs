@@ -319,6 +319,9 @@ async def partial_integrity(request: Request) -> HTMLResponse:
 
 @router.get("/partials/alerts", response_class=HTMLResponse, tags=["dashboard"])
 async def partial_alerts(request: Request) -> HTMLResponse:
-    """Placeholder until C16 lands the anomaly sink."""
     templates = request.app.state.templates
-    return templates.TemplateResponse("_alerts_card.html", {"request": request})
+    sink = request.app.state.alert_sink
+    return templates.TemplateResponse(
+        "_alerts_card.html",
+        {"request": request, "alerts": sink.recent(50)},
+    )

@@ -1,2 +1,14 @@
 <h2>Recent alerts</h2>
-<p class="muted">No alerts. Anomaly detection lands in the next commit.</p>
+{% if alerts %}
+<ul class="alerts">
+  {% for alert in alerts %}
+  <li class="alert sev-{{ alert.severity }}">
+    <span class="alert-type">{{ alert.type }}</span>
+    <span class="alert-msg">{{ alert.message }}</span>
+    {% if alert.actor %}<span class="alert-actor">actor={{ alert.actor }}</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No alerts.</p>
+{% endif %}
