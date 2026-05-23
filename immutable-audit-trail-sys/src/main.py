@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from src.api.routes import router as api_router
@@ -15,6 +17,13 @@ from src.crypto.signer import Ed25519Signer, Ed25519Verifier
 from src.interceptor.decorator import set_appender
 from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
+
+
+# Module-level constants: StaticFiles mount and Jinja2Templates factory are
+# stateless and safe to instantiate at import time. The mount itself happens
+# below at app construction; the templates factory is attached to app.state
+# during lifespan so route handlers can pull it off ``request.app.state``.
+_TEMPLATES = Jinja2Templates(directory="templates")
 
 
 @asynccontextmanager
@@ -43,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.session_factory = session_factory
     app.state.appender = appender
     app.state.chain_verifier = chain_verifier
+    app.state.templates = _TEMPLATES
 
     try:
         yield
@@ -57,5 +67,8 @@ app = FastAPI(
 )
 
 app.include_router(api_router)
+
+# Mount /static at app construction (no per-request state — safe outside lifespan).
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", tags=["observability"])

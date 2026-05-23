@@ -6,6 +6,7 @@ from typing import Optional
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse
 
 from src.api.models import AppendRequest, RecordResponse, RecordsList
 from src.chain.verifier import VerifyResult
@@ -260,3 +261,64 @@ async def reports(
             to_ts=to_ts,
         )
     raise HTTPException(status_code=400, detail=f"unknown framework: {framework}")
+
+
+# --- Dashboard ---------------------------------------------------------
+
+# Cache the integrity check for 5s — verify_full scans the whole chain
+# and the dashboard polls /partials/integrity every 10s by default.
+_INTEGRITY_CACHE: dict = {"ts": 0.0, "result": None}
+_INTEGRITY_TTL_SEC = 5.0
+
+
+@router.get("/", response_class=HTMLResponse, tags=["dashboard"])
+async def dashboard(request: Request) -> HTMLResponse:
+    templates = request.app.state.templates
+    settings = request.app.state.settings
+    return templates.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "refresh_ms": settings.dashboard_refresh_ms},
+    )
+
+
+@router.get("/partials/stats", response_class=HTMLResponse, tags=["dashboard"])
+async def partial_stats(request: Request) -> HTMLResponse:
+    templates = request.app.state.templates
+    return templates.TemplateResponse(
+        "_stats_card.html",
+        {"request": request, "stats": get_counters().snapshot()},
+    )
+
+
+@router.get("/partials/records", response_class=HTMLResponse, tags=["dashboard"])
+async def partial_records(request: Request) -> HTMLResponse:
+    templates = request.app.state.templates
+    factory = request.app.state.session_factory
+    async with factory() as session:
+        rows = (await session.execute(
+            sa.select(AuditRecordORM).order_by(AuditRecordORM.seq.desc()).limit(50)
+        )).scalars().all()
+    return templates.TemplateResponse(
+        "_records_table.html",
+        {"request": request, "records": rows},
+    )
+
+
+@router.get("/partials/integrity", response_class=HTMLResponse, tags=["dashboard"])
+async def partial_integrity(request: Request) -> HTMLResponse:
+    templates = request.app.state.templates
+    now = time.time()
+    if _INTEGRITY_CACHE["result"] is None or (now - _INTEGRITY_CACHE["ts"]) > _INTEGRITY_TTL_SEC:
+        _INTEGRITY_CACHE["result"] = await request.app.state.chain_verifier.verify_full()
+        _INTEGRITY_CACHE["ts"] = now
+    return templates.TemplateResponse(
+        "_integrity_card.html",
+        {"request": request, "verify": _INTEGRITY_CACHE["result"]},
+    )
+
+
+@router.get("/partials/alerts", response_class=HTMLResponse, tags=["dashboard"])
+async def partial_alerts(request: Request) -> HTMLResponse:
+    """Placeholder until C16 lands the anomaly sink."""
+    templates = request.app.state.templates
+    return templates.TemplateResponse("_alerts_card.html", {"request": request})

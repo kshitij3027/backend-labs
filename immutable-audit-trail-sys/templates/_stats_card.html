@@ -1,0 +1,8 @@
+<h2>Activity counters</h2>
+<dl class="kv">
+  <dt>Records appended</dt><dd>{{ stats.records_appended }}</dd>
+  <dt>Verifications run</dt><dd>{{ stats.verifications_run }}</dd>
+  <dt>Integrity breaks</dt><dd class="{% if stats.integrity_breaks_detected %}bad{% else %}good{% endif %}">{{ stats.integrity_breaks_detected }}</dd>
+  <dt>Decorator invocations</dt><dd>{{ stats.decorator_invocations_total }}</dd>
+  <dt>Decorator failures</dt><dd>{{ stats.decorator_failures_total }}</dd>
+</dl>

@@ -1,0 +1,13 @@
+<h2>Chain integrity</h2>
+<p class="status {% if verify.ok %}good{% else %}bad{% endif %}">
+  {{ verify.integrity_status }}
+</p>
+<dl class="kv">
+  <dt>Head seq</dt><dd>{{ verify.head_seq }}</dd>
+  <dt>Total records</dt><dd>{{ verify.total_records }}</dd>
+  <dt>Verified</dt><dd>{{ verify.verified_records }}</dd>
+  <dt>Failed</dt><dd class="{% if verify.failed_records %}bad{% endif %}">{{ verify.failed_records }}</dd>
+  {% if verify.first_break_seq is not none %}
+  <dt>First break at seq</dt><dd class="bad">{{ verify.first_break_seq }} ({{ verify.first_break_reason }})</dd>
+  {% endif %}
+</dl>

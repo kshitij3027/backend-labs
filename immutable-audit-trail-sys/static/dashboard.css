@@ -1,0 +1,91 @@
+:root {
+  --bg: #0f1115;
+  --fg: #e6e6e6;
+  --muted: #777;
+  --card: #1a1d24;
+  --border: #2a2f38;
+  --good: #4ade80;
+  --bad: #f87171;
+  --accent: #60a5fa;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+  background: var(--bg);
+  color: var(--fg);
+  line-height: 1.5;
+  padding: 1.5rem;
+}
+
+header { margin-bottom: 1.5rem; }
+header h1 { font-size: 1.5rem; color: var(--accent); }
+header .muted { font-size: 0.85rem; color: var(--muted); margin-top: 0.25rem; }
+
+.grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(3, 1fr);
+}
+
+.grid > section {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem;
+}
+
+.grid > section.wide { grid-column: 1 / -1; }
+
+section h2 {
+  font-size: 0.95rem;
+  color: var(--accent);
+  margin-bottom: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 1rem;
+  font-size: 0.9rem;
+}
+.kv dt { color: var(--muted); }
+.kv dd { text-align: right; font-variant-numeric: tabular-nums; }
+
+.status {
+  font-size: 1.5rem;
+  font-weight: bold;
+  text-align: center;
+  margin-bottom: 1rem;
+  padding: 0.5rem;
+  border-radius: 4px;
+}
+.status.good { background: rgba(74, 222, 128, 0.15); color: var(--good); }
+.status.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+
+.good { color: var(--good); }
+.bad { color: var(--bad); }
+.muted { color: var(--muted); }
+
+.placeholder { color: var(--muted); font-style: italic; }
+
+table.records {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+table.records th, table.records td {
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+table.records th { color: var(--muted); font-weight: normal; text-transform: uppercase; }
+table.records tr.bad td { color: var(--bad); }
+.hash { color: var(--muted); font-size: 0.75rem; }
+
+footer { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+footer a { color: var(--accent); text-decoration: none; margin-right: 0.5rem; }
+footer a:hover { text-decoration: underline; }

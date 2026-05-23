@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Immutable Audit Trail — Live Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Immutable Audit Trail</h1>
+    <p class="muted">Tamper-evident hash chain · SHA-256 · Ed25519 signatures · refresh: {{ refresh_ms }}ms</p>
+  </header>
+
+  <main class="grid">
+    <section id="stats-card"
+             hx-get="/partials/stats"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading stats…</div>
+    </section>
+
+    <section id="integrity-card"
+             hx-get="/partials/integrity"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading integrity status…</div>
+    </section>
+
+    <section id="alerts-card"
+             hx-get="/partials/alerts"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading alerts…</div>
+    </section>
+
+    <section id="records-table"
+             hx-get="/partials/records"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             class="wide">
+      <div class="placeholder">loading records…</div>
+    </section>
+  </main>
+
+  <footer>
+    <p class="muted">
+      <a href="/v1/verify" target="_blank">verify chain</a> ·
+      <a href="/api/stats" target="_blank">stats JSON</a> ·
+      <a href="/metrics" target="_blank">Prometheus metrics</a> ·
+      <a href="/v1/reports/gdpr" target="_blank">GDPR</a> ·
+      <a href="/v1/reports/hipaa" target="_blank">HIPAA</a> ·
+      <a href="/v1/reports/soc2" target="_blank">SOC 2</a> ·
+      <a href="/v1/reports/pci_dss" target="_blank">PCI DSS</a>
+    </p>
+  </footer>
+</body>
+</html>

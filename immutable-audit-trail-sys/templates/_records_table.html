@@ -1,0 +1,23 @@
+<h2>Latest records (newest first)</h2>
+<table class="records">
+  <thead>
+    <tr>
+      <th>seq</th><th>timestamp (UTC)</th><th>actor</th><th>action</th>
+      <th>resource</th><th>ok</th><th>ms</th><th>self_hash</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in records %}
+    <tr class="{% if not r.success %}bad{% endif %}">
+      <td>{{ r.seq }}</td>
+      <td>{{ r.timestamp_utc }}</td>
+      <td>{{ r.actor }}</td>
+      <td>{{ r.action }}</td>
+      <td>{{ r.resource }}</td>
+      <td>{% if r.success %}Y{% else %}N{% endif %}</td>
+      <td>{{ ('%.1f' % r.processing_ms) if r.processing_ms is not none else '-' }}</td>
+      <td class="hash">{{ r.self_hash[:12] }}…</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
