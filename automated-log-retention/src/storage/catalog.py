@@ -128,6 +128,43 @@ class CatalogRepo:
             )
             await session.commit()
 
+    async def list_files(
+        self,
+        tier: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[File]:
+        """Return a page of files, newest first, optionally filtered by tier.
+
+        Used by ``GET /v1/files`` (C12) to surface catalog rows to
+        operators and tests. The ordering (``id DESC``) means recently
+        ingested segments appear first, which matches how an operator
+        triaging "what just landed?" reads a list. Filter by ``tier`` to
+        narrow to one stage (``hot`` / ``warm`` / ``cold`` / ``archive``
+        / ``pending``).
+        """
+        async with self._sf() as session:
+            stmt = select(File)
+            if tier is not None:
+                stmt = stmt.where(File.tier == tier)
+            stmt = stmt.order_by(File.id.desc()).limit(limit).offset(offset)
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def count_files(self, tier: str | None = None) -> int:
+        """Return the total file count, optionally filtered by tier.
+
+        Used together with ``list_files`` to render paging UI — the
+        page itself comes from ``list_files``; the ``total`` field of
+        the API response is this method's output.
+        """
+        async with self._sf() as session:
+            stmt = select(func.count(File.id))
+            if tier is not None:
+                stmt = stmt.where(File.tier == tier)
+            result = await session.execute(stmt)
+            return int(result.scalar_one())
+
     async def list_due_files(
         self, now: datetime, limit: int = 1000
     ) -> list[File]:
