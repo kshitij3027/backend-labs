@@ -22,10 +22,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.persistence.models import File
+from src.persistence.models import File, PendingDelete
 from src.storage.tiers import TIERS
 
 
@@ -190,3 +190,81 @@ class CatalogRepo:
                 else:
                     result[tier] = int(total)
         return result
+
+    # --- pending_deletes queue (mark-then-sweep) ----------------------------
+    #
+    # The applier (C10) calls ``add_pending_delete`` when it has finished
+    # promoting a segment to its new tier and wants the original copy
+    # cleaned up after a grace window. The sweeper (C11) drains the
+    # queue via ``list_pending_deletes_due`` + ``delete_pending_delete_by_id``.
+    # ``count_pending_deletes`` exists only for the dashboard / job
+    # telemetry — neither the applier nor the sweeper read it.
+
+    async def add_pending_delete(
+        self,
+        *,
+        file_id: int,
+        path: str,
+        delete_after: datetime,
+    ) -> PendingDelete:
+        """Insert a new ``PendingDelete`` row and return the refreshed instance.
+
+        The returned object has ``id`` and ``created_at`` populated by the
+        commit + refresh, mirroring ``add_file``'s contract so callers can
+        log the row id immediately for audit / debugging.
+        """
+        async with self._sf() as session:
+            row = PendingDelete(
+                file_id=file_id,
+                path=path,
+                delete_after=delete_after,
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_pending_deletes_due(
+        self, now: datetime, limit: int = 500
+    ) -> list[PendingDelete]:
+        """Return rows whose ``delete_after`` has elapsed, oldest first.
+
+        Capped by ``limit`` (default 500) so one sweeper pass is bounded
+        even if a long pause built up a large backlog. The next pass will
+        pick up the rest on the next tick.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(PendingDelete)
+                .where(PendingDelete.delete_after <= now)
+                .order_by(PendingDelete.delete_after.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def delete_pending_delete_by_id(self, pending_id: int) -> None:
+        """Remove a single ``PendingDelete`` row by id.
+
+        Called by the sweeper after the underlying file has been unlinked
+        (or confirmed already absent). Idempotent at the SQL layer — a
+        no-op against an already-removed id, so repeated sweeps cannot
+        explode.
+        """
+        async with self._sf() as session:
+            await session.execute(
+                delete(PendingDelete).where(PendingDelete.id == pending_id)
+            )
+            await session.commit()
+
+    async def count_pending_deletes(self) -> int:
+        """Return the total number of queued deletes (all timestamps).
+
+        The dashboard surfaces this as a backpressure indicator: a slowly
+        growing queue with no sweep activity is the canonical "sweeper
+        misconfigured" symptom.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(func.count(PendingDelete.id))
+            )
+            return int(result.scalar_one())

@@ -379,3 +379,165 @@ async def test_total_bytes_by_tier_populated(session_factory):
     assert totals["cold"] == 1000
     assert totals["archive"] == 5
     assert totals["pending"] == 0
+
+
+# --- pending_deletes queue --------------------------------------------------
+#
+# PendingDelete rows carry a foreign-key to ``files.id``, so each test
+# below seeds a parent File first via the repo helper. The seed timestamps
+# are deliberately frozen at fixed moments so the ``<=`` filter behaviour
+# is exact (no flaky "did the wall clock tick past" failures).
+
+
+async def _seed_file(repo: CatalogRepo, *, source: str = "src") -> File:
+    """Insert a throwaway parent File so a PendingDelete row can FK to it."""
+    base = datetime(2026, 1, 1)
+    return await repo.add_file(
+        source=source,
+        segment_path=f"/tiers/hot/{source}.jsonl",
+        tier="hot",
+        size_bytes=10,
+        oldest_record_ts=base,
+        newest_record_ts=base,
+    )
+
+
+async def test_add_pending_delete_round_trip(session_factory):
+    """Inserted PendingDelete is returned with an id and shows up in due-list."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="rt")
+    delete_after = datetime(2026, 5, 1, 12, 0, 0)
+    row = await repo.add_pending_delete(
+        file_id=parent.id,
+        path="/tiers/pending/rt.jsonl",
+        delete_after=delete_after,
+    )
+    assert row.id is not None
+    assert row.file_id == parent.id
+    assert row.path == "/tiers/pending/rt.jsonl"
+    assert row.delete_after == delete_after
+    # ``created_at`` is server-defaulted to ``datetime.utcnow`` so we
+    # just assert it is set (not its precise value).
+    assert row.created_at is not None
+
+    # Becomes visible to the sweeper once ``now`` advances past the
+    # row's ``delete_after``.
+    now = delete_after + timedelta(seconds=1)
+    due = await repo.list_pending_deletes_due(now)
+    assert len(due) == 1
+    assert due[0].id == row.id
+
+
+async def test_list_pending_deletes_due_filters_future(session_factory):
+    """Future ``delete_after`` rows are excluded; only past ones returned."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="ff")
+    now = datetime(2026, 5, 1, 12, 0, 0)
+    past = now - timedelta(hours=1)
+    future = now + timedelta(hours=1)
+
+    past_row = await repo.add_pending_delete(
+        file_id=parent.id,
+        path="/tiers/pending/past.jsonl",
+        delete_after=past,
+    )
+    await repo.add_pending_delete(
+        file_id=parent.id,
+        path="/tiers/pending/future.jsonl",
+        delete_after=future,
+    )
+
+    due = await repo.list_pending_deletes_due(now)
+    assert len(due) == 1
+    assert due[0].id == past_row.id
+
+
+async def test_list_pending_deletes_due_orders_asc(session_factory):
+    """Rows are returned oldest ``delete_after`` first regardless of insert order."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="ord")
+    now = datetime(2026, 5, 1, 12, 0, 0)
+    t_old = now - timedelta(hours=3)
+    t_mid = now - timedelta(hours=2)
+    t_new = now - timedelta(hours=1)
+
+    # Insert deliberately out of order: mid, new, old.
+    mid_row = await repo.add_pending_delete(
+        file_id=parent.id, path="/tiers/pending/mid.jsonl", delete_after=t_mid
+    )
+    new_row = await repo.add_pending_delete(
+        file_id=parent.id, path="/tiers/pending/new.jsonl", delete_after=t_new
+    )
+    old_row = await repo.add_pending_delete(
+        file_id=parent.id, path="/tiers/pending/old.jsonl", delete_after=t_old
+    )
+
+    due = await repo.list_pending_deletes_due(now)
+    assert [r.id for r in due] == [old_row.id, mid_row.id, new_row.id]
+
+
+async def test_list_pending_deletes_due_respects_limit(session_factory):
+    """``limit`` caps the page size; remaining rows wait for the next pass."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="lim")
+    now = datetime(2026, 5, 1, 12, 0, 0)
+    past = now - timedelta(hours=1)
+    for i in range(5):
+        await repo.add_pending_delete(
+            file_id=parent.id,
+            path=f"/tiers/pending/lim-{i}.jsonl",
+            # Stagger ``delete_after`` so the order is deterministic.
+            delete_after=past - timedelta(seconds=i),
+        )
+
+    due = await repo.list_pending_deletes_due(now, limit=2)
+    assert len(due) == 2
+
+
+async def test_delete_pending_delete_by_id_removes_row(session_factory):
+    """``delete_pending_delete_by_id`` round-trips: inserted row vanishes."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="del")
+    delete_after = datetime(2026, 5, 1, 12, 0, 0)
+    row = await repo.add_pending_delete(
+        file_id=parent.id,
+        path="/tiers/pending/del.jsonl",
+        delete_after=delete_after,
+    )
+
+    assert await repo.count_pending_deletes() == 1
+    await repo.delete_pending_delete_by_id(row.id)
+    assert await repo.count_pending_deletes() == 0
+
+    # Verify via direct list as well — empty queue, regardless of ``now``.
+    now = delete_after + timedelta(days=1)
+    due = await repo.list_pending_deletes_due(now)
+    assert due == []
+
+
+async def test_count_pending_deletes_zero_state(session_factory):
+    """Fresh DB reports zero pending deletes."""
+    repo = CatalogRepo(session_factory)
+    assert await repo.count_pending_deletes() == 0
+
+
+async def test_count_pending_deletes_populated(session_factory):
+    """``count_pending_deletes`` reflects all rows, past or future."""
+    repo = CatalogRepo(session_factory)
+    parent = await _seed_file(repo, source="cnt")
+    now = datetime(2026, 5, 1, 12, 0, 0)
+    # Mix past + future so we know count is unconditional (not filtered).
+    for i in range(3):
+        await repo.add_pending_delete(
+            file_id=parent.id,
+            path=f"/tiers/pending/past-{i}.jsonl",
+            delete_after=now - timedelta(hours=i + 1),
+        )
+    for i in range(2):
+        await repo.add_pending_delete(
+            file_id=parent.id,
+            path=f"/tiers/pending/future-{i}.jsonl",
+            delete_after=now + timedelta(hours=i + 1),
+        )
+
+    assert await repo.count_pending_deletes() == 5
