@@ -25,6 +25,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from src.api.routes import router as api_router
 from src.audit.chain import AuditAppender
@@ -165,4 +166,11 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+# Mount the static dir OUTSIDE the lifespan: ``StaticFiles`` only needs
+# the directory to exist at request time (it walks lazily), and mounting
+# here keeps it visible to tests that exercise routes without going
+# through the lifespan-managed app.state plumbing. The Dockerfile COPYs
+# ``static/`` into ``/app/static`` so the relative path resolves in both
+# the container and the test runner (which runs from project root).
+app.mount("/static", StaticFiles(directory="static"), name="static")
 app.include_router(api_router)

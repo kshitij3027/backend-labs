@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 
 from src.api.models import (
     EvaluateResponse,
@@ -58,6 +60,14 @@ from src.storage.tiers import tier_dir
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# Module-level Jinja2Templates factory pointing at the project's
+# ``templates/`` directory (Dockerfile COPYs that into ``/app/templates``
+# so the same relative path resolves in container and host test runs).
+# C16 introduces ``GET /``; C17/C18 add the partials that the dashboard
+# polls via HTMX.
+_TEMPLATES = Jinja2Templates(directory="templates")
 
 
 # Roll the open hot-tier segment when it crosses this many bytes. The
@@ -83,6 +93,30 @@ async def health() -> HealthResponse:
     from C01 so existing tests / probes continue to pass.
     """
     return HealthResponse(status="healthy", timestamp=int(time.time()))
+
+
+# --- Dashboard ------------------------------------------------------------
+
+
+@router.get("/", response_class=HTMLResponse, tags=["dashboard"])
+async def dashboard(request: Request) -> HTMLResponse:
+    """Render the HTMX-polled dashboard shell.
+
+    Returns the full ``dashboard.html`` page; the four placeholder cards
+    inside (``#stats-card``, ``#tiers-card``, ``#policies-card``,
+    ``#audit-card``) self-load their content via ``hx-get`` against
+    ``/partials/...`` on initial render and re-poll every
+    ``dashboard_refresh_ms`` milliseconds (5 s default).
+
+    The partial routes themselves land in C17 (stats + tiers) and C18
+    (policies + audit) — until then the cards will surface a 404 from
+    the HTMX swap, but the page itself loads cleanly.
+    """
+    settings = request.app.state.settings
+    return _TEMPLATES.TemplateResponse(
+        "dashboard.html",
+        {"request": request, "refresh_ms": settings.dashboard_refresh_ms},
+    )
 
 
 # --- Ingest ---------------------------------------------------------------

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Automated Log Retention — Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Automated Log Retention</h1>
+    <p class="muted">Policy-driven 5-tier lifecycle · SHA-256 audit chain · refresh: {{ refresh_ms }}ms</p>
+  </header>
+
+  <main class="grid">
+    <section id="stats-card"
+             hx-get="/partials/stats"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading stats…</div>
+    </section>
+
+    <section id="tiers-card"
+             hx-get="/partials/tiers"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading tiers…</div>
+    </section>
+
+    <section id="policies-card"
+             hx-get="/partials/policies"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <div class="placeholder">loading policies…</div>
+    </section>
+
+    <section id="audit-card"
+             hx-get="/partials/audit"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             class="wide">
+      <div class="placeholder">loading audit…</div>
+    </section>
+  </main>
+
+  <footer>
+    <p class="muted">
+      <a href="/v1/reports/gdpr" target="_blank">GDPR</a> ·
+      <a href="/v1/reports/sox" target="_blank">SOX</a> ·
+      <a href="/v1/reports/hipaa" target="_blank">HIPAA</a> ·
+      <a href="/v1/reports/pci_dss" target="_blank">PCI DSS</a> ·
+      <a href="/v1/reports/soc2" target="_blank">SOC 2</a>
+    </p>
+  </footer>
+</body>
+</html>
