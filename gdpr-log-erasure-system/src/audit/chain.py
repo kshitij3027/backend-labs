@@ -21,6 +21,7 @@ story.
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -36,6 +37,22 @@ GENESIS_PREV_HASH: str = "0" * 64
 # Postgres advisory-lock key for the audit chain. A single fixed int means
 # every appender serialises on the same lock — globally ordered.
 AUDIT_CHAIN_LOCK_KEY: int = 0x6764_7072_4348_4149  # ascii "gdprCHAI" approx
+
+# Per-event-loop lock registry for non-Postgres dialects (SQLite in tests).
+# Module-level asyncio.Lock instances bind to the first event loop that
+# acquires them, which breaks pytest-asyncio (fresh loop per test function).
+# Keying by the current loop gives each loop its own lock without resorting
+# to globals tied to a specific loop.
+_CHAIN_APPEND_LOCKS: "dict[asyncio.AbstractEventLoop, asyncio.Lock]" = {}
+
+
+def _get_chain_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _CHAIN_APPEND_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAIN_APPEND_LOCKS[loop] = lock
+    return lock
 
 
 def compute_entry_hash(
@@ -98,42 +115,52 @@ async def append_audit_entry(
     from src.persistence.models import ErasureAuditLog  # local to avoid cycles
     from sqlalchemy import text
 
-    # Postgres-only: serialise appenders via advisory xact lock
     bind = session.get_bind()
-    if bind.dialect.name == "postgresql":
-        await session.execute(text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=AUDIT_CHAIN_LOCK_KEY))
+    is_postgres = bind.dialect.name == "postgresql"
 
-    stmt = (
-        select(ErasureAuditLog)
-        .order_by(ErasureAuditLog.sequence.desc())
-        .limit(1)
-    )
-    last = (await session.execute(stmt)).scalar_one_or_none()
-    if last is None:
-        raise RuntimeError(
-            "audit chain has no genesis row — init_db must run before append_audit_entry"
+    async def _body() -> ErasureAuditLog:
+        if is_postgres:
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(:k)").bindparams(k=AUDIT_CHAIN_LOCK_KEY)
+            )
+
+        stmt = (
+            select(ErasureAuditLog)
+            .order_by(ErasureAuditLog.sequence.desc())
+            .limit(1)
         )
-    next_sequence = last.sequence + 1
-    prev_hash = last.entry_hash
-    created_at = _utcnow()
-    payload_json_str = canonical_payload_json(payload)
-    entry_hash = compute_entry_hash(
-        prev_hash=prev_hash,
-        sequence=next_sequence,
-        event_type=event_type,
-        payload_json_str=payload_json_str,
-        created_at_iso=created_at.isoformat(),
-    )
+        last = (await session.execute(stmt)).scalar_one_or_none()
+        if last is None:
+            raise RuntimeError(
+                "audit chain has no genesis row — init_db must run before append_audit_entry"
+            )
+        next_sequence = last.sequence + 1
+        prev_hash = last.entry_hash
+        created_at = _utcnow()
+        payload_json_str = canonical_payload_json(payload)
+        entry_hash = compute_entry_hash(
+            prev_hash=prev_hash,
+            sequence=next_sequence,
+            event_type=event_type,
+            payload_json_str=payload_json_str,
+            created_at_iso=created_at.isoformat(),
+        )
 
-    entry = ErasureAuditLog(
-        request_id=request_id,
-        sequence=next_sequence,
-        event_type=event_type,
-        payload_json=payload,
-        prev_hash=prev_hash,
-        entry_hash=entry_hash,
-        created_at=created_at,
-    )
-    session.add(entry)
-    await session.flush()
-    return entry
+        entry = ErasureAuditLog(
+            request_id=request_id,
+            sequence=next_sequence,
+            event_type=event_type,
+            payload_json=payload,
+            prev_hash=prev_hash,
+            entry_hash=entry_hash,
+            created_at=created_at,
+        )
+        session.add(entry)
+        await session.flush()
+        return entry
+
+    if is_postgres:
+        return await _body()
+    lock = _get_chain_lock()
+    async with lock:
+        return await _body()
