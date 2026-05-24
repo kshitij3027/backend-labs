@@ -1,20 +1,9 @@
-"""FastAPI app entry point with the DB engine wired in via lifespan.
-
-C1 shipped the bare shell with an empty lifespan; C2 layers on the
-async engine, session factory, and ``init_db`` call so every later
-commit can request a session off ``app.state.session_factory`` without
-restructuring this module. Subsequent commits (redis client, scheduler,
-richer ``/health`` payload) will hang additional clients off the same
-``app.state`` namespace.
-
-Routes added later live in ``src/api/*`` and are mounted via
-``app.include_router``. ``/health`` stays inline so the compose
-healthcheck has something to hit immediately.
-"""
+"""FastAPI app entry point with DB engine + tracking router."""
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.api.routes_tracking import router as tracking_router
 from src.logging_config import configure_logging, get_logger
 from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
@@ -43,6 +32,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GDPR Log Erasure System", version="0.1.0", lifespan=lifespan)
+app.include_router(tracking_router)
 
 
 @app.get("/health")
