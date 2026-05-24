@@ -3,8 +3,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.api.routes_erasure import router as erasure_router
 from src.api.routes_stats import router as stats_router
 from src.api.routes_tracking import router as tracking_router
+from src.erasure.coordinator import ErasureCoordinator
 from src.logging_config import configure_logging, get_logger
 from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
@@ -21,9 +23,12 @@ async def lifespan(app: FastAPI):
     session_factory = make_session_factory(engine)
     await init_db(engine)
 
+    coordinator = ErasureCoordinator(session_factory, settings)
+
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = session_factory
+    app.state.coordinator = coordinator
 
     try:
         yield
@@ -35,6 +40,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GDPR Log Erasure System", version="0.1.0", lifespan=lifespan)
 app.include_router(tracking_router)
 app.include_router(stats_router)
+app.include_router(erasure_router)
 
 
 @app.get("/health")

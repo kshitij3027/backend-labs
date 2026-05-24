@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -19,7 +20,7 @@ class UserDataMappingCreate(BaseModel):
 
 
 class UserDataMappingResponse(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     id: int
     user_id: str
@@ -32,3 +33,41 @@ class UserDataMappingResponse(BaseModel):
         serialization_alias="metadata",
     )
     created_at: dt.datetime
+
+
+# ── Erasure requests ────────────────────────────────────────────────────────
+
+
+class ErasureRequestTypeIn(str, Enum):
+    DELETE = "DELETE"
+    ANONYMIZE = "ANONYMIZE"
+
+
+class ErasureRequestCreate(BaseModel):
+    user_id: str = Field(min_length=1, max_length=255)
+    request_type: ErasureRequestTypeIn
+
+
+class AuditEntryResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    sequence: int
+    event_type: str
+    payload: dict[str, Any] = Field(validation_alias="payload_json", serialization_alias="payload")
+    prev_hash: str
+    entry_hash: str
+    created_at: dt.datetime
+
+
+class ErasureRequestResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    user_id: str
+    request_type: str
+    state: str
+    error_message: Optional[str] = None
+    created_at: dt.datetime
+    started_at: Optional[dt.datetime] = None
+    completed_at: Optional[dt.datetime] = None
+    audit_entries: list[AuditEntryResponse] = Field(default_factory=list)
