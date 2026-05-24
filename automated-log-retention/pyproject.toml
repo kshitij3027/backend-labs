@@ -1,0 +1,8 @@
+[project]
+name = "automated-log-retention"
+version = "0.1.0"
+description = "Policy-driven log retention engine with tiered storage, compliance validation, and audit trail"
+requires-python = ">=3.11"
+
+[tool.setuptools]
+packages = ["src"]
