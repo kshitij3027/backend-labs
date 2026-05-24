@@ -13,9 +13,10 @@ synchronous sqlite3 connection from the pool).
 
 ``init_db`` is idempotent: ``create_all`` is a no-op on already-existing
 tables, so it's safe to call on every app startup. The audit chain
-genesis row is NOT inserted here — that lands in C13 alongside the
-appender, which has the canonicalisation + hashing logic the genesis
-row depends on.
+genesis row (``audit_entries.seq=0``) is inserted by
+:func:`src.audit.chain.ensure_genesis`, which we call here after
+``create_all`` lands so a fresh DB is immediately ready for
+:meth:`AuditAppender.append` calls without a second boot pass.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from src.audit.chain import ensure_genesis
 from src.persistence.models import Base
 
 log = logging.getLogger(__name__)
@@ -82,11 +84,26 @@ def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession
 
 
 async def init_db(engine: AsyncEngine) -> None:
-    """Create all tables declared on ``Base.metadata``.
+    """Create all tables and seed the audit-chain genesis row.
 
-    Idempotent: ``create_all`` skips tables that already exist. Safe to
-    call on every boot; the lifespan in C12 will do exactly that.
+    Idempotent: ``create_all`` skips tables that already exist, and
+    :func:`src.audit.chain.ensure_genesis` is a no-op when seq=0 is
+    already present. Safe to call on every boot; the lifespan in C12
+    does exactly that.
+
+    Genesis seeding lives here (rather than in the appender or in a
+    bespoke migration) so a fresh DB is immediately ready for an
+    appender ``append()`` call without a second startup pass. The
+    genesis row is deterministic — actor='system', action='genesis',
+    resource='audit_chain', metadata={} — so two boots against the
+    same DB never disagree about seq=0.
     """
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     log.info("init_db: all tables created (or already present)")
+
+    # Audit chain bootstrap. ensure_genesis() opens its own session
+    # against the same engine; idempotent, so subsequent boots are
+    # cheap no-ops.
+    session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+    await ensure_genesis(session_factory)

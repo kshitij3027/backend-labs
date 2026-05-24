@@ -45,9 +45,12 @@ from typing import Any, Awaitable, Callable
 
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.audit.chain import AuditAppender
+from src.audit.verifier import ChainVerifier
 from src.lifecycle.applier import apply_once
 from src.lifecycle.scanner import scan_once
 from src.lifecycle.sweeper import sweep_once
@@ -256,11 +259,17 @@ async def _scan_tick() -> Any:
 
 
 async def _apply_tick() -> Any:
-    """APScheduler entry point for the ``apply_job``."""
+    """APScheduler entry point for the ``apply_job``.
+
+    Passes the registry-held :class:`AuditAppender` (may be ``None`` in
+    tests that don't wire one) through to :func:`apply_once` so each
+    successful transition emits one audit-chain entry.
+    """
     catalog_repo = _REGISTRY["catalog_repo"]
     storage_root = _REGISTRY["storage_root"]
     delete_delay_hours = _REGISTRY["delete_delay_hours"]
     session_factory = _REGISTRY["session_factory"]
+    audit_appender = _REGISTRY.get("audit_appender")
 
     async def _do() -> Any:
         return await apply_once(
@@ -268,20 +277,54 @@ async def _apply_tick() -> Any:
             storage_root,
             _utcnow_naive(),
             delete_delay_hours=delete_delay_hours,
+            audit_appender=audit_appender,
         )
 
     return await _run_job_and_record(session_factory, "apply_job", _do)
 
 
 async def _sweep_tick() -> Any:
-    """APScheduler entry point for the ``sweep_job``."""
+    """APScheduler entry point for the ``sweep_job``.
+
+    Passes the registry-held :class:`AuditAppender` (may be ``None``)
+    through to :func:`sweep_once` so each hard delete emits one
+    audit-chain entry.
+    """
     catalog_repo = _REGISTRY["catalog_repo"]
     session_factory = _REGISTRY["session_factory"]
+    audit_appender = _REGISTRY.get("audit_appender")
 
     async def _do() -> Any:
-        return await sweep_once(catalog_repo, _utcnow_naive())
+        return await sweep_once(
+            catalog_repo,
+            _utcnow_naive(),
+            audit_appender=audit_appender,
+        )
 
     return await _run_job_and_record(session_factory, "sweep_job", _do)
+
+
+async def _verify_chain_tick() -> Any:
+    """APScheduler entry point for the nightly ``verify_chain_job``.
+
+    Builds a :class:`ChainVerifier` from the registry-held
+    ``session_factory`` and runs a full chain walk. The
+    :class:`VerifyResult` is returned so ``_run_job_and_record``
+    serialises it into the ``JobRun.summary_json`` field — that's how
+    the dashboard / future alerting will see the most recent integrity
+    state.
+
+    The verifier is constructed per-tick (cheap; just holds the session
+    factory) rather than registry-cached, so a future hot-reload of the
+    session factory is naturally picked up.
+    """
+    session_factory = _REGISTRY["session_factory"]
+    verifier = ChainVerifier(session_factory)
+
+    async def _do() -> Any:
+        return await verifier.verify_full()
+
+    return await _run_job_and_record(session_factory, "verify_chain_job", _do)
 
 
 def register_jobs(
@@ -295,18 +338,33 @@ def register_jobs(
     apply_interval_sec: int,
     sweep_interval_sec: int,
     delete_delay_hours: int,
+    audit_appender: AuditAppender | None = None,
 ) -> None:
-    """Register the 3 lifecycle jobs (scan / apply / sweep) on ``scheduler``.
+    """Register the 4 scheduler jobs on ``scheduler``.
+
+    Three lifecycle jobs run on an interval trigger; the fourth
+    (``verify_chain_job``) runs nightly via a cron trigger.
 
     Each job is a module-level coroutine (``_scan_tick`` / ``_apply_tick``
-    / ``_sweep_tick``) — APScheduler can pickle the bare function
-    reference, and the function looks up live state from the module
-    ``_REGISTRY`` at call time. See the module docstring for why the
-    closure / lambda approach doesn't work with ``SQLAlchemyJobStore``.
+    / ``_sweep_tick`` / ``_verify_chain_tick``) — APScheduler can pickle
+    the bare function reference, and the function looks up live state
+    from the module ``_REGISTRY`` at call time. See the module docstring
+    for why the closure / lambda approach doesn't work with
+    ``SQLAlchemyJobStore``.
 
     Intervals come from settings (defaults: 60 s each) — production-grade
     intervals would be measured in minutes, but for the demo / E2E tests
     we want fast feedback so the defaults stay low.
+
+    The optional ``audit_appender`` is stored in the registry so
+    ``_apply_tick`` / ``_sweep_tick`` can emit chain entries per
+    successful action. When omitted (existing tests, early-boot
+    scenarios) the lifecycle jobs simply skip the emit step.
+
+    The nightly ``verify_chain_job`` runs at 03:00 UTC daily — picked
+    to land outside normal ingest activity. It writes a ``JobRun`` row
+    whose ``summary_json`` carries the :class:`VerifyResult` so the
+    dashboard / future alerting can surface a broken chain promptly.
     """
     # Populate the registry FIRST so a tick that fires immediately after
     # ``scheduler.start()`` (e.g. ``next_run_time=now``) finds its state.
@@ -315,6 +373,7 @@ def register_jobs(
     _REGISTRY["storage_root"] = storage_root
     _REGISTRY["session_factory"] = session_factory
     _REGISTRY["delete_delay_hours"] = delete_delay_hours
+    _REGISTRY["audit_appender"] = audit_appender
 
     scheduler.add_job(
         _scan_tick,
@@ -334,8 +393,14 @@ def register_jobs(
         id="sweep_job",
         replace_existing=True,
     )
+    scheduler.add_job(
+        _verify_chain_tick,
+        CronTrigger(hour=3, minute=0),
+        id="verify_chain_job",
+        replace_existing=True,
+    )
     logger.info(
-        "registered scheduler jobs: scan=%ss apply=%ss sweep=%ss",
+        "registered scheduler jobs: scan=%ss apply=%ss sweep=%ss verify=cron(03:00 UTC)",
         scan_interval_sec,
         apply_interval_sec,
         sweep_interval_sec,

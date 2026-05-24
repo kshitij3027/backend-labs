@@ -26,14 +26,16 @@ no explicit ``@pytest.mark.asyncio`` is needed on each function.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import sqlalchemy as sa
 
+from src.audit.chain import AuditAppender
 from src.lifecycle.applier import ApplyReport, apply_once
 from src.lifecycle.scanner import scan_once
-from src.persistence.models import PendingDelete, Transition
+from src.persistence.models import AuditEntry, PendingDelete, Transition
 from src.policy.schema import Phase, Policy, PolicySet, Selector
 from src.storage.catalog import CatalogRepo
 from src.storage.tiers import ensure_tier_dirs, tier_dir
@@ -139,3 +141,79 @@ async def test_scan_then_apply_moves_hot_segment_to_warm(
     assert pds[0].file_id == file.id
     assert pds[0].path == str(pending_dst)
     assert pds[0].delete_after == NOW + timedelta(hours=24)
+
+
+async def test_scan_then_apply_emits_audit_entry_when_appender_wired(
+    tmp_path: Path, session_factory
+):
+    """C13: the applier emits one audit entry per successfully applied transition.
+
+    Same pipeline as the test above, but this time we wire an
+    :class:`AuditAppender` into ``apply_once`` and assert the chain
+    grew by exactly one ``transition_applied`` row carrying the right
+    metadata (from_tier, to_tier, file_id, bytes, action_type).
+    """
+    storage_root = tmp_path / "tiers"
+    ensure_tier_dirs(storage_root)
+    repo = CatalogRepo(session_factory)
+    appender = AuditAppender(session_factory)
+
+    content = b"audit-sample\n" * 50
+    hot_segment = tier_dir(storage_root, "hot") / "segment-200.jsonl"
+    hot_segment.write_bytes(content)
+    file = await repo.add_file(
+        source="app",
+        segment_path=str(hot_segment),
+        tier="hot",
+        size_bytes=len(content),
+        oldest_record_ts=NOW - timedelta(days=35),
+        newest_record_ts=NOW - timedelta(days=35),
+        next_eval_at=NOW - timedelta(minutes=1),
+    )
+    policy_set = PolicySet(
+        policies=[
+            Policy(
+                name="app-policy",
+                selector=Selector(source="app"),
+                phases=[
+                    Phase(after_days=0, action="promote", target_tier="hot"),
+                    Phase(after_days=30, action="promote", target_tier="warm"),
+                ],
+            )
+        ]
+    )
+
+    scan_report = await scan_once(repo, policy_set, NOW)
+    assert scan_report.transitions_planned == 1
+
+    apply_report = await apply_once(
+        repo, storage_root, NOW, audit_appender=appender
+    )
+    assert apply_report == ApplyReport(applied=1, failed=0)
+
+    # Audit chain: genesis (seq=0) + 1 transition_applied (seq=1). At
+    # least 2 rows total; the new row is keyed off our file.
+    async with session_factory() as session:
+        rows = (
+            await session.execute(
+                sa.select(AuditEntry).order_by(AuditEntry.seq.asc())
+            )
+        ).scalars().all()
+    assert len(rows) >= 2  # genesis + transition_applied
+    # First row is genesis.
+    assert rows[0].seq == 0
+    assert rows[0].action == "genesis"
+    # The transition_applied entry — locate by resource match (other
+    # entries from concurrent test data would still pass under this
+    # filter, but in this self-contained test there's exactly one).
+    matching = [r for r in rows if r.resource == f"file:{file.id}"]
+    assert len(matching) == 1
+    entry = matching[0]
+    assert entry.actor == "applier"
+    assert entry.action == "transition_applied"
+    metadata = json.loads(entry.metadata_json)
+    assert metadata["from_tier"] == "hot"
+    assert metadata["to_tier"] == "warm"
+    assert metadata["file_id"] == file.id
+    assert metadata["bytes"] == len(content)
+    assert metadata["action_type"] == "promote"

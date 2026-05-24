@@ -27,6 +27,8 @@ from typing import AsyncIterator
 from fastapi import FastAPI
 
 from src.api.routes import router as api_router
+from src.audit.chain import AuditAppender
+from src.audit.verifier import ChainVerifier
 from src.lifecycle import applier as _applier  # noqa: F401  (kept for tests/imports)
 from src.lifecycle import scanner as _scanner  # noqa: F401
 from src.lifecycle import sweeper as _sweeper  # noqa: F401
@@ -83,6 +85,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # 4. Catalog
     catalog_repo = CatalogRepo(session_factory)
 
+    # 4b. Audit chain — appender drives writes (per applied transition /
+    #     per sweep), verifier drives reads (nightly cron + future
+    #     dashboard partial). Both share the same session_factory; the
+    #     genesis row was already inserted by init_db so append() can
+    #     run immediately.
+    audit_appender = AuditAppender(session_factory)
+    chain_verifier = ChainVerifier(session_factory)
+
     # 5. Scheduler — needs a SYNC URL for its SQLAlchemy jobstore. The
     #    project's ``database_url`` defaults to ``sqlite+aiosqlite:///...``
     #    so we strip the ``+aiosqlite`` driver prefix to get the plain
@@ -99,6 +109,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         apply_interval_sec=settings.apply_interval_sec,
         sweep_interval_sec=settings.sweep_interval_sec,
         delete_delay_hours=settings.delete_delay_hours,
+        audit_appender=audit_appender,
     )
     scheduler.start()
 
@@ -109,6 +120,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.catalog_repo = catalog_repo
     app.state.policy_set = policy_set
     app.state.scheduler = scheduler
+    app.state.audit_appender = audit_appender
+    app.state.chain_verifier = chain_verifier
     app.state.ingest_buffer = {}
     app.state.ingest_lock = asyncio.Lock()
     app.state.startup_time = int(time.time())

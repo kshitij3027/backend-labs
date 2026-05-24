@@ -52,6 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from src.audit.chain import AuditAppender
 from src.storage.catalog import CatalogRepo
 from src.storage.compressor import (
     DEFAULT_ARCHIVE_LEVEL,
@@ -134,6 +135,7 @@ async def apply_once(
     *,
     batch_limit: int = 100,
     delete_delay_hours: int = 24,
+    audit_appender: AuditAppender | None = None,
 ) -> ApplyReport:
     """Execute one batch of pending ``Transition`` rows.
 
@@ -153,6 +155,14 @@ async def apply_once(
             compute each queued source-segment's ``delete_after`` field.
             Default 24 h gives an operator a full day to catch a bad
             policy push before bytes are unlinked.
+        audit_appender: optional :class:`AuditAppender`. When supplied,
+            one audit entry is emitted per successfully applied
+            transition (action=``"transition_applied"``). Defaults to
+            ``None`` so existing unit tests that don't wire the chain
+            keep working unchanged. The audit call is best-effort: a
+            failure to append does NOT roll back the transition — the
+            move already happened on disk, and rolling it back would
+            cost more bytes than the missing audit entry.
 
     Returns:
         An :class:`ApplyReport` summarising the pass. Suitable to persist
@@ -323,5 +333,31 @@ async def apply_once(
             transition.id, "applied", executed_at=now
         )
         applied += 1
+
+        # Best-effort audit emission. The transition has already landed
+        # on disk and in the catalog — a chain failure here is logged
+        # and swallowed (re-raising would force an operator to choose
+        # between "roll back the move on disk" and "leave the audit
+        # chain inconsistent", both worse than the missing entry).
+        if audit_appender is not None:
+            try:
+                await audit_appender.append(
+                    actor="applier",
+                    action="transition_applied",
+                    resource=f"file:{file.id}",
+                    metadata={
+                        "from_tier": transition.from_tier,
+                        "to_tier": transition.to_tier,
+                        "file_id": file.id,
+                        "bytes": file.size_bytes,
+                        "action_type": transition.action,
+                    },
+                )
+            except Exception:
+                logger.error(
+                    "apply_once: failed to append audit entry for transition %d",
+                    transition.id,
+                    exc_info=True,
+                )
 
     return ApplyReport(applied=applied, failed=failed)
