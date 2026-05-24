@@ -25,7 +25,7 @@ from datetime import datetime
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.persistence.models import File, PendingDelete
+from src.persistence.models import File, PendingDelete, Transition
 from src.storage.tiers import TIERS
 
 
@@ -268,3 +268,98 @@ class CatalogRepo:
                 select(func.count(PendingDelete.id))
             )
             return int(result.scalar_one())
+
+    # --- transitions queue (scanner → applier handoff) ----------------------
+    #
+    # The scanner (C09) plans work by inserting ``pending`` ``Transition``
+    # rows; the applier (C10) drains them oldest-first via
+    # ``list_pending_transitions``. ``add_transition`` mirrors ``add_file``
+    # / ``add_pending_delete``: commit + refresh so the returned ORM
+    # instance carries the autoincrement id (useful for logging and audit
+    # entries downstream).
+
+    async def add_transition(
+        self,
+        *,
+        file_id: int,
+        from_tier: str,
+        to_tier: str,
+        action: str,
+        status: str = "pending",
+        planned_at: datetime | None = None,
+    ) -> Transition:
+        """Insert a new ``Transition`` row and return the refreshed instance.
+
+        ``planned_at`` defaults to ``datetime.utcnow()`` if not supplied,
+        keeping the call sites at the scanner concise — the planner does
+        not need to materialize ``now`` twice when the model column
+        default would produce the same value.
+        """
+        async with self._sf() as session:
+            row = Transition(
+                file_id=file_id,
+                from_tier=from_tier,
+                to_tier=to_tier,
+                action=action,
+                status=status,
+                planned_at=planned_at if planned_at is not None else datetime.utcnow(),
+            )
+            session.add(row)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def list_pending_transitions(
+        self, limit: int = 100
+    ) -> list[Transition]:
+        """Return ``status='pending'`` rows ordered oldest-planned first.
+
+        Bounded by ``limit`` (default 100) so a single applier pass cannot
+        block on a huge backlog — the next tick will pick up the rest.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(Transition)
+                .where(Transition.status == "pending")
+                .order_by(Transition.planned_at.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def update_transition_status(
+        self,
+        transition_id: int,
+        status: str,
+        *,
+        executed_at: datetime | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Mark a Transition as ``applied`` (success) or ``failed`` (with error).
+
+        Called by the applier (C10) once each transition has been carried
+        out (or definitively failed). The three columns updated together
+        form the transition's post-execution audit footprint:
+
+          * ``status`` — final state (``applied`` / ``failed``).
+          * ``executed_at`` — when the applier finished; ``None`` if the
+            caller does not want to overwrite an existing value (rare,
+            but allowed so callers can mark status alone in tests).
+          * ``error`` — short failure description for the dashboard /
+            operator. Stored verbatim from ``str(exception)``; the
+            applier wraps the offending Transition in try/except and
+            records the message here instead of crashing the pass.
+
+        Single ``UPDATE`` statement — atomic at the SQL layer; no read
+        round-trip required.
+        """
+        async with self._sf() as session:
+            await session.execute(
+                update(Transition)
+                .where(Transition.id == transition_id)
+                .values(
+                    status=status,
+                    executed_at=executed_at,
+                    error=error,
+                )
+            )
+            await session.commit()
