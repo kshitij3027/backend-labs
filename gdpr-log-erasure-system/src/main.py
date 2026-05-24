@@ -1,8 +1,9 @@
-"""FastAPI app entry point with DB engine + tracking router."""
+"""FastAPI app entry point."""
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from src.api.routes_stats import router as stats_router
 from src.api.routes_tracking import router as tracking_router
 from src.logging_config import configure_logging, get_logger
 from src.persistence.db import init_db, make_engine, make_session_factory
@@ -33,6 +34,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GDPR Log Erasure System", version="0.1.0", lifespan=lifespan)
 app.include_router(tracking_router)
+app.include_router(stats_router)
 
 
 @app.get("/health")
