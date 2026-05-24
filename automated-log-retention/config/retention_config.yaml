@@ -1,0 +1,92 @@
+# Demo retention policies — one per compliance framework + one debug.
+#
+# Loaded at startup by src/policy/loader.py. Every policy below passes
+# the compliance validator: tagged policies meet their framework's
+# minimum retention window and immutability requirement; the debug
+# policy has no tag, so it's free to delete after 7 days.
+#
+# Phase ordering is strictly ascending by after_days (Pydantic enforces
+# this) and the action vocabulary is promote/compress/archive/delete.
+policies:
+  # GDPR — 3 yr minimum, mutable storage allowed (chain provides
+  # tamper-evidence). User activity logs are the prototypical scope.
+  - name: user_activity_gdpr
+    selector:
+      category: user_activity
+    priority: 100
+    compliance_tag: gdpr
+    immutable: false
+    phases:
+      - { after_days: 0,    action: promote,  target_tier: hot }
+      - { after_days: 30,   action: promote,  target_tier: warm }
+      - { after_days: 90,   action: compress, target_tier: cold,    compression_level: 3 }
+      - { after_days: 365,  action: archive,  target_tier: archive, compression_level: 19 }
+      - { after_days: 1095, action: delete }
+
+  # SOX — 7 yr minimum, immutable required. Payment / financial logs
+  # are kept indefinitely past the archive transition (no delete phase).
+  - name: payment_logs_sox
+    selector:
+      category: payment
+    priority: 1000
+    compliance_tag: sox
+    immutable: true
+    phases:
+      - { after_days: 0,   action: promote,  target_tier: hot }
+      - { after_days: 30,  action: promote,  target_tier: warm }
+      - { after_days: 90,  action: compress, target_tier: cold,    compression_level: 3 }
+      - { after_days: 365, action: archive,  target_tier: archive, compression_level: 19 }
+      # No delete phase — SOX is 7 yr; we keep indefinitely.
+
+  # HIPAA — 6 yr minimum, immutable required. Protected health info
+  # goes straight to archive after warm; deleted at 2190 d (6 yr).
+  - name: health_records_hipaa
+    selector:
+      category: health
+    priority: 1000
+    compliance_tag: hipaa
+    immutable: true
+    phases:
+      - { after_days: 0,    action: promote, target_tier: hot }
+      - { after_days: 30,   action: promote, target_tier: warm }
+      - { after_days: 90,   action: archive, target_tier: archive, compression_level: 19 }
+      - { after_days: 2190, action: delete }
+
+  # PCI DSS — 1 yr minimum, immutable required. Cardholder data logs
+  # archive aggressively at 90 d, delete at the regulatory floor.
+  - name: card_data_pci
+    selector:
+      category: payment_card
+    priority: 1000
+    compliance_tag: pci_dss
+    immutable: true
+    phases:
+      - { after_days: 0,   action: promote, target_tier: hot }
+      - { after_days: 90,  action: archive, target_tier: archive, compression_level: 19 }
+      - { after_days: 365, action: delete }
+
+  # SOC 2 — 1 yr Type II window, mutable allowed (chain integrity is
+  # the tamper-evidence). Operational audit logs.
+  - name: ops_audit_soc2
+    selector:
+      category: ops_audit
+    priority: 500
+    compliance_tag: soc2
+    immutable: false
+    phases:
+      - { after_days: 0,   action: promote,  target_tier: hot }
+      - { after_days: 30,  action: promote,  target_tier: warm }
+      - { after_days: 90,  action: compress, target_tier: cold,    compression_level: 3 }
+      - { after_days: 365, action: delete }
+
+  # Debug logs — no compliance tag, so the validator imposes no
+  # minimum. Delete after 7 d to keep disk usage bounded.
+  - name: debug_logs
+    selector:
+      level: DEBUG
+    priority: 10
+    compliance_tag: null
+    immutable: false
+    phases:
+      - { after_days: 0, action: promote, target_tier: hot }
+      - { after_days: 7, action: delete }
