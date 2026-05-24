@@ -66,7 +66,12 @@ async def app_under_test(tmp_path, monkeypatch) -> AsyncIterator[tuple]:
 
 @pytest.mark.asyncio
 async def test_get_report_unknown_framework_returns_400(app_under_test):
-    """An unsupported framework slug returns HTTP 400 with a helpful detail."""
+    """An unsupported framework slug returns HTTP 400 with a helpful detail.
+
+    The detail message must enumerate all five supported framework slugs
+    (``gdpr``, ``sox``, ``hipaa``, ``pci_dss``, ``soc2``) so an operator
+    can self-serve from the error alone — no docs lookup required.
+    """
     _app, client = app_under_test
     r = await client.get("/v1/reports/voightkampff")
     assert r.status_code == 400, r.text
@@ -74,7 +79,8 @@ async def test_get_report_unknown_framework_returns_400(app_under_test):
     assert "detail" in body
     assert "voightkampff" in body["detail"]
     # Detail should hint at the supported set so an operator can self-serve.
-    assert "gdpr" in body["detail"]
+    for fw in ("gdpr", "sox", "hipaa", "pci_dss", "soc2"):
+        assert fw in body["detail"], (fw, body["detail"])
 
 
 @pytest.mark.asyncio
@@ -126,6 +132,43 @@ async def test_get_report_hipaa_returns_200(app_under_test):
     assert all(
         p["compliance_tag"] == "hipaa" for p in body["policies_in_scope"]
     )
+
+
+@pytest.mark.asyncio
+async def test_get_report_pci_returns_200(app_under_test):
+    """The PCI DSS report renders successfully against the default policy YAML."""
+    _app, client = app_under_test
+    r = await client.get("/v1/reports/pci_dss")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["framework"] == "pci_dss"
+    # The default config includes one PCI policy (card_data_pci).
+    assert len(body["policies_in_scope"]) >= 1
+    assert all(
+        p["compliance_tag"] == "pci_dss" for p in body["policies_in_scope"]
+    )
+    # PCI renderer exposes ``cardholder_data_segments`` in extras even
+    # when no files have been ingested yet (0 is a valid value).
+    assert "cardholder_data_segments" in body["extras"]
+
+
+@pytest.mark.asyncio
+async def test_get_report_soc2_returns_200(app_under_test):
+    """The SOC 2 report renders successfully and reports chain integrity status."""
+    _app, client = app_under_test
+    r = await client.get("/v1/reports/soc2")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["framework"] == "soc2"
+    # The default config includes one SOC2 policy (ops_audit_soc2).
+    assert len(body["policies_in_scope"]) >= 1
+    assert all(
+        p["compliance_tag"] == "soc2" for p in body["policies_in_scope"]
+    )
+    # SOC2 renderer always reports chain integrity status — fresh DB has
+    # only the genesis row, which verifies cleanly.
+    assert body["extras"]["chain_integrity_status"] == "VALID"
+    assert body["violations"] == []
 
 
 @pytest.mark.asyncio

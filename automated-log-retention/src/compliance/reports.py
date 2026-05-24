@@ -415,17 +415,203 @@ async def render_hipaa_report(
 
 
 # ---------------------------------------------------------------------------
+# PCI DSS
+# ---------------------------------------------------------------------------
+
+
+async def render_pci_dss_report(
+    session_factory: async_sessionmaker[AsyncSession],
+    policy_set: PolicySet,
+    time_from: datetime,
+    time_to: datetime,
+) -> ReportBundle:
+    """Render the PCI DSS compliance report.
+
+    Rules enforced:
+
+      1. **Immutable policy (Req. 10.5.2).** PCI DSS requires that audit
+         trail files be protected from modification. Every PCI-tagged
+         policy must therefore have ``immutable=True``; we mirror the
+         boot-time validator so the report stands alone for an auditor.
+      2. **Immutable files (Req. 10.5.2).** Every in-scope ``File`` row
+         (not just archive — PCI considers the entire cardholder-data
+         lifecycle in scope) must have ``immutable=True``.
+      3. **Minimum retention (Req. 10.5.1).** Any ``delete`` phase must
+         fire on or after ``MIN_RETENTION_DAYS['pci_dss']`` (365 d / 12 mo).
+         PCI explicitly mandates a 12-month online window for audit logs.
+
+    Indefinite retention (no delete phase) is *allowed* — PCI's Req.
+    10.5.1 is a floor, not a ceiling. So unlike GDPR, the absence of a
+    delete phase is not a violation here.
+
+    The ``extras`` block exposes ``cardholder_data_segments`` (count of
+    in-scope ``File`` rows) — a coarse measure of the cardholder data
+    estate's footprint that auditors typically ask about first.
+    """
+    framework = "pci_dss"
+    policies, files, audit = await _gather_scope(
+        session_factory, policy_set, framework, time_from, time_to
+    )
+
+    violations: list[str] = []
+    # Rule 1: every PCI policy must be immutable=True.
+    for p in policies:
+        if not p.immutable:
+            violations.append(
+                f"PCI DSS policy '{p.name}' is not immutable (Req. 10.5.2)"
+            )
+    # Rule 2: every in-scope file must be immutable.
+    for f in files:
+        if not f.immutable:
+            violations.append(
+                f"PCI DSS file '{f.segment_path}' (id={f.id}) is not marked immutable"
+            )
+    # Rule 3: delete phases must fire >= 365d (Req. 10.5.1 — 12 months).
+    for p in policies:
+        for ph in p.phases:
+            if ph.action == "delete" and ph.after_days < MIN_RETENTION_DAYS[framework]:
+                violations.append(
+                    f"PCI DSS policy '{p.name}' delete fires at "
+                    f"{ph.after_days}d < required "
+                    f"{MIN_RETENTION_DAYS[framework]}d"
+                )
+
+    # Rule 4 (rule of thumb): PCI doesn't require an indefinite-retention
+    # ceiling — kept forever is fine, so a missing delete phase is NOT a
+    # violation. (Contrast GDPR's Art. 17 right-to-erasure stance.)
+
+    cardholder_count = len(files)
+    total_checks = max(len(policies) + len(files), 1)
+    failing = len(violations)
+    compliance_score = (
+        100.0 * max(total_checks - failing, 0) / total_checks
+        if total_checks > 0
+        else 100.0
+    )
+
+    return ReportBundle(
+        framework=framework,
+        generated_at=datetime.utcnow(),
+        time_range={"from": time_from.isoformat(), "to": time_to.isoformat()},
+        policies_in_scope=[p.model_dump(mode="json") for p in policies],
+        files_in_scope=[
+            FileSummary.model_validate(f, from_attributes=True) for f in files
+        ],
+        audit_in_range=_audit_summaries(audit),
+        violations=violations,
+        compliance_score=round(compliance_score, 2),
+        extras={"cardholder_data_segments": cardholder_count},
+    )
+
+
+# ---------------------------------------------------------------------------
+# SOC 2
+# ---------------------------------------------------------------------------
+
+
+async def render_soc2_report(
+    session_factory: async_sessionmaker[AsyncSession],
+    policy_set: PolicySet,
+    time_from: datetime,
+    time_to: datetime,
+) -> ReportBundle:
+    """Render the SOC 2 compliance report.
+
+    SOC 2 (Type II) doesn't prescribe a single rule set the way SOX or
+    HIPAA do — it's a set of Trust Service Criteria, of which CC7.2
+    ("monitoring of system components") and CC7.3 ("evaluation of
+    security events") map most directly to a retention engine's audit
+    trail. The check we run here is therefore the most load-bearing
+    one for SOC 2: **the audit chain must verify end-to-end**.
+
+    Rules enforced:
+
+      1. **Chain integrity.** Run :class:`ChainVerifier.verify_full` and
+         surface a violation if any break is detected. This is the
+         binary CC7.2 signal — either the audit trail is tamper-evident
+         and intact, or it is not.
+
+    Observations (no violation):
+
+      * Counts of ``transition_applied`` and ``hard_delete`` audit
+        events in-window are reported in ``extras`` as a coverage
+        signal. A fresh DB legitimately has zero — absence of coverage
+        is not a violation here, just a data point.
+
+    ``compliance_score`` is 100.0 when the chain is valid, 50.0 when
+    only the chain is broken (the report is still a half-credit pass —
+    policies were correctly authored, but the integrity surface failed).
+    """
+    framework = "soc2"
+    policies, files, audit = await _gather_scope(
+        session_factory, policy_set, framework, time_from, time_to
+    )
+
+    # SOC2-specific: re-run chain integrity check.
+    # Import inline to avoid a top-of-module cycle with audit/verifier
+    # (which currently doesn't import this module, but keeping the
+    # import inside the function makes the dependency localised).
+    from src.audit.verifier import ChainVerifier
+
+    verifier = ChainVerifier(session_factory)
+    chain_result = await verifier.verify_full()
+
+    violations: list[str] = []
+    if not chain_result.ok:
+        violations.append(
+            f"SOC 2: audit chain integrity broken at seq={chain_result.first_break_seq} "
+            f"(reason: {chain_result.first_break_reason})"
+        )
+
+    # Coverage signal: count transition_applied / hard_delete entries in
+    # the window. These are the events CC7.2 expects the engine to log
+    # for every retention action. Absent on a fresh DB — that's fine.
+    transition_audit_count = sum(1 for a in audit if a.action == "transition_applied")
+    delete_audit_count = sum(1 for a in audit if a.action == "hard_delete")
+
+    # Score: chain integrity is binary. SOC2 allows mutable storage so
+    # policy-immutability is not a check here — the score is essentially
+    # "did the chain verify?". Half-credit when only the chain broke.
+    if chain_result.ok:
+        compliance_score = 100.0
+    else:
+        compliance_score = 50.0
+
+    return ReportBundle(
+        framework=framework,
+        generated_at=datetime.utcnow(),
+        time_range={"from": time_from.isoformat(), "to": time_to.isoformat()},
+        policies_in_scope=[p.model_dump(mode="json") for p in policies],
+        files_in_scope=[
+            FileSummary.model_validate(f, from_attributes=True) for f in files
+        ],
+        audit_in_range=_audit_summaries(audit),
+        violations=violations,
+        compliance_score=round(compliance_score, 2),
+        extras={
+            "chain_integrity_status": "VALID" if chain_result.ok else "BROKEN",
+            "chain_head_seq": chain_result.head_seq,
+            "chain_first_break_seq": chain_result.first_break_seq,
+            "transition_audit_events": transition_audit_count,
+            "hard_delete_audit_events": delete_audit_count,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
 
-# Per-framework dispatch table. C15 will append ``pci_dss`` and ``soc2``
-# entries here without touching the route layer — the route just looks
-# up by name and raises ``KeyError`` for unknown frameworks.
+# Per-framework dispatch table. C15 adds ``pci_dss`` and ``soc2`` so the
+# route layer can dispatch all five frameworks by name without further
+# wiring; unknown slugs raise ``KeyError`` and the route translates to 400.
 _RENDERERS: dict[str, Any] = {
     "gdpr": render_gdpr_report,
     "sox": render_sox_report,
     "hipaa": render_hipaa_report,
+    "pci_dss": render_pci_dss_report,
+    "soc2": render_soc2_report,
 }
 
 
@@ -455,6 +641,8 @@ __all__ = [
     "TransitionSummary",
     "render_gdpr_report",
     "render_hipaa_report",
+    "render_pci_dss_report",
     "render_report",
+    "render_soc2_report",
     "render_sox_report",
 ]

@@ -410,6 +410,6 @@ async def get_report(framework: str, request: Request) -> dict:
     except KeyError:
         raise HTTPException(
             status_code=400,
-            detail=f"unknown framework: {framework}. Supported: gdpr, sox, hipaa",
+            detail=f"unknown framework: {framework}. Supported: gdpr, sox, hipaa, pci_dss, soc2",
         )
     return bundle.model_dump(mode="json")
