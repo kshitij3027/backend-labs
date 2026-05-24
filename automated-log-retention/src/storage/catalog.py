@@ -25,7 +25,7 @@ from datetime import datetime
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.persistence.models import File, JobRun, PendingDelete, Transition
+from src.persistence.models import AuditEntry, File, JobRun, PendingDelete, Transition
 from src.storage.tiers import TIERS
 
 
@@ -442,3 +442,24 @@ class CatalogRepo:
                 .limit(1)
             )
             return result.scalar_one_or_none()
+
+    # --- audit chain (read-only surface for the dashboard) -----------------
+
+    async def list_recent_audit_entries(
+        self, limit: int = 30
+    ) -> list[AuditEntry]:
+        """Return the most recent ``AuditEntry`` rows, newest first.
+
+        Drives the ``#audit-card`` HTMX partial (C18). Ordered by ``seq
+        DESC`` so the newest sealed entry appears at the top of the
+        rendered table — the conventional "tail -f"-style view operators
+        expect. Bounded by ``limit`` (default 30) to keep the partial's
+        DOM small enough for the 5 s poll interval to feel snappy.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(AuditEntry)
+                .order_by(AuditEntry.seq.desc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())

@@ -1,0 +1,17 @@
+<header><h2>Audit chain</h2></header>
+<table class="audit">
+  <thead><tr><th>seq</th><th>ts (UTC)</th><th>actor</th><th>action</th><th>resource</th><th>hash</th></tr></thead>
+  <tbody>
+  {% for e in entries %}
+    <tr>
+      <td>{{ e.seq }}</td>
+      <td>{{ e.ts_utc.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+      <td>{{ e.actor }}</td>
+      <td>{{ e.action }}</td>
+      <td class="resource">{{ e.resource }}</td>
+      <td class="hash" title="{{ e.entry_hash }}">{{ e.entry_hash[:8] }}…</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% if not entries %}<p class="muted">No audit entries.</p>{% endif %}

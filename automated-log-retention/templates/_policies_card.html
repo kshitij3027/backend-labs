@@ -1,0 +1,15 @@
+<header>
+  <h2>Policies <span class="badge {{ 'badge-ok' if chain_ok else 'badge-bad' }}">chain: {{ chain_status }}</span></h2>
+</header>
+<ul class="policies">
+  {% for p in policies %}
+  <li>
+    <strong>{{ p.name }}</strong>
+    {% if p.compliance_tag %}<span class="tag tag-{{ p.compliance_tag }}">{{ p.compliance_tag|upper }}</span>{% endif %}
+    <span class="muted">prio {{ p.priority }}</span>
+    <span class="muted">· {{ p.phases|length }} phases</span>
+    {% if p.immutable %}<span class="tag tag-immutable">IMMUTABLE</span>{% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% if not policies %}<p class="muted">No policies loaded.</p>{% endif %}

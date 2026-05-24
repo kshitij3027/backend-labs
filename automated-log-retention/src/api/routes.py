@@ -122,6 +122,13 @@ async def dashboard(request: Request) -> HTMLResponse:
 # --- Dashboard partials ---------------------------------------------------
 
 
+# Cached chain integrity result — verify_full walks the entire chain
+# and is too expensive to run on every dashboard refresh tick (every
+# 5 s). Cache the result for 5 s.
+_INTEGRITY_CACHE: dict = {"at": 0.0, "result": None}
+_INTEGRITY_TTL_SECONDS = 5.0
+
+
 @router.get("/partials/tiers", response_class=HTMLResponse, tags=["partials"])
 async def partial_tiers(request: Request) -> HTMLResponse:
     """Render the ``#tiers-card`` HTMX partial.
@@ -178,6 +185,59 @@ async def partial_stats(request: Request) -> HTMLResponse:
             "last_apply_at": last_apply.finished_at if last_apply else None,
             "last_sweep_at": last_sweep.finished_at if last_sweep else None,
         },
+    )
+
+
+@router.get("/partials/policies", response_class=HTMLResponse, tags=["partials"])
+async def partial_policies(request: Request) -> HTMLResponse:
+    """Render the ``#policies-card`` HTMX partial.
+
+    Surfaces every loaded retention policy (name, compliance_tag,
+    priority, # phases, immutable flag) plus a colour-coded chain
+    integrity badge (VALID / BROKEN at seq=N).
+
+    ``ChainVerifier.verify_full`` walks every ``audit_entries`` row and
+    recomputes its hash; on a healthy long-running install that's
+    O(chain_length) and would otherwise run every 5 s as the dashboard
+    polls. Cache the result for :data:`_INTEGRITY_TTL_SECONDS` so the
+    cost is bounded regardless of poll frequency. Within the TTL window
+    the cached :class:`VerifyResult` is reused as-is.
+    """
+    import time as _time
+    policy_set = request.app.state.policy_set
+    verifier = request.app.state.chain_verifier
+    now = _time.time()
+    if _INTEGRITY_CACHE["result"] is None or (now - _INTEGRITY_CACHE["at"]) > _INTEGRITY_TTL_SECONDS:
+        _INTEGRITY_CACHE["result"] = await verifier.verify_full()
+        _INTEGRITY_CACHE["at"] = now
+    chain_result = _INTEGRITY_CACHE["result"]
+    return _TEMPLATES.TemplateResponse(
+        "_policies_card.html",
+        {
+            "request": request,
+            "policies": list(policy_set.policies),
+            "chain_ok": chain_result.ok,
+            "chain_status": "VALID" if chain_result.ok else f"BROKEN at seq={chain_result.first_break_seq}",
+        },
+    )
+
+
+@router.get("/partials/audit", response_class=HTMLResponse, tags=["partials"])
+async def partial_audit(request: Request) -> HTMLResponse:
+    """Render the ``#audit-card`` HTMX partial.
+
+    Shows the most recent 30 ``audit_entries`` rows (newest first via
+    ``ORDER BY seq DESC`` in :meth:`CatalogRepo.list_recent_audit_entries`)
+    as a compact table: seq, ts, actor, action, resource, short-hash
+    preview. The full hash is exposed via the ``title`` attribute so an
+    operator can hover to see the 64-hex digest.
+    """
+    catalog_repo = request.app.state.catalog_repo
+    # Show newest first — list_recent_audit_entries already orders by seq DESC.
+    entries = await catalog_repo.list_recent_audit_entries(limit=30)
+    return _TEMPLATES.TemplateResponse(
+        "_audit_card.html",
+        {"request": request, "entries": entries},
     )
 
 
