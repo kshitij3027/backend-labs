@@ -1,0 +1,9 @@
+<header><h2>Tiers</h2></header>
+<dl class="tier-grid">
+  {% for tier, count in tier_counts.items() %}
+  <div class="tier-row">
+    <dt><span class="tier-name tier-{{ tier }}">{{ tier|upper }}</span></dt>
+    <dd>{{ count }} files · {{ tier_bytes[tier]|filesizeformat }}</dd>
+  </div>
+  {% endfor %}
+</dl>

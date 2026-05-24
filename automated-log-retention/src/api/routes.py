@@ -119,6 +119,68 @@ async def dashboard(request: Request) -> HTMLResponse:
     )
 
 
+# --- Dashboard partials ---------------------------------------------------
+
+
+@router.get("/partials/tiers", response_class=HTMLResponse, tags=["partials"])
+async def partial_tiers(request: Request) -> HTMLResponse:
+    """Render the ``#tiers-card`` HTMX partial.
+
+    Returns a small HTML fragment listing every tier (hot/warm/cold/
+    archive/pending) with its file count and total bytes. Driven by
+    ``count_by_tier`` + ``total_bytes_by_tier`` which both pre-seed all
+    five tier keys to 0, so the markup is stable on an empty DB (the
+    template iterates the count dict; the bytes dict is keyed by the
+    same tier names).
+    """
+    catalog_repo = request.app.state.catalog_repo
+    tier_counts = await catalog_repo.count_by_tier()
+    tier_bytes = await catalog_repo.total_bytes_by_tier()
+    return _TEMPLATES.TemplateResponse(
+        "_tiers_card.html",
+        {"request": request, "tier_counts": tier_counts, "tier_bytes": tier_bytes},
+    )
+
+
+@router.get("/partials/stats", response_class=HTMLResponse, tags=["partials"])
+async def partial_stats(request: Request) -> HTMLResponse:
+    """Render the ``#stats-card`` HTMX partial.
+
+    Surfaces six values:
+
+      * ``total_files`` / ``total_bytes`` — sum across every tier (the
+        per-tier breakdown lives in the sibling ``#tiers-card``).
+      * ``pending_transitions`` — applier backpressure indicator.
+      * ``last_scan_at`` / ``last_apply_at`` / ``last_sweep_at`` —
+        wall-clock recency of each scheduler job, pulled from the
+        ``job_runs`` table. ``None`` when the job hasn't fired yet;
+        the template renders that as an em-dash.
+    """
+    catalog_repo = request.app.state.catalog_repo
+    # Re-use the per-tier aggregates for the totals so the stats card and
+    # tiers card stay numerically consistent (one DB round per metric).
+    tier_counts = await catalog_repo.count_by_tier()
+    tier_bytes = await catalog_repo.total_bytes_by_tier()
+    total_files = sum(tier_counts.values())
+    total_bytes = sum(tier_bytes.values())
+    pending_transitions = await catalog_repo.count_pending_transitions()
+    last_scan = await catalog_repo.last_job_run("scan_job")
+    last_apply = await catalog_repo.last_job_run("apply_job")
+    last_sweep = await catalog_repo.last_job_run("sweep_job")
+    return _TEMPLATES.TemplateResponse(
+        "_stats_card.html",
+        {
+            "request": request,
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "pending_transitions": pending_transitions,
+            "last_scan_at": last_scan.finished_at if last_scan else None,
+            "last_apply_at": last_apply.finished_at if last_apply else None,
+            "last_sweep_at": last_sweep.finished_at if last_sweep else None,
+        },
+    )
+
+
 # --- Ingest ---------------------------------------------------------------
 
 

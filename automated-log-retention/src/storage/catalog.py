@@ -25,7 +25,7 @@ from datetime import datetime
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from src.persistence.models import File, PendingDelete, Transition
+from src.persistence.models import File, JobRun, PendingDelete, Transition
 from src.storage.tiers import TIERS
 
 
@@ -363,6 +363,23 @@ class CatalogRepo:
             )
             return list(result.scalars().all())
 
+    async def count_pending_transitions(self) -> int:
+        """Return the number of ``Transition`` rows still ``status='pending'``.
+
+        Surfaced on the dashboard's stats card (C17) as a backpressure
+        indicator: a queue that grows without ever draining means the
+        applier is failing or not running. ``list_pending_transitions``
+        caps at 100, which is fine for the applier's batch loop but
+        useless for telemetry — hence the separate count helper.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(func.count(Transition.id)).where(
+                    Transition.status == "pending"
+                )
+            )
+            return int(result.scalar_one())
+
     async def update_transition_status(
         self,
         transition_id: int,
@@ -400,3 +417,28 @@ class CatalogRepo:
                 )
             )
             await session.commit()
+
+    # --- job_runs (scheduler telemetry) -------------------------------------
+    #
+    # ``last_job_run`` is read by the dashboard's stats partial (C17) so
+    # operators can see when each lifecycle job last completed. The
+    # scheduler's ``_run_job_and_record`` wrapper (see ``src/scheduler/
+    # runner.py``) writes one row per tick keyed by ``job_name``
+    # (``scan_job`` / ``apply_job`` / ``sweep_job`` / ``verify_chain_job``).
+
+    async def last_job_run(self, job_name: str) -> JobRun | None:
+        """Return the most recent ``JobRun`` row for ``job_name`` (or ``None``).
+
+        Ordered by ``id DESC`` — autoincrement guarantees insertion order
+        matches start order, which is what the dashboard wants ("when did
+        the scheduler last touch this job?"). Returns ``None`` when the
+        job has never run, so the partial can render an em-dash sentinel.
+        """
+        async with self._sf() as session:
+            result = await session.execute(
+                select(JobRun)
+                .where(JobRun.job_name == job_name)
+                .order_by(JobRun.id.desc())
+                .limit(1)
+            )
+            return result.scalar_one_or_none()

@@ -1,0 +1,9 @@
+<header><h2>Stats</h2></header>
+<dl class="stats">
+  <div><dt>Total files</dt><dd>{{ total_files }}</dd></div>
+  <div><dt>Total ingested</dt><dd>{{ total_bytes|filesizeformat }}</dd></div>
+  <div><dt>Pending transitions</dt><dd>{{ pending_transitions }}</dd></div>
+  <div><dt>Last scan</dt><dd>{{ last_scan_at or "—" }}</dd></div>
+  <div><dt>Last apply</dt><dd>{{ last_apply_at or "—" }}</dd></div>
+  <div><dt>Last sweep</dt><dd>{{ last_sweep_at or "—" }}</dd></div>
+</dl>

@@ -113,3 +113,19 @@ footer a:hover { text-decoration: underline; }
 }
 .alerts .alert-msg { color: var(--fg); }
 .alerts .alert-actor { color: var(--muted); margin-left: 0.5rem; font-size: 0.75rem; }
+
+/* C17 — tiers + stats partials */
+dl.tier-grid { display: grid; gap: 0.4rem; font-size: 0.9rem; }
+.tier-row { display: grid; grid-template-columns: auto 1fr; gap: 0.75rem; align-items: center; }
+.tier-row dd { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tier-name { padding: 2px 6px; border-radius: 4px; font-weight: bold; font-size: 0.75rem; }
+.tier-hot { background: #3a2a1a; }
+.tier-warm { background: #3a3520; }
+.tier-cold { background: #1a2a3a; }
+.tier-archive { background: #2a1a3a; }
+.tier-pending { background: #3a1a1a; }
+
+dl.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem 1rem; font-size: 0.85rem; }
+dl.stats > div { display: flex; flex-direction: column; }
+dl.stats dt { color: var(--muted); font-size: 0.75rem; }
+dl.stats dd { font-variant-numeric: tabular-nums; }
