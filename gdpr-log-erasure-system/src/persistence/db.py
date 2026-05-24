@@ -73,13 +73,13 @@ async def init_db(engine: AsyncEngine) -> None:
     # at call time (not at module import) — this avoids a circular
     # import between db.py and models.py at startup.
     import datetime as _dt
-    import json as _json
 
     from sqlalchemy import select
 
     from src.audit.chain import (
         GENESIS_PREV_HASH,
         GENESIS_SEQUENCE,
+        canonical_payload_json,
         compute_entry_hash,
     )
     from src.persistence import models  # noqa: F401  (registers tables with Base)
@@ -103,7 +103,7 @@ async def init_db(engine: AsyncEngine) -> None:
             # round-trip.
             created_at = _dt.datetime.utcnow().replace(microsecond=0)
             payload = {"event": "genesis", "system": "gdpr-log-erasure"}
-            payload_json_str = _json.dumps(payload, sort_keys=True)
+            payload_json_str = canonical_payload_json(payload)
             entry_hash = compute_entry_hash(
                 prev_hash=GENESIS_PREV_HASH,
                 sequence=GENESIS_SEQUENCE,
