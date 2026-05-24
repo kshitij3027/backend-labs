@@ -1,0 +1,21 @@
+<h2>Audit Feed (last 20)</h2>
+{% if rows %}
+<table>
+  <thead>
+    <tr><th>Seq</th><th>Event</th><th>Request</th><th>When</th><th>Hash</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.sequence }}</td>
+      <td>{{ r.event_type }}</td>
+      <td>{{ (r.request_id or '—')[:8] }}</td>
+      <td>{{ r.created_at.strftime('%H:%M:%S') }}</td>
+      <td><span title="{{ r.entry_hash }}">{{ r.entry_hash[:12] }}…</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="placeholder">no audit entries yet</p>
+{% endif %}

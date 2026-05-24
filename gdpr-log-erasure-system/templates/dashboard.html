@@ -20,19 +20,28 @@
       <p class="placeholder">loading…</p>
     </section>
 
-    <section class="card" id="card-requests">
+    <section class="card" id="card-requests"
+             hx-get="/partials/requests"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
       <h2>In-Flight Requests</h2>
-      <p class="placeholder">(added in commit 10)</p>
+      <p class="placeholder">loading…</p>
     </section>
 
-    <section class="card" id="card-completed">
+    <section class="card" id="card-completed"
+             hx-get="/partials/completed"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
       <h2>Recently Completed</h2>
-      <p class="placeholder">(added in commit 10)</p>
+      <p class="placeholder">loading…</p>
     </section>
 
-    <section class="card" id="card-audit">
+    <section class="card" id="card-audit"
+             hx-get="/partials/audit"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
       <h2>Audit Feed (last 20)</h2>
-      <p class="placeholder">(added in commit 10)</p>
+      <p class="placeholder">loading…</p>
     </section>
   </main>
 </body>

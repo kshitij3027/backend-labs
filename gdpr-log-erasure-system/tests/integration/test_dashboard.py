@@ -87,3 +87,69 @@ async def test_static_htmx_min_js_served(client):
     assert r.status_code == 200
     # HTMX runtime is at least 40 KB
     assert len(r.content) > 40000
+
+
+# ── added in commit 10 ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_partial_requests_empty(client):
+    r = await client.get("/partials/requests")
+    assert r.status_code == 200
+    assert "no in-flight requests" in r.text
+
+
+@pytest.mark.asyncio
+async def test_partial_completed_empty(client):
+    r = await client.get("/partials/completed")
+    assert r.status_code == 200
+    assert "no completed requests yet" in r.text
+
+
+@pytest.mark.asyncio
+async def test_partial_audit_has_genesis_row(client):
+    r = await client.get("/partials/audit")
+    assert r.status_code == 200
+    # init_db has already seeded a GENESIS row visible via session_factory.
+    assert "Audit Feed" in r.text
+    assert "GENESIS" in r.text
+
+
+@pytest.mark.asyncio
+async def test_partial_requests_shows_inflight(client, session_factory):
+    from src.persistence.models import ErasureRequest, RequestType, RequestState
+    async with session_factory() as s:
+        s.add(ErasureRequest(user_id="dash-u", request_type=RequestType.DELETE, state=RequestState.PENDING))
+        await s.commit()
+    r = await client.get("/partials/requests")
+    assert r.status_code == 200
+    assert "dash-u" in r.text
+    assert 'class="pill PENDING"' in r.text
+
+
+@pytest.mark.asyncio
+async def test_partial_completed_shows_terminal(client, session_factory):
+    import datetime as dt
+    from src.persistence.models import ErasureRequest, RequestType, RequestState
+    async with session_factory() as s:
+        now = dt.datetime.utcnow().replace(microsecond=0)
+        s.add(ErasureRequest(
+            user_id="dash-c", request_type=RequestType.DELETE,
+            state=RequestState.COMPLETED,
+            started_at=now - dt.timedelta(seconds=2),
+            completed_at=now,
+        ))
+        await s.commit()
+    r = await client.get("/partials/completed")
+    assert r.status_code == 200
+    assert "dash-c" in r.text
+    assert 'class="pill COMPLETED"' in r.text
+
+
+@pytest.mark.asyncio
+async def test_dashboard_wires_all_four_cards(client):
+    """All four cards now have hx-get/hx-trigger."""
+    r = await client.get("/")
+    body = r.text
+    for path in ("/partials/stats", "/partials/requests", "/partials/completed", "/partials/audit"):
+        assert f'hx-get="{path}"' in body

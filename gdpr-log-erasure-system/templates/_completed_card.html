@@ -1,0 +1,22 @@
+<h2>Recently Completed</h2>
+{% if rows %}
+<table>
+  <thead>
+    <tr><th>ID</th><th>User</th><th>State</th><th>Completed</th><th>Duration</th><th>Error</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.id[:8] }}</td>
+      <td>{{ r.user_id }}</td>
+      <td><span class="pill {{ r.state }}">{{ r.state }}</span></td>
+      <td>{{ r.completed_at.strftime('%H:%M:%S') if r.completed_at else '—' }}</td>
+      <td>{% if r.duration_s is not none %}{{ "%.2fs"|format(r.duration_s) }}{% else %}—{% endif %}</td>
+      <td>{{ r.error_message[:40] if r.error_message else '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="placeholder">no completed requests yet</p>
+{% endif %}

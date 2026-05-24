@@ -1,0 +1,21 @@
+<h2>In-Flight Requests</h2>
+{% if rows %}
+<table>
+  <thead>
+    <tr><th>ID</th><th>User</th><th>Type</th><th>State</th><th>Started</th></tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.id[:8] }}</td>
+      <td>{{ r.user_id }}</td>
+      <td>{{ r.request_type }}</td>
+      <td><span class="pill {{ r.state }}">{{ r.state }}</span></td>
+      <td>{{ r.started_at.strftime('%H:%M:%S') if r.started_at else '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="placeholder">no in-flight requests</p>
+{% endif %}
