@@ -49,6 +49,7 @@ from src.api.models import (
     IngestRequest,
     IngestResponse,
 )
+from src.compliance.reports import render_report
 from src.lifecycle.applier import apply_once
 from src.lifecycle.scanner import scan_once
 from src.lifecycle.sweeper import sweep_once
@@ -369,3 +370,46 @@ async def evaluate(request: Request) -> EvaluateResponse:
         swept=sweep_report.swept,
         eval_seconds=elapsed,
     )
+
+
+# --- Compliance reports ---------------------------------------------------
+
+
+@router.get("/v1/reports/{framework}", tags=["reports"])
+async def get_report(framework: str, request: Request) -> dict:
+    """Render a per-framework compliance report.
+
+    Path arg ``framework`` is the slug (``gdpr``, ``sox``, ``hipaa`` in
+    C14; ``pci_dss`` and ``soc2`` land in C15). Optional query params:
+
+      * ``from`` — ISO timestamp; defaults to ``to - 30 days``.
+      * ``to``   — ISO timestamp; defaults to ``utcnow``.
+
+    Returns a JSON body matching :class:`ReportBundle`. Unknown framework
+    slugs return HTTP 400 listing the supported set (the unsupported
+    case is the most common operator misconfiguration — the list saves
+    a round trip to the docs).
+    """
+    qp = request.query_params
+    time_to_str = qp.get("to")
+    time_from_str = qp.get("from")
+    now = datetime.utcnow()
+    time_to = datetime.fromisoformat(time_to_str) if time_to_str else now
+    time_from = (
+        datetime.fromisoformat(time_from_str)
+        if time_from_str
+        else (time_to - timedelta(days=30))
+    )
+
+    session_factory = request.app.state.session_factory
+    policy_set = request.app.state.policy_set
+    try:
+        bundle = await render_report(
+            framework, session_factory, policy_set, time_from, time_to
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown framework: {framework}. Supported: gdpr, sox, hipaa",
+        )
+    return bundle.model_dump(mode="json")
