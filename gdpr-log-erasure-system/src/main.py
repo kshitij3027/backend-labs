@@ -1,8 +1,11 @@
-"""FastAPI app entry point."""
+"""FastAPI app entry point — API + HTMX dashboard."""
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
+from src.api.routes_dashboard import router as dashboard_router
 from src.api.routes_erasure import router as erasure_router
 from src.api.routes_stats import router as stats_router
 from src.api.routes_tracking import router as tracking_router
@@ -38,9 +41,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GDPR Log Erasure System", version="0.1.0", lifespan=lifespan)
+
+# CORS for the API (lets an external frontend hit /api/* if needed)
+_settings_for_cors = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings_for_cors.cors_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 app.include_router(tracking_router)
 app.include_router(stats_router)
 app.include_router(erasure_router)
+app.include_router(dashboard_router)
 
 
 @app.get("/health")

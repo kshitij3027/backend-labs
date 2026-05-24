@@ -34,3 +34,6 @@ freezegun==1.5.1
 
 # --- Test DB driver (in-memory SQLite for fast unit tests) ---
 aiosqlite==0.20.0
+
+# --- Templating (HTMX dashboard) ---
+jinja2==3.1.5

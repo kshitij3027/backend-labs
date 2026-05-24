@@ -1,0 +1,15 @@
+<h2>Statistics</h2>
+<div class="kv">
+  <div class="k">total mappings</div>      <div class="v">{{ stats.total_mappings }}</div>
+  <div class="k">unique users</div>        <div class="v">{{ stats.unique_users }}</div>
+  <div class="k">completion rate</div>     <div class="v">{{ "%.4f"|format(stats.completion_rate) }}</div>
+  <div class="k">data type counts</div>    <div class="v">
+    {% if stats.data_type_counts %}
+      {% for k, v in stats.data_type_counts.items() %}
+        {{ k }}={{ v }}{% if not loop.last %}, {% endif %}
+      {% endfor %}
+    {% else %}
+      <span class="placeholder">(none)</span>
+    {% endif %}
+  </div>
+</div>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GDPR Erasure Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css" />
+  <script src="/static/htmx.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>GDPR Log Erasure — Compliance Dashboard</h1>
+    <span class="meta">refresh every {{ refresh_ms }}ms</span>
+  </header>
+  <main>
+    <section class="card" id="card-stats"
+             hx-get="/partials/stats"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML">
+      <h2>Statistics</h2>
+      <p class="placeholder">loading…</p>
+    </section>
+
+    <section class="card" id="card-requests">
+      <h2>In-Flight Requests</h2>
+      <p class="placeholder">(added in commit 10)</p>
+    </section>
+
+    <section class="card" id="card-completed">
+      <h2>Recently Completed</h2>
+      <p class="placeholder">(added in commit 10)</p>
+    </section>
+
+    <section class="card" id="card-audit">
+      <h2>Audit Feed (last 20)</h2>
+      <p class="placeholder">(added in commit 10)</p>
+    </section>
+  </main>
+</body>
+</html>

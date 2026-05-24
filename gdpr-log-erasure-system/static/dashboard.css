@@ -1,0 +1,65 @@
+/* GDPR Erasure System — dashboard styles */
+:root {
+  --bg: #0f1115;
+  --surface: #1a1d26;
+  --surface-2: #232733;
+  --border: #2f3441;
+  --text: #e8eaef;
+  --muted: #8b92a3;
+  --accent: #5b8def;
+  --ok: #2eb872;
+  --warn: #e8a838;
+  --err: #d75f5f;
+  --info: #6cabd8;
+  --mono: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+header {
+  padding: 18px 24px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+header h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.3px; }
+header .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+
+main {
+  display: grid; gap: 16px; padding: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+}
+section.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+  min-height: 220px;
+}
+section.card h2 {
+  margin: 0 0 12px 0;
+  font-size: 14px; font-weight: 600; letter-spacing: 0.4px;
+  color: var(--muted); text-transform: uppercase;
+}
+
+.kv { display: grid; grid-template-columns: 180px 1fr; row-gap: 8px; font-family: var(--mono); font-size: 14px; }
+.kv .k { color: var(--muted); }
+.kv .v { color: var(--text); }
+
+table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 13px; }
+th { text-align: left; font-weight: 500; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--border); }
+td { padding: 6px 8px; border-bottom: 1px solid var(--surface-2); }
+
+.pill {
+  display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px;
+  font-family: var(--mono); letter-spacing: 0.5px; text-transform: uppercase;
+}
+.pill.PENDING { background: rgba(232,168,56,0.15); color: var(--warn); }
+.pill.DISCOVERING { background: rgba(108,171,216,0.18); color: var(--info); }
+.pill.EXECUTING { background: rgba(91,141,239,0.18); color: var(--accent); }
+.pill.VERIFYING { background: rgba(91,141,239,0.18); color: var(--accent); }
+.pill.COMPLETED { background: rgba(46,184,114,0.18); color: var(--ok); }
+.pill.FAILED { background: rgba(215,95,95,0.18); color: var(--err); }
+
+.placeholder { color: var(--muted); font-style: italic; }
