@@ -31,3 +31,6 @@ pytest==8.3.4
 pytest-asyncio==0.25.0
 pytest-cov==6.0.0
 freezegun==1.5.1
+
+# --- Test DB driver (in-memory SQLite for fast unit tests) ---
+aiosqlite==0.20.0

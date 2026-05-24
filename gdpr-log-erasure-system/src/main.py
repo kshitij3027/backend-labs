@@ -1,19 +1,22 @@
-"""FastAPI app entry point — C1 ships the bare shell.
+"""FastAPI app entry point with the DB engine wired in via lifespan.
 
-This commit deliberately wires NO database, redis, or business logic.
-The lifespan only initialises logging and stashes settings on app.state
-so subsequent commits (C12 in particular) can layer the DB engine,
-redis client, scheduler, and richer ``/health`` payload on top without
-restructuring this module.
+C1 shipped the bare shell with an empty lifespan; C2 layers on the
+async engine, session factory, and ``init_db`` call so every later
+commit can request a session off ``app.state.session_factory`` without
+restructuring this module. Subsequent commits (redis client, scheduler,
+richer ``/health`` payload) will hang additional clients off the same
+``app.state`` namespace.
 
-Routes added later go into ``src/api/*`` and are mounted via
-``app.include_router``. C1 exposes ``/health`` inline so the compose
+Routes added later live in ``src/api/*`` and are mounted via
+``app.include_router``. ``/health`` stays inline so the compose
 healthcheck has something to hit immediately.
 """
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from src.logging_config import configure_logging, get_logger
+from src.persistence.db import init_db, make_engine, make_session_factory
 from src.settings import get_settings
 
 
@@ -23,10 +26,19 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_level)
     log = get_logger(__name__)
     log.info("startup", host=settings.api_host, port=settings.api_port)
+
+    engine = make_engine(settings.database_url)
+    session_factory = make_session_factory(engine)
+    await init_db(engine)
+
     app.state.settings = settings
+    app.state.engine = engine
+    app.state.session_factory = session_factory
+
     try:
         yield
     finally:
+        await engine.dispose()
         log.info("shutdown")
 
 
