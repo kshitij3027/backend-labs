@@ -59,6 +59,39 @@ async def test_add_file_round_trip(session_factory):
     assert fetched.next_eval_at == next_eval
 
 
+async def test_add_file_persists_category(session_factory):
+    """``category`` is stored and read back verbatim; defaults to ``None``."""
+    repo = CatalogRepo(session_factory)
+    base = datetime(2026, 1, 1)
+    # Explicit category — round-trips.
+    with_cat = await repo.add_file(
+        source="app-cat",
+        segment_path="/tiers/hot/cat.jsonl",
+        tier="hot",
+        size_bytes=100,
+        oldest_record_ts=base,
+        newest_record_ts=base,
+        category="user_activity",
+    )
+    fetched = await repo.get_file(with_cat.id)
+    assert fetched is not None
+    assert fetched.category == "user_activity"
+
+    # Omitted category — defaults to None (back-compat with callers that
+    # never passed a category, e.g. older tests).
+    without_cat = await repo.add_file(
+        source="app-no-cat",
+        segment_path="/tiers/hot/no-cat.jsonl",
+        tier="hot",
+        size_bytes=100,
+        oldest_record_ts=base,
+        newest_record_ts=base,
+    )
+    fetched_none = await repo.get_file(without_cat.id)
+    assert fetched_none is not None
+    assert fetched_none.category is None
+
+
 async def test_get_file_missing_returns_none(session_factory):
     """Fetching an unknown id returns ``None`` instead of raising."""
     repo = CatalogRepo(session_factory)

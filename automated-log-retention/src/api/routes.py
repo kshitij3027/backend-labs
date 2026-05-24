@@ -77,6 +77,22 @@ _TEMPLATES = Jinja2Templates(directory="templates")
 _SEGMENT_ROLLOVER_BYTES = 5 * 1024 * 1024
 
 
+# Mapping from record ``category`` to its governing compliance framework
+# slug. The lifecycle scanner matches policies by category; the resulting
+# ``compliance_tag`` is also persisted on the ``File`` row so the
+# dashboard and reports can group segments by framework without
+# re-resolving the policy at query time. ``immutable`` follows from
+# REQUIRES_IMMUTABLE in src/compliance/rules.py.
+_CATEGORY_TO_COMPLIANCE: dict[str, str] = {
+    "user_activity": "gdpr",
+    "payment": "sox",
+    "health": "hipaa",
+    "payment_card": "pci_dss",
+    "ops_audit": "soc2",
+}
+_IMMUTABLE_TAGS: frozenset[str] = frozenset({"sox", "hipaa", "pci_dss"})
+
+
 def _utcnow_naive() -> datetime:
     """Naive UTC ``datetime`` — the project convention for DB columns."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -278,6 +294,11 @@ async def _flush_buffer_entry(app: FastAPI, source: str) -> None:
     size_bytes: int = entry["size_bytes"]
     first_ts: datetime = entry["first_ts"]
     last_ts: datetime = entry["last_ts"]
+    # ``category`` is the FIRST non-None record category observed for
+    # this segment (see ingest loop). Drives policy selection downstream.
+    category: str | None = entry.get("category")
+    compliance_tag = _CATEGORY_TO_COMPLIANCE.get(category) if category else None
+    immutable = compliance_tag in _IMMUTABLE_TAGS if compliance_tag else False
 
     # Register the closed segment with the catalog so the scanner can
     # plan its lifecycle. ``next_eval_at`` defaults to "tomorrow" so the
@@ -295,6 +316,9 @@ async def _flush_buffer_entry(app: FastAPI, source: str) -> None:
             size_bytes=size_bytes,
             oldest_record_ts=first_ts,
             newest_record_ts=last_ts,
+            category=category,
+            compliance_tag=compliance_tag,
+            immutable=immutable,
             next_eval_at=next_eval_at,
         )
     except Exception:
@@ -358,6 +382,11 @@ def _open_new_segment(
         "first_ts": None,
         "last_ts": None,
         "size_bytes": 0,
+        # Captured from the first non-None ``record.category`` written into
+        # this segment (see ingest loop). The lifecycle scanner matches
+        # policies by category — without this the demo policies in
+        # ``config/retention_config.yaml`` never select any file.
+        "category": None,
     }
 
 
@@ -419,6 +448,11 @@ async def ingest(body: IngestRequest, request: Request) -> IngestResponse:
                 if entry["first_ts"] is None:
                     entry["first_ts"] = rec_ts
                 entry["last_ts"] = rec_ts
+                # Capture the first non-None category seen for this
+                # segment; the scanner selects policies by category, and
+                # without it the demo config matches nothing.
+                if entry.get("category") is None and rec.category is not None:
+                    entry["category"] = rec.category
                 accepted += 1
             # Force the data through the kernel buffer so a subsequent
             # ``stat`` from another tier (or a test) sees the bytes.

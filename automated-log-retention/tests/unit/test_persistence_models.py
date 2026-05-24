@@ -49,6 +49,7 @@ def test_file_columns():
     expected = {
         "id",
         "source",
+        "category",
         "segment_path",
         "tier",
         "size_bytes",
@@ -61,6 +62,9 @@ def test_file_columns():
     }
     assert cols == expected, f"missing={expected - cols} extra={cols - expected}"
     assert File.__table__.columns["segment_path"].unique is True
+    # ``category`` is a nullable indexed string; the scanner reads it to
+    # match policies, so a missing column would silently break the demo.
+    assert File.__table__.columns["category"].nullable is True
 
 
 def test_audit_entry_seq_no_autoincrement():
@@ -93,6 +97,7 @@ async def test_indexes_exist(engine):
     assert "ix_files_tier" in index_by_name
     assert "ix_files_next_eval_at" in index_by_name
     assert "ix_files_source" in index_by_name
+    assert "ix_files_category" in index_by_name
     assert "ix_transitions_status" in index_by_name
     assert "ix_transitions_file_id" in index_by_name
     assert "ix_pending_deletes_delete_after" in index_by_name
@@ -125,6 +130,7 @@ async def test_file_round_trip(session_factory):
     async with session_factory() as session:
         f = File(
             source="app-1",
+            category="payment",
             segment_path="/tiers/hot/segment-1.jsonl",
             tier="hot",
             size_bytes=2048,
@@ -143,6 +149,7 @@ async def test_file_round_trip(session_factory):
         fetched = result.scalar_one()
     assert fetched.id == file_id
     assert fetched.source == "app-1"
+    assert fetched.category == "payment"
     assert fetched.segment_path == "/tiers/hot/segment-1.jsonl"
     assert fetched.tier == "hot"
     assert fetched.size_bytes == 2048

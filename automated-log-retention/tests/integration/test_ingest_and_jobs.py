@@ -198,6 +198,37 @@ async def test_files_filter_by_tier(app_under_test):
 
 
 @pytest.mark.asyncio
+async def test_ingest_persists_category_and_compliance_tag(app_under_test):
+    """A batch tagged ``user_activity`` lands in the catalog with
+    ``category='user_activity'`` and ``compliance_tag='gdpr'`` derived
+    via the route's CATEGORY_TO_COMPLIANCE mapping. Without this wiring
+    the scanner can't match the demo GDPR policy, so the assertion
+    doubles as a regression test for the lifecycle pipeline."""
+    app, client = app_under_test
+    r = await client.post(
+        "/v1/logs/ingest", json={"records": _records(3, source="ua-src")}
+    )
+    assert r.status_code == 200
+
+    # Force the open segment to register with the catalog.
+    r = await client.post("/v1/evaluate")
+    assert r.status_code == 200
+
+    # Read the underlying ORM row directly — the public FileSummary
+    # projection intentionally omits ``category`` and ``compliance_tag``.
+    repo = app.state.catalog_repo
+    rows = await repo.list_files(limit=10)
+    matching = [f for f in rows if f.source == "ua-src"]
+    assert len(matching) == 1
+    f = matching[0]
+    assert f.category == "user_activity"
+    assert f.compliance_tag == "gdpr"
+    # gdpr is NOT in the immutable set (mutable; chain provides
+    # tamper-evidence).
+    assert f.immutable is False
+
+
+@pytest.mark.asyncio
 async def test_files_pagination(app_under_test):
     """``limit`` + ``offset`` page consistently through results."""
     _app, client = app_under_test

@@ -50,6 +50,7 @@ class CatalogRepo:
         size_bytes: int,
         oldest_record_ts: datetime,
         newest_record_ts: datetime,
+        category: str | None = None,
         compliance_tag: str | None = None,
         immutable: bool = False,
         next_eval_at: datetime | None = None,
@@ -64,6 +65,7 @@ class CatalogRepo:
         async with self._sf() as session:
             f = File(
                 source=source,
+                category=category,
                 segment_path=segment_path,
                 tier=tier,
                 size_bytes=size_bytes,

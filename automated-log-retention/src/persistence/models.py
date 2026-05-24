@@ -52,6 +52,7 @@ class File(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     segment_path: Mapped[str] = mapped_column(String(1024), nullable=False, unique=True)
     tier: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
