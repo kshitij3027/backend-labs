@@ -49,16 +49,16 @@ coverage.xml
 *.swo
 .DS_Store
 
-# Project-local data
+# Project-local runtime data (root-anchored so src/storage/ etc. stay tracked)
 *.db
 *.db-journal
 *.sqlite
 *.sqlite3
-data/
-logs/
-storage/
-tiers/
-archive/
+/data/
+/logs/
+/storage/
+/tiers/
+/archive/
 *.log
 
 # Plan file (per repo convention)
