@@ -1,0 +1,33 @@
+# --- Web framework / API ---
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+python-multipart==0.0.20
+
+# --- Models / validation / config ---
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# --- Persistence: PostgreSQL (async SQLAlchemy + driver + migrations) ---
+SQLAlchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# --- Cache / queue: Redis (async client) ---
+redis==5.2.1
+
+# --- HTTP client (test + outbound calls to downstream log systems) ---
+httpx==0.28.1
+
+# --- Observability ---
+structlog==24.4.0
+prometheus-client==0.21.1
+
+# --- Async / concurrency helpers ---
+anyio==4.7.0
+tenacity==9.0.0
+
+# --- Testing ---
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+freezegun==1.5.1

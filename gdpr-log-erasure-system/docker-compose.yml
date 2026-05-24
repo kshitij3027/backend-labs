@@ -1,0 +1,111 @@
+# Compose stack for the GDPR Log Erasure System.
+#
+# Services:
+#   - postgres : PostgreSQL 16 (durable user-data mappings, erasure
+#                requests, append-only audit log). Healthcheck uses
+#                pg_isready so ``depends_on: condition: service_healthy``
+#                works for the app + tester.
+#   - redis    : Redis 7 (cache + future background-queue substrate).
+#                Healthcheck pings the server.
+#   - app      : FastAPI service (the actual application). Waits for
+#                postgres + redis to be healthy before booting and
+#                exposes its own /health for the tester to wait on.
+#   - tester   : ephemeral pytest container, guarded by the ``test``
+#                profile so ``docker compose up`` does NOT start it.
+#                Brought up explicitly via ``docker compose --profile
+#                test run --rm tester …`` — the Makefile targets do this.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gdpr-erasure-postgres
+    environment:
+      POSTGRES_DB: gdpr_erasure
+      POSTGRES_USER: erasure_user
+      POSTGRES_PASSWORD: changeme
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erasure_user -d gdpr_erasure"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: gdpr-erasure-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gdpr-erasure:dev
+    container_name: gdpr-erasure-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    env_file:
+      # ``.env.example`` ships with sane defaults; mark optional so
+      # ``docker compose config`` works on a fresh clone before the
+      # operator copies it to ``.env``.
+      - path: .env.example
+        required: false
+    environment:
+      # Explicit overrides so the app inside the compose network reaches
+      # the postgres + redis containers by service DNS name (not
+      # localhost, which would point at the container itself).
+      DATABASE_URL: postgresql+asyncpg://erasure_user:changeme@postgres:5432/gdpr_erasure
+      REDIS_URL: redis://redis:6379/0
+      PYTHONUNBUFFERED: "1"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  tester:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: gdpr-erasure-tester:dev
+    container_name: gdpr-erasure-tester
+    profiles:
+      - test
+    depends_on:
+      app:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8000
+      DATABASE_URL: postgresql+asyncpg://erasure_user:changeme@postgres:5432/gdpr_erasure
+      REDIS_URL: redis://redis:6379/0
+      ANONYMIZATION_HASH_SALT: test-salt-do-not-use-in-prod
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      # Bind-mount the whole project so edits to src/ or tests/ are
+      # picked up without rebuilding the tester image.
+      - .:/app
+    working_dir: /app
+
+volumes:
+  pgdata: {}

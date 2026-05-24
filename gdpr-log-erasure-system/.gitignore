@@ -1,0 +1,71 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Build / packaging ---
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# --- Testing / coverage ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.cache/
+
+# --- Type checkers / linters ---
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+
+# --- Local databases / audit artifacts ---
+*.db
+*.sqlite
+*.sqlite3
+/data/
+pgdata/
+redisdata/
+audit-exports/
+erasure-exports/
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# --- Project plan (per repo rule #6) ---
+plan.md
+project_requirements.md
+
+# --- Docker local state ---
+.docker/
