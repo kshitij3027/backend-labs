@@ -49,3 +49,4 @@ __all__ = ["FRAMEWORK_REGISTRY", "FrameworkRules", "register_framework"]
 # FinHealth modules are added in later commits.
 from . import sox  # noqa: E402, F401  (import-after-definition is intentional)
 from . import hipaa  # noqa: E402, F401
+from . import pci_dss  # noqa: E402, F401
