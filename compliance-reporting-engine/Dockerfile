@@ -61,6 +61,14 @@ COPY --chown=appuser:appuser src ./src
 COPY --chown=appuser:appuser templates ./templates
 COPY --chown=appuser:appuser static ./static
 
+# The coordinator writes encrypted reports here. The compose stack mounts
+# a named volume at this path; Docker provisions named-volume mountpoints
+# as root by default, so we create the directory with appuser ownership
+# in the image first — the volume driver inherits the mountpoint's
+# ownership on first mount, which keeps the write path working under
+# the non-root runtime user.
+RUN mkdir -p /app/exports && chown -R appuser:appuser /app/exports
+
 USER appuser
 EXPOSE 8000
 

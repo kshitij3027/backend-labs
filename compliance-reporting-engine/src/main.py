@@ -21,9 +21,11 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
+from .api import routes_frameworks, routes_reports, routes_stats
 from .logging_config import configure_logging, get_logger
 from .persistence.db import init_db, make_engine, make_session_factory
 from .reporting.coordinator import ReportCoordinator
+from .reporting.exporters import EXPORTERS
 from .settings import get_settings
 from .signing.fernet_store import load_or_create_fernet
 from .signing.hmac_signer import load_secondary_signing_key, load_signing_key
@@ -71,13 +73,20 @@ async def lifespan(app: FastAPI):
         fernet=fernet,
         storage_path=Path(settings.storage_path),
         semaphore=semaphore,
-        # Exporters land in commits 10-12; coordinator can still be
-        # instantiated with an empty registry — generate() will fail
-        # any incoming request with "no exporter registered" until then.
-        exporters={},
+        # Wire in every exporter that has self-registered into the
+        # EXPORTERS dict at import time (JSON / XML / CSV / PDF in
+        # commits 10-12). Copy via dict(...) so a runtime mutation of
+        # the live registry can't surprise an in-flight coordinator.
+        exporters=dict(EXPORTERS),
     )
     app.state.coordinator = coordinator
     app.state.semaphore = semaphore
+    # Stash the signing keys + Fernet on app.state so the request
+    # handlers can pull them via Depends(...) without re-loading from
+    # settings on every call.
+    app.state.signing_key = signing_key
+    app.state.secondary_signing_key = secondary_signing_key
+    app.state.fernet = fernet
     logger.info(
         "coordinator_ready",
         storage_path=str(settings.storage_path),
@@ -93,6 +102,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Compliance Reporting Engine", lifespan=lifespan)
+
+# Mount the resource routers. Each one owns a clean URL prefix; the
+# dashboard partials + Jinja templates land in commits 15-17.
+app.include_router(routes_reports.router)
+app.include_router(routes_frameworks.router)
+app.include_router(routes_stats.router)
 
 
 @app.get("/health")
