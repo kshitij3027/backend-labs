@@ -20,8 +20,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
-from .api import routes_frameworks, routes_reports, routes_stats
+from .api import routes_dashboard, routes_frameworks, routes_reports, routes_stats
 from .logging_config import configure_logging, get_logger
 from .persistence.db import init_db, make_engine, make_session_factory
 from .reporting.coordinator import ReportCoordinator
@@ -88,6 +90,7 @@ async def lifespan(app: FastAPI):
     app.state.signing_key = signing_key
     app.state.secondary_signing_key = secondary_signing_key
     app.state.fernet = fernet
+    app.state.templates = Jinja2Templates(directory="templates")
     logger.info(
         "coordinator_ready",
         storage_path=str(settings.storage_path),
@@ -128,11 +131,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Compliance Reporting Engine", lifespan=lifespan)
 
+# Serve vendored htmx + the dashboard CSS straight from disk — no CDN,
+# no bundler, one HTTP round-trip per asset.
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Mount the resource routers. Each one owns a clean URL prefix; the
 # dashboard partials + Jinja templates land in commits 15-17.
 app.include_router(routes_reports.router)
 app.include_router(routes_frameworks.router)
 app.include_router(routes_stats.router)
+app.include_router(routes_dashboard.router)
 
 
 @app.get("/health")

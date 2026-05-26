@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Compliance Reporting Engine</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="/static/dashboard.css" />
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Compliance Reporting Engine</h1>
+    <p class="subtitle">SOX &middot; HIPAA &middot; PCI-DSS &middot; GDPR &middot; FinHealth (bonus)</p>
+  </header>
+
+  <main class="grid">
+    <section class="card"
+             hx-get="/partials/stats"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             aria-label="Engine statistics">
+      <div class="card-loading">Loading stats&hellip;</div>
+    </section>
+
+    <!-- Commit 16 will populate the recent / breakdown / inflight cards here.
+         Commit 17 will populate the FinHealth card. -->
+  </main>
+
+  <footer class="footer">
+    <small>Refresh interval: {{ refresh_ms }}ms</small>
+  </footer>
+</body>
+</html>

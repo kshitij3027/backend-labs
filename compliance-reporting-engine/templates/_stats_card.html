@@ -1,0 +1,15 @@
+<h2 class="card-title">Engine statistics</h2>
+<div class="stat-grid">
+  <div class="stat">
+    <span class="stat-label">Total reports</span>
+    <span class="stat-value">{{ stats.total_reports }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">Success rate</span>
+    <span class="stat-value">{{ "{:.1%}".format(stats.success_rate) }}</span>
+  </div>
+  <div class="stat">
+    <span class="stat-label">In flight</span>
+    <span class="stat-value">{{ stats.in_flight }}</span>
+  </div>
+</div>
