@@ -49,6 +49,7 @@ def register_exporter(format_code: str) -> Callable[[Callable[[dict], bytes]], C
 # concrete modules directly.
 from . import json_exporter  # noqa: E402,F401
 from . import xml_exporter  # noqa: E402,F401
+from . import csv_exporter  # noqa: E402,F401
 
 
 __all__ = ["EXPORTERS", "register_exporter"]
