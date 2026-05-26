@@ -1,0 +1,78 @@
+# Compose stack for the Multi-Framework Compliance Reporting Engine.
+#
+# Services:
+#   - postgres : PostgreSQL 16 (durable log events, report rows, report
+#                files). Healthcheck via pg_isready so the app + tester
+#                can wait on ``depends_on: condition: service_healthy``.
+#   - app      : FastAPI service (the actual application). Waits for
+#                postgres to be healthy before booting.
+#   - tester   : ephemeral pytest container, guarded by the ``test``
+#                profile so ``docker compose up`` does NOT start it.
+#                Brought up explicitly via ``docker compose --profile
+#                test run --rm tester ...`` -- the Makefile targets do
+#                this.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: compliance
+      POSTGRES_PASSWORD: compliance
+      POSTGRES_DB: compliance
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "compliance", "-d", "compliance"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://compliance:compliance@postgres:5432/compliance
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      LOG_LEVEL: INFO
+      STORAGE_PATH: /app/exports
+      SUPPORTED_FRAMEWORKS: "SOX,HIPAA,PCI_DSS,GDPR"
+      MAX_CONCURRENT_REPORTS: "5"
+      REPORT_TIMEOUT_SECONDS: "300"
+      SCHEDULER_ENABLED: "false"
+      DEFAULT_EXPORT_FORMAT: PDF
+      HMAC_SIGNING_KEY: change-me-in-production-this-is-a-32byte-min-key
+      FERNET_ENCRYPTION_KEY: ""
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - exports:/app/exports
+  tester:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      DATABASE_URL: postgresql+asyncpg://compliance:compliance@postgres:5432/compliance
+      BASE_URL: http://app:8000
+      LOG_LEVEL: WARNING
+      STORAGE_PATH: /app/exports
+      SUPPORTED_FRAMEWORKS: "SOX,HIPAA,PCI_DSS,GDPR"
+      MAX_CONCURRENT_REPORTS: "5"
+      REPORT_TIMEOUT_SECONDS: "300"
+      SCHEDULER_ENABLED: "false"
+      DEFAULT_EXPORT_FORMAT: PDF
+      HMAC_SIGNING_KEY: change-me-in-production-this-is-a-32byte-min-key
+      FERNET_ENCRYPTION_KEY: ""
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - exports:/app/exports
+volumes:
+  pgdata:
+  exports:

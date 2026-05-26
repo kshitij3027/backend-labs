@@ -1,0 +1,102 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+keys/
+
+# --- Cryptographic material (signing keys must never be committed) ---
+signing-keys/
+*.priv
+*.private
+private_key*
+keypair*
+*.fernet.key
+
+# --- Test & coverage artifacts ---
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+.cache
+
+# --- Database / local data ---
+*.db
+*.sqlite
+*.sqlite3
+data/
+local-data/
+
+# --- Generated reports & exports ---
+reports/
+exports/
+output/
+*.pdf
+*.xlsx
+*.csv.gz
+!docs/**/*.pdf
+
+# --- Logs ---
+*.log
+logs/
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- mypy / ruff / type-checker caches ---
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# --- Project plan (per repo convention) ---
+plan.md
+project_requirements.md
+
+# --- Frontend artifacts (the React dashboard lives in its own sub-package) ---
+node_modules/
+.next/
+build-frontend/

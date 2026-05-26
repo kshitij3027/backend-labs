@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1.6
+#
+# Single-stage tester image. Installs the full requirements (including
+# test deps) once at build time. docker-compose bind-mounts the project
+# over /app at run time so edits to src/ or tests/ are picked up
+# without rebuilding.
+#
+# curl + jq are present so shell-driven E2E probes (scripts/e2e.sh in a
+# later commit) can hit the live app and parse JSON responses.
+# libpq5 is the runtime lib asyncpg + psycopg2-binary load when the
+# test suite hits PostgreSQL.
+
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpq5 \
+        curl \
+        jq \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+CMD ["pytest", "-v"]
