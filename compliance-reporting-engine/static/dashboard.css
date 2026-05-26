@@ -328,3 +328,44 @@ td {
   font-family: var(--mono);
   color: var(--muted);
 }
+
+/* --- Commit 17: FinHealth bonus card --- */
+
+.finhealth-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.finhealth-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--fw-finhealth);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.finhealth-meta {
+  font-family: var(--mono);
+  color: var(--muted);
+  flex: 1 1 auto;
+}
+.dual-sign-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+.dual-sign-full    { background: rgba(232, 95, 138, 0.18); color: var(--fw-finhealth); border-color: rgba(232, 95, 138, 0.45); }
+.dual-sign-partial { background: rgba(232, 168, 56, 0.15); color: var(--warn); border-color: rgba(232, 168, 56, 0.4); }
+.dual-sign-none    { background: rgba(215, 95, 95, 0.15); color: var(--err); border-color: rgba(215, 95, 95, 0.4); }

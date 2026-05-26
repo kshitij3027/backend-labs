@@ -46,7 +46,13 @@
       <div class="card-loading">Loading in-flight reports&hellip;</div>
     </section>
 
-    <!-- Commit 17 will populate the FinHealth card here. -->
+    <section class="card"
+             hx-get="/partials/finhealth"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             aria-label="FinHealth bonus reports">
+      <div class="card-loading">Loading FinHealth&hellip;</div>
+    </section>
   </main>
 
   <footer class="footer">

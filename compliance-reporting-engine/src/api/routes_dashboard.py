@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..services.stats_service import (
     compute_dashboard_stats,
     framework_breakdown,
+    list_finhealth_reports,
     list_in_flight_reports,
     list_recent_reports,
 )
@@ -118,5 +119,24 @@ async def inflight_partial(
     return request.app.state.templates.TemplateResponse(
         request,
         "_inflight_card.html",
+        {"reports": reports},
+    )
+
+
+@router.get("/partials/finhealth", response_class=HTMLResponse)
+async def finhealth_partial(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    """Render the FinHealth bonus card body for HTMX innerHTML swap.
+
+    Surfaces the last 5 FinHealth reports with dual-signature status
+    pills (primary / secondary HMAC presence) so an auditor can see at
+    a glance which composite-framework reports are fully attested.
+    """
+    reports = await list_finhealth_reports(session, limit=5)
+    return request.app.state.templates.TemplateResponse(
+        request,
+        "_finhealth_card.html",
         {"reports": reports},
     )

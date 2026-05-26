@@ -263,6 +263,62 @@ async def list_in_flight_reports(session: AsyncSession) -> list[RecentCardRow]:
     return [_shape_card_row(row) for row in rows]
 
 
+async def list_finhealth_reports(
+    session: AsyncSession,
+    *,
+    limit: int = 5,
+) -> list[dict]:
+    """Last N FinHealth reports + the count of composite_risk findings.
+
+    The composite_risk count isn't stored on the row — it's a finding,
+    which only lives in the rendered report payload. So we return the
+    report row and let the template render whatever it can pull off the
+    Report model (``signature_secondary_hex`` presence is a good proxy
+    for "dual-signed and ready").
+
+    Returned dicts are shaped for direct template consumption:
+    ``report_id_short`` is the first 8 hex chars of the UUID,
+    ``created_at_short`` is a YYYY-MM-DD HH:MM rendering, and
+    ``signature_present`` / ``secondary_signature_present`` are
+    pre-computed booleans so the Jinja partial stays declarative.
+    """
+    rows = (
+        await session.execute(
+            select(Report)
+            .where(Report.framework == "FINHEALTH")
+            .order_by(Report.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+
+    results: list[dict] = []
+    for row in rows:
+        report_id_str = str(row.id)
+        created_short = (
+            row.created_at.strftime(_TIMESTAMP_DISPLAY_FORMAT)
+            if row.created_at is not None
+            else ""
+        )
+        download_url: Optional[str] = (
+            f"/reports/{row.id}/download" if row.state == "COMPLETED" else None
+        )
+        results.append(
+            {
+                "report_id": row.id,
+                "report_id_short": report_id_str[:8],
+                "framework": row.framework,
+                "export_format": row.export_format,
+                "state": row.state,
+                "created_at": row.created_at,
+                "created_at_short": created_short,
+                "signature_present": bool(row.signature_hex),
+                "secondary_signature_present": bool(row.signature_secondary_hex),
+                "download_url": download_url,
+            }
+        )
+    return results
+
+
 async def framework_breakdown(
     session: AsyncSession,
 ) -> list[tuple[str, int, int]]:

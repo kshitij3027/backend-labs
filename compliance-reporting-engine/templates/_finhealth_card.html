@@ -1,0 +1,29 @@
+<h2 class="card-title">FinHealth (dual-signed bonus)</h2>
+{% if reports %}
+<ul class="finhealth-list">
+  {% for r in reports %}
+  <li class="finhealth-item">
+    <span class="mono">{{ r.report_id_short }}</span>
+    <span class="finhealth-meta">{{ r.export_format }}</span>
+    <span class="state-badge state-{{ r.state|lower }}">{{ r.state }}</span>
+    <span class="dual-sign-pill {% if r.signature_present and r.secondary_signature_present %}dual-sign-full{% elif r.signature_present %}dual-sign-partial{% else %}dual-sign-none{% endif %}"
+          title="Primary {{ '+' if r.signature_present else '-' }} / Secondary {{ '+' if r.secondary_signature_present else '-' }}">
+      {% if r.signature_present and r.secondary_signature_present %}
+        DUAL-SIGNED
+      {% elif r.signature_present %}
+        single-signed
+      {% else %}
+        unsigned
+      {% endif %}
+    </span>
+    {% if r.download_url %}
+    <a href="{{ r.download_url }}" class="download-link" aria-label="Download FinHealth report {{ r.report_id_short }}">&#x2193;</a>
+    {% else %}
+    <span class="muted">&mdash;</span>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No FinHealth reports yet &mdash; generate one to demo the dual-signature flow.</p>
+{% endif %}

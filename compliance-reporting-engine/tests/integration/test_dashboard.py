@@ -55,3 +55,25 @@ async def test_static_assets_served() -> None:
     assert len(js.content) > 1000  # non-trivial vendored asset
     assert css.status_code == 200
     assert len(css.content) > 100
+
+
+@pytest.mark.asyncio
+async def test_finhealth_partial_renders_empty() -> None:
+    """The FinHealth partial renders an empty placeholder when no reports exist."""
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
+        response = await client.get("/partials/finhealth")
+    assert response.status_code == 200
+    body = response.text
+    # Card title always renders; placeholder copy when no FinHealth reports.
+    assert "FinHealth" in body
+
+
+@pytest.mark.asyncio
+async def test_dashboard_shell_includes_finhealth_card() -> None:
+    """The dashboard shell wires the FinHealth partial via hx-get."""
+    async with httpx.AsyncClient(base_url=BASE_URL, timeout=10.0) as client:
+        response = await client.get("/")
+    assert response.status_code == 200
+    body = response.text
+    # The shell renders an hx-get for the FinHealth partial endpoint.
+    assert "/partials/finhealth" in body

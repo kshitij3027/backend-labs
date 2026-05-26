@@ -51,3 +51,4 @@ from . import sox  # noqa: E402, F401  (import-after-definition is intentional)
 from . import hipaa  # noqa: E402, F401
 from . import pci_dss  # noqa: E402, F401
 from . import gdpr  # noqa: E402, F401
+from . import finhealth  # noqa: E402, F401

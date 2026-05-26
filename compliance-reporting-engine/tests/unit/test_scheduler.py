@@ -67,20 +67,21 @@ def _fake_coordinator() -> MagicMock:
 def test_install_jobs_registers_one_per_framework() -> None:
     """``install_jobs()`` registers exactly one job per supported framework.
 
-    The default supported list has 4 frameworks. FinHealth is *not*
-    appended here because the registry hasn't imported it yet (commit
-    17 lands FinHealth) — so we expect exactly 4 jobs.
+    The default supported list has 4 frameworks; commit 17 added
+    FinHealth to the registry, and the scheduler auto-appends it
+    (since it has its own weekly cadence). Expect exactly 5 jobs.
     """
     scheduler = ReportScheduler(_fake_coordinator(), _fake_settings())
     scheduler.install_jobs()
 
-    assert len(scheduler.installed_jobs) == 4
+    assert len(scheduler.installed_jobs) == 5
     job_ids = {job.id for job in scheduler.installed_jobs}
     assert job_ids == {
         "generate-sox",
         "generate-hipaa",
         "generate-pci_dss",
         "generate-gdpr",
+        "generate-finhealth",
     }
 
 
@@ -97,23 +98,26 @@ def test_each_job_has_cron_trigger() -> None:
 
 
 def test_unknown_framework_skipped_with_warning() -> None:
-    """``install_jobs(["NOPE", "SOX"])`` only registers SOX, no exception."""
+    """``install_jobs(["NOPE", "SOX"])`` only registers SOX (plus the
+    auto-appended FinHealth), no exception."""
     scheduler = ReportScheduler(_fake_coordinator(), _fake_settings())
     scheduler.install_jobs(frameworks=["NOPE", "SOX"])
 
-    assert len(scheduler.installed_jobs) == 1
-    assert scheduler.installed_jobs[0].id == "generate-sox"
+    job_ids = {job.id for job in scheduler.installed_jobs}
+    # SOX registers; NOPE is skipped; FinHealth is auto-appended.
+    assert job_ids == {"generate-sox", "generate-finhealth"}
 
 
 def test_install_jobs_uses_settings_list_by_default() -> None:
-    """When ``frameworks=None`` the scheduler reads the settings list."""
+    """When ``frameworks=None`` the scheduler reads the settings list
+    and auto-appends FinHealth."""
     scheduler = ReportScheduler(
         _fake_coordinator(), _fake_settings(supported=["SOX"])
     )
     scheduler.install_jobs()
 
-    assert len(scheduler.installed_jobs) == 1
-    assert scheduler.installed_jobs[0].id == "generate-sox"
+    job_ids = {job.id for job in scheduler.installed_jobs}
+    assert job_ids == {"generate-sox", "generate-finhealth"}
 
 
 def test_period_for_daily_window() -> None:
@@ -193,7 +197,7 @@ def test_install_jobs_idempotent_on_repeated_call() -> None:
     # APScheduler internal job store.
     scheduler.install_jobs()
     # The snapshot list double-counts (it's append-only), but the
-    # scheduler's own job store still has just 4 unique IDs.
+    # scheduler's own job store still has just 5 unique IDs.
     assert len(scheduler.installed_jobs) == 2 * first_count
     job_ids = {j.id for j in scheduler.scheduler.get_jobs()}
     assert job_ids == {
@@ -201,6 +205,7 @@ def test_install_jobs_idempotent_on_repeated_call() -> None:
         "generate-hipaa",
         "generate-pci_dss",
         "generate-gdpr",
+        "generate-finhealth",
     }
 
 
@@ -216,7 +221,10 @@ def test_scheduler_can_start_and_shutdown() -> None:
     async def _run() -> None:
         scheduler = ReportScheduler(_fake_coordinator(), _fake_settings())
         scheduler.install_jobs(frameworks=[])
-        assert scheduler.installed_jobs == []
+        # FinHealth is auto-appended from the registry even when the
+        # caller passes an explicit empty list, so we expect a single
+        # job (the weekly FinHealth one) rather than zero.
+        assert {j.id for j in scheduler.installed_jobs} == {"generate-finhealth"}
         scheduler.start()
         try:
             assert scheduler.scheduler.running is True

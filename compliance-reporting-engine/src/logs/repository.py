@@ -86,11 +86,23 @@ async def query_logs_for_framework_in_window(
     )
     result = await session.execute(stmt)
     rows = result.scalars().all()
-    matches = [
-        event
-        for event in rows
-        if event.framework_tags and framework in event.framework_tags
-    ]
+    # FinHealth is a composite framework — the seeder doesn't tag events
+    # with ``"FINHEALTH"`` directly. Instead, it matches any event tagged
+    # with either of its two source frameworks (SOX or HIPAA).
+    if framework == "FINHEALTH":
+        composite_sources = ("SOX", "HIPAA")
+        matches = [
+            event
+            for event in rows
+            if event.framework_tags
+            and any(tag in composite_sources for tag in event.framework_tags)
+        ]
+    else:
+        matches = [
+            event
+            for event in rows
+            if event.framework_tags and framework in event.framework_tags
+        ]
     logger.info(
         "log_events_queried",
         framework=framework,
