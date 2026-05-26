@@ -61,13 +61,13 @@ test-int:
 seed-logs:
 	docker compose --profile test run --rm tester python scripts/seed_logs.py --count 5000
 
-seed-reports:
+seed-reports: ## Hit /reports/generate once per framework x format combo (demo data)
 	docker compose --profile test run --rm tester python scripts/seed_reports.py
 
-e2e:
+e2e: ## Full end-to-end: seed -> generate per framework -> verify -> download
 	docker compose --profile test run --rm tester bash scripts/e2e.sh
 
-load:
+load: ## 5-concurrent generations sanity test (asserts <120s + 100% success)
 	docker compose --profile test run --rm tester python scripts/load_test.py
 
 clean:
