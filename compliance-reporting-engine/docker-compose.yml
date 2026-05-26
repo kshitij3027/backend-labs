@@ -39,7 +39,7 @@ services:
       SUPPORTED_FRAMEWORKS: "SOX,HIPAA,PCI_DSS,GDPR"
       MAX_CONCURRENT_REPORTS: "5"
       REPORT_TIMEOUT_SECONDS: "300"
-      SCHEDULER_ENABLED: "false"
+      SCHEDULER_ENABLED: "${SCHEDULER_ENABLED:-false}"
       DEFAULT_EXPORT_FORMAT: PDF
       HMAC_SIGNING_KEY: change-me-in-production-this-is-a-32byte-min-key
       FERNET_ENCRYPTION_KEY: ""
@@ -63,7 +63,7 @@ services:
       SUPPORTED_FRAMEWORKS: "SOX,HIPAA,PCI_DSS,GDPR"
       MAX_CONCURRENT_REPORTS: "5"
       REPORT_TIMEOUT_SECONDS: "300"
-      SCHEDULER_ENABLED: "false"
+      SCHEDULER_ENABLED: "${SCHEDULER_ENABLED:-false}"
       DEFAULT_EXPORT_FORMAT: PDF
       HMAC_SIGNING_KEY: change-me-in-production-this-is-a-32byte-min-key
       FERNET_ENCRYPTION_KEY: ""

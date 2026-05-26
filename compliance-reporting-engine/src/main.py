@@ -26,6 +26,7 @@ from .logging_config import configure_logging, get_logger
 from .persistence.db import init_db, make_engine, make_session_factory
 from .reporting.coordinator import ReportCoordinator
 from .reporting.exporters import EXPORTERS
+from .scheduling.scheduler import ReportScheduler
 from .settings import get_settings
 from .signing.fernet_store import load_or_create_fernet
 from .signing.hmac_signer import load_secondary_signing_key, load_signing_key
@@ -94,10 +95,34 @@ async def lifespan(app: FastAPI):
         secondary_key_loaded=secondary_signing_key is not None,
     )
 
+    # --- APScheduler wiring (commit 14) ---
+    # Optional: gated by ``SCHEDULER_ENABLED``. We always set
+    # ``app.state.scheduler`` (to either the wrapper or ``None``) so
+    # the shutdown branch below can branch on a single attribute
+    # without an ``hasattr`` dance.
+    if settings.scheduler_enabled:
+        scheduler_wrapper = ReportScheduler(coordinator, settings)
+        scheduler_wrapper.install_jobs()
+        scheduler_wrapper.start()
+        app.state.scheduler = scheduler_wrapper
+        logger.info(
+            "scheduler_enabled",
+            job_count=len(scheduler_wrapper.installed_jobs),
+        )
+    else:
+        app.state.scheduler = None
+        logger.info("scheduler_disabled")
+
     try:
         yield
     finally:
         logger.info("app_shutting_down")
+        if app.state.scheduler is not None:
+            # ``wait=False`` so a slow in-flight generate doesn't block
+            # the lifespan teardown. The coordinator is fire-and-forget
+            # so any in-flight tasks will drain (or fail cleanly) as
+            # the event loop closes.
+            app.state.scheduler.shutdown(wait=False)
         await engine.dispose()
 
 
