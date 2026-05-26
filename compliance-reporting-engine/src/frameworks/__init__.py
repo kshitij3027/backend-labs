@@ -48,3 +48,4 @@ __all__ = ["FRAMEWORK_REGISTRY", "FrameworkRules", "register_framework"]
 # adds an entry to ``FRAMEWORK_REGISTRY``. HIPAA / PCI-DSS / GDPR /
 # FinHealth modules are added in later commits.
 from . import sox  # noqa: E402, F401  (import-after-definition is intentional)
+from . import hipaa  # noqa: E402, F401
