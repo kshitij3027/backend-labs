@@ -1,0 +1,35 @@
+<h2 class="card-title">Recent reports</h2>
+{% if reports %}
+<table class="recent-table">
+  <thead>
+    <tr>
+      <th>ID</th>
+      <th>Framework</th>
+      <th>Format</th>
+      <th>State</th>
+      <th>Created</th>
+      <th>Download</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in reports %}
+    <tr>
+      <td class="mono">{{ r.report_id_short }}</td>
+      <td>{{ r.framework }}</td>
+      <td>{{ r.export_format }}</td>
+      <td><span class="state-badge state-{{ r.state|lower }}">{{ r.state }}</span></td>
+      <td class="mono">{{ r.created_at_short }}</td>
+      <td>
+        {% if r.download_url %}
+        <a href="{{ r.download_url }}" class="download-link" aria-label="Download report {{ r.report_id_short }}">&#x2193;</a>
+        {% else %}
+        <span class="muted">&mdash;</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="empty">No reports generated yet.</p>
+{% endif %}

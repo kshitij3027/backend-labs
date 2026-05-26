@@ -22,8 +22,31 @@
       <div class="card-loading">Loading stats&hellip;</div>
     </section>
 
-    <!-- Commit 16 will populate the recent / breakdown / inflight cards here.
-         Commit 17 will populate the FinHealth card. -->
+    <section class="card"
+             hx-get="/partials/recent"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             aria-label="Recent reports">
+      <div class="card-loading">Loading recent reports&hellip;</div>
+    </section>
+
+    <section class="card"
+             hx-get="/partials/breakdown"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             aria-label="Framework breakdown">
+      <div class="card-loading">Loading breakdown&hellip;</div>
+    </section>
+
+    <section class="card"
+             hx-get="/partials/inflight"
+             hx-trigger="load, every {{ refresh_ms }}ms"
+             hx-swap="innerHTML"
+             aria-label="In-flight reports">
+      <div class="card-loading">Loading in-flight reports&hellip;</div>
+    </section>
+
+    <!-- Commit 17 will populate the FinHealth card here. -->
   </main>
 
   <footer class="footer">

@@ -148,3 +148,183 @@ td {
   font-size: 11px;
   text-align: right;
 }
+
+/* --- Commit 16 additions: recent / breakdown / in-flight cards --- */
+
+/* Per-framework accent hues. Used by both the breakdown stacked-bar
+ * segments and the legend dots so the visual key stays consistent
+ * with the table state badges. Tints are slightly desaturated so they
+ * read clearly against the dark surface without screaming. */
+:root {
+  --fw-sox: #5b8def;        /* blue */
+  --fw-hipaa: #2eb8a3;      /* teal */
+  --fw-pci_dss: #e8a838;    /* amber */
+  --fw-gdpr: #9d6cd8;       /* violet */
+  --fw-finhealth: #e85f8a;  /* rose */
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.empty {
+  color: var(--muted);
+  font-size: 13px;
+  font-style: italic;
+  margin: 8px 0 0;
+}
+
+/* --- Recent reports table --- */
+
+.recent-table {
+  table-layout: auto;
+}
+.recent-table th,
+.recent-table td {
+  font-size: 12px;
+  white-space: nowrap;
+}
+.recent-table tbody tr:hover {
+  background: rgba(91, 141, 239, 0.06);
+}
+
+.download-link {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: rgba(91, 141, 239, 0.18);
+  color: var(--accent);
+  text-decoration: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1;
+}
+.download-link:hover {
+  background: rgba(91, 141, 239, 0.32);
+}
+
+/* --- State badges (used in recent + in-flight cards) --- */
+
+.state-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-family: var(--mono);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+.state-pending     { background: rgba(232, 168, 56, 0.15); color: var(--warn); border-color: rgba(232, 168, 56, 0.4); }
+.state-aggregating { background: rgba(108, 171, 216, 0.18); color: var(--info); border-color: rgba(108, 171, 216, 0.4); }
+.state-exporting   { background: rgba(91, 141, 239, 0.18); color: var(--accent); border-color: rgba(91, 141, 239, 0.4); }
+.state-signing     { background: rgba(91, 141, 239, 0.18); color: var(--accent); border-color: rgba(91, 141, 239, 0.4); }
+.state-completed   { background: rgba(46, 184, 114, 0.18); color: var(--ok); border-color: rgba(46, 184, 114, 0.4); }
+.state-failed      { background: rgba(215, 95, 95, 0.18); color: var(--err); border-color: rgba(215, 95, 95, 0.4); }
+
+/* --- Framework breakdown: stacked bar + legend --- */
+
+.breakdown-bar {
+  display: flex;
+  width: 100%;
+  height: 28px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+.breakdown-segment {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(15, 17, 21, 0.85);
+  letter-spacing: 0.3px;
+  overflow: hidden;
+  white-space: nowrap;
+  min-width: 0;
+}
+.breakdown-label {
+  padding: 0 6px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+}
+.breakdown-sox       { background: var(--fw-sox); }
+.breakdown-hipaa     { background: var(--fw-hipaa); }
+.breakdown-pci_dss   { background: var(--fw-pci_dss); }
+.breakdown-gdpr      { background: var(--fw-gdpr); }
+.breakdown-finhealth { background: var(--fw-finhealth); }
+
+.breakdown-legend {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 6px 12px;
+}
+.breakdown-legend li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.legend-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.legend-name {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.legend-count {
+  margin-left: auto;
+  color: var(--accent);
+}
+.legend-pct {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.legend-sox       { background: var(--fw-sox); }
+.legend-hipaa     { background: var(--fw-hipaa); }
+.legend-pci_dss   { background: var(--fw-pci_dss); }
+.legend-gdpr      { background: var(--fw-gdpr); }
+.legend-finhealth { background: var(--fw-finhealth); }
+
+/* --- In-flight list --- */
+
+.inflight-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.inflight-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+}
+.inflight-meta {
+  flex: 1 1 auto;
+  font-family: var(--mono);
+  color: var(--muted);
+}

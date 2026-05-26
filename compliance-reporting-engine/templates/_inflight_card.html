@@ -1,0 +1,14 @@
+<h2 class="card-title">In-flight reports</h2>
+{% if reports %}
+<ul class="inflight-list">
+  {% for r in reports %}
+  <li class="inflight-item">
+    <span class="mono">{{ r.report_id_short }}</span>
+    <span class="inflight-meta">{{ r.framework }} &rarr; {{ r.export_format }}</span>
+    <span class="state-badge state-{{ r.state|lower }}">{{ r.state }}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No reports in flight.</p>
+{% endif %}

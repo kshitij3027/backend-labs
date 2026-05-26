@@ -1,0 +1,24 @@
+<h2 class="card-title">Framework breakdown</h2>
+{% if items %}
+<div class="breakdown-bar" role="img" aria-label="Framework distribution">
+  {% for name, count, pct in items %}
+  <div class="breakdown-segment breakdown-{{ name|lower }}"
+       style="width: {{ pct }}%;"
+       title="{{ name }}: {{ count }} ({{ pct }}%)">
+    <span class="breakdown-label">{{ name }}</span>
+  </div>
+  {% endfor %}
+</div>
+<ul class="breakdown-legend">
+  {% for name, count, pct in items %}
+  <li>
+    <span class="legend-dot legend-{{ name|lower }}"></span>
+    <span class="legend-name">{{ name }}</span>
+    <span class="legend-count mono">{{ count }}</span>
+    <span class="legend-pct muted">({{ pct }}%)</span>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="empty">No reports yet &mdash; generate one to see the breakdown.</p>
+{% endif %}

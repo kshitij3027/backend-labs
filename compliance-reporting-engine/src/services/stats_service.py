@@ -1,18 +1,26 @@
 """Dashboard statistics aggregator.
 
-One read-only function lives here: :func:`compute_dashboard_stats`. It
-takes an async session and rolls up the four numbers + two breakdown
-dicts + the recent-reports list that the dashboard's stats card and
-recent-card render.
+The headline export here is :func:`compute_dashboard_stats`, which
+rolls up the four numbers + two breakdown dicts + the recent-reports
+list that the dashboard's stats card renders.
+
+Three smaller helpers feed the commit-16 HTMX partial cards:
+
+  * :func:`list_recent_reports` — last N report rows shaped into
+    :class:`RecentCardRow` (adds the short id, formatted timestamp,
+    and download URL the template expects).
+  * :func:`list_in_flight_reports` — same shape, filtered to
+    non-terminal states (PENDING / AGGREGATING / EXPORTING / SIGNING).
+  * :func:`framework_breakdown` — ``(framework, count, percent_int)``
+    tuples sorted by count DESC, ready for the stacked-bar partial.
 
 Why a separate service module (vs. inlining in the route)? Two reasons:
 
   1. The stats logic is non-trivial — five queries, one rate
      calculation, one ORM-to-Pydantic mapping. Pulling it out keeps
      the route handler readable and unit-testable in isolation.
-  2. The same aggregator gets reused by the HTMX dashboard partial in
-     commit 16, so we want one source of truth for "what does the
-     dashboard see?".
+  2. The same aggregators get reused by the HTMX dashboard partials,
+     so we want one source of truth for "what does the dashboard see?".
 
 ``success_rate`` deliberately excludes in-flight reports (PENDING /
 AGGREGATING / EXPORTING / SIGNING). A report still mid-flight isn't
@@ -23,6 +31,11 @@ without divide-by-zero panic.
 """
 from __future__ import annotations
 
+from datetime import datetime
+from typing import Optional
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,6 +53,69 @@ _IN_FLIGHT_STATES: tuple[str, ...] = (
     "EXPORTING",
     "SIGNING",
 )
+
+
+# Format used by the recent / in-flight cards to render the
+# ``created_at`` column. Year-month-day plus hour:minute keeps the
+# table compact while still letting an operator eyeball "is this
+# recent?" without expanding the column.
+_TIMESTAMP_DISPLAY_FORMAT = "%Y-%m-%d %H:%M"
+
+
+class RecentCardRow(BaseModel):
+    """One row rendered by the recent / in-flight HTMX partial cards.
+
+    A thin presentation-layer model: the fields here exist purely to
+    feed the Jinja templates without forcing the template to call
+    helper functions. ``report_id_short`` is the first 8 hex chars of
+    the UUID (more than enough to disambiguate in a 10-row table) and
+    ``download_url`` is only set on COMPLETED rows so the template can
+    conditionally render the download link without an extra state
+    check.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    report_id: UUID
+    report_id_short: str
+    framework: str
+    export_format: str
+    state: str
+    created_at: datetime
+    created_at_short: str
+    completed_at: Optional[datetime] = None
+    download_url: Optional[str] = None
+
+
+def _shape_card_row(report: Report) -> RecentCardRow:
+    """Project a ``Report`` ORM row onto a :class:`RecentCardRow`.
+
+    Two derived fields land here so the template stays declarative:
+    the 8-char short id and the human-friendly ``YYYY-MM-DD HH:MM``
+    timestamp. ``download_url`` is only populated for COMPLETED rows
+    — the download endpoint 404s otherwise, so surfacing the link on
+    a half-done report would just lead a curious user to a dead end.
+    """
+    report_id_str = str(report.id)
+    download_url: Optional[str] = (
+        f"/reports/{report.id}/download" if report.state == "COMPLETED" else None
+    )
+    created_short = (
+        report.created_at.strftime(_TIMESTAMP_DISPLAY_FORMAT)
+        if report.created_at is not None
+        else ""
+    )
+    return RecentCardRow(
+        report_id=report.id,
+        report_id_short=report_id_str[:8],
+        framework=report.framework,
+        export_format=report.export_format,
+        state=report.state,
+        created_at=report.created_at,
+        created_at_short=created_short,
+        completed_at=report.completed_at,
+        download_url=download_url,
+    )
 
 
 async def compute_dashboard_stats(
@@ -146,3 +222,78 @@ async def compute_dashboard_stats(
         in_flight=int(in_flight_count),
         recent=recent,
     )
+
+
+async def list_recent_reports(
+    session: AsyncSession,
+    *,
+    limit: int = 10,
+) -> list[RecentCardRow]:
+    """Fetch the last ``limit`` reports, newest first, shaped for the recent card.
+
+    Used by ``GET /partials/recent``. The shaping (``report_id_short``,
+    ``created_at_short``, conditional ``download_url``) happens in
+    :func:`_shape_card_row` so the template stays presentation-free.
+    """
+    rows = (
+        await session.execute(
+            select(Report)
+            .order_by(Report.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return [_shape_card_row(row) for row in rows]
+
+
+async def list_in_flight_reports(session: AsyncSession) -> list[RecentCardRow]:
+    """Fetch every report still in a non-terminal state, newest first.
+
+    "In-flight" means PENDING / AGGREGATING / EXPORTING / SIGNING — the
+    same set that drives the in-flight counter on the stats card. The
+    dashboard polls this endpoint on the same cadence, so each pass
+    naturally shows reports moving along the pipeline.
+    """
+    rows = (
+        await session.execute(
+            select(Report)
+            .where(Report.state.in_(_IN_FLIGHT_STATES))
+            .order_by(Report.created_at.desc())
+        )
+    ).scalars().all()
+    return [_shape_card_row(row) for row in rows]
+
+
+async def framework_breakdown(
+    session: AsyncSession,
+) -> list[tuple[str, int, int]]:
+    """Aggregate report counts per framework with integer percentages.
+
+    Returns a list of ``(framework, count, percent_int)`` tuples sorted
+    by count DESC, ties broken by framework name. ``percent_int`` is
+    ``round(count / total * 100)`` so the stacked-bar segments add up
+    to a clean 100% (within ±1 % rounding noise — acceptable for a
+    visual breakdown).
+
+    Returns an empty list when no reports exist, letting the template
+    render an "empty" placeholder without divide-by-zero panic.
+    """
+    rows = (
+        await session.execute(
+            select(Report.framework, func.count(Report.id))
+            .group_by(Report.framework)
+        )
+    ).all()
+    if not rows:
+        return []
+
+    counts: list[tuple[str, int]] = [(fw, int(cnt)) for fw, cnt in rows]
+    total = sum(cnt for _, cnt in counts)
+    if total <= 0:
+        return []
+
+    # Sort by count DESC, framework ASC for stable ordering. The
+    # template iterates the list in order, so the largest segment
+    # lands on the left of the stacked bar.
+    counts.sort(key=lambda pair: (-pair[1], pair[0]))
+
+    return [(fw, cnt, round(cnt / total * 100)) for fw, cnt in counts]
