@@ -10,6 +10,7 @@ pydantic-settings==2.6.1
 # --- Database & ORM ---
 sqlalchemy==2.0.36
 alembic==1.13.3
+aiosqlite==0.20.0
 psycopg2-binary==2.9.10
 asyncpg==0.30.0
 
