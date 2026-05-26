@@ -75,7 +75,7 @@ output/
 
 # --- Logs ---
 *.log
-logs/
+/logs/
 
 # --- IDE / editor ---
 .idea/
