@@ -5,6 +5,7 @@ import json
 import socket
 from typing import Any, Iterable, Protocol, runtime_checkable
 
+from src.instrumentation.decorator import profile_stage
 from src.logging_config import get_logger
 from src.metrics.sample import StageName
 from src.settings import Settings
@@ -73,6 +74,7 @@ class _BaseStage:
 class ParseStage(_BaseStage):
     name: StageName = "parse"
 
+    @profile_stage("parse")
     async def process(self, record: dict) -> dict | None:
         line = record.get("line", "")
         if not line:
@@ -90,6 +92,7 @@ class ValidateStage(_BaseStage):
     name: StageName = "validate"
     _REQUIRED = frozenset({"ts", "level", "msg"})
 
+    @profile_stage("validate")
     async def process(self, record: dict) -> dict | None:
         if not self._REQUIRED.issubset(record.keys()):
             return None
@@ -110,6 +113,7 @@ class TransformStage(_BaseStage):
         self._host = host or socket.gethostname()
         self._env = env
 
+    @profile_stage("transform")
     async def process(self, record: dict) -> dict | None:
         record = dict(record)
         record["host"] = self._host
@@ -124,6 +128,7 @@ class WriteStage(_BaseStage):
         super().__init__(inbound, outbound=None)
         self.sink: list[dict] = []
 
+    @profile_stage("write")
     async def process(self, record: dict) -> dict | None:
         return record
 
