@@ -16,11 +16,15 @@ from src.settings import Settings
 
 
 class BatchingWriteStage(WriteStage):
-    """Coalesce up to ``batch_size`` records (or wait at most 100ms) before
-    appending to the in-memory sink. Reduces per-record overhead under
-    write-saturated workloads."""
+    """Coalesce up to ``batch_size`` records (or wait at most ``max_wait_sec``)
+    before appending to the in-memory sink. The default 5ms cap keeps tail
+    latency low when the upstream goes quiet (synthetic-pipeline finish), so
+    the optimization doesn't regress on workloads where the underlying write
+    is essentially free (in-memory append). Real disk/network sinks benefit
+    from coalescing far more than they pay in flush latency.
+    """
 
-    def __init__(self, inbound: asyncio.Queue, batch_size: int = 100, max_wait_sec: float = 0.1) -> None:
+    def __init__(self, inbound: asyncio.Queue, batch_size: int = 50, max_wait_sec: float = 0.005) -> None:
         super().__init__(inbound=inbound)
         self._batch_size = batch_size
         self._max_wait_sec = max_wait_sec
