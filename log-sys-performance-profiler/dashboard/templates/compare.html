@@ -1,3 +1,39 @@
 <!doctype html>
-<html><head><title>Compare</title></head>
-<body><p>placeholder — populated in commit 19 (refresh={{ refresh_ms }}ms)</p></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log Pipeline Profiler — Compare</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/chart.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Run Comparison</h1>
+    <a href="/" style="color:#93c5fd;text-decoration:none;font-size:0.9rem;">← back to dashboard</a>
+  </header>
+
+  <section id="diff-summary" class="card" style="margin-bottom:1rem">
+    <div class="muted">loading comparison…</div>
+  </section>
+
+  <h2 style="font-size:1rem;color:#9ca3af">Baseline</h2>
+  <section class="grid">
+    <div class="card"><h3>CPU% per stage</h3><canvas id="baseline-cpu"></canvas></div>
+    <div class="card"><h3>Memory MB per stage</h3><canvas id="baseline-mem"></canvas></div>
+    <div class="card"><h3>Queue depth per stage</h3><canvas id="baseline-queue"></canvas></div>
+    <div class="card"><h3>Throughput samples / window</h3><canvas id="baseline-throughput"></canvas></div>
+  </section>
+
+  <h2 style="font-size:1rem;color:#9ca3af;margin-top:1rem">Optimized</h2>
+  <section class="grid">
+    <div class="card"><h3>CPU% per stage</h3><canvas id="optimized-cpu"></canvas></div>
+    <div class="card"><h3>Memory MB per stage</h3><canvas id="optimized-mem"></canvas></div>
+    <div class="card"><h3>Queue depth per stage</h3><canvas id="optimized-queue"></canvas></div>
+    <div class="card"><h3>Throughput samples / window</h3><canvas id="optimized-throughput"></canvas></div>
+  </section>
+
+  <script>window.REFRESH_MS = {{ refresh_ms | default(2000) }};</script>
+  <script src="/static/compare.js"></script>
+</body>
+</html>

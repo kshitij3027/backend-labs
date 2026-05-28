@@ -52,3 +52,24 @@ async def test_static_dashboard_css_served() -> None:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
             r = await ac.get("/static/dashboard.css")
             assert r.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_static_compare_js_served() -> None:
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
+            r = await ac.get("/static/compare.js")
+            assert r.status_code == 200
+            assert b"compare" in r.content.lower()  # sanity check
+
+
+@pytest.mark.asyncio
+async def test_compare_page_references_chart_and_compare_js() -> None:
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as ac:
+            r = await ac.get("/compare")
+            assert r.status_code == 200
+            body = r.text
+            assert "chart.min.js" in body
+            assert "compare.js" in body
+            assert "Run Comparison" in body
