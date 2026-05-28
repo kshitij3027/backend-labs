@@ -1,0 +1,11 @@
+services:
+  tester:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      LOG_LEVEL: "WARNING"
+    volumes:
+      - .:/app
+    working_dir: /app

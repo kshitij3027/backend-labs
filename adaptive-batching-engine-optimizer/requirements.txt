@@ -1,0 +1,27 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Data validation / config
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Numerics (gradient estimation, smoothing)
+numpy==2.2.1
+
+# System metrics (CPU / memory sampling)
+psutil==6.1.1
+
+# Dashboard templates
+jinja2==3.1.5
+
+# WebSocket support (also pulled in via uvicorn[standard])
+websockets==14.1
+
+# HTTP client (for testing / health checks)
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
