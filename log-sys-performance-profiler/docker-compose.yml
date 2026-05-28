@@ -1,0 +1,42 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PROFILER_PORT: "8000"
+      DASHBOARD_REFRESH_SEC: "2"
+      DETECTION_WINDOW_SEC: "10"
+      OVERHEAD_TARGET_PCT: "2"
+      METRICS_BUFFER_SIZE: "10000"
+      METRICS_BATCH_SIZE: "100"
+      LOAD_TEST_LOG_COUNT: "1000"
+      LOAD_TEST_CONCURRENCY: "4"
+      BOTTLENECK_Z_THRESHOLD: "2.0"
+      INSTRUMENTED_STAGES: "parse,validate,transform,write"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+  tester:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      BASE_URL: "http://app:8000"
+      LOG_LEVEL: "WARNING"
+      PROFILER_PORT: "8000"
+      DASHBOARD_REFRESH_SEC: "2"
+      DETECTION_WINDOW_SEC: "10"
+      OVERHEAD_TARGET_PCT: "2"
+      METRICS_BUFFER_SIZE: "10000"
+      METRICS_BATCH_SIZE: "100"
+      LOAD_TEST_LOG_COUNT: "1000"
+      LOAD_TEST_CONCURRENCY: "4"
+      BOTTLENECK_Z_THRESHOLD: "2.0"
+      INSTRUMENTED_STAGES: "parse,validate,transform,write"
+    volumes:
+      - .:/app
+    working_dir: /app
