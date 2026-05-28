@@ -1,3 +1,48 @@
 <!doctype html>
-<html><head><title>Log Pipeline Profiler</title></head>
-<body><p>placeholder — populated in commit 18 (refresh={{ refresh_ms }}ms)</p></body></html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Log Pipeline Performance Profiler</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/chart.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Log Pipeline Performance Profiler</h1>
+    <span id="status-pill" class="pill ok">live</span>
+  </header>
+
+  <section id="bottleneck-banner" class="banner" hidden>
+    <strong>Bottleneck detected:</strong> <span id="bn-text"></span>
+  </section>
+
+  <section class="controls">
+    <button id="start-baseline" type="button">Start load test</button>
+    <select id="opt-select"><option value="">— pick optimization —</option></select>
+    <button id="apply-opt" type="button" disabled>Apply optimization (baseline vs optimized)</button>
+    <span id="run-status" class="muted"></span>
+  </section>
+
+  <section class="grid">
+    <div class="card"><h3>CPU% per stage</h3><canvas id="cpu-chart"></canvas></div>
+    <div class="card"><h3>Memory MB per stage</h3><canvas id="mem-chart"></canvas></div>
+    <div class="card"><h3>Queue depth per stage</h3><canvas id="queue-chart"></canvas></div>
+    <div class="card"><h3>Throughput (samples / window)</h3><canvas id="throughput-chart"></canvas></div>
+  </section>
+
+  <section class="lower">
+    <div class="card">
+      <h3>Recommendations</h3>
+      <ul id="recs"><li class="muted">no recommendations yet</li></ul>
+    </div>
+    <div class="card">
+      <h3>Recent runs</h3>
+      <ul id="recent-runs"><li class="muted">no runs yet</li></ul>
+    </div>
+  </section>
+
+  <script>window.REFRESH_MS = {{ refresh_ms | default(2000) }};</script>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
