@@ -2,6 +2,8 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 import src.optimizations.batch_writer  # noqa: F401 — registers
 import src.optimizations.object_pool  # noqa: F401 — registers
@@ -9,7 +11,10 @@ import src.optimizations.fsm_parser  # noqa: F401 — registers
 import src.optimizations.precompiled_validator  # noqa: F401 — registers
 import src.optimizations.async_io_variant  # noqa: F401 — registers
 import src.optimizations.mmap_reader  # noqa: F401 — registers
+from src.api.routes_compare import router as compare_router
+from src.api.routes_dashboard import router as dashboard_router
 from src.api.routes_metrics import router as metrics_router
+from src.api.routes_optimizations import router as optimizations_router
 from src.api.routes_runs import router as runs_router
 from src.benchmark.harness import BeforeAfterHarness
 from src.instrumentation.decorator import set_collector
@@ -49,6 +54,7 @@ async def lifespan(app: FastAPI):
     app.state.runner = runner
     app.state.run_store = run_store
     app.state.harness = harness
+    app.state.templates = Jinja2Templates(directory="dashboard/templates")
 
     drain_task = asyncio.create_task(collector.drain_loop())
     sample_task = asyncio.create_task(sampler.sample_loop())
@@ -71,6 +77,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Log Pipeline Performance Profiler", lifespan=lifespan)
 app.include_router(runs_router)
 app.include_router(metrics_router)
+app.include_router(compare_router)
+app.include_router(optimizations_router)
+app.include_router(dashboard_router)
+app.mount("/static", StaticFiles(directory="dashboard/static"), name="static")
 
 
 @app.get("/health")
