@@ -85,3 +85,25 @@ async def get_run(
     if summary is None:
         raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
     return RunSummaryOut(**summary.to_dict())
+
+
+@router.get("/{run_id}/bottlenecks")
+async def get_bottlenecks(
+    run_id: str,
+    store: Annotated[RunStore, Depends(get_store)],
+) -> list[dict]:
+    summary = store.get(run_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+    return summary.bottlenecks
+
+
+@router.get("/{run_id}/recommendations")
+async def get_recommendations(
+    run_id: str,
+    store: Annotated[RunStore, Depends(get_store)],
+) -> list[dict]:
+    summary = store.get(run_id)
+    if summary is None:
+        raise HTTPException(status_code=404, detail=f"run not found: {run_id}")
+    return summary.recommendations

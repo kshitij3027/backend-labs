@@ -9,6 +9,7 @@ import src.optimizations.fsm_parser  # noqa: F401 — registers
 import src.optimizations.precompiled_validator  # noqa: F401 — registers
 import src.optimizations.async_io_variant  # noqa: F401 — registers
 import src.optimizations.mmap_reader  # noqa: F401 — registers
+from src.api.routes_metrics import router as metrics_router
 from src.api.routes_runs import router as runs_router
 from src.benchmark.harness import BeforeAfterHarness
 from src.instrumentation.decorator import set_collector
@@ -69,6 +70,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Log Pipeline Performance Profiler", lifespan=lifespan)
 app.include_router(runs_router)
+app.include_router(metrics_router)
 
 
 @app.get("/health")
