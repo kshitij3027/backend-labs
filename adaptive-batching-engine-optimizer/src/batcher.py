@@ -151,6 +151,11 @@ class AdaptiveBatcher:
         self._queue_depth: int = 0
         self._last_reason: str = ""
         self._constraint_active: bool = False
+        # Ticks elapsed since the last EMERGENCY tick. Seeded to stable_window so
+        # ordinary startup STABLE detection is *not* blocked; it is zeroed on each
+        # emergency and must climb back to stable_window before STABLE can
+        # re-engage (see :meth:`_is_stable` for the rationale).
+        self._ticks_since_emergency: int = self.stable_window
         # Optional interval override set by apply_config; tick() prefers it when
         # no explicit interval argument is supplied.
         self._interval_override: float | None = None
@@ -253,6 +258,14 @@ class AdaptiveBatcher:
             reason = f"{new_state.value}: gradient={gradient:.4g}"
         self._last_reason = reason
 
+        # Track distance from the last emergency so STABLE cannot latch onto the
+        # flat batch trace a sustained emergency leaves behind (see _is_stable).
+        self._ticks_since_emergency = (
+            0
+            if new_state is OptimizerState.EMERGENCY
+            else self._ticks_since_emergency + 1
+        )
+
         # 10) Record the measured snapshot (batch_size = the size that produced
         #     these metrics, i.e. current_batch, not the next-tick choice).
         snap = self.collector.record_metrics(
@@ -291,9 +304,20 @@ class AdaptiveBatcher:
         robust: it behaves the same whether the optimum sits at 50 or 5000.
 
         Returns:
-            ``False`` if fewer than ``stable_window`` snapshots exist yet or the
-            mean batch size is zero; otherwise ``spread < stable_batch_rel_threshold``.
+            ``False`` if fewer than ``stable_window`` snapshots exist yet, fewer
+            than ``stable_window`` ticks have elapsed since the last emergency, or
+            the mean batch size is zero; otherwise
+            ``spread < stable_batch_rel_threshold``.
         """
+        # A sustained EMERGENCY holds the batch flat (at/near min_batch_size), so
+        # a naive spread check would latch STABLE the instant the loop resumes
+        # OPTIMIZING on recovery — freezing the batch at the floor instead of
+        # re-climbing. Suppress STABLE until a full clean window has elapsed since
+        # the last emergency tick, forcing a genuine re-climb before settling.
+        # On the normal no-emergency path this counter stays >= stable_window, so
+        # STABLE detection at the optimum is unaffected.
+        if self._ticks_since_emergency < self.stable_window:
+            return False
         window = self.collector.snapshot(self.stable_window)
         if len(window) < self.stable_window:
             return False
@@ -389,3 +413,4 @@ class AdaptiveBatcher:
         self._queue_depth = 0
         self._constraint_active = False
         self._last_reason = ""
+        self._ticks_since_emergency = self.stable_window

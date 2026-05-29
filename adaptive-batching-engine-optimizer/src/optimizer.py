@@ -303,9 +303,22 @@ class OptimizationEngine:
         Used by the batcher for emergency overrides (e.g. dropping to a safe
         default under resource stress) without going through a gradient step.
 
+        An out-of-band jump invalidates the finite-difference climb history: the
+        stored ``_prev_batch_size`` / ``_prev_utility`` were measured at the old
+        (pre-jump) batch, so differencing the next sample against them would
+        compare two unrelated operating points. In particular, after an emergency
+        slams the batch down to the floor, that stale pair makes "smaller" look
+        better and pins the optimizer at ``min_batch_size`` on recovery. We
+        therefore clear the climb memory and reset the probe direction to ``+1``
+        so the next :meth:`update` starts a fresh upward climb from ``value``.
+
         Args:
             value: Desired batch size; clamped into ``[min, max]`` before taking effect.
         """
         self._batch_size = int(
             min(max(value, self.min_batch_size), self.max_batch_size)
         )
+        self._prev_batch_size = None
+        self._prev_utility = None
+        self._direction = 1
+        self._last_gradient = 0.0
