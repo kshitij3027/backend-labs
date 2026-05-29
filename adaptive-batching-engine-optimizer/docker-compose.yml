@@ -1,10 +1,27 @@
 services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      MIN_BATCH_SIZE: "50"
+      MAX_BATCH_SIZE: "5000"
+      INITIAL_BATCH_SIZE: "100"
+      SMOOTHING_ALPHA: "0.2"
+      OPTIMIZATION_INTERVAL: "1.0"        # livelier than the 5.0 default for the live demo/dashboard
+      CPU_CONSTRAINT_THRESHOLD: "90"
+      MEMORY_CONSTRAINT_THRESHOLD: "90"
+      LATENCY_CONSTRAINT_THRESHOLD: "1000"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
   tester:
     profiles: ["test"]
     build:
       context: .
       dockerfile: Dockerfile.test
     environment:
+      BASE_URL: "http://app:8000"
       LOG_LEVEL: "WARNING"
     volumes:
       - .:/app
