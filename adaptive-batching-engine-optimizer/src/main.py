@@ -21,15 +21,39 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from src.api.routes_load import router as load_router
 from src.api.routes_metrics import router as metrics_router
 from src.api.routes_optimizer import router as optimizer_router
 from src.batcher import AdaptiveBatcher
 from src.settings import get_settings
+from src.websocket import ConnectionManager
 
 logger = logging.getLogger("adaptive_batcher")
+
+
+def _ws_payload(batcher) -> dict:
+    """Build the JSON payload broadcast to dashboard clients each tick.
+
+    Bundles the latest snapshot, the current optimizer status, and the rolling
+    chart series into one envelope so a client can paint the whole dashboard from
+    a single message. Pydantic models are dumped with ``mode="json"`` so enums
+    (e.g. :class:`~src.models.OptimizerState`) serialise to their values.
+
+    Args:
+        batcher: The live :class:`~src.batcher.AdaptiveBatcher`.
+
+    Returns:
+        A JSON-serialisable dict tagged ``"type": "tick"``.
+    """
+    snap = batcher.latest_snapshot()
+    return {
+        "type": "tick",
+        "snapshot": snap.model_dump(mode="json") if snap is not None else None,
+        "status": batcher.status().model_dump(mode="json"),
+        "series": batcher.metrics_series(get_settings().dashboard_points),
+    }
 
 
 async def optimization_loop(app: FastAPI) -> None:
@@ -37,19 +61,22 @@ async def optimization_loop(app: FastAPI) -> None:
 
     Each iteration reads the live cadence from ``app.state.loop_interval`` (so a
     config change retunes it without a restart), ticks the batcher with that
-    interval, then sleeps for the same interval. A failing tick is logged and
-    swallowed so a single bad cycle never kills the loop; an
-    :class:`asyncio.CancelledError` (raised on shutdown) is re-raised so the task
-    can unwind cleanly.
+    interval, broadcasts the fresh optimizer state to every ``/ws/metrics``
+    client, then sleeps for the same interval. The tick *and* the broadcast share
+    one ``try`` block: a failing tick or a failing broadcast is logged and
+    swallowed so a single bad cycle (or a misbehaving client) never kills the
+    loop; an :class:`asyncio.CancelledError` (raised on shutdown) is re-raised so
+    the task can unwind cleanly.
 
     Args:
-        app: The running application, used to reach ``app.state.batcher`` and the
-            current ``app.state.loop_interval``.
+        app: The running application, used to reach ``app.state.batcher``, the
+            current ``app.state.loop_interval``, and ``app.state.ws_manager``.
     """
     while True:
         interval = app.state.loop_interval
         try:
             app.state.batcher.tick(interval=interval)
+            await app.state.ws_manager.broadcast(_ws_payload(app.state.batcher))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 — never let one bad tick kill the loop
@@ -66,6 +93,7 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.batcher = AdaptiveBatcher()  # constructs components, primes psutil
     app.state.loop_interval = settings.optimization_interval
+    app.state.ws_manager = ConnectionManager()  # dashboard fan-out, before the loop
     app.state.optimization_task = asyncio.create_task(optimization_loop(app))
     logger.info(
         "adaptive batcher starting on %s:%s (interval=%.3gs)",
@@ -96,6 +124,29 @@ app.include_router(load_router)
 async def health() -> dict[str, str]:
     """Liveness probe used by Docker's HEALTHCHECK and the e2e wait loop."""
     return {"status": "healthy"}
+
+
+@app.websocket("/ws/metrics")
+async def ws_metrics(websocket: WebSocket) -> None:
+    """Stream the optimizer state + metrics to a dashboard client.
+
+    On connect the current state is pushed immediately (so a fresh client paints
+    without waiting a full tick); thereafter the background
+    :func:`optimization_loop` broadcasts a fresh payload on every cycle. Inbound
+    client messages are ignored — the receive loop exists only to detect a
+    disconnect and unregister the socket so it stops receiving broadcasts.
+    """
+    manager = websocket.app.state.ws_manager
+    await manager.connect(websocket)
+    # Push the current state immediately so a fresh client paints without waiting a full tick.
+    await manager.send_personal(websocket, _ws_payload(websocket.app.state.batcher))
+    try:
+        while True:
+            await websocket.receive_text()  # keep the connection open; client msgs ignored
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:  # noqa: BLE001 — any socket error: drop the client cleanly
+        manager.disconnect(websocket)
 
 
 if __name__ == "__main__":
