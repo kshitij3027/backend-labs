@@ -2,8 +2,8 @@
 
 help:
 	@echo "Targets:"
-	@echo "  build        - build the test image (test profile)"
-	@echo "  up           - start app service (detached; added in a later commit)"
+	@echo "  build        - build the app + tester images"
+	@echo "  up           - start the app (detached) at http://localhost:8000"
 	@echo "  down         - stop and remove the stack"
 	@echo "  logs         - tail app logs"
 	@echo "  test         - run the full test suite in Docker"
