@@ -32,6 +32,7 @@ WORKDIR /app
 
 COPY --from=builder /root/.local /home/appuser/.local
 COPY src/ ./src/
+COPY dashboard/ ./dashboard/
 
 RUN chown -R appuser:appuser /app /home/appuser/.local
 

@@ -21,7 +21,10 @@ import logging
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 
 from src.api.routes_load import router as load_router
 from src.api.routes_metrics import router as metrics_router
@@ -118,6 +121,22 @@ app = FastAPI(title="Adaptive Batching Engine Optimizer", lifespan=lifespan)
 app.include_router(metrics_router)
 app.include_router(optimizer_router)
 app.include_router(load_router)
+
+# Live dashboard: vanilla HTML + vendored Chart.js, served same-origin. The
+# template/static dirs are copied into the image (see Dockerfile) and read at
+# runtime relative to the working directory.
+templates = Jinja2Templates(directory="dashboard/templates")
+app.mount("/static", StaticFiles(directory="dashboard/static"), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    """Serve the live optimizer dashboard (it streams from ``/ws/metrics``)."""
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"dashboard_points": get_settings().dashboard_points},
+    )
 
 
 @app.get("/health")

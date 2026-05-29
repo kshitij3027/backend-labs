@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adaptive Batching Engine — Live Optimizer</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <!-- Vendored Chart.js (no CDN, no build step) — exposes the global `Chart`. -->
+  <script src="/static/chart.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Adaptive Batching Engine — Live Optimizer</h1>
+    <div class="badges">
+      <!-- Connection health: flips between Connecting / Connected / Reconnecting. -->
+      <span id="conn-badge" class="pill conn-bad">Connecting…</span>
+      <!-- Control-loop operating state: LEARNING / OPTIMIZING / STABLE / EMERGENCY. -->
+      <span id="state-badge" class="pill state-learning">LEARNING</span>
+      <!-- Safety-constraint indicator: shows when the optimizer is clamped. -->
+      <span id="constraint-badge" class="pill constraint-ok">No constraint</span>
+    </div>
+  </header>
+
+  <!-- Live metric cards. Each value cell has an id so dashboard.js can patch it. -->
+  <section class="cards">
+    <div class="card metric"><h3>Batch size</h3><div id="m-batch" class="value">—</div></div>
+    <div class="card metric"><h3>Throughput</h3><div id="m-throughput" class="value">—</div><div class="unit">rec/s</div></div>
+    <div class="card metric"><h3>Latency</h3><div id="m-latency" class="value">—</div><div class="unit">ms</div></div>
+    <div class="card metric"><h3>CPU</h3><div id="m-cpu" class="value">—</div><div class="unit">%</div></div>
+    <div class="card metric"><h3>Memory</h3><div id="m-memory" class="value">—</div><div class="unit">%</div></div>
+    <div class="card metric"><h3>Queue depth</h3><div id="m-queue" class="value">—</div></div>
+    <div class="card metric"><h3>Last gradient</h3><div id="m-gradient" class="value">—</div></div>
+  </section>
+
+  <!-- Two live line charts fed by the WebSocket `series` payload. -->
+  <section class="grid">
+    <div class="card">
+      <h3>Throughput &amp; batch size</h3>
+      <div class="chart-box"><canvas id="throughputChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Resource utilisation</h3>
+      <div class="chart-box"><canvas id="resourceChart"></canvas></div>
+    </div>
+  </section>
+
+  <p class="caption muted">
+    Data streams live over the <code>/ws/metrics</code> WebSocket and shows the
+    last ~<span id="points-note">20</span> points. Charts auto-reconnect on drop.
+  </p>
+
+  <!-- Inject how many trailing points to chart (defaults to 20 in JS if absent). -->
+  <script>window.DASHBOARD_POINTS = {{ dashboard_points | default(20) }};</script>
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
