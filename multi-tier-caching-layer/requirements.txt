@@ -1,0 +1,26 @@
+# Web framework & ASGI server
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Caching tiers
+cachetools==5.5.0        # L1: in-process LRU / TTL cache
+redis==5.2.1             # L2: distributed cache (async client included)
+
+# Storage efficiency
+zstandard==0.23.0        # zstd compression for time-series blobs in L2
+
+# L3 / log-query backend store
+asyncpg==0.30.0          # async PostgreSQL driver
+SQLAlchemy==2.0.36       # query layer / async ORM
+
+# Config & validation
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# HTTP client (dashboard calls, health checks, tests)
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+websockets==14.1         # WebSocket client for E2E /ws/metrics checks

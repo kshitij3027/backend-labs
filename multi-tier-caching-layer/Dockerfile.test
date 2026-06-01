@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1.6
+# Single-stage test image: installs deps and runs the pytest suite.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app
+
+# curl + jq for E2E health/JSON checks; build-essential + gcc to compile
+# zstandard / asyncpg wheels when no manylinux wheel is available.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl jq build-essential gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ src/
+COPY tests/ tests/
+COPY scripts/ scripts/
+COPY pytest.ini .
+
+CMD ["pytest", "-v"]

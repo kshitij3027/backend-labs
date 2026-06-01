@@ -1,0 +1,35 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Test & coverage artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+
+# Redis dump files (local runs)
+*.rdb
+
+# OS
+.DS_Store
+
+# Planning doc (repo convention — keep local, do not commit)
+plan.md
+project_requirements.md

@@ -1,0 +1,16 @@
+.git
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.rdb
+.DS_Store
+README.md
+plan.md
+project_requirements.md
+.env
