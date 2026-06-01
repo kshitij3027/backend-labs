@@ -1,0 +1,53 @@
+# Multi-Tier Caching Layer — service topology.
+#
+# C2 defines only the runnable `app` (no external deps for /health) and the
+# profile-gated `test` service. Later commits append, in this order:
+#   * redis     (redis:7-alpine, redis-cli ping healthcheck)         — C8
+#   * postgres  (postgres:16-alpine, pg_isready healthcheck, volume) — C9
+#   * db-init   (one-shot `python scripts/init_db.py`)               — C9
+# and wire `app`/`test`/`e2e` depends_on for them, plus REDIS_URL / DATABASE_URL
+# into the relevant `environment:` blocks. The `e2e` and `loadtest` profile
+# services are added by C19 / C20.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Only what's relevant now — Redis/Postgres env added in later commits.
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    # No depends_on yet — /health needs no external services. (redis/postgres
+    # + db-init dependencies added in later commits.)
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - test
+    environment:
+      - PYTHONPATH=/app
+    # No depends_on yet — unit/integration deps (redis/postgres) added later.
+    command: ["pytest", "-v"]
+
+  # --- appended by later commits ---------------------------------------------
+  # redis:    redis:7-alpine + redis-cli ping healthcheck                  (C8)
+  # postgres: postgres:16-alpine + pg_isready healthcheck + pgdata volume  (C9)
+  # db-init:  one-shot `python scripts/init_db.py`, depends postgres ok    (C9)
+  # e2e:      profile ["e2e"], `python scripts/verify_e2e.py`              (C19)
+  # loadtest: profile ["loadtest"], `python scripts/load_test.py`         (C20)
