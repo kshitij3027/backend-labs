@@ -34,6 +34,16 @@ services:
         limits:
           memory: 512M
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   test:
     build:
       context: .
@@ -42,11 +52,13 @@ services:
       - test
     environment:
       - PYTHONPATH=/app
-    # No depends_on yet — unit/integration deps (redis/postgres) added later.
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["pytest", "-v"]
 
   # --- appended by later commits ---------------------------------------------
-  # redis:    redis:7-alpine + redis-cli ping healthcheck                  (C8)
   # postgres: postgres:16-alpine + pg_isready healthcheck + pgdata volume  (C9)
   # db-init:  one-shot `python scripts/init_db.py`, depends postgres ok    (C9)
   # e2e:      profile ["e2e"], `python scripts/verify_e2e.py`              (C19)
