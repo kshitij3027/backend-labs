@@ -13,9 +13,15 @@ import os
 
 import pytest
 
+from src.cache_manager import CacheManager
 from src.db.pool import apply_schema, create_pool
+from src.db.seed import seed_raw_logs
+from src.l1_cache import L1Cache
 from src.l2_redis import L2Redis
+from src.metrics import Metrics
+from src.patterns import PatternEngine
 from src.settings import Settings
+from src.singleflight import SingleFlight
 
 # The compose ``test`` service injects these; defaults keep host-side
 # collection from crashing on import even when the services aren't reachable.
@@ -72,3 +78,35 @@ async def pg_pool():
         yield pool
     finally:
         await pool.close()
+
+
+@pytest.fixture
+async def cache_manager(redis_l2, pg_pool):
+    """Yield a fully-wired :class:`~src.cache_manager.CacheManager`.
+
+    Builds the keystone read-through manager over the REAL per-test Redis
+    (``redis_l2``) and Postgres (``pg_pool``) fixtures, with fresh in-process
+    collaborators (L1, metrics, patterns, single-flight). A small deterministic
+    ``raw_logs`` dataset is seeded so backend aggregations return real data.
+
+    A 100ms ``backend_delay_ms`` makes the slow path measurably slower than a
+    cache hit (so timing assertions hold) and guarantees concurrent cold gets
+    overlap (so the single-flight test can observe coalescing). The manager's
+    ``l1``/``l2``/``pg_pool`` are exposed as attributes for assertions.
+    """
+    # Seed a deterministic corpus so backend GROUP BY queries return data.
+    await seed_raw_logs(pg_pool, 500, seed=99, end_ts=1_780_000_000)
+
+    manager = CacheManager(
+        l1=L1Cache(max_size=1000, ttl=300),
+        l2=redis_l2,
+        pg_pool=pg_pool,
+        metrics=Metrics(),
+        patterns=PatternEngine(),
+        singleflight=SingleFlight(),
+        time_bucket_seconds=300,
+        backend_delay_ms=100,
+        l2_ttl_seconds=600,
+        l2_compress=False,
+    )
+    yield manager
