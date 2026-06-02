@@ -215,3 +215,152 @@ class CacheManager:
             compress=self.l2_compress,
         )
         return result
+
+    # ------------------------------------------------------------------ #
+    # Tier-walk read without side effects (no backend, no metrics)
+    # ------------------------------------------------------------------ #
+    async def _peek(self, key: str) -> Any | None:
+        """Return the cached value for ``key`` from the fastest tier holding it.
+
+        Walks L1 -> L2 -> L3 and backfills the faster tiers on the way up, but —
+        unlike :meth:`get` — it does **not** fall through to the slow backend and
+        does **not** record metrics or query patterns. It is the read side of
+        :meth:`append_timeseries`, which must inspect (and incrementally update)
+        an already-cached series without paying for or skewing a backend compute.
+
+        Returns the value, or ``None`` if no tier currently holds ``key``.
+        """
+        # 1) L1 — in-process, fastest.
+        v = self.l1.get(key)
+        if v is not None:
+            return v
+
+        # 2) L2 — Redis (fail-soft: a miss/failure simply returns None).
+        v = await self.l2.get(key)
+        if v is not None:
+            self.l1.set(key, v)  # backfill L1
+            return v
+
+        # 3) L3 — materialized Postgres aggregate.
+        v = await l3_store.get(self.pg_pool, key)
+        if v is not None:
+            # Backfill both faster tiers (no tags — we don't have query/params here).
+            self.l1.set(key, v)
+            await self.l2.set(
+                key, v, ttl=self.l2_ttl_seconds, compress=self.l2_compress
+            )
+            return v
+
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Selective invalidation
+    # ------------------------------------------------------------------ #
+    async def invalidate(
+        self,
+        *,
+        pattern: str | None = None,
+        tags: list[str] | None = None,
+    ) -> dict:
+        """Evict cache entries by glob ``pattern`` and/or invalidation ``tags``.
+
+        At least one of ``pattern`` or ``tags`` must be supplied (else a
+        :class:`ValueError` is raised). Both may be supplied, in which case their
+        per-tier removal counts are summed.
+
+        * **pattern** — a glob (e.g. ``"q:*"``). L1 is purged via
+          :meth:`L1Cache.scan_delete`, L2 via :meth:`L2Redis.invalidate_pattern`
+          (``SCAN`` based), and L3 via :func:`l3_store.invalidate_pattern` after
+          translating the glob to a SQL ``LIKE`` pattern (``*`` -> ``%``,
+          ``?`` -> ``_``).
+        * **tags** — for each tag, the member keys recorded in its ``tag:<tag>``
+          set are read via :meth:`L2Redis.tag_members`, unioned, then deleted
+          from **every** tier (L1, L2, L3). The ``tag:<tag>`` set itself is then
+          dropped so stale bookkeeping doesn't linger.
+
+        Returns a per-tier removal tally ``{"l1": int, "l2": int, "l3": int}``
+        (pattern + tag contributions summed). Robust to a tier reporting 0 or
+        degrading (L2 ops are fail-soft and simply contribute 0).
+        """
+        if not pattern and not tags:
+            raise ValueError("invalidate() requires at least one of pattern or tags")
+
+        l1_n = 0
+        l2_n = 0
+        l3_n = 0
+
+        # --- pattern invalidation across all three tiers ------------------ #
+        if pattern:
+            l1_n += self.l1.scan_delete(pattern)
+            l2_n += await self.l2.invalidate_pattern(pattern)
+            like_pattern = pattern.replace("*", "%").replace("?", "_")
+            l3_n += await l3_store.invalidate_pattern(self.pg_pool, like_pattern)
+
+        # --- tag invalidation: resolve members, delete from every tier ---- #
+        if tags:
+            keys: set[str] = set()
+            for tag in tags:
+                members = await self.l2.tag_members(tag)
+                keys.update(members)
+
+            for key in keys:
+                if self.l1.delete(key):
+                    l1_n += 1
+                l2_n += await self.l2.delete(key)
+                l3_n += await l3_store.delete(self.pg_pool, key)
+
+            # Drop the tag sets themselves now that their members are gone.
+            for tag in tags:
+                await self.l2.delete(f"tag:{tag}")
+
+        return {"l1": l1_n, "l2": l2_n, "l3": l3_n}
+
+    # ------------------------------------------------------------------ #
+    # Incremental time-series append (no backend recompute)
+    # ------------------------------------------------------------------ #
+    async def append_timeseries(
+        self, query: str, params: dict | None, point: dict
+    ) -> bool:
+        """Append ``point`` to an already-cached time-series, updating all tiers.
+
+        This is the §3 *incremental update* path: instead of re-running the slow
+        backend to refresh a time-series, a single new data ``point`` is appended
+        to the existing cached list and the result is re-stored across L1, L2, and
+        L3 — **no backend recompute happens**.
+
+        The current value is read via :meth:`_peek` (so the backend is never
+        invoked). If nothing is cached for ``(query, params)``, or the cached
+        value is not a ``list``, this returns ``False`` (the caller may choose to
+        compute the series first via :meth:`get`). Otherwise ``point`` is appended
+        to a shallow copy of the list, the new list is written to every tier with
+        the query's invalidation tags, and ``True`` is returned.
+        """
+        params = params or {}
+        key = cache_key(query, params, bucket_seconds=self.time_bucket_seconds)
+
+        current = await self._peek(key)
+        if current is None or not isinstance(current, list):
+            return False
+
+        new_list = list(current)
+        new_list.append(point)
+
+        tags = list(tags_for(query, params))
+        self.l1.set(key, new_list)
+        await self.l2.set(
+            key,
+            new_list,
+            ttl=self.l2_ttl_seconds,
+            tags=tags,
+            compress=self.l2_compress,
+        )
+        await l3_store.upsert(
+            self.pg_pool,
+            key,
+            query,
+            params,
+            new_list,
+            tags=tags,
+            compress=self.l2_compress,
+        )
+        return True

@@ -221,6 +221,36 @@ class L2Redis:
             self.degraded = True
             return deleted
 
+    async def tag_members(self, tag: str) -> list[str]:
+        """Return the member keys recorded under ``tag:<tag>`` as ``str``.
+
+        Reads the tag set with ``SMEMBERS`` (members come back as ``bytes`` from
+        the ``decode_responses=False`` client and are decoded to ``str`` here).
+        Fail-soft: returns ``[]`` on a missing tag or any Redis failure (and
+        flips :attr:`degraded` on failure). Never raises.
+        """
+        if self._client is None:
+            self.degraded = True
+            return []
+
+        tag_set = f"tag:{tag}"
+        try:
+            members = await asyncio.wait_for(
+                self._client.smembers(tag_set), self.timeout
+            )
+        except _FAILSOFT_EXCEPTIONS:
+            self.errors += 1
+            self.degraded = True
+            return []
+
+        result: list[str] = []
+        for member in members or ():
+            if isinstance(member, bytes):
+                result.append(member.decode())
+            else:
+                result.append(str(member))
+        return result
+
     async def invalidate_tag(self, tag: str) -> int:
         """Delete all keys tagged ``tag`` plus the ``tag:<tag>`` set itself.
 
