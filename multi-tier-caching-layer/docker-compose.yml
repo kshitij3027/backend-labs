@@ -17,12 +17,16 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     environment:
-      # Only what's relevant now — Redis/Postgres env added in later commits.
       - API_HOST=0.0.0.0
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    # No depends_on yet — /health needs no external services. (redis/postgres
-    # + db-init dependencies added in later commits.)
+      - DATABASE_URL=postgresql://cache:cache@postgres:5432/cache
+      # Redis dependency + REDIS_URL into app come in C15.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
@@ -44,6 +48,34 @@ services:
       timeout: 3s
       retries: 5
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: cache
+      POSTGRES_PASSWORD: cache
+      POSTGRES_DB: cache
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cache -d cache"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "scripts/init_db.py"]
+    environment:
+      - DATABASE_URL=postgresql://cache:cache@postgres:5432/cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   test:
     build:
       context: .
@@ -53,13 +85,19 @@ services:
     environment:
       - PYTHONPATH=/app
       - REDIS_URL=redis://redis:6379/0
+      - DATABASE_URL=postgresql://cache:cache@postgres:5432/cache
+    # Tests manage their own schema/data via the pg_pool fixture; they depend
+    # only on the running services, NOT on the heavy db-init seed.
     depends_on:
       redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     command: ["pytest", "-v"]
 
   # --- appended by later commits ---------------------------------------------
-  # postgres: postgres:16-alpine + pg_isready healthcheck + pgdata volume  (C9)
-  # db-init:  one-shot `python scripts/init_db.py`, depends postgres ok    (C9)
   # e2e:      profile ["e2e"], `python scripts/verify_e2e.py`              (C19)
   # loadtest: profile ["loadtest"], `python scripts/load_test.py`         (C20)
+
+volumes:
+  pgdata: {}

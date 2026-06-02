@@ -20,8 +20,11 @@ RUN pip install --no-cache-dir --user -r requirements.txt
 
 FROM python:3.12-slim AS runtime
 
+# PYTHONPATH=/app so `python scripts/init_db.py` (the db-init service) and any
+# script entrypoint can import the `src` package regardless of CWD/sys.path[0].
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
     PATH=/home/appuser/.local/bin:$PATH
 
 # curl only — needed by the HEALTHCHECK below.
@@ -36,6 +39,8 @@ WORKDIR /app
 COPY --from=builder /root/.local /home/appuser/.local
 # NOTE: dashboard/ is added by a later commit; do not COPY it yet.
 COPY src/ ./src/
+# scripts/ holds init_db.py, run by the compose db-init service off this image.
+COPY scripts/ ./scripts/
 
 RUN chown -R appuser:appuser /app /home/appuser/.local
 
