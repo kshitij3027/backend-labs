@@ -21,12 +21,14 @@ services:
       - API_PORT=8000
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - DATABASE_URL=postgresql://cache:cache@postgres:5432/cache
-      # Redis dependency + REDIS_URL into app come in C15.
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       postgres:
         condition: service_healthy
       db-init:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 10s
