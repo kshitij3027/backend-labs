@@ -37,10 +37,11 @@ RUN useradd --uid 1000 --shell /bin/bash --create-home appuser
 WORKDIR /app
 
 COPY --from=builder /root/.local /home/appuser/.local
-# NOTE: dashboard/ is added by a later commit; do not COPY it yet.
 COPY src/ ./src/
 # scripts/ holds init_db.py, run by the compose db-init service off this image.
 COPY scripts/ ./scripts/
+# dashboard/ holds the static index page + vendored Chart.js served at "/".
+COPY dashboard/ ./dashboard/
 
 RUN chown -R appuser:appuser /app /home/appuser/.local
 

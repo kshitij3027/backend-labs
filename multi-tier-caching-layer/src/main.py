@@ -22,6 +22,8 @@ from contextlib import asynccontextmanager, suppress
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api.routes_cache import router as cache_router
 from src.api.routes_patterns import router as patterns_router
@@ -54,9 +56,16 @@ def _current_payload(app: FastAPI) -> dict:
     metrics = app.state.metrics
     patterns = app.state.patterns
     l2 = app.state.l2
+    snap = metrics.snapshot()
+    l1_stats = app.state.l1.stats()
+    snap["memory"] = {
+        "l1_mb": l1_stats["approx_mb"],
+        "l1_entries": l1_stats["entries"],
+        "cap_mb": app.state.settings.cache_mem_cap_mb,
+    }
     return {
         "type": "tick",
-        "stats": metrics.snapshot(),
+        "stats": snap,
         "series": metrics.series(),
         "recommendations": patterns.recommendations(10),
         "degraded": l2.degraded,
@@ -150,9 +159,16 @@ async def lifespan(app: FastAPI):
     # Canonical per-tick payload builder, sharing the shape used by the
     # ``/ws/metrics`` endpoint's immediate push (see ``_current_payload``).
     def _ws_payload() -> dict:
+        snap = metrics.snapshot()
+        l1_stats = l1.stats()
+        snap["memory"] = {
+            "l1_mb": l1_stats["approx_mb"],
+            "l1_entries": l1_stats["entries"],
+            "cap_mb": settings.cache_mem_cap_mb,
+        }
         return {
             "type": "tick",
-            "stats": metrics.snapshot(),
+            "stats": snap,
             "series": metrics.series(),
             "recommendations": patterns.recommendations(10),
             "degraded": l2.degraded,
@@ -207,9 +223,20 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Multi-Tier Caching Layer", lifespan=lifespan)
+
+# Serve the live monitoring dashboard's static assets (vendored Chart.js, CSS,
+# JS). The JS derives the WebSocket URL from ``location`` at runtime, so no
+# server-side templating is needed — the index page is served verbatim below.
+app.mount("/static", StaticFiles(directory="dashboard/static"), name="static")
 app.include_router(query_router)
 app.include_router(cache_router)
 app.include_router(patterns_router)
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard() -> FileResponse:
+    """Serve the single-page live monitoring dashboard (plain HTML)."""
+    return FileResponse("dashboard/templates/index.html")
 
 
 @app.websocket("/ws/metrics")

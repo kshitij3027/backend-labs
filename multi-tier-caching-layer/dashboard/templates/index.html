@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-Tier Caching Layer</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <!-- Vendored Chart.js (no CDN, no build step) — exposes the global `Chart`. -->
+  <script src="/static/chart.min.js"></script>
+  <!-- Deferred so the DOM is parsed before the dashboard wiring runs. -->
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Multi-Tier Caching Layer</h1>
+    <div class="badges">
+      <!-- Connection health: flips between Connecting / Connected / Reconnecting. -->
+      <span id="conn-status" class="pill conn-bad">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- Degradation banner: revealed by dashboard.js when degraded / alert fires. -->
+  <div id="alert-banner" class="alert-banner" hidden>
+    <strong>Cache degraded.</strong>
+    <span id="alert-detail">L2 (Redis) is unavailable or the hit rate dropped below threshold.</span>
+  </div>
+
+  <!-- Live metric cards. Each value cell has a stable id so dashboard.js can patch it. -->
+  <section class="cards">
+    <div class="card metric"><h3>Hit rate</h3><div id="m-hit-rate" class="value">—</div><div class="unit">%</div></div>
+    <div class="card metric"><h3>Total requests</h3><div id="m-total-requests" class="value">—</div></div>
+    <div class="card metric"><h3>L1 memory</h3><div id="m-l1-mb" class="value">—</div><div class="unit">MB</div></div>
+    <div class="card metric"><h3>Cached p90</h3><div id="m-cached-p90" class="value">—</div><div class="unit">ms</div></div>
+    <div class="card metric"><h3>Uncached p90</h3><div id="m-uncached-p90" class="value">—</div><div class="unit">ms</div></div>
+    <div class="card metric"><h3>Degraded</h3><div id="m-degraded" class="value">—</div></div>
+  </section>
+
+  <!-- Live charts fed by the WebSocket payload (series + per-tick stats). -->
+  <section class="grid">
+    <div class="card">
+      <h3>Hit rate over time</h3>
+      <div class="chart-box"><canvas id="hitRateChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Hits per tier</h3>
+      <div class="chart-box"><canvas id="tierChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Latency: cached vs uncached (p90)</h3>
+      <div class="chart-box"><canvas id="latencyChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Warming recommendations</h3>
+      <ul id="recommendations" class="rec-list">
+        <li class="muted">Waiting for pattern data…</li>
+      </ul>
+    </div>
+  </section>
+
+  <p class="caption muted">
+    Data streams live over the <code>/ws/metrics</code> WebSocket. The dashboard
+    auto-reconnects on drop with exponential backoff + jitter.
+  </p>
+</body>
+</html>
