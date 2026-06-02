@@ -1,4 +1,4 @@
-.PHONY: help build up down logs test test-unit test-int test-e2e clean
+.PHONY: help build up down logs test test-unit test-int test-e2e e2e clean
 
 help:
 	@echo "Targets:"
@@ -10,9 +10,9 @@ help:
 	@echo "  test-unit  - run only tests/unit in Docker"
 	@echo "  test-int   - run only tests/integration in Docker"
 	@echo "  test-e2e   - run only tests/e2e in Docker"
+	@echo "  e2e        - cross-container E2E verifier against the live stack"
 	@echo "  clean      - down + remove volumes"
-# The `e2e` (cross-container verifier) and `load` (load test) targets are
-# added by later commits (C19 / C20).
+# The `load` (load test) target is added by a later commit (C20).
 
 build:
 	docker compose --profile test build
@@ -37,6 +37,9 @@ test-int:
 
 test-e2e:
 	docker compose --profile test run --rm test pytest tests/e2e -v
+
+e2e:
+	docker compose --profile e2e run --build --rm e2e; ec=$$?; docker compose down; exit $$ec
 
 clean:
 	docker compose down -v

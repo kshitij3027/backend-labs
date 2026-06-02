@@ -97,8 +97,30 @@ services:
         condition: service_healthy
     command: ["pytest", "-v"]
 
+  # Cross-container E2E verifier (C19). Waits for the full stack to be healthy,
+  # then drives the live `app` over HTTP + WebSocket by service name. Run via
+  # `make e2e` (`--profile e2e up --build --abort-on-container-exit`); its exit
+  # code is the suite's pass/fail. It does NOT stop redis — the stop-Redis
+  # fallback choreography is host/main-thread driven (see plan.md).
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - e2e
+    environment:
+      - APP_URL=http://app:8000
+      - PYTHONPATH=/app
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+
   # --- appended by later commits ---------------------------------------------
-  # e2e:      profile ["e2e"], `python scripts/verify_e2e.py`              (C19)
   # loadtest: profile ["loadtest"], `python scripts/load_test.py`         (C20)
 
 volumes:
