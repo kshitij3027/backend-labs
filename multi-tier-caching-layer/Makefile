@@ -1,4 +1,4 @@
-.PHONY: help build up down logs test test-unit test-int test-e2e e2e clean
+.PHONY: help build up down logs test test-unit test-int test-e2e e2e load clean
 
 help:
 	@echo "Targets:"
@@ -11,8 +11,8 @@ help:
 	@echo "  test-int   - run only tests/integration in Docker"
 	@echo "  test-e2e   - run only tests/e2e in Docker"
 	@echo "  e2e        - cross-container E2E verifier against the live stack"
+	@echo "  load       - containerized load test (throughput + cached p90 gates)"
 	@echo "  clean      - down + remove volumes"
-# The `load` (load test) target is added by a later commit (C20).
 
 build:
 	docker compose --profile test build
@@ -40,6 +40,9 @@ test-e2e:
 
 e2e:
 	docker compose --profile e2e run --build --rm e2e; ec=$$?; docker compose down; exit $$ec
+
+load:
+	docker compose --profile loadtest run --build --rm loadtest; ec=$$?; docker compose down; exit $$ec
 
 clean:
 	docker compose down -v

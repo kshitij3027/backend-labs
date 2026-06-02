@@ -120,8 +120,25 @@ services:
         condition: service_healthy
     command: ["python", "scripts/verify_e2e.py"]
 
-  # --- appended by later commits ---------------------------------------------
-  # loadtest: profile ["loadtest"], `python scripts/load_test.py`         (C20)
+  # Containerized load test (C20). Waits for `app` to be healthy, then drives a
+  # Zipfian query mix over HTTP by service name and asserts throughput > 100
+  # req/s, cached p90 < 100ms, and error rate <= 1%. Run via `make load`
+  # (`--profile loadtest run --build --rm loadtest`); its exit code is the gate
+  # pass/fail. The seed (db-init) pre-loads ~200k rows so the uncached path runs
+  # a real GROUP BY scan, making the cache speedup genuine.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles:
+      - loadtest
+    environment:
+      - APP_URL=http://app:8000
+      - PYTHONPATH=/app
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py"]
 
 volumes:
   pgdata: {}
