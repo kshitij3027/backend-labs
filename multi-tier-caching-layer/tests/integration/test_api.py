@@ -183,3 +183,54 @@ async def test_cache_hot_returns_list() -> None:
             resp = await client.get("/cache/hot")
             assert resp.status_code == 200
             assert isinstance(resp.json()["hot"], list)
+
+
+async def test_patterns_reports_temporal_source_and_recommendations() -> None:
+    """GET /patterns returns temporal + per-source analysis and ranked recs.
+
+    Drives a handful of ``/query`` calls across the ``api``/``web``/``db``
+    sources (with a repeat to bump frequency), then asserts the ``/patterns``
+    report reflects that traffic: at least four observations, a populated
+    ``per_source`` map that includes a queried source, a present hour-of-day
+    histogram, and a non-empty recommendation list whose items carry the core
+    scoring keys.
+    """
+    await _seed_dataset()
+
+    window = {"start": 1_779_000_000, "end": 1_781_000_000}
+    bodies = [
+        {"query": "error_rate", "params": {"source": "api", **window}},
+        {"query": "avg_latency", "params": {"source": "web", **window}},
+        {"query": "error_rate", "params": {"source": "db", **window}},
+        # A repeat of the first query so at least one source has count > 1.
+        {"query": "error_rate", "params": {"source": "api", **window}},
+    ]
+
+    async with app.router.lifespan_context(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            for body in bodies:
+                resp = await client.post("/query", json=body)
+                assert resp.status_code == 200
+
+            report = await client.get("/patterns")
+            assert report.status_code == 200
+            data = report.json()
+
+            # Every issued query is recorded as an observation.
+            assert data["total_observations"] >= 4
+
+            # per_source is populated and includes at least one queried source.
+            per_source = data["per_source"]
+            assert isinstance(per_source, dict)
+            assert per_source  # non-empty
+            assert {"api", "web", "db"} & set(per_source)
+
+            # Temporal histograms are present (hour-of-day always zero-filled).
+            assert "hour_of_day" in data["temporal"]
+
+            # Recommendations are ranked and carry the core scoring keys.
+            recs = data["recommendations"]
+            assert isinstance(recs, list)
+            assert recs  # non-empty
+            assert {"key", "query", "score", "count"} <= set(recs[0])

@@ -24,6 +24,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from src.api.routes_cache import router as cache_router
+from src.api.routes_patterns import router as patterns_router
 from src.api.routes_query import router as query_router
 from src.cache_manager import CacheManager
 from src.db.pool import apply_schema, create_pool
@@ -146,6 +147,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Multi-Tier Caching Layer", lifespan=lifespan)
 app.include_router(query_router)
 app.include_router(cache_router)
+app.include_router(patterns_router)
 
 
 @app.get("/health")

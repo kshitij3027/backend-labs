@@ -54,6 +54,34 @@ class HotKeysResponse(BaseModel):
     hot: list = Field(default_factory=list)
 
 
+class PatternReport(BaseModel):
+    """Query-pattern analysis surface for ``GET /patterns`` (project §3 Feature A).
+
+    Assembled from :meth:`PatternEngine.analyze` plus
+    :meth:`PatternEngine.recommendations`. Fields lean on permissive ``dict`` /
+    ``list`` typing for the same reason as the other envelopes here — the
+    underlying engine shapes are already well-defined.
+
+    Attributes
+    ----------
+    temporal:
+        ``{"hour_of_day": {0..23: n}, "day_of_week": {0..6: n}}`` — zero-filled
+        histograms over the recent observation window.
+    per_source:
+        Per-source query counts (``None`` sources rendered as ``"unknown"``).
+    total_observations:
+        Size of the observation window the analysis was computed over.
+    recommendations:
+        Ranked warming recommendations, each
+        ``{"key", "query", "source", "score", "count", "reason"}``.
+    """
+
+    temporal: dict
+    per_source: dict = Field(default_factory=dict)
+    total_observations: int = 0
+    recommendations: list = Field(default_factory=list)
+
+
 class WarmResponse(BaseModel):
     """Acknowledgement for ``POST /cache/warm`` — how many keys were warmed."""
 
