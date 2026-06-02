@@ -31,6 +31,38 @@ async def get(pool: asyncpg.Pool, key: str) -> Any | None:
     return decode_value(row["payload"])
 
 
+async def get_query_params(
+    pool: asyncpg.Pool, key: str
+) -> tuple[str, dict[str, Any]] | None:
+    """Return the ``(query, params)`` that produced the row under ``key``.
+
+    Used by the proactive warmer (C14): recommendations carry only the cache
+    *key* (plus query name and source), not the full ``params`` (start/end
+    window). To re-warm a recommended key the warmer recovers its original
+    ``(query, params)`` from here and replays it through
+    :meth:`CacheManager.get`, which pulls the value up from L3 into L1/L2
+    without recomputing when L3 already holds it.
+
+    ``params`` is stored as ``jsonb``. asyncpg may decode it either as a native
+    ``dict`` or as a JSON ``str`` (depending on codec registration), so we
+    ``json.loads`` when it arrives as text and coerce a missing/odd value to an
+    empty dict. Returns ``None`` if no row exists for ``key``.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT query, params FROM precomputed_aggregates WHERE key = $1", key
+        )
+    if row is None:
+        return None
+
+    params = row["params"]
+    if isinstance(params, str):
+        params = json.loads(params)
+    if not isinstance(params, dict):
+        params = {}
+    return row["query"], params
+
+
 async def get_with_meta(pool: asyncpg.Pool, key: str) -> dict[str, Any] | None:
     """Return ``{"result", "computed_at", "tags"}`` for ``key``, or ``None``.
 
