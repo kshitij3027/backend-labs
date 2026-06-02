@@ -34,6 +34,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 
 import httpx
 import websockets
@@ -41,8 +42,24 @@ import websockets
 # Talk to the app by service name inside the compose network.
 APP_URL = os.environ.get("APP_URL", "http://app:8000")
 
+# A fresh, unique cache-buster computed once per process run. ``_nonce`` is an
+# INERT param: the backend handlers only read source/start/end/bucket/limit
+# (see src/backend.py), so it is ignored server-side, but src/keys.py folds
+# every non-timestamp param into the canonical SHA-256 cache key. Threading a
+# unique nonce through the queries guarantees the first /query is a genuine
+# COLD miss regardless of any prior cache state (e.g. a warm Redis/Postgres left
+# over from ``make test`` on the same volume), making this verifier
+# order-independent. ``time.time()`` is fine here — this script runs as a normal
+# OS process, not in a frozen/replayed environment.
+_NONCE = f"{time.time():.6f}-{os.getpid()}"
+
 # A query window that brackets the seeded corpus (db-init seeds end_ts ~ 1.78e9).
-_BASE_PARAMS = {"source": "api", "start": 1_779_000_000, "end": 1_781_000_000}
+_BASE_PARAMS = {
+    "source": "api",
+    "start": 1_779_000_000,
+    "end": 1_781_000_000,
+    "_nonce": _NONCE,
+}
 _QUERY_BODY = {"query": "error_rate", "params": dict(_BASE_PARAMS)}
 
 # Per-request timeout for HTTP calls (the cold path runs a real GROUP BY scan).
@@ -104,7 +121,9 @@ async def miss_then_hit(client: httpx.AsyncClient) -> None:
 async def semantic_equivalence(client: httpx.AsyncClient) -> None:
     """A same-bucket, cosmetically-different timestamp normalizes to a hit."""
     print("E2E: semantic equivalence (same 300s bucket -> same key -> hit) ...")
-    # 1_779_000_123 floors to the same 300s bucket as 1_779_000_000.
+    # 1_779_000_123 floors to the same 300s bucket as 1_779_000_000. Spreading
+    # _BASE_PARAMS first carries the SAME _nonce as the miss-then-hit query, so
+    # this cosmetically-different timestamp normalizes to that exact key and hits.
     body = {
         "query": "error_rate",
         "params": {**_BASE_PARAMS, "start": 1_779_000_123},
