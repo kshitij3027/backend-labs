@@ -1,0 +1,18 @@
+# Web/API framework & ASGI server
+fastapi==0.115.6
+uvicorn[standard]==0.34.0   # ASGI server with WebSocket support for the live dashboard
+websockets==14.1            # WebSocket client used by the E2E verifier
+
+# Storage formats
+pyarrow==18.1.0             # columnar storage via Apache Arrow / Parquet
+lz4==4.3.3                  # LZ4-framed compression for the append-only ROW JSONL backend
+                            # (row storage otherwise uses stdlib append-only JSONL — no dependency)
+
+# Validation / data models
+pydantic==2.10.4            # Pydantic v2 (also bundled with FastAPI)
+pydantic-settings==2.7.0    # env/.env-driven Settings (BaseSettings) + @lru_cache get_settings()
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2      # enables asyncio_mode=auto for async integration/e2e tests
+httpx==0.28.1               # FastAPI TestClient + E2E HTTP client
