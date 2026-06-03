@@ -1,0 +1,39 @@
+# Adaptive Storage Format Optimizer — service topology.
+#
+# C2 defines only the runnable `app` (no external deps for /health) and the
+# profile-gated `test` service. The `e2e` and `loadtest` cross-container
+# services are added later in C23.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - DATA_DIR=/app/data
+      - LOG_DIR=/app/logs
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - PYTHONPATH=/app
+    command: ["pytest", "-v"]
