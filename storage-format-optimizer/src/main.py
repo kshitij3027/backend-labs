@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_query import router as query_router
@@ -50,8 +50,103 @@ from src.storage.columnar_backend import ColumnarBackend
 from src.storage.hybrid_backend import HybridBackend
 from src.storage.row_backend import RowBackend
 from src.tier_manager import TierManager
+from src.websocket import ConnectionManager
 
 logger = logging.getLogger("storage_format_optimizer")
+
+
+def _build_tick(app: FastAPI) -> dict:
+    """Build the live dashboard payload from current ``app.state`` snapshots.
+
+    Cheap by design: it folds the manifest once, reading each partition's
+    **already-stored** ``format`` / ``tier`` / ``index`` off the cached
+    :class:`~src.manifest.PartitionMeta` — it never re-runs the format selector
+    or touches a data file. The base document comes from
+    :meth:`~src.metrics.Metrics.snapshot`; this function fills in the
+    manifest-derived format distribution, per-tenant breakdown, per-tier counts,
+    indexed-column total, and the storage byte/compression rollup that the
+    metrics aggregator deliberately leaves to the caller.
+
+    The returned dict is fully JSON-serialisable (plain dicts/lists of
+    numbers/strings) so :meth:`ConnectionManager.broadcast` can send it as-is::
+
+        {"type": "tick", "stats": <enriched snapshot>, "series": {...},
+         "tenants": {tenant: {format: count}}, "migrations": [...],
+         "indexes": {"columns_indexed": int}, "tiers": {tier: count}}
+    """
+    metrics = app.state.metrics
+    manifest = app.state.manifest
+    snap = metrics.snapshot()
+
+    dist = {"row": 0, "columnar": 0, "hybrid": 0}
+    tiers = {"hot": 0, "warm": 0, "cold": 0}
+    by_format_bytes = {"row": 0, "columnar": 0, "hybrid": 0}
+    total = 0
+    uncompressed = 0
+    per_tenant: dict[str, dict[str, int]] = {}  # tenant -> {format: count}
+    indexed_columns_total = 0
+
+    for tenant in manifest.all_tenants():
+        tenant_counts = {"row": 0, "columnar": 0, "hybrid": 0}
+        for meta in manifest.list_partitions(tenant):
+            fmt = meta.format.value
+            dist[fmt] = dist.get(fmt, 0) + 1
+            tenant_counts[fmt] = tenant_counts.get(fmt, 0) + 1
+            # Guard None tier (defaults to "hot") so the payload never carries
+            # a non-serialisable / missing key.
+            tier = meta.tier.value if meta.tier else "hot"
+            tiers[tier] = tiers.get(tier, 0) + 1
+            by_format_bytes[fmt] = by_format_bytes.get(fmt, 0) + meta.size_bytes
+            total += meta.size_bytes
+            uncompressed += meta.uncompressed_estimate_bytes
+            indexed_columns_total += (
+                len(meta.index.get("columns", [])) if meta.index else 0
+            )
+        per_tenant[tenant] = tenant_counts
+
+    # Overlay the manifest-derived format + storage rollups onto the snapshot.
+    snap["formats"]["distribution"] = dist
+    snap["formats"]["partitions_total"] = sum(dist.values())
+    snap["storage"]["by_format"] = by_format_bytes
+    snap["storage"]["total_bytes"] = total
+    snap["storage"]["uncompressed_estimate_bytes"] = uncompressed
+    snap["storage"]["compression_ratio"] = (uncompressed / total) if total > 0 else 1.0
+
+    return {
+        "type": "tick",
+        "stats": snap,
+        "series": metrics.series(),
+        "tenants": per_tenant,
+        "migrations": snap["migrations"]["recent"],
+        "indexes": {"columns_indexed": indexed_columns_total},
+        "tiers": tiers,
+    }
+
+
+async def _broadcast_loop(app: FastAPI, stop_event: asyncio.Event) -> None:
+    """Advance the time-series and fan a tick out to every dashboard client.
+
+    Runs alongside the migration loop and shares the **same** ``stop_event``, so
+    a single ``stop_event.set()`` in the lifespan teardown wakes both promptly.
+    Each iteration appends one point to the metrics time-series (so the live
+    charts scroll even while idle) and broadcasts the freshly built tick, then
+    sleeps until either ``ws_push_interval_seconds`` elapses or the stop event
+    fires — never busy-spinning. Any per-tick exception is logged and swallowed
+    so one bad tick can never kill the loop.
+    """
+    while not stop_event.is_set():
+        try:
+            app.state.metrics.append_series_point()  # advance the series each tick
+            await app.state.ws_manager.broadcast(_build_tick(app))
+        except Exception:  # noqa: BLE001 — never let one tick kill the loop
+            logger.exception("ws broadcast tick failed")
+        try:
+            await asyncio.wait_for(
+                stop_event.wait(),
+                timeout=app.state.settings.ws_push_interval_seconds,
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 @asynccontextmanager
@@ -152,6 +247,9 @@ async def lifespan(app: FastAPI):
     except Exception:  # noqa: BLE001 - startup cleanup is best-effort, never fatal.
         logger.exception("orphan sweep failed on startup; continuing")
 
+    # --- dashboard WebSocket fan-out -----------------------------------------
+    ws_manager = ConnectionManager()
+
     # --- publish the whole graph on app.state --------------------------------
     # Dependencies / routers reach these via src.api.dependencies; later commits
     # (stats route, WS broadcast) read the policy engines + backends directly.
@@ -167,12 +265,20 @@ async def lifespan(app: FastAPI):
     app.state.ingest_engine = ingest_engine
     app.state.query_engine = query_engine
     app.state.migration_engine = migration_engine
+    app.state.ws_manager = ws_manager
 
-    # --- start the background migration loop AFTER the graph is published ----
+    # --- start the background loops AFTER the graph is published -------------
+    # Both the migration loop and the WS broadcast loop share this one stop
+    # event, so a single ``stop_event.set()`` on teardown signals both at once.
     stop_event = asyncio.Event()
     app.state.stop_event = stop_event
     migration_task = asyncio.create_task(migration_engine.run(stop_event))
     app.state.migration_task = migration_task
+    # Metrics broadcast loop: pushes a tick to every connected dashboard every
+    # ``ws_push_interval_seconds`` and sleeps on the shared stop_event so
+    # shutdown wakes it immediately.
+    ws_broadcast_task = asyncio.create_task(_broadcast_loop(app, stop_event))
+    app.state.ws_broadcast_task = ws_broadcast_task
 
     logger.info(
         "storage-format-optimizer starting on %s:%s (data_dir=%s)",
@@ -184,9 +290,14 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # Reverse-order teardown: stop + cancel + await the migration loop.
+        # Reverse-order teardown: the single stop_event signals both loops; then
+        # cancel + await each (broadcast first, since it started last) while
+        # suppressing the expected CancelledError.
         stop_event.set()
+        ws_broadcast_task.cancel()
         migration_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await ws_broadcast_task
         with suppress(asyncio.CancelledError):
             await migration_task
         logger.info("storage-format-optimizer shutdown")
@@ -197,6 +308,30 @@ app = FastAPI(title="Adaptive Storage Format Optimizer", lifespan=lifespan)
 app.include_router(ingest_router)
 app.include_router(query_router)
 app.include_router(stats_router)
+
+
+@app.websocket("/ws")
+async def ws_metrics(websocket: WebSocket) -> None:
+    """Stream live optimizer metrics to a dashboard client.
+
+    On connect the client receives an immediate :func:`_build_tick` snapshot (so
+    the dashboard paints without waiting for the next tick); thereafter the
+    background broadcast loop in :func:`lifespan` pushes a tick every
+    ``ws_push_interval_seconds``. We loop on ``receive_text`` purely to detect the
+    client going away, unregistering it on :class:`WebSocketDisconnect` (and on
+    any other receive error) so a dead socket is always pruned.
+    """
+    mgr = websocket.app.state.ws_manager
+    await mgr.connect(websocket)
+    try:
+        # Immediate push so a freshly connected dashboard renders at once.
+        await mgr.send_personal(websocket, _build_tick(websocket.app))
+        while True:
+            await websocket.receive_text()  # keep-alive; client messages ignored
+    except WebSocketDisconnect:
+        mgr.disconnect(websocket)
+    except Exception:  # noqa: BLE001 — prune on any receive failure, never raise
+        mgr.disconnect(websocket)
 
 
 @app.get("/health")
