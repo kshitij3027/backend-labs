@@ -14,7 +14,19 @@ to the partition file:
 Multiple ``write()`` calls therefore concatenate multiple independent blocks in
 the same file. The length prefix lets :meth:`RowBackend.read` walk block-by-block
 and decode every batch correctly, without a separate index or rewriting existing
-data on append. The on-disk file is ``paths.row`` (``row.jsonl.lz4``).
+data on append.
+
+Configurable target file
+------------------------
+By default the on-disk file is ``paths.row`` (``row.jsonl.lz4``). The target is
+selectable via the ``file_attr`` constructor argument: a backend constructed as
+``RowBackend(file_attr="recent")`` reads/writes ``paths.recent`` (and its
+``paths.recent_new`` staging path) instead, while keeping the *identical* block
+format and code path. This lets :class:`~src.storage.hybrid_backend.HybridBackend`
+reuse this backend verbatim for its fast "recent" row side. ``file_attr`` is
+resolved against :class:`~src.paths.PartitionPaths` via ``getattr`` on every
+call, so the live and ``.new`` attributes (e.g. ``recent`` / ``recent_new``) must
+both exist on the paths object.
 
 Empty-batch policy
 ------------------
@@ -34,6 +46,7 @@ from __future__ import annotations
 import json
 import os
 import struct
+from pathlib import Path
 from typing import Any
 
 from ..compression import frame_lz4, unframe_lz4
@@ -115,15 +128,42 @@ class RowBackend(StorageBackend):
     See the module docstring for the on-disk block format. Writes append a single
     block; reads walk all blocks; filtering and projection run in-process via the
     shared helpers in :mod:`src.storage.base`.
+
+    The **target file** within a partition is configurable via ``file_attr``
+    (default ``"row"``), resolved against :class:`~src.paths.PartitionPaths` at
+    call time. ``RowBackend(file_attr="recent")`` therefore drives the HYBRID
+    recent side (``paths.recent`` / ``paths.recent_new``) with the same logic. The
+    default keeps every existing caller and on-disk path unchanged.
     """
 
     format = Format.ROW
 
-    def write(self, entries: list[dict], paths: PartitionPaths) -> WriteResult:
-        """Append ``entries`` as one LZ4 block to ``paths.row``.
+    def __init__(self, *, file_attr: str = "row") -> None:
+        """Initialise the backend, choosing which partition file it targets.
 
-        Creates the partition directory if needed, then opens the row file in
-        binary append mode so existing blocks are preserved.
+        Args:
+            file_attr: Name of the :class:`~src.paths.PartitionPaths` attribute
+                holding the live data file (default ``"row"``). The matching
+                staging attribute is assumed to be ``f"{file_attr}_new"`` (e.g.
+                ``"row"`` → ``"row_new"``, ``"recent"`` → ``"recent_new"``); both
+                must exist on the paths object passed to each method.
+        """
+        self._file_attr = file_attr
+
+    def _file(self, paths: PartitionPaths) -> Path:
+        """Return the live data file path (``getattr(paths, file_attr)``)."""
+        return getattr(paths, self._file_attr)
+
+    def _file_new(self, paths: PartitionPaths) -> Path:
+        """Return the staging file path (``getattr(paths, f"{file_attr}_new")``)."""
+        return getattr(paths, f"{self._file_attr}_new")
+
+    def write(self, entries: list[dict], paths: PartitionPaths) -> WriteResult:
+        """Append ``entries`` as one LZ4 block to the target file.
+
+        The target is ``getattr(paths, file_attr)`` (``paths.row`` by default).
+        Creates the partition directory if needed, then opens the file in binary
+        append mode so existing blocks are preserved.
 
         Args:
             entries: Flat record dicts to append.
@@ -136,10 +176,45 @@ class RowBackend(StorageBackend):
         """
         ensure_dir(paths.dir)
         block = _encode_block(entries)
-        with open(paths.row, "ab") as fh:
+        with open(self._file(paths), "ab") as fh:
             fh.write(block)
         return WriteResult(
             row_count_delta=len(entries),
+            size_bytes=self.size_bytes(paths),
+            codecs={},
+        )
+
+    def overwrite(self, rows: list[dict], paths: PartitionPaths) -> WriteResult:
+        """Replace the target file's contents with a single fresh block of ``rows``.
+
+        Unlike :meth:`write` (which appends), this **truncates** the target and
+        writes exactly one block, then fsyncs for durability. It is the in-place,
+        same-path counterpart to :meth:`rewrite_from` (which stages to ``.new``)
+        and is used by :class:`~src.storage.hybrid_backend.HybridBackend` to
+        compact the recent side after sealing. An empty ``rows`` list writes a
+        valid empty block (keeping :meth:`read`/:meth:`size_bytes` uniform).
+
+        Note: writing the block directly is *not* atomic against a concurrent
+        reader; HYBRID's seal instead stages to ``paths.recent_new`` and
+        ``os.replace``-s. This method is offered as a minimal truncate primitive
+        and is not used on the atomic seal path.
+
+        Args:
+            rows: Flat record dicts to become the file's sole block.
+            paths: Resolved partition paths.
+
+        Returns:
+            A :class:`WriteResult` with ``row_count_delta == len(rows)``, the
+            post-write file size, and an empty ``codecs`` map.
+        """
+        ensure_dir(paths.dir)
+        block = _encode_block(rows)
+        with open(self._file(paths), "wb") as fh:
+            fh.write(block)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return WriteResult(
+            row_count_delta=len(rows),
             size_bytes=self.size_bytes(paths),
             codecs={},
         )
@@ -166,11 +241,12 @@ class RowBackend(StorageBackend):
             (pre-filter); ``rowgroups_skipped`` is always ``0`` for ROW. A
             missing partition file yields ``ReadResult([], 0)``.
         """
-        if not paths.row.exists():
+        target = self._file(paths)
+        if not target.exists():
             return ReadResult([], 0)
 
         rows: list[dict] = []
-        with open(paths.row, "rb") as fh:
+        with open(target, "rb") as fh:
             _decode_into(fh, rows)
 
         scanned = len(rows)
@@ -179,9 +255,12 @@ class RowBackend(StorageBackend):
         return ReadResult(rows, rows_scanned=scanned)
 
     def size_bytes(self, paths: PartitionPaths) -> int:
-        """Return ``paths.row``'s size in bytes, or ``0`` if it does not exist."""
+        """Return the target file's size in bytes, or ``0`` if it does not exist.
+
+        The target is ``getattr(paths, file_attr)`` (``paths.row`` by default).
+        """
         try:
-            return paths.row.stat().st_size
+            return self._file(paths).stat().st_size
         except FileNotFoundError:
             return 0
 
@@ -197,10 +276,11 @@ class RowBackend(StorageBackend):
         """Copy-on-write rewrite of ``source``'s data into ROW format.
 
         Reads *all* rows from ``source`` (full record, no filter) and writes them
-        as a single fresh ROW block to the **staging** path ``dst_paths.row_new``
-        (truncating/creating, never appending), then fsyncs that file so it is
-        durable before the migration engine flips the manifest. The live file is
-        left untouched.
+        as a single fresh ROW block to the **staging** path
+        ``getattr(dst_paths, f"{file_attr}_new")`` (``dst_paths.row_new`` by
+        default; truncating/creating, never appending), then fsyncs that file so
+        it is durable before the migration engine flips the manifest. The live
+        file is left untouched.
 
         ``codecs`` and ``index_cols`` are accepted for ABC compatibility but
         ignored — ROW has no per-column codecs or row-group index.
@@ -214,13 +294,15 @@ class RowBackend(StorageBackend):
 
         Returns:
             A :class:`RewriteResult` whose ``staged`` holds the single
-            ``(dst_paths.row_new, dst_paths.row)`` pair for the engine to
+            ``(<file_attr>_new, <file_attr>)`` pair (e.g.
+            ``(dst_paths.row_new, dst_paths.row)``) for the engine to
             ``os.replace``.
         """
         rows = source.read(src_paths, columns=None, filters=None).rows
         ensure_dir(dst_paths.dir)
 
-        staging = dst_paths.row_new
+        staging = self._file_new(dst_paths)
+        final = self._file(dst_paths)
         block = _encode_block(rows)
         # Truncate/create (not append): the staging file is a complete rewrite.
         with open(staging, "wb") as fh:
@@ -232,5 +314,5 @@ class RowBackend(StorageBackend):
             row_count=len(rows),
             size_bytes=staging.stat().st_size,
             codecs={},
-            staged=[(staging, dst_paths.row)],
+            staged=[(staging, final)],
         )
