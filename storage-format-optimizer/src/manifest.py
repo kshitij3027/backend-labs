@@ -354,6 +354,84 @@ class ManifestStore:
                 meta.access["last_write"] = last_write
             self._bump_and_persist(tenant, manifest)
 
+    async def apply_ingest(
+        self,
+        tenant: str,
+        partition_id: str,
+        *,
+        row_count_delta: int,
+        size_bytes: int,
+        last_write: float,
+        paths: dict[str, str],
+        create_format: Format = Format.ROW,
+        uncompressed_estimate_bytes: int | None = None,
+    ) -> PartitionMeta:
+        """Atomically apply one ingest write's effects to a partition, then persist.
+
+        This is the ingest hot-path mutator. It performs the whole
+        read-modify-write under the tenant lock so concurrent ingests to the same
+        tenant cannot lose each other's counter updates (the classic lost-update
+        race when two writers read ``row_count``, each add their delta, and the
+        second clobbers the first):
+
+        * **Missing partition** → create a fresh
+          :class:`PartitionMeta` with ``format=create_format`` and the supplied
+          ``paths`` (this is the first write to a brand-new partition).
+        * **Existing partition** → keep its current ``format`` and ``paths``
+          untouched (a migration may have flipped it to COLUMNAR/HYBRID; ingest
+          must not stomp that). Only the counters below are updated.
+
+        On the resulting meta (new or existing):
+
+        * ``row_count += row_count_delta`` — *accumulated*, so it stays correct
+          across many sequential and concurrent writes.
+        * ``size_bytes`` is **set** to the post-write on-disk size the caller
+          measured.
+        * ``access["last_write"]`` is set to ``last_write``.
+        * ``uncompressed_estimate_bytes`` is **set** when provided (the engine
+          passes the new absolute estimate; left untouched when ``None``).
+
+        Then ``version``/``updated_at`` are bumped and the manifest is written
+        atomically via :meth:`_bump_and_persist`.
+
+        Args:
+            tenant: Tenant identifier.
+            partition_id: Partition the write targeted.
+            row_count_delta: Rows added by this write (added to the running total).
+            size_bytes: The partition's on-disk size after the write.
+            last_write: Timestamp to record as the partition's last write.
+            paths: Logical-name → relative-path map used only when *creating* a
+                new partition record.
+            create_format: Format to stamp on a newly-created partition (defaults
+                to :attr:`Format.ROW`); ignored when the partition already exists.
+            uncompressed_estimate_bytes: New absolute uncompressed-size estimate
+                to set, or ``None`` to leave the existing value unchanged.
+
+        Returns:
+            The updated (or newly created) :class:`PartitionMeta`.
+        """
+        async with self._lock(tenant):
+            manifest = self.load(tenant)
+            meta = manifest.partitions.get(partition_id)
+            if meta is None:
+                # First write to this partition: create the record, adopting the
+                # caller's format + paths.
+                meta = PartitionMeta(
+                    partition_id=partition_id,
+                    format=create_format,
+                    paths=dict(paths),
+                )
+                manifest.partitions[partition_id] = meta
+            # Existing meta keeps its current format/paths (a migration may have
+            # changed them); only the counters below move.
+            meta.row_count += row_count_delta
+            meta.size_bytes = size_bytes
+            meta.access["last_write"] = last_write
+            if uncompressed_estimate_bytes is not None:
+                meta.uncompressed_estimate_bytes = uncompressed_estimate_bytes
+            self._bump_and_persist(tenant, manifest)
+            return meta
+
     # ------------------------------------------------------------------ #
     # Internal helpers                                                    #
     # ------------------------------------------------------------------ #
