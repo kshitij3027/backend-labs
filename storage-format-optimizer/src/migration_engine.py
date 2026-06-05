@@ -274,11 +274,19 @@ class MigrationEngine:
         try:
             # Phase 1 — heavy rewrite to *.new staging only (no lock held, live
             # files + manifest untouched).
+            #
+            # Pass codecs=None (NOT the old meta.codecs) so the target backend
+            # is free to LEARN/infer fresh codecs for the partition's current
+            # data: a migration is precisely when re-learning the best per-column
+            # codec pays off. Passing the OLD codecs as an override would pin the
+            # previous choices and defeat adaptive compression. The learned
+            # codecs surface on ``rr.codecs`` and flow into ``swap_format`` below
+            # (``new_codecs=rr.codecs``) so they are persisted into the manifest.
             rr = target.rewrite_from(
                 source,
                 src_paths,
                 dst_paths,
-                codecs=(meta.codecs or None),
+                codecs=None,
             )
 
             # Phase 2 — commit each staged file with an atomic same-fs rename.

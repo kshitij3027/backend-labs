@@ -250,6 +250,67 @@ class ColumnarBackend(StorageBackend):
         self._compression: CompressionChooser = compression or CompressionChooser()
 
     # ------------------------------------------------------------------
+    # Adaptive learning (Feature B)
+    # ------------------------------------------------------------------
+    def _learn_codecs(self, table: pa.Table) -> None:
+        """Learn the best codec per column on a sample, ahead of the write.
+
+        When the chooser's :attr:`~src.compression.CompressionChooser.enabled`
+        flag is set, this trials the chooser's candidate codecs on a small
+        single-column sample of each column and remembers the winner under the
+        bare column name (the same key :meth:`_codecs_for_table` looks up via
+        ``codec_for(name, dtype)``). After this runs, the per-column codec map
+        computed by :meth:`_codecs_for_table` reflects the *learned* winners
+        rather than only the dtype defaults.
+
+        Robustness / gating:
+            * If learning is disabled (``enabled`` is falsy), this returns
+              immediately and stores nothing — behaviour then collapses to the
+              old dtype-default path.
+            * Empty / column-less tables short-circuit (nothing to learn).
+            * Each column is learned in isolation inside ``try/except`` so a
+              single bad column (e.g. a nested type a codec chokes on) can never
+              abort the surrounding write.
+
+        Args:
+            table: The table about to be written; its columns are sampled and
+                trial-compressed.
+        """
+        # Master gate: when learning is off, do no work (old dtype-default path).
+        if not getattr(self._compression, "enabled", True):
+            return
+
+        if table.num_columns == 0 or table.num_rows == 0:
+            return
+
+        # Cap the learning sample at the chooser's configured row budget; the
+        # chooser also re-truncates internally, so this is just to avoid handing
+        # it a needlessly large slice.
+        sample_rows = getattr(self._compression, "sample_rows", 2000)
+
+        # Reuse the same small value sample size as dtype inference for parity
+        # with :meth:`_codecs_for_table`.
+        infer_n = 256
+
+        for field in table.schema:
+            name = field.name
+            try:
+                column = table.column(name)
+                # Infer the dtype from a tiny value sample (matches the lookup
+                # path), then learn over a bounded single-column sample.
+                infer_sample = column.slice(
+                    0, min(infer_n, table.num_rows)
+                ).to_pylist()
+                dtype = _infer_dtype(name, field.type, infer_sample)
+
+                col_table = table.select([name]).slice(0, sample_rows)
+                self._compression.learn(name, dtype, col_table)
+            except Exception:  # noqa: BLE001 - one column can't abort the write.
+                # Leave this column to fall back to its dtype default in
+                # ``codec_for``; learning the rest still proceeds.
+                continue
+
+    # ------------------------------------------------------------------
     # Codec selection
     # ------------------------------------------------------------------
     def _codecs_for_table(
@@ -363,6 +424,11 @@ class ColumnarBackend(StorageBackend):
             merged = list(entries)
 
         table = _table_from_rows(merged)
+
+        # The write path uses fast, deterministic dtype-default codecs (via
+        # _codecs_for_table -> codec_for). Adaptive codec LEARNING is deliberately
+        # confined to migration (rewrite_from), the moment we reformat a whole
+        # partition — so ordinary writes stay cheap and predictable.
         compression_map, dictionary_cols = self._codecs_for_table(table)
 
         # Write to staging, then atomically replace the live file.
@@ -464,8 +530,12 @@ class ColumnarBackend(StorageBackend):
 
         Explicit ``codecs`` (if provided) **override** the inferred map on a
         per-column basis (explicit wins; columns absent from the override keep
-        their inferred codec). ``index_cols`` is accepted for ABC compatibility
-        and is not used for sorting here.
+        their inferred codec) and **suppress learning**. When ``codecs`` is
+        ``None`` and the chooser is enabled, the backend first *learns* the best
+        codec per column on a sample (:meth:`_learn_codecs`) so the chosen map
+        reflects the learned winners; with a disabled chooser this is a no-op and
+        the dtype defaults are used. ``index_cols`` is accepted for ABC
+        compatibility and is not used for sorting here.
 
         Args:
             source: Backend to migrate from.
@@ -487,6 +557,16 @@ class ColumnarBackend(StorageBackend):
         ensure_dir(dst_paths.dir)
 
         table = _table_from_rows(rows)
+
+        # When the caller supplies NO explicit override, a rewrite (e.g. a
+        # migration) is exactly when we want to (re)learn the best codec for the
+        # partition's current data. Learn on a sample first so the codec map
+        # below reflects the learned winners; ``_learn_codecs`` is itself a no-op
+        # when the chooser is disabled. An explicit ``codecs`` override skips
+        # learning entirely and is honoured verbatim (current behaviour).
+        if codecs is None:
+            self._learn_codecs(table)
+
         compression_map, dictionary_cols = self._codecs_for_table(table)
 
         # Explicit per-column overrides win; drop dictionary flags whose codec was
