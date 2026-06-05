@@ -20,7 +20,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.compression import VALID_CODECS, codec_for_dtype
+from src.compression import VALID_CODECS, CompressionChooser, codec_for_dtype
 from src.models import Filter
 from src.paths import partition_paths
 from src.storage.base import ReadResult
@@ -124,10 +124,16 @@ def test_pushdown_gte(tmp_data_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 def test_per_column_codec_applied(tmp_data_dir: Path) -> None:
     paths = partition_paths(tmp_data_dir, "acme", "p_codec")
-    backend = ColumnarBackend()
+    # Disable adaptive learning so this test exercises the *static* dtype-default
+    # path deterministically. With learning off, ``_learn_codecs`` is a no-op and
+    # ``codec_for(name, dtype)`` falls through to ``codec_for_dtype(dtype)`` — the
+    # behaviour these assertions were written to verify. (With the default
+    # enabled chooser, Feature B would learn a per-column winner from the sample
+    # data instead, deliberately overriding the dtype default.)
+    backend = ColumnarBackend(compression=CompressionChooser(enabled=False))
 
     # Low-cardinality ``level`` (only two distinct values across many rows) and a
-    # numeric ``ts`` column. The default chooser maps these via codec_for_dtype:
+    # numeric ``ts`` column. The dtype-default mapping (via codec_for_dtype) is:
     #   ts    -> "timestamp"              -> SNAPPY
     #   level -> "text_low_cardinality"   -> GZIP
     rows = [
