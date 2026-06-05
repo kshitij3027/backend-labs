@@ -64,6 +64,7 @@ import time
 from typing import Callable
 
 from src.format_selector import FormatSelector
+from src.index_manager import PartitionIndex
 from src.manifest import ManifestStore
 from src.metrics import Metrics
 from src.models import Format
@@ -125,8 +126,10 @@ class MigrationEngine:
             compression: The compression chooser. Accepted now for C17/C18
                 wiring (learned codecs / index-aware rewrites) and stored unused
                 in this commit.
-            index_manager: The index manager. Accepted now for C17/C18 wiring
-                and stored unused in this commit.
+            index_manager: The :class:`~src.index_manager.IndexManager` policy
+                engine. Used here to choose which columns to index when a
+                partition migrates (``candidate_columns``) and which built
+                indexes to prune in the loop (``prune``).
             metrics: The :class:`~src.metrics.Metrics` sink for migration
                 gauges / outcome records.
             settings: Runtime :class:`~src.settings.Settings` (bucket width, loop
@@ -140,8 +143,9 @@ class MigrationEngine:
         self._selector = selector
         self._tier_manager = tier_manager
         self._pattern_tracker = pattern_tracker
-        # Accepted for forward (C17/C18) wiring; intentionally unused this commit.
+        # Accepted for forward (C17) wiring; intentionally unused this commit.
         self._compression = compression
+        # Drives index build (on migrate) and prune (in the loop) — Feature C.
         self._index_manager = index_manager
         self._metrics = metrics
         self._settings = settings
@@ -179,6 +183,58 @@ class MigrationEngine:
             "recent": f"{pid}/{RECENT_NAME}",
             "parquet": f"{pid}/{PARQUET_NAME}",
         }
+
+    def _build_index(
+        self,
+        tenant: str,
+        pid: str,
+        source: StorageBackend,
+        src_paths,
+    ) -> dict | None:
+        """Compute the min/max index to persist for a migrating partition.
+
+        Asks the index manager which columns are currently worth indexing for
+        this partition (frequent *and* selective filters — see
+        :meth:`~src.index_manager.IndexManager.candidate_columns`). If there are
+        none, returns ``None`` so the caller passes ``new_index=None`` to
+        ``swap_format`` and the partition's existing index is left untouched.
+
+        Otherwise it reads the source partition once (full, unfiltered) through
+        its current backend and builds per-column min/max bounds over those rows
+        via :meth:`~src.index_manager.PartitionIndex.from_rows`, returning the
+        ``{"columns": [...], "stats": {...}}`` dict the manifest stores.
+
+        Fully isolated: any failure (read error, odd data) is swallowed and
+        ``None`` is returned, because a best-effort index must never break or
+        abort a migration — correctness of the data move comes first.
+
+        Args:
+            tenant: Tenant identifier.
+            pid: Partition id being migrated.
+            source: The *source* backend (the partition's current format) used to
+                read the rows the index is computed over.
+            src_paths: The partition's resolved paths (``partition_paths(...)``).
+
+        Returns:
+            The index dict to persist, or ``None`` to leave the existing index
+            in place.
+        """
+        try:
+            cols = self._index_manager.candidate_columns(tenant, pid)
+            if not cols:
+                return None
+            # Read the partition's rows once (no projection / no filter) so the
+            # bounds reflect every value actually stored.
+            rows = source.read(src_paths, columns=None, filters=None).rows
+            return PartitionIndex.from_rows(rows, cols).to_dict()
+        except Exception:  # noqa: BLE001 - index build is best-effort, never fatal.
+            logger.exception(
+                "index build failed (continuing migration without index): "
+                "tenant=%s partition=%s",
+                tenant,
+                pid,
+            )
+            return None
 
     def _age_seconds(self, pid: str, now: float) -> float:
         """Return how long ago the partition's time-bucket began, in seconds.
@@ -289,11 +345,21 @@ class MigrationEngine:
                 codecs=None,
             )
 
+            # Phase 1b — build the min/max index for the columns query patterns
+            # show are worth indexing (frequent + selective). Read from the
+            # SOURCE backend (the data is unchanged by the reformat, so the
+            # bounds are identical) while the live files are still the source's.
+            # Best-effort: ``_build_index`` swallows its own errors and returns
+            # ``None`` (leave the existing index) so it can never abort a
+            # migration.
+            new_index = self._build_index(tenant, pid, source, src_paths)
+
             # Phase 2 — commit each staged file with an atomic same-fs rename.
             for staging, final in rr.staged:
                 os.replace(staging, final)
 
-            # Phase 3 — atomically flip the manifest pointer to the new format.
+            # Phase 3 — atomically flip the manifest pointer to the new format
+            # (and persist the freshly-built index when one was produced).
             await self._manifest.swap_format(
                 tenant,
                 pid,
@@ -301,6 +367,7 @@ class MigrationEngine:
                 new_paths=self._new_paths_for(pid, target_format),
                 new_codecs=rr.codecs,
                 new_size=target.size_bytes(dst_paths),
+                new_index=new_index,
                 uncompressed_estimate_bytes=meta.uncompressed_estimate_bytes
                 or None,
                 reason=reason,
@@ -459,6 +526,11 @@ class MigrationEngine:
                         if migrated >= self._settings.migration_max_per_tick:
                             break
                         pid = meta.partition_id
+                        # Prune indexes that have stopped earning their keep
+                        # (recent skip-benefit ~0). Cheap and isolated: it only
+                        # touches partitions that actually have a built index,
+                        # and never blocks the migration evaluation below.
+                        await self._prune_index(tenant, meta)
                         try:
                             did = await self.migrate_partition_once(
                                 tenant, pid, now=self._clock()
@@ -484,6 +556,43 @@ class MigrationEngine:
                 )
             except asyncio.TimeoutError:
                 pass
+
+    async def _prune_index(self, tenant: str, meta) -> None:
+        """Drop a partition's index columns that no longer earn their keep.
+
+        Reads the columns currently built on the partition
+        (``meta.index["columns"]``), asks the index manager which of them should
+        be dropped (recent skip-benefit below the floor — see
+        :meth:`~src.index_manager.IndexManager.prune`), and, if any, removes them
+        from the manifest via
+        :meth:`~src.manifest.ManifestStore.drop_index_columns`.
+
+        Cheap and exception-isolated so it is safe to call once per partition per
+        tick: it short-circuits immediately when the partition has no built index,
+        and any failure is logged and swallowed so one partition's pruning can
+        never disrupt the migration loop.
+
+        Args:
+            tenant: Tenant identifier.
+            meta: The partition's current :class:`~src.manifest.PartitionMeta`.
+        """
+        try:
+            built_cols = (meta.index or {}).get("columns", [])
+            if not built_cols:
+                return
+            to_drop = self._index_manager.prune(
+                tenant, meta.partition_id, built_cols
+            )
+            if to_drop:
+                await self._manifest.drop_index_columns(
+                    tenant, meta.partition_id, to_drop
+                )
+        except Exception:  # noqa: BLE001 - pruning must never break the loop.
+            logger.exception(
+                "index prune error: tenant=%s partition=%s",
+                tenant,
+                meta.partition_id,
+            )
 
     # ------------------------------------------------------------------ #
     # Maintenance

@@ -69,7 +69,8 @@ class QueryResult:
       ``group_by``) and :attr:`rows` is ``None``.
 
     :attr:`meta` is always present and reports per-query accounting:
-    ``query_class``, ``partitions_read``, ``formats_used`` (format value →
+    ``query_class``, ``partitions_read``, ``partitions_skipped`` (partitions the
+    min/max index let us skip reading entirely), ``formats_used`` (format value →
     partitions read in that format), ``rows_scanned``, ``rowgroups_skipped`` and
     the total wall-clock ``elapsed_ms``.
     """
@@ -196,12 +197,44 @@ class QueryEngine:
         rowgroups_skipped = 0
         formats_used: dict[str, int] = {}
         partitions_read = 0
+        partitions_skipped = 0
 
         for meta in parts:
             paths = partition_paths(
                 self._settings.data_dir, tenant, meta.partition_id
             )
             backend = self._backends[meta.format]
+
+            # --- Index-driven partition skip (Feature C) ---
+            # Before paying to decode this partition, consult its persisted
+            # min/max index: if a filtered, indexed column proves the partition's
+            # range cannot overlap the predicate, the partition holds no matching
+            # row and we skip reading it entirely. ``partition_can_match`` is
+            # sound — it only returns False on a *proven* miss — so this never
+            # drops rows that should have been returned. Partitions without an
+            # index (empty ``stats``) always fall through to a normal read.
+            stats = (meta.index or {}).get("stats", {})
+            if stats and filters:
+                can_match, decisive = self._index_manager.partition_can_match(
+                    stats, filters
+                )
+                if not can_match:
+                    # Skipped work is the benefit the index just delivered: count
+                    # the whole partition's rows as skipped, treat it as one
+                    # skipped "row-group", and credit each decisive column so an
+                    # index that keeps skipping work stays alive (and one that
+                    # never skips trends toward being dropped).
+                    rowgroups_skipped += 1
+                    partitions_skipped += 1
+                    for col in decisive:
+                        self._index_manager.record_benefit(
+                            tenant,
+                            meta.partition_id,
+                            col,
+                            rows_skipped=meta.row_count,
+                            rows_total=max(meta.row_count, 1),
+                        )
+                    continue
 
             p0 = time.perf_counter()
             rr = backend.read(
@@ -271,6 +304,7 @@ class QueryEngine:
         meta_out = {
             "query_class": qclass.value,
             "partitions_read": partitions_read,
+            "partitions_skipped": partitions_skipped,
             "formats_used": formats_used,
             "rows_scanned": rows_scanned,
             "rowgroups_skipped": rowgroups_skipped,

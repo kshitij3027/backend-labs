@@ -300,3 +300,103 @@ class IndexManager:
             for column in built_columns
             if self.should_drop(tenant, partition_id, column)
         ]
+
+    # ------------------------------------------------------------------ #
+    # Pure index-skip evaluation (no state) — used by the query engine.   #
+    # ------------------------------------------------------------------ #
+    def partition_can_match(
+        self, index_stats: dict, filters: list
+    ) -> tuple[bool, list[str]]:
+        """Decide whether a partition *could* contain rows matching ``filters``.
+
+        Uses the partition's persisted per-column min/max bounds
+        (``index_stats`` = the ``meta.index["stats"]`` shape,
+        ``{col: {"min": .., "max": ..}}``) to prove, for each filtered column
+        that is indexed, whether the filter's value range can overlap the
+        column's ``[min, max]``. If **any** indexed filter proves no overlap, the
+        partition cannot hold a matching row (filters are AND-ed) and it is safe
+        to skip reading it entirely.
+
+        **Soundness is the contract here.** The method only returns "cannot
+        match" when an indexed filter *provably* excludes the partition. In every
+        ambiguous case it errs toward "can match" so a partition is never skipped
+        incorrectly:
+
+        * a filter on a column with no stats is ignored (no bound to prove on);
+        * ``ne`` is never used to skip (the excluded value may be one of many in
+          range, so the partition can still match);
+        * a ``TypeError`` from comparing incomparable types (e.g. a string filter
+          against numeric bounds) is treated as "can match".
+
+        Overlap test per operator (bounds are ``lo = min``, ``hi = max``):
+
+        * ``eq v``  → overlaps iff ``lo <= v <= hi``.
+        * ``gt v``  → overlaps iff ``hi > v``   (some value strictly above ``v``).
+        * ``gte v`` → overlaps iff ``hi >= v``.
+        * ``lt v``  → overlaps iff ``lo < v``    (some value strictly below ``v``).
+        * ``lte v`` → overlaps iff ``lo <= v``.
+        * ``in [..]`` → overlaps iff the values' span ``[min(vals), max(vals)]``
+          intersects ``[lo, hi]`` (equivalently, ``min(vals) <= hi and
+          max(vals) >= lo``). An empty ``in`` list matches nothing → no overlap.
+        * ``ne``    → always treated as overlapping (never decisive for skipping).
+
+        This is a pure, deterministic function: no clock, no randomness, no
+        recorded state is touched.
+
+        Args:
+            index_stats: The partition's per-column min/max bounds, i.e.
+                ``meta.index.get("stats", {})``.
+            filters: The query's filters (objects with ``.column``, ``.op`` and
+                ``.value`` — e.g. :class:`~src.models.Filter`).
+
+        Returns:
+            ``(can_match, decisive_columns)``. When the partition can match,
+            ``(True, [])``. When an indexed filter proves no overlap,
+            ``(False, [column])`` naming the single column that ruled it out.
+        """
+        for f in filters:
+            bounds = index_stats.get(f.column)
+            if not bounds or "min" not in bounds or "max" not in bounds:
+                # No usable index for this column — cannot prove exclusion.
+                continue
+            if f.op == "ne":
+                # ``ne`` never proves a partition empty: the excluded value is
+                # only one of potentially many values in range.
+                continue
+
+            lo = bounds["min"]
+            hi = bounds["max"]
+            value = f.value
+            try:
+                if f.op == "eq":
+                    overlaps = lo <= value <= hi
+                elif f.op == "gt":
+                    overlaps = hi > value
+                elif f.op == "gte":
+                    overlaps = hi >= value
+                elif f.op == "lt":
+                    overlaps = lo < value
+                elif f.op == "lte":
+                    overlaps = lo <= value
+                elif f.op == "in":
+                    vals = list(value) if value is not None else []
+                    if not vals:
+                        # ``in []`` matches no row at all.
+                        overlaps = False
+                    else:
+                        # Range-overlap of the values' span with [lo, hi].
+                        overlaps = (min(vals) <= hi) and (max(vals) >= lo)
+                else:  # pragma: no cover - unknown op, be conservative.
+                    overlaps = True
+            except TypeError:
+                # Incomparable types (e.g. str filter vs numeric bounds): we
+                # cannot prove exclusion, so treat as a possible match.
+                continue
+
+            if not overlaps:
+                # This indexed predicate cannot be satisfied anywhere in the
+                # partition; since filters AND together, the partition is empty
+                # for this query and can be skipped.
+                return (False, [f.column])
+
+        return (True, [])

@@ -306,6 +306,42 @@ class ManifestStore:
             }
             self._bump_and_persist(tenant, manifest)
 
+    async def drop_index_columns(
+        self, tenant: str, partition_id: str, drop: list[str]
+    ) -> None:
+        """Remove ``drop`` columns from a partition's built index, then persist.
+
+        Prunes columns the index manager has decided no longer earn their keep:
+        each named column is removed from both ``meta.index["columns"]`` and
+        ``meta.index["stats"]``. Runs under the per-tenant lock (like every other
+        mutator) so a concurrent ``swap_format`` cannot clobber the write.
+
+        Skipped cheaply when there is nothing to do — an empty ``drop`` list, a
+        missing partition, or a partition with no index — so the migration loop
+        can call it unconditionally without paying for a manifest rewrite when no
+        pruning is needed. No-op (no version bump, no disk write) in those cases.
+        """
+        if not drop:
+            return
+        async with self._lock(tenant):
+            manifest = self.load(tenant)
+            meta = manifest.partitions.get(partition_id)
+            if meta is None or not meta.index:
+                return
+            drop_set = set(drop)
+            columns = meta.index.get("columns", [])
+            stats = meta.index.get("stats", {})
+            new_columns = [c for c in columns if c not in drop_set]
+            if len(new_columns) == len(columns):
+                # None of the requested columns were actually built — nothing to
+                # persist (avoid a needless version bump + write).
+                return
+            meta.index["columns"] = new_columns
+            meta.index["stats"] = {
+                c: bounds for c, bounds in stats.items() if c not in drop_set
+            }
+            self._bump_and_persist(tenant, manifest)
+
     async def record_access(
         self, tenant: str, partition_id: str, access: dict[str, Any]
     ) -> None:
