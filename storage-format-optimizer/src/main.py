@@ -30,6 +30,8 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_query import router as query_router
@@ -308,6 +310,16 @@ app = FastAPI(title="Adaptive Storage Format Optimizer", lifespan=lifespan)
 app.include_router(ingest_router)
 app.include_router(query_router)
 app.include_router(stats_router)
+
+# Serve the live monitoring dashboard's static assets (vendored Chart.js, CSS,
+# JS). The Dockerfile COPYs the whole tree, so ``dashboard/`` ships automatically.
+app.mount("/static", StaticFiles(directory="dashboard/static"), name="static")
+
+
+@app.get("/", include_in_schema=False)
+async def dashboard() -> FileResponse:
+    """Serve the single-page live monitoring dashboard (plain HTML)."""
+    return FileResponse("dashboard/templates/index.html")
 
 
 @app.websocket("/ws")

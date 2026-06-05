@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Adaptive Storage Format Optimizer</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <!-- Vendored Chart.js (no CDN, no build step) — exposes the global `Chart`. -->
+  <script src="/static/chart.min.js"></script>
+  <!-- Deferred so the DOM is parsed before the dashboard wiring runs. -->
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Adaptive Storage Format Optimizer</h1>
+    <div class="badges">
+      <!-- Connection health: flips between Connecting / Connected / Reconnecting. -->
+      <span id="conn-status" class="pill conn-bad">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- Live metric cards. Each value cell has a stable id so dashboard.js can patch it. -->
+  <section class="cards">
+    <div class="card metric"><h3>Total storage</h3><div id="m-total-storage" class="value">—</div><div class="unit">MB</div></div>
+    <div class="card metric"><h3>Compression ratio</h3><div id="m-compression-ratio" class="value">—</div><div class="unit">×</div></div>
+    <div class="card metric"><h3>Active partitions</h3><div id="m-active-partitions" class="value">—</div></div>
+    <div class="card metric"><h3>Ingest rate</h3><div id="m-ingest-eps" class="value">—</div><div class="unit">entries/s</div></div>
+    <div class="card metric"><h3>Analytical speedup</h3><div id="m-analytical-speedup" class="value">—</div><div class="unit">× vs row</div></div>
+    <div class="card metric"><h3>Migrations completed</h3><div id="m-migrations-completed" class="value">—</div></div>
+  </section>
+
+  <!-- Live charts fed by the WebSocket payload (series + per-tick stats). -->
+  <section class="grid">
+    <div class="card">
+      <h3>Format distribution</h3>
+      <div class="chart-box"><canvas id="formatChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Formats per tenant</h3>
+      <div class="chart-box"><canvas id="tenantChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Migrations over time</h3>
+      <div class="chart-box"><canvas id="migrationChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Latency by format (p90)</h3>
+      <div class="chart-box"><canvas id="latencyByFormatChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Storage &amp; compression over time</h3>
+      <div class="chart-box"><canvas id="storageChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Indexed columns</h3>
+      <div class="chart-box"><canvas id="indexChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Partitions per tier</h3>
+      <div class="chart-box"><canvas id="tierChart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Migration activity</h3>
+      <ul id="migration-log" class="rec-list">
+        <li class="muted">Waiting for migration activity…</li>
+      </ul>
+    </div>
+  </section>
+
+  <p class="caption muted">
+    Data streams live over the <code>/ws</code> WebSocket. The dashboard
+    auto-reconnects on drop with exponential backoff + jitter.
+  </p>
+</body>
+</html>
