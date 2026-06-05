@@ -1,8 +1,9 @@
 # Adaptive Storage Format Optimizer — service topology.
 #
-# C2 defines only the runnable `app` (no external deps for /health) and the
-# profile-gated `test` service. The `e2e` and `loadtest` cross-container
-# services are added later in C23.
+# C2 defines the runnable `app` (no external deps for /health) and the
+# profile-gated `test` service. C23 adds the `e2e` and `loadtest` cross-container
+# services: both build `Dockerfile.test`, wait for `app` to be healthy, and drive
+# it by service name (`http://app:8000`). Run via `make e2e` / `make load`.
 
 services:
   app:
@@ -37,3 +38,36 @@ services:
     environment:
       - PYTHONPATH=/app
     command: ["pytest", "-v"]
+
+  # Cross-container E2E verifier (C23). Waits for `app` to be healthy, then drives
+  # the live server over HTTP + WebSocket by service name and walks the full
+  # ingest -> query -> stats -> migration flow. Run via `make e2e`; its exit code
+  # is the suite's pass/fail.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - APP_URL=http://app:8000
+      - PYTHONPATH=/app
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+
+  # Containerized load test (C23). Waits for `app` to be healthy, then drives an
+  # ingest-heavy mix by service name and asserts ingest throughput > 1000
+  # entries/sec, query p90 < 100ms, and error rate <= 1%. Run via `make load`.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - APP_URL=http://app:8000
+      - PYTHONPATH=/app
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py"]
