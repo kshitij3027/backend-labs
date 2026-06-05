@@ -21,9 +21,12 @@ env/
 .coverage
 htmlcov/
 
-# Generated storage data (the engine writes data to disk)
-data/
-storage/
+# Generated storage data & logs (the engine writes these at runtime).
+# Anchored with a leading slash so they only match the project-root dirs and
+# never the `src/storage/` source package.
+/data/
+/logs/
+/storage/
 *.parquet
 *.arrow
 *.db
