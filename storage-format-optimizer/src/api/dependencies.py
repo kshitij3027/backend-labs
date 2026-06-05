@@ -20,11 +20,14 @@ from typing import TYPE_CHECKING
 from fastapi import Request
 
 if TYPE_CHECKING:  # pragma: no cover - typing-only imports, no runtime cost.
+    from src.format_selector import FormatSelector
     from src.ingest_engine import IngestEngine
     from src.manifest import ManifestStore
     from src.metrics import Metrics
+    from src.pattern_tracker import PatternTracker
     from src.query_engine import QueryEngine
     from src.settings import Settings
+    from src.tier_manager import TierManager
 
 
 def get_ingest_engine(request: Request) -> "IngestEngine":
@@ -50,3 +53,18 @@ def get_metrics(request: Request) -> "Metrics":
 def get_settings_dep(request: Request) -> "Settings":
     """Return the process-wide :class:`~src.settings.Settings` from ``app.state``."""
     return request.app.state.settings
+
+
+def get_selector(request: Request) -> "FormatSelector":
+    """Return the process-wide :class:`~src.format_selector.FormatSelector`."""
+    return request.app.state.selector
+
+
+def get_tier_manager(request: Request) -> "TierManager":
+    """Return the process-wide :class:`~src.tier_manager.TierManager`."""
+    return request.app.state.tier_manager
+
+
+def get_pattern_tracker(request: Request) -> "PatternTracker":
+    """Return the process-wide :class:`~src.pattern_tracker.PatternTracker`."""
+    return request.app.state.pattern_tracker

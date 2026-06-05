@@ -33,6 +33,7 @@ from fastapi import FastAPI
 
 from src.api.routes_ingest import router as ingest_router
 from src.api.routes_query import router as query_router
+from src.api.routes_stats import router as stats_router
 from src.compression import CompressionChooser
 from src.format_selector import FormatSelector
 from src.index_manager import IndexManager
@@ -195,6 +196,7 @@ app = FastAPI(title="Adaptive Storage Format Optimizer", lifespan=lifespan)
 
 app.include_router(ingest_router)
 app.include_router(query_router)
+app.include_router(stats_router)
 
 
 @app.get("/health")
