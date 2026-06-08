@@ -1,8 +1,10 @@
-"""Crash-safe Bloom filter snapshots — the ``BLM1`` on-disk format.
+"""Crash-safe Bloom filter snapshots — the ``BLM1`` and ``SBF1`` formats.
 
 This module turns a single :class:`~src.bloom.BloomFilter` into one
-self-validating binary blob and back, plus the atomic file plumbing that gets
-the blob on and off disk without ever exposing a half-written snapshot.
+self-validating binary blob and back (``BLM1``), wraps a whole
+:class:`~src.scalable.ScalableBloomFilter` series the same way (``SBF1``),
+and provides the atomic file plumbing that gets either on and off disk
+without ever exposing a half-written snapshot.
 
 The ``BLM1`` format (version 1, all fields little-endian)
 ---------------------------------------------------------
@@ -64,9 +66,34 @@ The snapshot path in C7/C8 serializes **under the filter's lock** (a cheap,
 µs-scale memory copy) and performs the slow file I/O **outside** it.
 :func:`save` composes the two for single-owner convenience.
 
-NOTE: C6 adds an ``SBF1`` container that wraps a sequence of these ``BLM1``
-blobs plus scalable-filter parameters. Everything in this module is
-deliberately single-filter-scoped until then.
+The ``SBF1`` container format (version 1, all fields little-endian)
+-------------------------------------------------------------------
+A scalable filter (C6) is a small parameter block plus an ordered series of
+plain Bloom filter slices, and its snapshot mirrors that shape exactly: an
+``SBF1`` header followed by one complete, length-prefixed ``BLM1`` blob per
+slice. ::
+
+    offset     size    field
+    ------     ----    -----
+    0          4       magic  b"SBF1"
+    4          2       container format version, u16  (currently 1)
+    6          8       initial_capacity (n0), u64
+    14         8       target_fp_rate, IEEE-754 f64
+    22         2       growth factor (s), u16
+    24         8       tightening ratio (r), IEEE-754 f64
+    32         8       seed — base hash seed (slice i hashes with seed+i), u64
+    40         2       slice_count, u16
+    42         ...     slice_count × ( blob_length u32  +  one BLM1 blob )
+    last 4     4       CRC32 (zlib.crc32) over everything before it, u32
+
+Embedding whole ``BLM1`` blobs (inner CRCs included) instead of inventing a
+second bitset encoding keeps exactly one parser and one validator per filter
+shape — :func:`loads_scalable` walks the slice table and delegates every
+entry to :func:`loads`. Restoring follows the same no-re-derivation rule as
+``BLM1``: the stored parameters and slice list are taken verbatim via
+``object.__new__`` (never re-run through the sizing/budget formulas), and
+*any* invalid byte — container or inner slice — rejects the whole snapshot
+with ``None`` plus a logged warning, never an exception.
 """
 from __future__ import annotations
 
@@ -79,6 +106,7 @@ from pathlib import Path
 from bitarray import bitarray
 
 from src.bloom import BloomFilter
+from src.scalable import ScalableBloomFilter
 
 logger = logging.getLogger(__name__)
 
@@ -344,3 +372,262 @@ def load(path: str | Path) -> BloomFilter | None:
         )
         return None
     return loads(data)
+
+
+# ---------------------------------------------------------------------- #
+# SBF1 — scalable-filter container (params header + one BLM1 per slice)  #
+# ---------------------------------------------------------------------- #
+
+#: 4-byte container magic: "Scalable Bloom Filter, format 1".
+SCALABLE_MAGIC = b"SBF1"
+
+#: Current SBF1 container version, stored as u16 right after the magic.
+SCALABLE_VERSION = 1
+
+#: Series parameters, little-endian: initial_capacity u64, target_fp_rate
+#: f64, growth u16, tightening f64, seed u64, slice_count u16.
+_SBF_PARAMS_STRUCT = struct.Struct("<QdHdQH")
+
+#: Per-slice length prefix: size of the following BLM1 blob, u32.
+_SBF_SLICE_LEN_STRUCT = struct.Struct("<I")
+
+#: Byte offset where the params header ends and the slice table begins (42).
+_SBF_PREFIX_LEN = (
+    len(SCALABLE_MAGIC) + _VERSION_STRUCT.size + _SBF_PARAMS_STRUCT.size
+)
+
+#: Smallest structurally possible container: prefix + empty table + CRC (46).
+_SBF_MIN_LEN = _SBF_PREFIX_LEN + _CRC_STRUCT.size
+
+
+def dumps_scalable(sbf: ScalableBloomFilter) -> bytes:
+    """Serialize ``sbf`` into one self-validating ``SBF1`` container.
+
+    Each slice is embedded as a complete :func:`dumps` ``BLM1`` blob (inner
+    CRC included) behind a u32 length prefix, so the container needs no
+    second bitset encoding and the loader can delegate slice validation
+    wholesale to :func:`loads`. Like :func:`dumps`, this is pure in-memory
+    work — run it under the filter's lock (C7) and hand the bytes to
+    :func:`write_atomic` outside it.
+    """
+    slices = sbf.slices
+    parts = [
+        SCALABLE_MAGIC,
+        _VERSION_STRUCT.pack(SCALABLE_VERSION),
+        _SBF_PARAMS_STRUCT.pack(
+            sbf.initial_capacity,
+            sbf.target_fp_rate,
+            sbf.growth,
+            sbf.tightening,
+            sbf.seed,
+            len(slices),
+        ),
+    ]
+    for s in slices:
+        blob = dumps(s)
+        parts.append(_SBF_SLICE_LEN_STRUCT.pack(len(blob)))
+        parts.append(blob)
+    body = b"".join(parts)
+    return body + _CRC_STRUCT.pack(zlib.crc32(body))
+
+
+def loads_scalable(data: bytes) -> ScalableBloomFilter | None:
+    """Parse an ``SBF1`` container, or return ``None`` if anything is invalid.
+
+    Validates, in cheap-to-expensive order: structural length, magic,
+    version, container CRC32, parameter plausibility, then the slice table
+    (every length prefix in bounds, every inner blob a valid ``BLM1`` per
+    :func:`loads`, no bytes left over). Any failure — including a single bad
+    slice — logs a warning and rejects the whole snapshot with ``None``: a
+    scalable filter with a missing slice would violate the zero-false-
+    negative contract for every key that lived there, so partial restores
+    are never attempted. The filter is then rebuilt verbatim (parameters and
+    slices exactly as stored, no re-derivation) via ``object.__new__``.
+    """
+    if len(data) < _SBF_MIN_LEN:
+        logger.warning(
+            "SBF1 snapshot rejected: %d bytes is below the %d-byte "
+            "structural minimum",
+            len(data),
+            _SBF_MIN_LEN,
+        )
+        return None
+
+    if data[: len(SCALABLE_MAGIC)] != SCALABLE_MAGIC:
+        logger.warning(
+            "SBF1 snapshot rejected: bad magic %r (expected %r)",
+            bytes(data[: len(SCALABLE_MAGIC)]),
+            SCALABLE_MAGIC,
+        )
+        return None
+
+    (version,) = _VERSION_STRUCT.unpack_from(data, len(SCALABLE_MAGIC))
+    if version != SCALABLE_VERSION:
+        logger.warning(
+            "SBF1 snapshot rejected: unsupported container version %d "
+            "(this build reads %d)",
+            version,
+            SCALABLE_VERSION,
+        )
+        return None
+
+    (stored_crc,) = _CRC_STRUCT.unpack_from(data, len(data) - _CRC_STRUCT.size)
+    computed_crc = zlib.crc32(data[: -_CRC_STRUCT.size])
+    if stored_crc != computed_crc:
+        logger.warning(
+            "SBF1 snapshot rejected: CRC mismatch (stored 0x%08x, computed "
+            "0x%08x) — torn write or corruption",
+            stored_crc,
+            computed_crc,
+        )
+        return None
+
+    (
+        initial_capacity,
+        target_fp_rate,
+        growth,
+        tightening,
+        seed,
+        slice_count,
+    ) = _SBF_PARAMS_STRUCT.unpack_from(data, len(SCALABLE_MAGIC) + _VERSION_STRUCT.size)
+
+    # Same plausibility gates as the ScalableBloomFilter constructor (NaN in
+    # either float field fails its comparison and is rejected here too).
+    if (
+        initial_capacity < 1
+        or not 0.0 < target_fp_rate < 1.0
+        or growth < 2
+        or not 0.0 < tightening < 1.0
+        or slice_count < 1
+    ):
+        logger.warning(
+            "SBF1 snapshot rejected: implausible params (initial_capacity=%d, "
+            "target_fp_rate=%r, growth=%d, tightening=%r, slice_count=%d)",
+            initial_capacity,
+            target_fp_rate,
+            growth,
+            tightening,
+            slice_count,
+        )
+        return None
+
+    # Walk the slice table: slice_count length-prefixed BLM1 blobs that must
+    # consume exactly the bytes between the header and the CRC trailer.
+    offset = _SBF_PREFIX_LEN
+    end = len(data) - _CRC_STRUCT.size
+    slices: list[BloomFilter] = []
+    for index in range(slice_count):
+        if offset + _SBF_SLICE_LEN_STRUCT.size > end:
+            logger.warning(
+                "SBF1 snapshot rejected: slice table truncated at slice %d "
+                "of %d",
+                index,
+                slice_count,
+            )
+            return None
+        (blob_len,) = _SBF_SLICE_LEN_STRUCT.unpack_from(data, offset)
+        offset += _SBF_SLICE_LEN_STRUCT.size
+        if offset + blob_len > end:
+            logger.warning(
+                "SBF1 snapshot rejected: slice %d of %d claims %d bytes but "
+                "only %d remain",
+                index,
+                slice_count,
+                blob_len,
+                end - offset,
+            )
+            return None
+        inner = loads(data[offset : offset + blob_len])
+        if inner is None:
+            # loads() already logged the specific reason.
+            logger.warning(
+                "SBF1 snapshot rejected: inner BLM1 blob for slice %d of %d "
+                "failed validation",
+                index,
+                slice_count,
+            )
+            return None
+        slices.append(inner)
+        offset += blob_len
+
+    if offset != end:
+        logger.warning(
+            "SBF1 snapshot rejected: %d trailing bytes after the last of %d "
+            "slices",
+            end - offset,
+            slice_count,
+        )
+        return None
+
+    return _restore_scalable(
+        initial_capacity=initial_capacity,
+        target_fp_rate=target_fp_rate,
+        growth=growth,
+        tightening=tightening,
+        seed=seed,
+        slices=slices,
+    )
+
+
+def _restore_scalable(
+    *,
+    initial_capacity: int,
+    target_fp_rate: float,
+    growth: int,
+    tightening: float,
+    seed: int,
+    slices: list[BloomFilter],
+) -> ScalableBloomFilter:
+    """Rebuild a ScalableBloomFilter from stored state, bypassing ``__init__``.
+
+    The constructor would eagerly create a fresh slice 0 from the sizing and
+    budget formulas; a snapshot must instead restore the exact slices its
+    keys were admitted into (same rationale as :func:`_restore_filter`). The
+    stored parameters still matter — they drive every *future* slice the
+    restored filter appends — so they are restored verbatim alongside the
+    slice list.
+    """
+    sbf = object.__new__(ScalableBloomFilter)
+    sbf._initial_capacity = initial_capacity
+    sbf._target_fp_rate = target_fp_rate
+    sbf._growth = growth
+    sbf._tightening = tightening
+    sbf._seed = seed
+    sbf._slices = slices
+    return sbf
+
+
+def save_scalable(sbf: ScalableBloomFilter, path: str | Path) -> None:
+    """Serialize ``sbf`` and atomically write it to ``path``.
+
+    Convenience composition of :func:`dumps_scalable` + :func:`write_atomic`
+    for single-owner callers, mirroring :func:`save`. The concurrent
+    snapshot path (C7/C8) calls the primitives itself: serialize under the
+    filter's lock, write outside it.
+    """
+    write_atomic(dumps_scalable(sbf), path)
+
+
+def load_scalable(path: str | Path) -> ScalableBloomFilter | None:
+    """Read and validate the ``SBF1`` container at ``path``.
+
+    ``None`` means "start fresh", exactly like :func:`load`: a missing file
+    is the normal first boot (info log); unreadable or invalid content is
+    warned about by :func:`loads_scalable` and never raises.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        logger.info(
+            "SBF1 snapshot %s not found; starting with a fresh filter", path
+        )
+        return None
+    except OSError as exc:
+        logger.warning(
+            "SBF1 snapshot %s unreadable (%s); starting with a fresh filter",
+            path,
+            exc,
+        )
+        return None
+    return loads_scalable(data)
