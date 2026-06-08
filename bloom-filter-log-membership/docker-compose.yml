@@ -1,0 +1,39 @@
+# Bloom Filter Log Membership — service topology.
+#
+# C2 defines the runnable `app` (no external deps for /health) and the
+# profile-gated `test` service. Later commits add the `dashboard` service
+# on port 8002 (C12) and the cross-container `e2e` / `loadtest` services
+# that drive the live stack by service name (C13).
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bloom-filter-app
+    ports:
+      - "${API_PORT:-8001}:8001"
+    environment:
+      - DATA_DIR=/app/data
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8001/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    # In-process filter state on a single uvicorn worker — 512m is plenty
+    # (the three spec filters total ~5 MB of bit arrays).
+    mem_limit: 512m
+    restart: unless-stopped
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - PYTHONPATH=/app
+    command: ["pytest", "-v"]
