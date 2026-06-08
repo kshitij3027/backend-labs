@@ -1,0 +1,26 @@
+# ─── Bloom Filter Log Membership — Python dependencies ───────────────────────
+# Shared pins are kept consistent with the rest of backend-labs; the two
+# bloom-specific libraries (mmh3, bitarray) are pinned to current stable releases.
+
+# Web / API framework & ASGI server
+fastapi==0.115.6
+uvicorn[standard]==0.34.0    # ASGI server (bundles websockets) — runs both the
+                             # long-lived API service and the separate dashboard process
+
+# Bloom filter core
+mmh3==5.2.1                  # MurmurHash3 — fast non-cryptographic hashing; one 128-bit
+                             # digest is split into two 64-bit halves to derive the k indices
+bitarray==3.8.1              # memory-efficient backing bit array (where the space savings
+                             # actually come from) + fast tofile()/fromfile() persistence
+
+# Validation / config
+pydantic==2.10.4             # request / response models (also bundled with FastAPI)
+pydantic-settings==2.7.0     # env / .env-driven Settings
+
+# Dashboard ↔ API link + E2E / tests
+websockets==14.1             # WS client the dashboard process uses to stream live metrics
+httpx==0.28.1                # dashboard → API calls + FastAPI TestClient / E2E HTTP client
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2       # async API / integration tests

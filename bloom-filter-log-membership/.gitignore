@@ -1,0 +1,40 @@
+# ─── Bloom Filter Log Membership ─────────────────────────────────────────────
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+
+# Test & tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Persisted filter state & logs (written at runtime).
+# Anchored with a leading slash so they only match the project-root dirs and
+# never a same-named source package.
+/data/
+/logs/
+*.bloom          # serialized bit array + filter params (the on-disk snapshot)
+*.bloom.tmp      # temp file for atomic snapshot writes (write-then-rename)
+*.snapshot
+
+# OS
+.DS_Store
+
+# Planning doc (repo convention — keep local, do not commit)
+plan.md
+project_requirements.md
