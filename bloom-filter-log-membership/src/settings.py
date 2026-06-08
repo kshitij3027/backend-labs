@@ -5,10 +5,9 @@ Every field is overridable via an environment variable of the same name
 documents the full set with defaults.
 
 The class is deliberately flat and easy to extend: later commits append the
-per-log-type filter sizing fields (capacity / target FP rate per filter),
-snapshot + rotation intervals, scalable-filter growth parameters, and the
-two-tier pipeline thresholds — all as plain defaulted fields here, so one
-``get_settings()`` call stays the single source of configuration truth.
+two-tier pipeline thresholds (C10) and the ``sessions`` filter sizing (C11) —
+all as plain defaulted fields here, so one ``get_settings()`` call stays the
+single source of configuration truth.
 """
 from __future__ import annotations
 
@@ -41,9 +40,63 @@ class Settings(BaseSettings):
     filters survive container restarts; tests point it at a tmp dir.
     """
 
+    # --- per-log-type filter sizing (spec defaults) ---
+    error_logs_capacity: int = 1_000_000
+    """Expected distinct error-log keys — slice-0 capacity of that filter."""
+
+    error_logs_fp_rate: float = 0.01
+    """Target compound false-positive rate for the ``error_logs`` filter."""
+
+    access_logs_capacity: int = 5_000_000
+    """Expected distinct access-log keys — slice-0 capacity of that filter."""
+
+    access_logs_fp_rate: float = 0.05
+    """Target compound false-positive rate for the ``access_logs`` filter."""
+
+    security_logs_capacity: int = 100_000
+    """Expected distinct security-log keys — slice-0 capacity of that filter."""
+
+    security_logs_fp_rate: float = 0.001
+    """Target compound false-positive rate for the ``security_logs`` filter."""
+
+    # --- scalable filter growth (Extended B: adaptive sizing) ---
+    sbf_growth_factor: int = 2
+    """Capacity multiplier between consecutive SBF slices (paper's s, >= 2)."""
+
+    sbf_tightening_ratio: float = 0.85
+    """FP-budget ratio between consecutive SBF slices (paper's r, in (0, 1))."""
+
+    # --- snapshots ---
+    snapshot_interval_seconds: float = 30.0
+    """Cadence of the background ``save_all()`` snapshot task (C8)."""
+
+    # --- rotation (Extended B: time-based rotation) ---
+    rotation_max_age_seconds: float = 86_400.0
+    """Rotate a filter generation once it is this old. ``0`` disables rotation."""
+
+    rotation_check_interval_seconds: float = 60.0
+    """How often the background rotation task (C8) calls ``rotate_if_due()``."""
+
     # --- logging ---
     log_level: str = "INFO"
     """Stdlib logging level name (DEBUG / INFO / WARNING / ERROR)."""
+
+    def filter_configs(self) -> dict[str, tuple[int, float]]:
+        """Return ``{filter_name: (capacity, target_fp_rate)}`` for every filter.
+
+        The single place the :class:`~src.manager.FilterManager` reads its
+        routing table from — filter names, sizing, and FP targets all come
+        from here, so adding a filter (C11 adds ``sessions``) is one new
+        entry plus its two fields, with no manager changes.
+        """
+        return {
+            "error_logs": (self.error_logs_capacity, self.error_logs_fp_rate),
+            "access_logs": (self.access_logs_capacity, self.access_logs_fp_rate),
+            "security_logs": (
+                self.security_logs_capacity,
+                self.security_logs_fp_rate,
+            ),
+        }
 
 
 @lru_cache
