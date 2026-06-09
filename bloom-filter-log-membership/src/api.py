@@ -21,12 +21,28 @@ C9 adds the demo endpoints:
   micro-benchmark that quantifies the speed and memory trade WITHOUT
   touching the live filters or their metrics.
 
+C10 adds the Extended C two-tier pipeline (:mod:`src.storage` is the sqlite
+"expensive storage" tier, :mod:`src.pipeline` the decision logic):
+
+* ``POST /pipeline/ingest`` — one call writes BOTH tiers (sqlite row +
+  filter bits), so the filters auto-update as new logs arrive.
+* ``POST /pipeline/lookup`` — bloom-first membership: a filter negative
+  skips storage entirely (the speed win); a positive is verified against
+  sqlite, and a disproved positive is counted as an observed false
+  positive. When a filter's live FP estimate breaches
+  ``FP_FALLBACK_THRESHOLD``, lookups bypass the filter and
+  ``FP_ROTATE_ON_BREACH`` grants one health-restoring rotation per breach
+  episode.
+* ``GET /pipeline/stats`` — pipeline counters: storage rows, storage-skip
+  rate, observed FP rate, fallback state, rotations triggered.
+
 The :func:`lifespan` context manager owns the whole state graph: it resolves
 settings, builds the metrics registry + manager, reloads persisted snapshots
-from ``data_dir`` (warm start), runs the periodic snapshot and rotation
-background tasks while the app serves, and saves one final snapshot on the
-way out. Later commits keep growing this module in place: C10 adds the
-``/pipeline`` two-tier endpoints and C11 the ``/sessions`` endpoints.
+from ``data_dir`` (warm start), opens the sqlite log store and wraps it with
+the manager in the two-tier pipeline, runs the periodic snapshot and rotation
+background tasks while the app serves, then saves one final snapshot and
+closes the store on the way out. Later commits keep growing this module in
+place: C11 adds the ``/sessions`` endpoints.
 
 Why the hot handlers are ``async def`` with no await
 ----------------------------------------------------
@@ -38,10 +54,13 @@ call the manager's sync methods inline on the event loop; the filter locks
 are never held across an await because there is no await to hold them
 across.
 
-The ``/demo`` handlers are the mirror image: bulk/CPU-bound work (tens of
-thousands of adds, seconds-long linear-scan benchmarks) declared ``sync
-def``, so Starlette dispatches them to the AnyIO threadpool and the event
-loop stays free to serve concurrent hot ``/logs`` traffic. Their bulk loops
+The ``/demo`` and ``/pipeline`` handlers are the mirror image: work that is
+bulky (tens of thousands of adds, seconds-long linear-scan benchmarks) or
+that blocks on disk (every ``/pipeline`` call runs sqlite statements)
+declared ``sync def``, so Starlette dispatches them to the AnyIO threadpool
+and the event loop stays free to serve concurrent hot ``/logs`` traffic. A
+sqlite statement is exactly the kind of millisecond-scale blocking I/O the
+event loop must never absorb. Bulk loops
 go through ``manager.add`` one key at a time, so a filter lock is only ever
 held for a single µs-scale operation — a long populate can interleave with,
 but never starve, live adds and queries.
@@ -70,7 +89,9 @@ from pydantic import BaseModel, Field
 from src.bloom import BloomFilter
 from src.manager import FilterManager
 from src.metrics import MetricsRegistry
+from src.pipeline import TwoTierPipeline
 from src.settings import Settings, get_settings
+from src.storage import LogStore
 
 logger = logging.getLogger("bloom_filter_log_membership")
 
@@ -170,6 +191,46 @@ class PerformanceTestResponse(BaseModel):
     processing_time_ms: float
 
 
+class PipelineIngestResponse(BaseModel):
+    """Shape of ``/pipeline/ingest`` (C10).
+
+    ``status`` is always ``"stored"`` — after the call the row exists in the
+    storage tier whether or not this request created it; the ``duplicate``
+    flag carries that nuance (True when the row already existed).
+    ``bloom_updated`` reports that the matching filter was fed the key in
+    the same call — Extended C's "auto-update the filter as new logs
+    arrive".
+    """
+
+    status: Literal["stored"]
+    bloom_updated: bool
+    duplicate: bool
+    processing_time_ms: float
+
+
+class PipelineLookupResponse(BaseModel):
+    """Shape of ``/pipeline/lookup`` (C10) — the two-tier answer.
+
+    ``found`` is the authoritative answer. ``source`` says how it was
+    produced: ``"bloom_negative"`` (the filter said definitely-not, so
+    storage was skipped — ``storage_checked`` False, the Extended-C payoff)
+    or ``"storage"`` (sqlite was consulted, either to verify a bloom
+    positive or because FP-threshold fallback bypassed the filter —
+    ``fallback_active``). ``false_positive`` marks a bloom positive that
+    storage disproved. ``might_exist`` is the bloom tier's claim; under
+    fallback the filter is never consulted, so it degenerates to the
+    storage answer.
+    """
+
+    found: bool
+    might_exist: bool
+    source: Literal["bloom_negative", "storage"]
+    storage_checked: bool
+    false_positive: bool
+    fallback_active: bool
+    processing_time_ms: float
+
+
 # --------------------------------------------------------------------- #
 # background tasks                                                      #
 # --------------------------------------------------------------------- #
@@ -246,13 +307,15 @@ async def lifespan(app: FastAPI):
 
     Startup: settings → logging → metrics + manager → ``load_all`` (adopt
     any valid on-disk snapshots — corrupt/missing/config-mismatched files
-    just mean a fresh filter, never a crash) → publish everything on
+    just mean a fresh filter, never a crash) → open the sqlite log store
+    and build the two-tier pipeline over it (C10) → publish everything on
     ``app.state`` → start the snapshot + rotation tasks.
 
     Shutdown: cancel both tasks and wait for them to finish unwinding
     (``gather`` with ``return_exceptions`` swallows their
-    ``CancelledError``), then take one final snapshot so everything added
-    since the last periodic save survives the restart.
+    ``CancelledError``), take one final snapshot so everything added since
+    the last periodic save survives the restart, then close the sqlite
+    store (last: the final save must never find it already closed).
     """
     settings = get_settings()
     # basicConfig accepts level names ("INFO") as well as numeric levels.
@@ -270,9 +333,14 @@ async def lifespan(app: FastAPI):
         {name: "restored" if ok else "fresh" for name, ok in loaded.items()},
     )
 
+    store = LogStore(settings.sqlite_path)
+    pipeline = TwoTierPipeline(manager=manager, store=store, settings=settings)
+
     app.state.settings = settings
     app.state.manager = manager
     app.state.metrics = metrics
+    app.state.store = store
+    app.state.pipeline = pipeline
     app.state.started_at = time.time()
 
     snapshot_task = asyncio.create_task(
@@ -284,13 +352,17 @@ async def lifespan(app: FastAPI):
 
     logger.info(
         "bloom-filter-log-membership starting on %s:%s (data_dir=%s, "
-        "filters=%s, snapshot every %.0fs, rotation check every %.0fs)",
+        "sqlite=%s, filters=%s, snapshot every %.0fs, rotation check "
+        "every %.0fs, fp fallback threshold=%s, rotate on breach=%s)",
         settings.api_host,
         settings.api_port,
         settings.data_dir,
+        settings.sqlite_path,
         list(manager.names),
         settings.snapshot_interval_seconds,
         settings.rotation_check_interval_seconds,
+        settings.fp_fallback_threshold,
+        settings.fp_rotate_on_breach,
     )
     try:
         yield
@@ -300,6 +372,7 @@ async def lifespan(app: FastAPI):
         await asyncio.gather(snapshot_task, rotation_task, return_exceptions=True)
         _locked_save(manager, data_dir)
         logger.info("final snapshot saved to %s", data_dir)
+        store.close()
         logger.info("bloom-filter-log-membership shutdown")
 
 
@@ -609,6 +682,72 @@ def demo_performance_test(
         false_positives_observed=false_positives,
         processing_time_ms=round(processing_time_ms, 3),
     )
+
+
+# --------------------------------------------------------------------- #
+# two-tier pipeline endpoints (C10, Extended C)                          #
+# --------------------------------------------------------------------- #
+
+
+@app.post("/pipeline/ingest", response_model=PipelineIngestResponse)
+def pipeline_ingest(
+    entry: LogEntryRequest, request: Request
+) -> PipelineIngestResponse:
+    """Ingest one log entry into BOTH tiers: sqlite row + bloom filter bits.
+
+    ``sync def`` like every ``/pipeline`` handler: the sqlite statement is
+    real blocking disk I/O (WAL append), so the handler runs on the AnyIO
+    threadpool and the event loop keeps serving the hot ``/logs``
+    endpoints. ``processing_time_ms`` is whole-handler wall time (storage
+    insert + filter add), 3 decimals.
+    """
+    handler_start = time.perf_counter()
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    result = pipeline.ingest(entry.log_type, entry.log_key)
+    return PipelineIngestResponse(
+        status="stored",
+        bloom_updated=result["bloom_updated"],
+        duplicate=result["duplicate"],
+        processing_time_ms=round(
+            (time.perf_counter() - handler_start) * 1000.0, 3
+        ),
+    )
+
+
+@app.post("/pipeline/lookup", response_model=PipelineLookupResponse)
+def pipeline_lookup(
+    entry: LogEntryRequest, request: Request
+) -> PipelineLookupResponse:
+    """Two-tier membership lookup: bloom first, storage only when needed.
+
+    The field to watch is ``storage_checked`` — False is Extended C's
+    payoff: the filter's definite "no" made the expensive tier unnecessary
+    for this lookup. See :meth:`TwoTierPipeline.lookup` for the full
+    decision tree, including the FP-threshold fallback and the
+    one-rotation-per-breach trigger.
+    """
+    handler_start = time.perf_counter()
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    result = pipeline.lookup(entry.log_type, entry.log_key)
+    return PipelineLookupResponse(
+        **result,
+        processing_time_ms=round(
+            (time.perf_counter() - handler_start) * 1000.0, 3
+        ),
+    )
+
+
+@app.get("/pipeline/stats")
+def pipeline_stats(request: Request) -> dict:
+    """Per-filter pipeline counters plus ``_totals`` (open dict, like /stats).
+
+    ``sync def``: the per-filter ``storage_rows`` figures are sqlite COUNT
+    queries. Shape detail lives on :meth:`TwoTierPipeline.stats`; the
+    headline number is ``storage_skipped_pct`` — how much expensive-tier
+    traffic the bloom front absorbed.
+    """
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    return pipeline.stats()
 
 
 if __name__ == "__main__":

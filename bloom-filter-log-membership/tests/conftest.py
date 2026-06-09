@@ -54,16 +54,21 @@ def api_env(
 ) -> Iterator[Path]:
     """Full environment isolation for app-level (lifespan-running) tests.
 
-    Layers on ``tmp_data_dir`` (isolated ``DATA_DIR``) and parks both
-    background-task intervals at an hour so neither the snapshot loop nor
-    the rotation loop can ever fire mid-test — tests that *want* the loops
-    to fire override the env again (and re-clear the settings cache)
-    before opening their TestClient. Yields the data dir so tests can
-    assert on snapshot files. The cache is cleared on the way out as well,
-    so the next test cannot inherit these settings.
+    Layers on ``tmp_data_dir`` (isolated ``DATA_DIR``), points the C10
+    pipeline's ``SQLITE_PATH`` at a per-test database file under that same
+    tmp dir (the storage tier must never touch the repo's ./data), and
+    parks both background-task intervals at an hour so neither the snapshot
+    loop nor the rotation loop can ever fire mid-test — tests that *want*
+    the loops to fire override the env again (and re-clear the settings
+    cache) before opening their TestClient. The pipeline's FP-fallback
+    knobs stay at their code defaults; the breach drills in
+    ``test_pipeline.py`` build their own environment instead. Yields the
+    data dir so tests can assert on snapshot files. The cache is cleared on
+    the way out as well, so the next test cannot inherit these settings.
     """
     monkeypatch.setenv("SNAPSHOT_INTERVAL_SECONDS", "3600")
     monkeypatch.setenv("ROTATION_CHECK_INTERVAL_SECONDS", "3600")
+    monkeypatch.setenv("SQLITE_PATH", str(tmp_data_dir / "logs.db"))
     get_settings.cache_clear()
     yield tmp_data_dir
     get_settings.cache_clear()

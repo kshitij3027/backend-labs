@@ -77,6 +77,38 @@ class Settings(BaseSettings):
     rotation_check_interval_seconds: float = 60.0
     """How often the background rotation task (C8) calls ``rotate_if_due()``."""
 
+    # --- two-tier pipeline (Extended C, C10) ---
+    sqlite_path: str = "./data/logs.db"
+    """Path of the sqlite database playing the "expensive storage" tier.
+
+    Ground truth for the ``/pipeline`` endpoints: every ingested key lands
+    here as a row, and bloom positives are verified against it. Defaults
+    under ``data_dir`` so compose's ``./data`` bind mount persists it next to
+    the filter snapshots; tests point it at a tmp file.
+    """
+
+    fp_fallback_threshold: float = 0.05
+    """Live-FP-estimate breach point for the pipeline's bloom bypass.
+
+    When a filter's CURRENT generation reports a ``compound_estimated_fp``
+    above this value, ``/pipeline/lookup`` stops consulting the bloom filter
+    and goes straight to storage (a saturated filter rarely answers "no", so
+    its storage savings have evaporated — see :mod:`src.pipeline`).
+    Meaningful values are strictly between 0 and 1: at or above 1.0 the
+    estimate can never breach (fallback effectively disabled), while 0.0
+    forces permanent fallback after the very first insert.
+    """
+
+    fp_rotate_on_breach: bool = True
+    """Rotate a filter once per FP-threshold breach episode (C10).
+
+    On the first fallback lookup of a breach, the pipeline calls
+    ``FilterManager.rotate`` to install a fresh current generation and
+    restore filter health. The trigger re-arms only after the estimate drops
+    back under ``fp_fallback_threshold``, so a sustained breach can never
+    cause a rotation storm.
+    """
+
     # --- logging ---
     log_level: str = "INFO"
     """Stdlib logging level name (DEBUG / INFO / WARNING / ERROR)."""
