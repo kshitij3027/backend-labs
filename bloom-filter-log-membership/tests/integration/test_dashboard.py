@@ -196,6 +196,7 @@ def test_index_serves_dashboard_page(dashboard_client: TestClient) -> None:
         "/static/dashboard.css",
         'id="conn-pill"',
         'id="pipeline-strip"',
+        'rel="icon"',  # empty data-URL icon — keeps GET /favicon.ico (404) out of the console
     ):
         assert needle in r.text, f"dashboard HTML is missing {needle!r}"
 
