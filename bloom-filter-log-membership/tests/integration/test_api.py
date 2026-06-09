@@ -131,7 +131,11 @@ def test_empty_log_key_is_422(client: TestClient) -> None:
 
 
 def test_stats_structure(client: TestClient) -> None:
-    """Top-level shape: service id, uptime, all three filters, totals."""
+    """Top-level shape: service id, uptime, all four filters, totals.
+
+    The filter fleet is the three log types plus the C11 ``sessions``
+    filter — a full /stats citizen even though it is not a ``log_type``.
+    """
     response = client.get("/stats")
     assert response.status_code == 200
     stats = response.json()
@@ -139,7 +143,7 @@ def test_stats_structure(client: TestClient) -> None:
     assert set(stats) == {"service", "uptime_seconds", "filters", "totals"}
     assert stats["service"] == "bloom-filter-log-membership"
     assert stats["uptime_seconds"] >= 0.0
-    assert set(stats["filters"]) == set(ALL_LOG_TYPES)
+    assert set(stats["filters"]) == set(ALL_LOG_TYPES) | {"sessions"}
     assert set(stats["totals"]) == {
         "elements_added",
         "adds_total",

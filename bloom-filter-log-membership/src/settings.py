@@ -4,10 +4,10 @@ Every field is overridable via an environment variable of the same name
 (UPPER_SNAKE, case-insensitive) or a project-root ``.env`` file. ``.env.example``
 documents the full set with defaults.
 
-The class is deliberately flat and easy to extend: later commits append the
-two-tier pipeline thresholds (C10) and the ``sessions`` filter sizing (C11) —
-all as plain defaulted fields here, so one ``get_settings()`` call stays the
-single source of configuration truth.
+The class is deliberately flat and easy to extend: C10 appended the
+two-tier pipeline thresholds and C11 the ``sessions`` filter sizing — all as
+plain defaulted fields here, so one ``get_settings()`` call stays the single
+source of configuration truth.
 """
 from __future__ import annotations
 
@@ -58,6 +58,30 @@ class Settings(BaseSettings):
 
     security_logs_fp_rate: float = 0.001
     """Target compound false-positive rate for the ``security_logs`` filter."""
+
+    # --- session tracking filter (Extended A, C11) ---
+    sessions_capacity: int = 1_000_000
+    """Expected distinct session IDs per generation — ``sessions`` slice-0 capacity.
+
+    Sized for Extended A's headline workload: 1M session-ID inserts *per
+    day*. "Daily" is carried by rotation, not by this number alone — the
+    default ``rotation_max_age_seconds`` (86 400 s) rotates every filter,
+    sessions included, once a day, so one generation only ever absorbs ~one
+    day's worth of inserts and this capacity is the honest per-generation
+    bound. The <2MB success criterion is judged at exactly this sizing: at
+    ``sessions_fp_rate`` 0.01 the SBF grants slice 0 the tightened budget
+    ``0.01 × (1 − 0.85) = 0.0015``, giving ``m ≈ 13.53 Mbit ≈ 1.69 MB`` —
+    comfortably under the 2 MB line (``/sessions/stats`` reports the live
+    ``memory_under_2mb`` verdict).
+    """
+
+    sessions_fp_rate: float = 0.01
+    """Target compound false-positive rate for the ``sessions`` filter.
+
+    0.01 keeps the 1M-capacity slice 0 at ~1.69 MB (see
+    ``sessions_capacity``); tightening it to 0.001 would push slice 0 to
+    ~2.5 MB and bust the Extended-A <2MB memory criterion.
+    """
 
     # --- scalable filter growth (Extended B: adaptive sizing) ---
     sbf_growth_factor: int = 2
@@ -118,8 +142,13 @@ class Settings(BaseSettings):
 
         The single place the :class:`~src.manager.FilterManager` reads its
         routing table from — filter names, sizing, and FP targets all come
-        from here, so adding a filter (C11 adds ``sessions``) is one new
-        entry plus its two fields, with no manager changes.
+        from here, so adding a filter is one new entry plus its two fields,
+        with no manager changes. Exactly how C11 added ``sessions``: the
+        manager, pipeline counters, snapshots, and rotation all picked the
+        fourth filter up from this dict automatically. The ``/logs/*`` and
+        ``/demo/*`` endpoints deliberately did NOT — their ``log_type``
+        universe is the API-level ``LogType`` Literal, so sessions traffic
+        only flows through the dedicated ``/sessions/*`` endpoints.
         """
         return {
             "error_logs": (self.error_logs_capacity, self.error_logs_fp_rate),
@@ -128,6 +157,7 @@ class Settings(BaseSettings):
                 self.security_logs_capacity,
                 self.security_logs_fp_rate,
             ),
+            "sessions": (self.sessions_capacity, self.sessions_fp_rate),
         }
 
 

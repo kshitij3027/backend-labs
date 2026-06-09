@@ -36,13 +36,34 @@ C10 adds the Extended C two-tier pipeline (:mod:`src.storage` is the sqlite
 * ``GET /pipeline/stats`` — pipeline counters: storage rows, storage-skip
   rate, observed FP rate, fallback state, rotations triggered.
 
+C11 adds the Extended A session-tracking endpoints. The fourth managed
+filter (``sessions``: 1M daily session IDs at p=0.01, slice-0 ≈ 1.69 MB —
+under the spec's 2 MB line) is registered purely through
+:meth:`Settings.filter_configs`; the manager, pipeline counters, snapshot
+and rotation tasks all pick it up by name with zero code changes here.
+Session traffic rides the same two-tier pipeline as ``/pipeline/*`` but
+through dedicated routes — the ``/logs``/``/demo`` ``log_type`` Literal
+deliberately excludes ``sessions``:
+
+* ``POST /sessions/ingest`` — write-through: a sqlite row plus the session
+  ID hashed into the sessions filter at ingestion time.
+* ``POST /sessions/query`` — membership that consults the bloom filter
+  BEFORE any storage lookup, with the spec confidence wording.
+* ``GET /sessions/stats`` — filter gauges, the live ``memory_under_2mb``
+  verdict, pipeline tallies, and operation metrics in one read.
+* ``POST /sessions/performance-test`` — Extended A #5: the same probe
+  sequence run WITH the bloom tier (two-tier read) and WITHOUT it (direct
+  sqlite); the headline is storage calls AVOIDED (~50% at the 50/50 probe
+  mix) — raw latency is reported but never gated, since against a warm
+  in-process sqlite both paths are µs-scale — plus the
+  100%-of-non-existent-sessions correctness accounting.
+
 The :func:`lifespan` context manager owns the whole state graph: it resolves
 settings, builds the metrics registry + manager, reloads persisted snapshots
 from ``data_dir`` (warm start), opens the sqlite log store and wraps it with
 the manager in the two-tier pipeline, runs the periodic snapshot and rotation
 background tasks while the app serves, then saves one final snapshot and
-closes the store on the way out. Later commits keep growing this module in
-place: C11 adds the ``/sessions`` endpoints.
+closes the store on the way out.
 
 Why the hot handlers are ``async def`` with no await
 ----------------------------------------------------
@@ -54,9 +75,10 @@ call the manager's sync methods inline on the event loop; the filter locks
 are never held across an await because there is no await to hold them
 across.
 
-The ``/demo`` and ``/pipeline`` handlers are the mirror image: work that is
-bulky (tens of thousands of adds, seconds-long linear-scan benchmarks) or
-that blocks on disk (every ``/pipeline`` call runs sqlite statements)
+The ``/demo``, ``/pipeline``, and ``/sessions`` handlers are the mirror
+image: work that is bulky (tens of thousands of adds, seconds-long
+benchmark loops) or that blocks on disk (every ``/pipeline`` and
+``/sessions`` call can run sqlite statements)
 declared ``sync def``, so Starlette dispatches them to the AnyIO threadpool
 and the event loop stays free to serve concurrent hot ``/logs`` traffic. A
 sqlite statement is exactly the kind of millisecond-scale blocking I/O the
@@ -228,6 +250,108 @@ class PipelineLookupResponse(BaseModel):
     storage_checked: bool
     false_positive: bool
     fallback_active: bool
+    processing_time_ms: float
+
+
+#: Name of the C11 session-tracking filter as registered in
+#: :meth:`Settings.filter_configs`. Deliberately NOT part of ``LogType``:
+#: sessions are not a log type, so ``/logs/*``, ``/demo/*``, and
+#: ``/pipeline/*`` all 422 on it and session traffic flows exclusively
+#: through the ``/sessions/*`` endpoints below.
+SESSIONS_FILTER = "sessions"
+
+
+class SessionRequest(BaseModel):
+    """Body of ``/sessions/ingest`` and ``/sessions/query`` (C11).
+
+    ``session_id`` is the caller's opaque e-commerce session identifier
+    (cookie value, cart token, JWT id, ...) — the service only ever hashes
+    it, never parses it. Empty IDs are rejected like empty log keys: always
+    a caller bug, never a real session identity.
+    """
+
+    session_id: str = Field(min_length=1)
+
+
+class SessionIngestResponse(BaseModel):
+    """Shape of ``/sessions/ingest``.
+
+    "Hash the session ID during ingestion" (Extended A #2) happens inside
+    :meth:`TwoTierPipeline.ingest`: the same call that lands the sqlite row
+    feeds the ID's hashes into the sessions filter, so the filter can answer
+    for this session from this moment on. ``status`` is always ``"stored"``
+    (after the call the row exists either way); ``duplicate`` is True when
+    this session ID had already been ingested.
+    """
+
+    status: Literal["stored"]
+    duplicate: bool
+    processing_time_ms: float
+
+
+class SessionQueryResponse(BaseModel):
+    """Shape of ``/sessions/query`` — bloom checked BEFORE any storage lookup.
+
+    ``found`` is the authoritative answer; ``might_exist`` is the bloom
+    tier's claim, and ``confidence`` is that claim in the spec's wording:
+    ``"definitely_not_exist"`` when the filter ruled the session out
+    (``storage_checked`` False — sqlite was never touched, Extended A's
+    "check the bloom filter first" payoff) and ``"probably_exists"`` when
+    the filter said maybe (storage then verified, so ``found`` may
+    correct an over-claim). Under FP-threshold fallback the filter is
+    bypassed and ``might_exist`` degenerates to the storage answer, so the
+    confidence wording stays truthful there too.
+    """
+
+    session_id: str
+    might_exist: bool
+    found: bool
+    source: Literal["bloom_negative", "storage"]
+    storage_checked: bool
+    confidence: Literal["probably_exists", "definitely_not_exist"]
+    processing_time_ms: float
+
+
+class SessionPerformanceTestResponse(BaseModel):
+    """Result of one ``/sessions/performance-test`` with/without-bloom run.
+
+    Extended A #5 — identical probe sequence run twice: WITH the bloom
+    tier (filter probe, storage only on a filter positive) and WITHOUT it
+    (direct sqlite ``exists`` per probe). The headline numbers are the
+    ``storage_calls_*`` trio: how many storage lookups each pass actually
+    made, and the percentage the filter eliminated outright — the filter's
+    structural win, ~50% at this benchmark's 50/50 present/absent mix and
+    approaching 100% on real miss-heavy dedup traffic. ``speedup``
+    (direct-sqlite avg / with-bloom avg) is reported exactly as measured
+    but is NOT the claim: against a warm in-process sqlite whose point-PK
+    SELECTs cost ~a µs, a Python-level filter probe costs about the same,
+    so speedup can honestly read below 1.0 here even though both paths sit
+    far under the spec's 1 ms line (handler docstring has the full
+    framing). ``non_existent_correctly_identified_pct`` is the success
+    criterion "100% of non-existent sessions correctly identified" — of the
+    never-ingested probe IDs, the share answered ``found`` False. It is
+    structurally 100.0: a bloom negative IS a proof of absence, and the
+    rare bloom false positive gets corrected by the storage verification —
+    which is exactly why the two-tier design preserves correctness while
+    skipping most absent-key storage work. ``filter_memory_*`` reports the
+    live sessions filter's current generation (the <2MB exhibit).
+    """
+
+    sessions_seeded: int
+    lookups: int
+    with_bloom_total_ms: float
+    with_bloom_avg_ms: float
+    without_bloom_total_ms: float
+    without_bloom_avg_ms: float
+    speedup: float
+    storage_lookups_skipped: int
+    storage_skipped_pct: float
+    storage_calls_with_bloom: int
+    storage_calls_without_bloom: int
+    storage_calls_avoided_pct: float
+    non_existent_correctly_identified_pct: float
+    filter_memory_bytes: int
+    filter_memory_mb: float
     processing_time_ms: float
 
 
@@ -748,6 +872,268 @@ def pipeline_stats(request: Request) -> dict:
     """
     pipeline: TwoTierPipeline = request.app.state.pipeline
     return pipeline.stats()
+
+
+# --------------------------------------------------------------------- #
+# session tracking endpoints (C11, Extended A)                          #
+# --------------------------------------------------------------------- #
+
+
+@app.post("/sessions/ingest", response_model=SessionIngestResponse)
+def sessions_ingest(
+    body: SessionRequest, request: Request
+) -> SessionIngestResponse:
+    """Ingest one e-commerce session ID: sqlite row + bloom bits in one call.
+
+    The two-tier write is exactly ``/pipeline/ingest``'s, routed to the
+    ``sessions`` filter — the session ID is hashed into the filter during
+    ingestion (Extended A #2), so the very next ``/sessions/query`` can
+    already answer for it. ``sync def`` because the storage half is a
+    blocking sqlite INSERT (module docstring's threadpool rationale).
+    """
+    handler_start = time.perf_counter()
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    result = pipeline.ingest(SESSIONS_FILTER, body.session_id)
+    return SessionIngestResponse(
+        status="stored",
+        duplicate=result["duplicate"],
+        processing_time_ms=round(
+            (time.perf_counter() - handler_start) * 1000.0, 3
+        ),
+    )
+
+
+@app.post("/sessions/query", response_model=SessionQueryResponse)
+def sessions_query(
+    body: SessionRequest, request: Request
+) -> SessionQueryResponse:
+    """Has this session been seen? Bloom filter first, storage only if needed.
+
+    Extended A #3 verbatim: the query interface checks the bloom filter
+    BEFORE any storage lookup — :meth:`TwoTierPipeline.lookup` short-circuits
+    on a filter negative (``storage_checked`` False), and only a filter
+    positive pays the sqlite verification. ``confidence`` translates the
+    filter's claim into the spec wording (see the response model).
+    """
+    handler_start = time.perf_counter()
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    result = pipeline.lookup(SESSIONS_FILTER, body.session_id)
+    return SessionQueryResponse(
+        session_id=body.session_id,
+        might_exist=result["might_exist"],
+        found=result["found"],
+        source=result["source"],
+        storage_checked=result["storage_checked"],
+        confidence=(
+            "probably_exists" if result["might_exist"] else "definitely_not_exist"
+        ),
+        processing_time_ms=round(
+            (time.perf_counter() - handler_start) * 1000.0, 3
+        ),
+    )
+
+
+@app.get("/sessions/stats")
+def sessions_stats(request: Request) -> dict:
+    """One-read session health: filter gauges, <2MB verdict, pipeline, ops.
+
+    ``memory_under_2mb`` judges the Extended-A criterion ("<2MB memory
+    usage for 1M sessions") against the CURRENT generation's bitset bytes —
+    the generation that absorbs the day's 1M inserts and whose sizing the
+    criterion is about. (A previous generation, when one exists after a
+    rotation, doubles the *process* footprint for one grace period; that
+    total lives in ``/stats`` as ``memory_bytes``.) ``pipeline`` is this
+    filter's slice of ``/pipeline/stats`` (storage rows, skip rate,
+    observed FPs); ``ops`` is the add/query latency-and-counter ledger.
+    ``sync def``: the pipeline block runs sqlite COUNTs.
+    """
+    manager: FilterManager = request.app.state.manager
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    merged = manager.stats()[SESSIONS_FILTER]
+    memory_bytes = merged["memory_bytes"]  # current generation only
+    return {
+        "filter": {
+            "elements_added": merged["count"],
+            "capacity": merged["capacity"],
+            "slice_count": merged["slice_count"],
+            "rotations": merged["rotations"],
+            "memory_bytes": memory_bytes,
+            "memory_mb": round(memory_bytes / _MB, 3),
+            "estimated_fp_rate": merged["compound_estimated_fp"],
+            "target_fp_rate": merged["target_fp_rate"],
+        },
+        "memory_under_2mb": memory_bytes < 2 * _MB,
+        "pipeline": pipeline.stats()[SESSIONS_FILTER],
+        "ops": merged["ops"],
+    }
+
+
+@app.post(
+    "/sessions/performance-test",
+    response_model=SessionPerformanceTestResponse,
+)
+def sessions_performance_test(
+    request: Request,
+    sessions: int = Query(default=5_000, ge=100, le=50_000),
+    lookups: int = Query(default=2_000, ge=10, le=50_000),
+) -> SessionPerformanceTestResponse:
+    """Measure session-query performance WITH vs WITHOUT the bloom filter.
+
+    Unlike ``/demo/performance-test`` (throwaway filter vs a linear list),
+    this benchmark runs against the LIVE system: it seeds ``sessions``
+    fresh nonce'd session IDs through :meth:`TwoTierPipeline.ingest` (real
+    two-tier writes — sqlite rows plus filter bits), then runs one probe
+    sequence (50/50 seeded/absent in a fixed alternating order, seeded
+    picks drawn by a deterministic RNG) through both passes:
+
+    * **WITH bloom** — the two-tier read path: probe the sessions filter
+      under its lock (current generation, then previous); only a filter
+      positive pays ``store.exists``. Timed at the manager/store level
+      rather than through :meth:`TwoTierPipeline.lookup`, deliberately:
+      every pipeline lookup also reads the live FP estimate for the
+      fallback trigger, and that estimate is a full-bitset popcount —
+      O(m) over the sessions filter's ~1.7 MB slice — pure health
+      bookkeeping that would dominate the µs-scale membership read this
+      benchmark exists to measure. The decision tree (negative →
+      storage skipped; positive → storage verifies) is exactly the
+      pipeline's.
+    * **WITHOUT bloom** — ``store.exists`` directly for every probe: what
+      every lookup would cost if no filter stood in front of storage.
+
+    How to read the results (deliberately honest reporting)
+    --------------------------------------------------------
+    Against THIS storage tier — a warm, in-process sqlite whose point-PK
+    SELECTs cost on the order of a microsecond — the bloom filter does not
+    win on raw per-call latency: one filter probe (a Python-level lock
+    acquisition, an mmh3 hash, and a two-generation bit check) costs about
+    as much as the SELECT it stands in front of, and on the 50/50 mix the
+    seeded half pays filter AND storage. ``speedup`` therefore routinely
+    reads below 1.0 here, and it is reported exactly as measured — no
+    gating in this handler, no artificial sleeps, no crippled sqlite to
+    flatter the filter. Both averages are µs-scale either way, far under
+    the spec's <1 ms query criterion.
+
+    The filter's genuine win in this regime is structural, and that is
+    what the ``storage_calls_*`` fields capture: every bloom negative
+    eliminates its storage call outright — ~50% of all calls at this mix,
+    and real dedup/session traffic is miss-heavy, pushing the avoided
+    share toward 100%. The value of each avoided call then scales with
+    what storage actually costs in production — a remote, disk-bound, or
+    contended store at ms-scale round trips, not a warm local sqlite. The
+    avoided-call percentage is the number that transfers to those
+    deployments; the latency delta is an artifact of how cheap this
+    particular baseline happens to be.
+
+    Probe-order fairness: BOTH passes consume the same list through the
+    same loop shape, and the with-bloom pass runs first, so any cache
+    warming favors the direct-sqlite baseline.
+
+    Correctness accounting: an absent probe is "correctly identified" when
+    the with-bloom pass answers ``found`` False — either via the filter's
+    proof of absence or via storage disproving a filter false positive.
+    Both routes are exact, so the percentage is structurally 100.0 (the
+    Extended-A success criterion).
+
+    ``sync def``: seeding runs ``sessions`` sqlite INSERTs and both passes
+    hammer sqlite SELECTs — threadpool work, event loop stays free. Worst
+    case (50k/50k) is a few seconds, bounded by the ``le`` caps; repeated
+    runs keep adding nonce'd rows but stay far inside the 1M slice-0.
+    """
+    handler_start = time.perf_counter()
+    manager: FilterManager = request.app.state.manager
+    pipeline: TwoTierPipeline = request.app.state.pipeline
+    store: LogStore = request.app.state.store
+
+    # --- seed: real two-tier ingests, fresh per call (nonce) ---
+    nonce = uuid4().hex[:8]
+    seeded = [f"sess-{nonce}-{i:010d}" for i in range(sessions)]
+    for session_id in seeded:
+        pipeline.ingest(SESSIONS_FILTER, session_id)
+
+    # --- one probe sequence, 50/50 seeded/absent, used by BOTH passes ---
+    rng = random.Random(_PERF_PROBE_SEED)
+    probes: list[str] = []
+    is_absent: list[bool] = []
+    for i in range(lookups):
+        if i % 2 == 0:
+            probes.append(seeded[rng.randrange(sessions)])
+            is_absent.append(False)
+        else:
+            probes.append(f"sess-absent-{nonce}-{i:010d}")
+            is_absent.append(True)
+
+    mf = manager.get(SESSIONS_FILTER)
+
+    def with_bloom(session_id: str) -> tuple[bool, bool]:
+        """Two-tier read: return ``(found, storage_checked)`` for one probe."""
+        with mf.lock:
+            might = mf.current.might_contain(session_id)
+            if not might and mf.previous is not None:
+                might = mf.previous.might_contain(session_id)
+        if not might:
+            return False, False  # proof of absence: storage never touched
+        return store.exists(SESSIONS_FILTER, session_id), True
+
+    # --- pass A: WITH the bloom tier ---
+    with_results: list[tuple[bool, bool]] = []
+    append_result = with_results.append
+    start = time.perf_counter()
+    for probe in probes:
+        append_result(with_bloom(probe))
+    with_total_ms = (time.perf_counter() - start) * 1000.0
+
+    # --- pass B: WITHOUT it — every probe pays the storage lookup ---
+    _, without_total_ms = _time_membership(
+        lambda session_id: store.exists(SESSIONS_FILTER, session_id), probes
+    )
+
+    storage_lookups_skipped = sum(
+        1 for _found, checked in with_results if not checked
+    )
+    # Pass A only hits storage on filter positives; pass B on every probe.
+    storage_calls_with_bloom = lookups - storage_lookups_skipped
+    storage_calls_without_bloom = lookups
+    absent_total = sum(is_absent)
+    absent_correct = sum(
+        1
+        for (found, _checked), absent in zip(with_results, is_absent)
+        if absent and not found
+    )
+
+    with_avg_ms = with_total_ms / lookups
+    without_avg_ms = without_total_ms / lookups
+    # max() guards the (theoretical) zero-duration pass on a coarse timer.
+    speedup = without_avg_ms / max(with_avg_ms, 1e-9)
+
+    with mf.lock:
+        filter_memory_bytes = mf.current.memory_bytes
+
+    processing_time_ms = (time.perf_counter() - handler_start) * 1000.0
+    return SessionPerformanceTestResponse(
+        sessions_seeded=sessions,
+        lookups=lookups,
+        with_bloom_total_ms=round(with_total_ms, 3),
+        with_bloom_avg_ms=round(with_avg_ms, 6),
+        without_bloom_total_ms=round(without_total_ms, 3),
+        without_bloom_avg_ms=round(without_avg_ms, 6),
+        speedup=round(speedup, 4),
+        storage_lookups_skipped=storage_lookups_skipped,
+        storage_skipped_pct=round(100.0 * storage_lookups_skipped / lookups, 2),
+        storage_calls_with_bloom=storage_calls_with_bloom,
+        storage_calls_without_bloom=storage_calls_without_bloom,
+        storage_calls_avoided_pct=round(
+            100.0
+            * (storage_calls_without_bloom - storage_calls_with_bloom)
+            / storage_calls_without_bloom,
+            2,
+        ),
+        non_existent_correctly_identified_pct=round(
+            100.0 * absent_correct / max(1, absent_total), 2
+        ),
+        filter_memory_bytes=filter_memory_bytes,
+        filter_memory_mb=round(filter_memory_bytes / _MB, 3),
+        processing_time_ms=round(processing_time_ms, 3),
+    )
 
 
 if __name__ == "__main__":

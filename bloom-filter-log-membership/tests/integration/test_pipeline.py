@@ -184,7 +184,11 @@ def test_validation_rejects_unknown_type_and_empty_key(
 
 
 def test_stats_shape_and_totals(client: TestClient) -> None:
-    """Every log type carries the full per-filter key set, plus _totals."""
+    """Every managed filter carries the full per-filter key set, plus _totals.
+
+    The C11 ``sessions`` filter shows up here automatically — the pipeline
+    counters are keyed by manager name, not by the ``log_type`` Literal.
+    """
     _ingest(client, "error_logs", "stat-a")
     _ingest(client, "security_logs", "stat-b")
     _lookup(client, "error_logs", "stat-a")  # storage hit
@@ -195,10 +199,11 @@ def test_stats_shape_and_totals(client: TestClient) -> None:
         "error_logs",
         "access_logs",
         "security_logs",
+        "sessions",
         "_totals",
     }
-    for log_type in ("error_logs", "access_logs", "security_logs"):
-        assert set(stats[log_type]) == PER_FILTER_STAT_KEYS, log_type
+    for name in ("error_logs", "access_logs", "security_logs", "sessions"):
+        assert set(stats[name]) == PER_FILTER_STAT_KEYS, name
     assert set(stats["_totals"]) == TOTALS_STAT_KEYS
 
     error_logs = stats["error_logs"]

@@ -26,8 +26,9 @@ import pytest
 from src.manager import FilterManager
 from src.settings import Settings
 
-#: Every env var the C7 settings extension added — deleted in the defaults
-#: test so ambient configuration cannot mask a wrong default.
+#: Every filter-fleet env var the C7 settings extension added (plus C11's
+#: sessions pair) — deleted in the defaults test so ambient configuration
+#: cannot mask a wrong default.
 NEW_ENV_VARS = (
     "ERROR_LOGS_CAPACITY",
     "ERROR_LOGS_FP_RATE",
@@ -35,6 +36,8 @@ NEW_ENV_VARS = (
     "ACCESS_LOGS_FP_RATE",
     "SECURITY_LOGS_CAPACITY",
     "SECURITY_LOGS_FP_RATE",
+    "SESSIONS_CAPACITY",
+    "SESSIONS_FP_RATE",
     "SBF_GROWTH_FACTOR",
     "SBF_TIGHTENING_RATIO",
     "SNAPSHOT_INTERVAL_SECONDS",
@@ -42,14 +45,16 @@ NEW_ENV_VARS = (
     "ROTATION_CHECK_INTERVAL_SECONDS",
 )
 
-ALL_NAMES = ("error_logs", "access_logs", "security_logs")
+#: The full managed-filter fleet in filter_configs() declaration order:
+#: the three spec log types plus the C11 ``sessions`` filter.
+ALL_NAMES = ("error_logs", "access_logs", "security_logs", "sessions")
 
 
 def make_settings(**overrides: object) -> Settings:
     """Settings with tiny per-type capacities so tests run in microseconds.
 
-    All six sizing fields are passed explicitly (deterministic regardless of
-    environment); anything else can be overridden per test.
+    All eight sizing fields are passed explicitly (deterministic regardless
+    of environment); anything else can be overridden per test.
     """
     fields: dict[str, object] = dict(
         error_logs_capacity=200,
@@ -58,6 +63,8 @@ def make_settings(**overrides: object) -> Settings:
         access_logs_fp_rate=0.05,
         security_logs_capacity=100,
         security_logs_fp_rate=0.001,
+        sessions_capacity=150,
+        sessions_fp_rate=0.01,
     )
     fields.update(overrides)
     return Settings(**fields)  # type: ignore[arg-type]
@@ -69,7 +76,7 @@ def make_settings(**overrides: object) -> Settings:
 
 
 def test_settings_new_field_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The C7 settings fields carry the spec defaults."""
+    """The C7 (and C11 sessions) settings fields carry the spec defaults."""
     for var in NEW_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     s = Settings()
@@ -79,6 +86,8 @@ def test_settings_new_field_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.access_logs_fp_rate == 0.05
     assert s.security_logs_capacity == 100_000
     assert s.security_logs_fp_rate == 0.001
+    assert s.sessions_capacity == 1_000_000  # Extended A: 1M daily sessions
+    assert s.sessions_fp_rate == 0.01
     assert s.sbf_growth_factor == 2
     assert s.sbf_tightening_ratio == 0.85
     assert s.snapshot_interval_seconds == 30.0
@@ -95,11 +104,14 @@ def test_settings_filter_configs_mapping() -> None:
         access_logs_fp_rate=0.25,
         security_logs_capacity=33,
         security_logs_fp_rate=0.125,
+        sessions_capacity=44,
+        sessions_fp_rate=0.0625,
     )
     assert s.filter_configs() == {
         "error_logs": (11, 0.5),
         "access_logs": (22, 0.25),
         "security_logs": (33, 0.125),
+        "sessions": (44, 0.0625),
     }
 
 
@@ -108,13 +120,14 @@ def test_settings_filter_configs_mapping() -> None:
 # ---------------------------------------------------------------------- #
 
 
-def test_names_lists_all_three_filters() -> None:
+def test_names_lists_all_four_filters() -> None:
+    """Three log types + sessions, in filter_configs() declaration order."""
     manager = FilterManager(make_settings())
     assert manager.names == ALL_NAMES
 
 
 def test_routing_isolation_between_log_types() -> None:
-    """A key added to one filter is invisible to the other two."""
+    """A key added to one filter is invisible to the other three."""
     manager = FilterManager(make_settings())
     added, duration_ms = manager.add("error_logs", "ERR-2026-001")
     assert added is True
@@ -124,6 +137,7 @@ def test_routing_isolation_between_log_types() -> None:
     # The sibling filters are empty (all bits 0), so their "no" is exact.
     assert manager.query("access_logs", "ERR-2026-001")[0] is False
     assert manager.query("security_logs", "ERR-2026-001")[0] is False
+    assert manager.query("sessions", "ERR-2026-001")[0] is False
 
 
 def test_per_type_sizing_matches_settings() -> None:
