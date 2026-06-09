@@ -32,6 +32,32 @@ class Settings(BaseSettings):
     api_port: int = 8001
     """TCP port of the membership API (the dashboard process later takes 8002)."""
 
+    # --- dashboard process (C12) ---
+    dashboard_host: str = "0.0.0.0"
+    """Interface the SEPARATE dashboard process (``src.dashboard``) binds to."""
+
+    dashboard_port: int = 8002
+    """TCP port of the dashboard web UI — a different process than the API,
+    so dashboard page loads and WebSocket fan-out never compete with the hot
+    ``/logs/add`` / ``/logs/query`` path for the API's event loop."""
+
+    api_base_url: str = "http://localhost:8001"
+    """Where the dashboard process reaches the membership API over HTTP.
+
+    The dashboard NEVER imports the manager or filters — process separation
+    is the point — so this URL is its only window into the service. Compose
+    sets it to ``http://app:8001`` (service-name DNS); the localhost default
+    suits running both processes by hand on one machine.
+    """
+
+    dashboard_refresh_ms: int = 5000
+    """Cadence (milliseconds) of the dashboard's poll-and-broadcast tick.
+
+    Every interval the dashboard fetches ``/stats`` + ``/pipeline/stats`` +
+    ``/sessions/stats`` from the API and pushes one tick to every connected
+    WebSocket client. Tests park it at 100 ms to observe periodic ticks fast.
+    """
+
     # --- storage ---
     data_dir: str = "./data"
     """Directory holding persisted filter snapshots (``*.bloom``).

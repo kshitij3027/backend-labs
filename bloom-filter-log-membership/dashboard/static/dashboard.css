@@ -1,0 +1,168 @@
+/* Bloom Filter Log Membership — dashboard theme.
+ * Dark, compact, dependency-free; matches the backend-labs dashboard look
+ * (storage-format-optimizer) so the repo's UIs feel like one family. */
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 1.5rem;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f1115;
+  color: #e8e8ea;
+}
+
+/* ---- Header + badge row ------------------------------------------------ */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1.25rem;
+}
+header h1 { margin: 0; font-size: 1.3rem; }
+.badges { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+
+.pill {
+  font-size: 0.75rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  background: #1f2937;
+  color: #9ca3af;
+  font-family: monospace;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+/* Connection health: green when connected, red when disconnected, amber when
+ * the socket is up but the membership API is unreachable (tick.error set). */
+.pill.conn-ok   { background: #064e3b; color: #6ee7b7; }
+.pill.conn-bad  { background: #7f1d1d; color: #fca5a5; }
+.pill.conn-warn { background: #78350f; color: #fcd34d; }
+
+/* ---- Per-filter stat cards --------------------------------------------- */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+.card {
+  background: #1a1d24;
+  padding: 1rem;
+  border-radius: 8px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+.card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #9ca3af;
+}
+.filter-card .big {
+  font-size: 1.7rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+.filter-card .unit { font-size: 0.75rem; color: #6b7280; margin: 0.15rem 0 0.6rem; }
+
+/* Label/value rows inside a filter card. */
+.kv { margin: 0; }
+.kv div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.18rem 0;
+  border-bottom: 1px solid #2a2f3a;
+  font-size: 0.8rem;
+}
+.kv div:last-child { border-bottom: none; }
+.kv dt { color: #9ca3af; }
+.kv dd {
+  margin: 0;
+  font-family: monospace;
+  font-variant-numeric: tabular-nums;
+  color: #e8e8ea;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* ---- Chart + form grid -------------------------------------------------- */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+.grid.forms { grid-template-columns: repeat(3, 1fr); }
+
+/* Fixed-height box so the responsive canvas always has room to render. */
+.chart-box { position: relative; width: 100%; height: 280px; }
+.chart-box canvas { width: 100% !important; height: 100% !important; }
+
+/* ---- Forms --------------------------------------------------------------- */
+form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+select, input[type="text"] {
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  color: #e8e8ea;
+  font-size: 0.85rem;
+  padding: 0.45rem 0.6rem;
+}
+input[type="text"] { flex: 1 1 8rem; min-width: 0; }
+select:focus, input[type="text"]:focus { outline: 1px solid #60a5fa; }
+button {
+  background: #1d4ed8;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0.45rem 0.9rem;
+  cursor: pointer;
+}
+button:hover { background: #2563eb; }
+button:disabled { background: #374151; cursor: wait; }
+
+.result-row { margin-top: 0.6rem; min-height: 1.2rem; }
+.result { font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+/* Result semantics: a bloom positive is only ever "probably" (amber); a
+ * negative is a guarantee (green); transport errors are red. */
+.result.amber { color: #fcd34d; }
+.result.green { color: #6ee7b7; }
+.result.red   { color: #fca5a5; }
+
+/* ---- Pipeline summary strip ---------------------------------------------- */
+.strip-card { margin-bottom: 1rem; }
+.strip { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; }
+.strip .chip {
+  font-family: monospace;
+  font-size: 0.78rem;
+  background: #0f1115;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 0.3rem 0.55rem;
+  white-space: nowrap;
+}
+.strip .chip .name { color: #93c5fd; }
+.strip .chip .warn { color: #fcd34d; }
+
+/* ---- Misc ----------------------------------------------------------------- */
+.caption { margin: 0.75rem 0 0; }
+.muted { color: #6b7280; font-size: 0.85rem; }
+code {
+  background: #1f2937;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
+@media (max-width: 900px) {
+  .grid, .grid.forms { grid-template-columns: 1fr; }
+}

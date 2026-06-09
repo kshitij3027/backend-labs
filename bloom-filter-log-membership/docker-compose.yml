@@ -30,6 +30,36 @@ services:
     mem_limit: 512m
     restart: unless-stopped
 
+  # C12: the real-time dashboard — the SAME image as `app` (compose builds it
+  # once and reuses it), just a different command, so dashboard page loads and
+  # WebSocket fan-out run in their own process and never compete with the hot
+  # /logs add/query path. It reaches the API over HTTP by service name.
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bloom-filter-dashboard
+    command: ["uvicorn", "src.dashboard:app", "--host", "0.0.0.0", "--port", "8002"]
+    ports:
+      - "${DASHBOARD_PORT:-8002}:8002"
+    environment:
+      - API_BASE_URL=http://app:8001
+      - DASHBOARD_REFRESH_MS=${DASHBOARD_REFRESH_MS:-5000}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8002/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    depends_on:
+      app:
+        condition: service_healthy
+    # Stateless process: settings + one poll task + connection set. 256m is
+    # generous headroom for uvicorn + httpx.
+    mem_limit: 256m
+    restart: unless-stopped
+
   test:
     build:
       context: .

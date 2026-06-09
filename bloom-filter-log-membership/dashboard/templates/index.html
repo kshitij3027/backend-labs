@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bloom Filter Log Membership — Live Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <!-- Vendored Chart.js 4.4.1 UMD (no CDN, no build step) — exposes the global `Chart`. -->
+  <script src="/static/chart.umd.min.js"></script>
+  <!-- Deferred so the DOM is parsed before the dashboard wiring runs. -->
+  <script src="/static/dashboard.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Bloom Filter Log Membership</h1>
+    <div class="badges">
+      <!-- Live cadence label — dashboard.js rewrites it from tick.refresh_ms. -->
+      <span id="refresh-label" class="pill">every 5s</span>
+      <!-- Connection health: green connected / red disconnected / amber API error.
+           When the API is unreachable the tick's error string lands in `title`. -->
+      <span id="conn-pill" class="pill conn-bad">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- Per-filter stat cards. Stable sub-ids (card-<filter>-<field>) are patched
+       by dashboard.js on every tick; values start as em dashes until the first
+       tick paints them. -->
+  <section class="cards">
+    <div class="card filter-card" id="card-error_logs">
+      <h3>error_logs</h3>
+      <div class="big" id="card-error_logs-elements">—</div>
+      <div class="unit">elements added</div>
+      <dl class="kv">
+        <div><dt>adds</dt><dd id="card-error_logs-adds">—</dd></div>
+        <div><dt>queries</dt><dd id="card-error_logs-queries">—</dd></div>
+        <div><dt>avg query</dt><dd id="card-error_logs-avgq">—</dd></div>
+        <div><dt>memory</dt><dd id="card-error_logs-mem">—</dd></div>
+        <div><dt>est / target FP</dt><dd id="card-error_logs-fp">—</dd></div>
+        <div><dt>slices</dt><dd id="card-error_logs-slices">—</dd></div>
+        <div><dt>rotations</dt><dd id="card-error_logs-rot">—</dd></div>
+      </dl>
+    </div>
+
+    <div class="card filter-card" id="card-access_logs">
+      <h3>access_logs</h3>
+      <div class="big" id="card-access_logs-elements">—</div>
+      <div class="unit">elements added</div>
+      <dl class="kv">
+        <div><dt>adds</dt><dd id="card-access_logs-adds">—</dd></div>
+        <div><dt>queries</dt><dd id="card-access_logs-queries">—</dd></div>
+        <div><dt>avg query</dt><dd id="card-access_logs-avgq">—</dd></div>
+        <div><dt>memory</dt><dd id="card-access_logs-mem">—</dd></div>
+        <div><dt>est / target FP</dt><dd id="card-access_logs-fp">—</dd></div>
+        <div><dt>slices</dt><dd id="card-access_logs-slices">—</dd></div>
+        <div><dt>rotations</dt><dd id="card-access_logs-rot">—</dd></div>
+      </dl>
+    </div>
+
+    <div class="card filter-card" id="card-security_logs">
+      <h3>security_logs</h3>
+      <div class="big" id="card-security_logs-elements">—</div>
+      <div class="unit">elements added</div>
+      <dl class="kv">
+        <div><dt>adds</dt><dd id="card-security_logs-adds">—</dd></div>
+        <div><dt>queries</dt><dd id="card-security_logs-queries">—</dd></div>
+        <div><dt>avg query</dt><dd id="card-security_logs-avgq">—</dd></div>
+        <div><dt>memory</dt><dd id="card-security_logs-mem">—</dd></div>
+        <div><dt>est / target FP</dt><dd id="card-security_logs-fp">—</dd></div>
+        <div><dt>slices</dt><dd id="card-security_logs-slices">—</dd></div>
+        <div><dt>rotations</dt><dd id="card-security_logs-rot">—</dd></div>
+      </dl>
+    </div>
+
+    <div class="card filter-card" id="card-sessions">
+      <h3>sessions</h3>
+      <div class="big" id="card-sessions-elements">—</div>
+      <div class="unit">sessions tracked</div>
+      <dl class="kv">
+        <div><dt>adds</dt><dd id="card-sessions-adds">—</dd></div>
+        <div><dt>queries</dt><dd id="card-sessions-queries">—</dd></div>
+        <div><dt>avg query</dt><dd id="card-sessions-avgq">—</dd></div>
+        <div><dt>memory</dt><dd id="card-sessions-mem">—</dd></div>
+        <div><dt>est / target FP</dt><dd id="card-sessions-fp">—</dd></div>
+        <div><dt>slices</dt><dd id="card-sessions-slices">—</dd></div>
+        <div><dt>rotations</dt><dd id="card-sessions-rot">—</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <!-- Live charts fed by the WebSocket ticks. -->
+  <section class="grid">
+    <div class="card">
+      <h3>Estimated FP rate over time</h3>
+      <div class="chart-box"><canvas id="fp-chart"></canvas></div>
+    </div>
+    <div class="card">
+      <h3>Memory per filter</h3>
+      <div class="chart-box"><canvas id="mem-chart"></canvas></div>
+    </div>
+  </section>
+
+  <!-- Interactive forms — POST to this process's /proxy/* routes, which relay
+       to the API (the browser never talks to :8001 directly, so no CORS). -->
+  <section class="grid forms">
+    <div class="card">
+      <h3>Add log entry</h3>
+      <form id="add-form" autocomplete="off">
+        <select id="add-type" aria-label="log type for add">
+          <option value="error_logs">error_logs</option>
+          <option value="access_logs">access_logs</option>
+          <option value="security_logs">security_logs</option>
+        </select>
+        <input id="add-key" type="text" placeholder="log key (e.g. req-42af)" required>
+        <button id="add-btn" type="submit">Add</button>
+      </form>
+      <div class="result-row"><span id="add-result" class="result muted">—</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Query membership</h3>
+      <form id="query-form" autocomplete="off">
+        <select id="query-type" aria-label="log type for query">
+          <option value="error_logs">error_logs</option>
+          <option value="access_logs">access_logs</option>
+          <option value="security_logs">security_logs</option>
+        </select>
+        <input id="query-key" type="text" placeholder="log key to look up" required>
+        <button id="query-btn" type="submit">Query</button>
+      </form>
+      <div class="result-row"><span id="query-result" class="result muted">—</span></div>
+    </div>
+
+    <div class="card">
+      <h3>Session lookup</h3>
+      <form id="session-form" autocomplete="off">
+        <input id="session-id" type="text" placeholder="session id (e.g. sess-9f31)" required>
+        <button id="session-btn" type="submit">Check session</button>
+      </form>
+      <div class="result-row"><span id="session-result" class="result muted">—</span></div>
+    </div>
+  </section>
+
+  <!-- Two-tier pipeline summary — per filter: how much expensive-storage
+       traffic the bloom tier absorbed, and the observed FP rate. -->
+  <section class="card strip-card">
+    <h3>Two-tier pipeline</h3>
+    <div id="pipeline-strip" class="strip">
+      <span class="muted">Waiting for first tick…</span>
+    </div>
+  </section>
+
+  <footer class="caption muted">
+    auto-refresh every <span id="footer-refresh">5</span>s · API :8001 ·
+    dashboard :8002 · live data streams over the <code>/ws</code> WebSocket
+    with exponential-backoff reconnect
+  </footer>
+</body>
+</html>

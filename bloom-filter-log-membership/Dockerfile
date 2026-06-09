@@ -40,6 +40,11 @@ COPY --from=builder /root/.local /home/appuser/.local
 # Runtime image ships only the application package — tests and tooling stay in
 # Dockerfile.test, which COPYs the whole tree instead.
 COPY src/ ./src/
+# Dashboard page + assets (vendored Chart.js). ONE image serves both
+# processes: compose runs this same image twice — `app` with the default CMD
+# below and `dashboard` with `uvicorn src.dashboard:app ... --port 8002` —
+# so the dashboard tree ships here too (a few hundred KB, mostly Chart.js).
+COPY dashboard/ ./dashboard/
 
 # /app/data backs the persisted filter snapshots (*.bloom); compose bind-mounts
 # ./data over it, but the image still works standalone.
