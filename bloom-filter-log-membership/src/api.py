@@ -12,13 +12,21 @@ C8 wires the core membership API around the per-log-type
   avg/p50/p99 latencies) plus cross-filter totals and process uptime.
 * ``GET /health`` — unchanged liveness probe for Docker's HEALTHCHECK.
 
+C9 adds the demo endpoints:
+
+* ``POST /demo/populate`` — bulk-seed N demo entries round-robined across
+  the three log-type filters through the same ``manager.add`` path real
+  traffic uses (so /stats counters and latency metrics move like real load).
+* ``POST /demo/performance-test`` — a self-contained bloom-vs-linear-search
+  micro-benchmark that quantifies the speed and memory trade WITHOUT
+  touching the live filters or their metrics.
+
 The :func:`lifespan` context manager owns the whole state graph: it resolves
 settings, builds the metrics registry + manager, reloads persisted snapshots
 from ``data_dir`` (warm start), runs the periodic snapshot and rotation
 background tasks while the app serves, and saves one final snapshot on the
-way out. Later commits grow this module in place: C9 adds the ``/demo``
-endpoints, C10 the ``/pipeline`` two-tier endpoints, and C11 the
-``/sessions`` endpoints.
+way out. Later commits keep growing this module in place: C10 adds the
+``/pipeline`` two-tier endpoints and C11 the ``/sessions`` endpoints.
 
 Why the hot handlers are ``async def`` with no await
 ----------------------------------------------------
@@ -30,6 +38,14 @@ call the manager's sync methods inline on the event loop; the filter locks
 are never held across an await because there is no await to hold them
 across.
 
+The ``/demo`` handlers are the mirror image: bulk/CPU-bound work (tens of
+thousands of adds, seconds-long linear-scan benchmarks) declared ``sync
+def``, so Starlette dispatches them to the AnyIO threadpool and the event
+loop stays free to serve concurrent hot ``/logs`` traffic. Their bulk loops
+go through ``manager.add`` one key at a time, so a filter lock is only ever
+held for a single µs-scale operation — a long populate can interleave with,
+but never starve, live adds and queries.
+
 The service always runs a SINGLE uvicorn worker: all filter state lives
 in-process, so multiple workers would each hold a divergent copy of every
 filter and answer queries inconsistently.
@@ -38,16 +54,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import threading
 import time
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
+from uuid import uuid4
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from pydantic import BaseModel, Field
 
+from src.bloom import BloomFilter
 from src.manager import FilterManager
 from src.metrics import MetricsRegistry
 from src.settings import Settings, get_settings
@@ -107,6 +127,46 @@ class QueryResponse(BaseModel):
 
     might_exist: bool
     confidence: Literal["probably_exists", "definitely_not_exist"]
+    processing_time_ms: float
+
+
+class PopulateResponse(BaseModel):
+    """Spec shape for ``/demo/populate``: ``{"status": "completed", "records_added": N}``.
+
+    Exactly these two keys and nothing else — the spec's sample output shows
+    only ``status`` and ``records_added``, and restraint here IS fidelity.
+    Timing detail for demo seeding belongs in ``/stats`` (the adds run
+    through the metered ``manager.add`` path), not in extra response fields.
+    """
+
+    status: Literal["completed"]
+    records_added: int
+
+
+class PerformanceTestResponse(BaseModel):
+    """Result of one ``/demo/performance-test`` bloom-vs-linear benchmark run.
+
+    All times come from ``time.perf_counter`` around identical probe loops.
+    ``speedup_vs_linear`` is the headline number (avg linear lookup / avg
+    bloom lookup); ``memory_ratio`` is bloom bitset bytes over the summed
+    UTF-8 byte length of the dataset keys — a conservative ratio, see the
+    handler. ``false_positives_observed`` counts absent-key probes the bloom
+    filter answered True (the bounded error the memory win is paid for
+    with); ``processing_time_ms`` is whole-handler wall time including
+    dataset construction.
+    """
+
+    dataset_size: int
+    lookups: int
+    bloom_total_ms: float
+    bloom_avg_ms: float
+    linear_total_ms: float
+    linear_avg_ms: float
+    speedup_vs_linear: float
+    bloom_memory_bytes: int
+    keys_memory_bytes_estimate: int
+    memory_ratio: float
+    false_positives_observed: int
     processing_time_ms: float
 
 
@@ -364,6 +424,191 @@ async def get_stats(request: Request) -> dict:
             "memory_mb": round(total_memory / _MB, 3),
         },
     }
+
+
+# --------------------------------------------------------------------- #
+# demo endpoints (C9)                                                   #
+# --------------------------------------------------------------------- #
+
+#: Round-robin targets for ``/demo/populate`` — the three spec log types in
+#: ``LogType`` declaration order. Deliberately derived from the ``Literal``
+#: (not ``manager.names``): C11 registers a fourth ``sessions`` filter with
+#: the manager, and demo seeding must keep targeting only the log-type
+#: filters the public ``/logs`` API exposes.
+_DEMO_LOG_TYPES: tuple[str, ...] = get_args(LogType)
+
+#: Every benchmark key is padded to this many bytes. The benchmark's memory
+#: comparison is "bloom bitset vs storing the full keys", so the keys must
+#: be shaped like REAL log keys — request ids, session tokens, sha256-hashed
+#: log lines — which run ~64 bytes, not like a 15-byte loop counter (the
+#: sizing discussion in ``src/bloom.py`` uses the same 64-byte reference
+#: key). At p=0.01 the filter pays ~1.2 bytes per key against 64 bytes of
+#: key text → ratio ≈ 0.019, comfortably inside the spec's <5% criterion.
+_PERF_KEY_LENGTH = 64
+
+#: FP target for the throwaway benchmark filter — matches the spec's
+#: ``error_logs`` configuration (the "default" filter config).
+_PERF_FP_RATE = 0.01
+
+#: Fixed seed for the probe-position RNG: probe positions are deterministic
+#: across calls (reproducible benchmark), while key CONTENT still varies via
+#: the per-call nonce. Same constant as the filters' hash seed, reused
+#: purely for recognizability.
+_PERF_PROBE_SEED = 0x5EEDB10C
+
+
+def _perf_key(namespace: str, nonce: str, i: int) -> str:
+    """Build one realistic-length benchmark key: ``<namespace>-<nonce>-<i>`` padded.
+
+    The namespace keeps dataset keys (``perf``) and guaranteed-absent probe
+    keys (``absent``) in disjoint families; the zero-padded index plus
+    right-padding to ``_PERF_KEY_LENGTH`` makes every key the same realistic
+    size — constant per-comparison cost for the linear scan and an honest
+    byte count for the memory comparison.
+    """
+    return f"{namespace}-{nonce}-{i:010d}".ljust(_PERF_KEY_LENGTH, "x")
+
+
+def _time_membership(
+    contains: Callable[[str], bool], probes: list[str]
+) -> tuple[list[bool], float]:
+    """Run ``contains`` over ``probes``; return ``(answers, total_ms)``.
+
+    One shared harness so both data structures pay the *identical* loop and
+    result-append overhead — the measured difference is then the structures',
+    not the harness's. Answers are collected (not discarded) because the
+    bloom run needs them to count observed false positives.
+    """
+    answers: list[bool] = []
+    append = answers.append
+    start = time.perf_counter()
+    for probe in probes:
+        append(contains(probe))
+    total_ms = (time.perf_counter() - start) * 1000.0
+    return answers, total_ms
+
+
+@app.post("/demo/populate", response_model=PopulateResponse)
+def demo_populate(
+    request: Request,
+    count: int = Query(default=10_000, ge=1, le=1_000_000),
+) -> PopulateResponse:
+    """Bulk-insert ``count`` demo entries round-robined across the log types.
+
+    ``sync def`` on purpose: this is bulk work (default 10k adds, up to 1M),
+    so FastAPI runs it on the AnyIO threadpool and the event loop stays free
+    for concurrent hot ``/logs`` traffic; each iteration takes a filter lock
+    for one µs-scale add only (module docstring). Worst case at the 1M cap
+    is a few seconds of threadpool time — fine for a demo endpoint, and the
+    ``le`` bound exists precisely to cap it.
+
+    Keys are ``demo-<nonce>-<i>`` with a fresh uuid4-derived 8-hex-char
+    nonce per call, so REPEATED populates add new records instead of
+    re-adding the previous batch (``elements_added`` keeps growing, which is
+    what a demo wants to show). Inserts go through :meth:`FilterManager.add`
+    exactly like ``/logs/add`` traffic, so per-filter counters and latency
+    metrics in ``/stats`` move like real load — that is the point of a seed.
+
+    Distribution: key ``i`` goes to ``_DEMO_LOG_TYPES[i % 3]``, so a count
+    divisible by 3 lands exactly count/3 in each filter.
+    """
+    manager: FilterManager = request.app.state.manager
+    nonce = uuid4().hex[:8]
+    n_types = len(_DEMO_LOG_TYPES)
+    for i in range(count):
+        manager.add(_DEMO_LOG_TYPES[i % n_types], f"demo-{nonce}-{i}")
+    return PopulateResponse(status="completed", records_added=count)
+
+
+@app.post("/demo/performance-test", response_model=PerformanceTestResponse)
+def demo_performance_test(
+    lookups: int = Query(default=2_000, ge=1, le=50_000),
+    dataset_size: int = Query(default=20_000, ge=100, le=200_000),
+) -> PerformanceTestResponse:
+    """Micro-benchmark: bloom filter vs traditional (linear list) lookup.
+
+    Entirely self-contained — builds a throwaway key list and a throwaway
+    :class:`BloomFilter` and never touches the live filters or their
+    metrics, because a benchmark must not pollute the ``/stats`` numbers
+    operators (and the dashboard) are watching. "Traditional lookup" is a
+    plain Python list with linear search, per the spec's success criteria
+    ("100x+ speed improvement over linear search").
+
+    Method:
+
+    * ``dataset_size`` keys, padded to 64 bytes each (``_PERF_KEY_LENGTH``
+      rationale above), inserted into a fresh filter sized for exactly
+      ``dataset_size`` at p=0.01.
+    * ``lookups`` membership probes, 50/50 present/absent. Present probes
+      are drawn uniformly (seeded RNG → deterministic positions) from the
+      dataset; absent probes come from the disjoint ``absent-*`` family.
+    * BOTH structures consume the *same* probe list through the same timing
+      harness (:func:`_time_membership`); bloom runs first, so any cache
+      warming of the probe strings benefits the linear baseline — the
+      reported speedup is, if anything, understated.
+    * ``keys_memory_bytes_estimate`` is the summed UTF-8 length of the raw
+      keys only. Deliberately conservative: it ignores CPython str object
+      overhead (~49 bytes each) and set/dict bucket overhead, so the real
+      ratio against an in-memory key set is even better than reported.
+
+    Runtime: ``sync def`` → threadpool. The defaults cost ~2000 × 20000 ≈
+    40M worst-case string compares for the linear baseline — a couple of
+    seconds of CPython; that slowness is the exhibit, not a bug. Maxed-out
+    params (50k × 200k) run for minutes — an operator's deliberate choice
+    on a demo endpoint, bounded by the ``le`` caps.
+    """
+    handler_start = time.perf_counter()
+    nonce = uuid4().hex[:8]
+
+    dataset = [_perf_key("perf", nonce, i) for i in range(dataset_size)]
+
+    bloom = BloomFilter(expected_items=dataset_size, fp_rate=_PERF_FP_RATE)
+    for key in dataset:
+        bloom.add(key)
+
+    rng = random.Random(_PERF_PROBE_SEED)
+    probes: list[str] = []
+    present: list[bool] = []
+    for i in range(lookups):
+        if i % 2 == 0:
+            probes.append(dataset[rng.randrange(dataset_size)])
+            present.append(True)
+        else:
+            probes.append(_perf_key("absent", nonce, i // 2))
+            present.append(False)
+
+    bloom_answers, bloom_total_ms = _time_membership(bloom.might_contain, probes)
+    _, linear_total_ms = _time_membership(dataset.__contains__, probes)
+
+    false_positives = sum(
+        1
+        for answer, is_present in zip(bloom_answers, present)
+        if answer and not is_present
+    )
+
+    bloom_avg_ms = bloom_total_ms / lookups
+    linear_avg_ms = linear_total_ms / lookups
+    # max() guards the (theoretical) zero-duration bloom run on a coarse timer.
+    speedup = linear_avg_ms / max(bloom_avg_ms, 1e-9)
+
+    keys_memory_bytes = sum(len(key.encode("utf-8")) for key in dataset)
+    memory_ratio = bloom.memory_bytes / keys_memory_bytes
+
+    processing_time_ms = (time.perf_counter() - handler_start) * 1000.0
+    return PerformanceTestResponse(
+        dataset_size=dataset_size,
+        lookups=lookups,
+        bloom_total_ms=round(bloom_total_ms, 3),
+        bloom_avg_ms=round(bloom_avg_ms, 6),
+        linear_total_ms=round(linear_total_ms, 3),
+        linear_avg_ms=round(linear_avg_ms, 6),
+        speedup_vs_linear=round(speedup, 2),
+        bloom_memory_bytes=bloom.memory_bytes,
+        keys_memory_bytes_estimate=keys_memory_bytes,
+        memory_ratio=round(memory_ratio, 6),
+        false_positives_observed=false_positives,
+        processing_time_ms=round(processing_time_ms, 3),
+    )
 
 
 if __name__ == "__main__":
