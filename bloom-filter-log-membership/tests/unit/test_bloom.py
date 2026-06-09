@@ -190,6 +190,51 @@ class TestDeterminism:
             assert all(0 <= index < bf.m for index in indexes)
 
 
+class TestBitsSetCache:
+    """bits_set is an O(1) cached popcount — it must never drift from truth.
+
+    The property used to run a full ``bitarray.count()`` per read (O(m),
+    ~ms-scale at the 31 Mbit access_logs size) and ``estimated_fp_rate``
+    reads it on every pipeline lookup. It is now a counter that ``add``
+    maintains incrementally; every test here pins the cache against the
+    ground-truth popcount of the backing bitarray.
+    """
+
+    def test_cache_agrees_with_ground_truth_after_distinct_adds(self) -> None:
+        """After N distinct adds, the cache equals a real bitarray.count()."""
+        bf = BloomFilter(expected_items=10_000, fp_rate=0.01)
+        for i in range(1_000):
+            bf.add(f"cache-{i}")
+        assert bf.bits_set == bf.bits.count()
+        assert bf.bits_set > 0
+
+    def test_duplicate_adds_do_not_change_bits_set(self) -> None:
+        """Re-adds flip no bits, so the cache must not move (and stays true)."""
+        bf = BloomFilter(expected_items=1_000, fp_rate=0.01)
+        for i in range(100):
+            bf.add(f"dup-{i}")
+        before = bf.bits_set
+        for i in range(100):
+            bf.add(f"dup-{i}")
+        assert bf.bits_set == before
+        assert bf.bits_set == bf.bits.count()
+
+    def test_same_seed_same_keys_produce_equal_bits_set(self) -> None:
+        """Two filters with identical seed and inserts report the same cache."""
+        a = BloomFilter(expected_items=10_000, fp_rate=0.01, seed=1234)
+        b = BloomFilter(expected_items=10_000, fp_rate=0.01, seed=1234)
+        for i in range(500):
+            a.add(f"k-{i}")
+            b.add(f"k-{i}")
+        assert a.bits_set == b.bits_set
+        assert a.bits_set == a.bits.count()
+
+    def test_empty_filter_bits_set_is_zero(self) -> None:
+        bf = BloomFilter(expected_items=1_000, fp_rate=0.01)
+        assert bf.bits_set == 0
+        assert bf.bits_set == bf.bits.count()
+
+
 class TestFPEstimates:
     """Live and theoretical estimates track the design target at capacity."""
 

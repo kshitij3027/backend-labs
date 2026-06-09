@@ -281,6 +281,10 @@ def _restore_filter(
     bf._k = k
     bf._bits = bits
     bf._count = count
+    # Rebuild the O(1) popcount cache that __init__/add() normally maintain.
+    # One full count() is fine here — restore is a startup-only path — and
+    # from then on add() keeps the cache exact incrementally.
+    bf._bits_set = bits.count()
     return bf
 
 

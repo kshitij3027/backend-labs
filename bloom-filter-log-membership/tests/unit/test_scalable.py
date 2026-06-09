@@ -308,6 +308,29 @@ class TestCompoundFalsePositives:
         )
 
 
+class TestBitsSetCacheAcrossGrowth:
+    """The O(1) bits_set cache must hold for every slice the series appends.
+
+    compound_estimated_fp reads each slice's cached popcount per call, so a
+    slice whose cache drifted from the real bitarray.count() would skew the
+    pipeline's fallback gauge silently.
+    """
+
+    def test_every_slice_cache_matches_real_popcount_after_overfill(self) -> None:
+        sbf = ScalableBloomFilter(initial_capacity=100, target_fp_rate=0.01)
+        for i in range(400):
+            sbf.add(f"cache-{i}")
+        assert sbf.slice_count >= 3  # growth definitely happened
+
+        for s in sbf.slices:
+            assert s.bits_set == s.bits.count()
+        # Reads are pure: repeated compound estimates return the identical
+        # value (no hidden state moves on the query path).
+        first = sbf.compound_estimated_fp
+        assert sbf.compound_estimated_fp == first
+        assert sbf.compound_estimated_fp == first
+
+
 class TestStats:
     """stats() is the JSON-friendly contract /stats (C8) builds on."""
 

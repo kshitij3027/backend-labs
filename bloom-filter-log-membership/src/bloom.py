@@ -141,6 +141,11 @@ class BloomFilter:
         self._bits.setall(0)
         # Distinct-ish insert count (see add()); drives theoretical_fp_rate.
         self._count = 0
+        # Cached popcount of _bits, maintained incrementally by add() — kept
+        # so estimated_fp_rate stays O(1) on hot lookup paths. bitarray's
+        # count() is C-fast but O(m): at access_logs scale (~31 Mbit) that
+        # is ~ms-scale, unacceptable per-query.
+        self._bits_set = 0
 
     # ------------------------------------------------------------------ #
     # hashing                                                            #
@@ -174,13 +179,15 @@ class BloomFilter:
         to avoid duplicate-driven slice growth).
         """
         bits = self._bits
-        new = False
+        flipped = 0  # bits this call turned 0→1
         for index in self._indexes(item):
             if not bits[index]:
                 bits[index] = 1
-                new = True
+                flipped += 1
+        new = flipped > 0
         if new:
             self._count += 1
+            self._bits_set += flipped  # maintain the O(1) popcount cache
         return new
 
     def might_contain(self, item: str) -> bool:
@@ -221,8 +228,15 @@ class BloomFilter:
 
     @property
     def bits_set(self) -> int:
-        """Number of 1-bits currently in the array (popcount)."""
-        return self._bits.count()
+        """Number of 1-bits currently in the array (cached popcount).
+
+        Served from a counter that ``add`` maintains incrementally — bits
+        only ever flip 0→1, so summing each call's flips is exact. Cached to
+        keep ``estimated_fp_rate`` O(1) on hot lookup paths: a real
+        ``bitarray.count()`` is C-fast but O(m), and at 31 Mbit
+        (access_logs) it is ~ms-scale — unacceptable per-query.
+        """
+        return self._bits_set
 
     @property
     def fill_ratio(self) -> float:

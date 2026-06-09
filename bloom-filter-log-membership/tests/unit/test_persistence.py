@@ -64,6 +64,12 @@ def assert_same_filter(
     # The bitset itself is bit-identical.
     assert restored.bits == original.bits
     assert restored.bits.tobytes() == original.bits.tobytes()
+    # The O(1) popcount cache is rebuilt at load time: it must equal the
+    # ground-truth popcount AND the original's cache, so the live FP
+    # estimate derived from it survives the roundtrip exactly.
+    assert restored.bits_set == restored.bits.count()
+    assert restored.bits_set == original.bits_set
+    assert restored.estimated_fp_rate == original.estimated_fp_rate
     # Zero false negatives survive persistence: every inserted key answers True.
     for key in inserted:
         assert restored.might_contain(key) is True
