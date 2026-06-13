@@ -1,0 +1,17 @@
+# Web API + dashboard
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+jinja2==3.1.5
+pydantic==2.10.4
+pydantic-settings==2.7.0
+
+# HTTP client (testing / health checks / E2E)
+httpx==0.28.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+pytest-cov==6.0.0
+
+# Linting
+ruff==0.8.6
