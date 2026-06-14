@@ -1,0 +1,30 @@
+# Delta Encoding Log Engine — service topology.
+#
+# C9 defines the runnable `app`: a single FastAPI process on :8080 holding the
+# segment store + metrics in memory (no volume, no database). Later commits add
+# the `test` / `e2e` / `loadtest` profile services that drive the live stack by
+# service name (`make test` / `make e2e` / `make load`).
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: delta-encoding-app
+    ports:
+      - "${API_PORT:-8080}:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - KEYFRAME_INTERVAL=${KEYFRAME_INTERVAL:-100}
+      - DELTA_BASELINE=${DELTA_BASELINE:-previous}
+      - GZIP_DELTAS=${GZIP_DELTAS:-false}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    # In-memory state on a single uvicorn worker — 512m is ample headroom for
+    # uvicorn plus one batch + its delta encoding.
+    mem_limit: 512m
+    restart: unless-stopped
