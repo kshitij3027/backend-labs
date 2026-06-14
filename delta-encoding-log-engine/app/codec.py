@@ -56,6 +56,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.encoders import EncoderConfig, compress_delta, expand_delta
 from app.models import LogEntry
 
 # Delta wire keys. Kept as module constants so the segment/keyframe layer (and tests)
@@ -264,6 +265,7 @@ def encode(
     *,
     keyframe_interval: int = 100,
     baseline: str = "previous",
+    encoder_config: EncoderConfig | None = None,
 ) -> EncodedLog:
     """Delta-encode ``entries`` into keyframe + delta segments.
 
@@ -273,6 +275,16 @@ def encode(
     list is never mutated, and each stored keyframe is a deep copy of its source
     entry so later caller mutations of decoded entries cannot corrupt the encoded
     form. ``encode([], …)`` yields an empty :class:`EncodedLog` with no segments.
+
+    ``encoder_config`` is the OPTIONAL typed-encoder layer (see
+    :mod:`app.encoders`). When it is ``None`` (the default) or disabled, each
+    delta is stored exactly as :func:`diff_entries` produced it — output is
+    byte-identical to the pre-encoder codec. When it is enabled, each delta is
+    passed through :func:`~app.encoders.compress_delta` (against the same baseline
+    operand the diff used) to produce a typed candidate, which is adopted **only
+    if its canonical form is strictly smaller** than the plain delta. This
+    per-delta size guard makes typed encoding incapable of ever increasing stored
+    bytes, and leaves the result self-describing so :func:`decode` needs no config.
 
     Raises ``ValueError`` if ``keyframe_interval < 1`` or ``baseline`` is not one
     of ``"previous"`` / ``"keyframe"``.
@@ -289,6 +301,26 @@ def encode(
     if count == 0:
         return encoded
 
+    # Whether the optional typed-encoder layer is active for this encode. When
+    # off, the closure below short-circuits to the plain delta (no extra work and
+    # — critically — byte-identical output to the pre-encoder codec).
+    encoders_on = encoder_config is not None and encoder_config.enabled
+
+    def _maybe_typed(plain_delta: dict, base: LogEntry) -> dict:
+        """Return the typed candidate iff strictly smaller, else the plain delta.
+
+        ``compress_delta`` always yields a typed candidate; this size guard (on
+        canonical bytes, the same accounting the metrics layer uses) is what
+        guarantees the adopted delta is never larger than the plain one. ``base``
+        is the exact operand the diff was computed against.
+        """
+        if not encoders_on:
+            return plain_delta
+        cand = compress_delta(plain_delta, base, encoder_config)
+        if len(canonical_bytes(cand)) < len(canonical_bytes(plain_delta)):
+            return cand
+        return plain_delta
+
     k = keyframe_interval
     # Iterate segment by segment over the global index space. ``start`` is always a
     # multiple of K and marks the keyframe; the segment ends at min(start+K, count).
@@ -298,12 +330,14 @@ def encode(
         deltas: list[dict] = []
         # Diff every following entry in this segment against its baseline. In
         # ``previous`` mode the baseline walks forward (keyframe → entry[start+1]
-        # → …); in ``keyframe`` mode it is pinned to the segment keyframe.
+        # → …); in ``keyframe`` mode it is pinned to the segment keyframe. The
+        # same baseline operand is reused for the typed encoder's size guard.
         for i in range(start + 1, end):
             if baseline == "previous":
-                deltas.append(diff_entries(entries[i - 1], entries[i]))
+                base = entries[i - 1]
             else:  # baseline == "keyframe"
-                deltas.append(diff_entries(keyframe_entry, entries[i]))
+                base = keyframe_entry
+            deltas.append(_maybe_typed(diff_entries(base, entries[i]), base))
         encoded.segments.append(
             Segment(
                 start_index=start,
@@ -336,11 +370,17 @@ def decode(encoded: EncodedLog) -> list[LogEntry]:
         if baseline == "previous":
             current = seg.keyframe
             for delta in seg.deltas:
-                current = apply_delta(current, delta)  # builds a new dict each hop
+                # ``expand_delta`` is a no-op when the delta has no ``"@"`` part
+                # (plain commit-4/5 deltas), so this is byte-identical with the
+                # encoder layer off; when on, it reverses the typed instructions
+                # against ``current`` (the same baseline encode diffed against).
+                plain = expand_delta(delta, current)
+                current = apply_delta(current, plain)  # builds a new dict each hop
                 result.append(current)
         else:  # baseline == "keyframe"
             for delta in seg.deltas:
-                result.append(apply_delta(seg.keyframe, delta))
+                plain = expand_delta(delta, seg.keyframe)
+                result.append(apply_delta(seg.keyframe, plain))
     return result
 
 
@@ -370,13 +410,17 @@ def reconstruct_index(encoded: EncodedLog, index: int) -> LogEntry:
 
     if encoded.baseline == "previous":
         # Replay the chain from the keyframe up to (and including) deltas[offset-1].
+        # ``expand_delta`` is a no-op for plain deltas (encoder off ⇒ identical),
+        # and reverses typed instructions against the running ``current`` baseline.
         current = seg.keyframe
         for j in range(offset):
-            current = apply_delta(current, seg.deltas[j])
+            plain = expand_delta(seg.deltas[j], current)
+            current = apply_delta(current, plain)
         return current
 
     # baseline == "keyframe": single hop from the keyframe.
-    return apply_delta(seg.keyframe, seg.deltas[offset - 1])
+    plain = expand_delta(seg.deltas[offset - 1], seg.keyframe)
+    return apply_delta(seg.keyframe, plain)
 
 
 def keyframe_indices(encoded: EncodedLog) -> list[int]:
