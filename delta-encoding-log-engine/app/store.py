@@ -261,15 +261,28 @@ class SegmentStore:
         with self._lock:
             return copy.deepcopy(self._raw)
 
-    def compress(self, entries: list[LogEntry] | None = None) -> CompressionStats:
+    def compress(
+        self,
+        entries: list[LogEntry] | None = None,
+        *,
+        keyframe_interval: int | None = None,
+        baseline: str | None = None,
+    ) -> CompressionStats:
         """Delta-encode a batch, store the result, and return its byte accounting.
 
         When ``entries`` is ``None`` the stored raw batch is used (raising
         ``ValueError`` if none has been set); otherwise a deep copy of ``entries``
         becomes the new raw batch first. The batch is encoded with the store's
-        ``keyframe_interval`` / ``baseline`` / ``encoder_config``; the resulting
-        :class:`~app.codec.EncodedLog` and its :class:`CompressionStats` are saved
-        and the stats returned.
+        ``encoder_config`` and its configured ``keyframe_interval`` / ``baseline``;
+        the resulting :class:`~app.codec.EncodedLog` and its :class:`CompressionStats`
+        are saved and the stats returned.
+
+        ``keyframe_interval`` / ``baseline`` are **per-call overrides**: when given
+        (not ``None``) they are used for *this* encode only and do **not** change the
+        store's configured defaults, so a subsequent ``compress`` with no overrides
+        encodes with the original config again. When omitted, the store's configured
+        values are used (the original behaviour), so existing ``compress(entries)`` /
+        ``compress()`` calls are unaffected.
         """
         with self._lock:
             if entries is None:
@@ -284,10 +297,16 @@ class SegmentStore:
                 source = copy.deepcopy(entries)
                 self._raw = source
 
+            # Resolve per-call overrides against the store's configured defaults. The
+            # store's own _keyframe_interval / _baseline are never mutated here, so an
+            # override is scoped strictly to this encode.
+            kf = keyframe_interval if keyframe_interval is not None else self._keyframe_interval
+            base = baseline if baseline is not None else self._baseline
+
             encoded = encode(
                 source,
-                keyframe_interval=self._keyframe_interval,
-                baseline=self._baseline,
+                keyframe_interval=kf,
+                baseline=base,
                 encoder_config=self._encoder_config,
             )
             stats = _compute_stats(source, encoded)

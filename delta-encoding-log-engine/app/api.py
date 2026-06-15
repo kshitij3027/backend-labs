@@ -95,11 +95,15 @@ def compress(req: CompressRequest, request: Request) -> dict:
 
     The batch is the stored raw batch when ``use_generated`` is ``True`` (400 if none has
     been generated yet), otherwise ``req.logs`` (400 if absent). ``keyframe_interval`` /
-    ``baseline`` overrides, when provided, are applied to the store for this call only and
-    then restored. Unexpected failures bump the error counter and surface as a 500.
+    ``baseline`` overrides, when provided, are passed straight to
+    :meth:`~app.store.SegmentStore.compress` as per-call overrides (scoped to this encode;
+    the store's configured defaults are untouched). On success the reconstruction cache is
+    cleared, since the compressed log just changed and any cached entries are now stale.
+    Unexpected failures bump the error counter and surface as a 500.
     """
     store = request.app.state.store
     metrics = request.app.state.metrics
+    recon_cache = request.app.state.recon_cache
 
     # Resolve the batch to compress.
     if req.use_generated:
@@ -117,21 +121,18 @@ def compress(req: CompressRequest, request: Request) -> dict:
             )
         batch = req.logs
 
-    # Per-call overrides: temporarily swap the store's encode config, restoring it
-    # in a finally so a later compression sees the configured defaults again.
-    override_kf = req.keyframe_interval is not None
-    override_base = req.baseline is not None
-    saved_kf = store._keyframe_interval
-    saved_base = store._baseline
-
     try:
-        if override_kf:
-            store._keyframe_interval = req.keyframe_interval
-        if override_base:
-            store._baseline = req.baseline
-
+        # Per-call overrides go straight to the store, which scopes them to this encode
+        # without mutating its configured defaults (None ⇒ use the store's config).
         with metrics.time_block("compress", entries=len(batch)):
-            stats = store.compress(batch)
+            stats = store.compress(
+                batch,
+                keyframe_interval=req.keyframe_interval,
+                baseline=req.baseline,
+            )
+        # The compressed log changed: drop any cached reconstructions so a subsequent
+        # /api/logs/{index} reflects the NEW log rather than a stale entry.
+        recon_cache.clear()
         return stats.to_dict()
     except HTTPException:
         # Client error already classified — re-raise without touching the counter.
@@ -139,11 +140,6 @@ def compress(req: CompressRequest, request: Request) -> dict:
     except Exception as exc:  # noqa: BLE001 — unexpected: count it and 500.
         metrics.incr_error()
         raise HTTPException(status_code=500, detail=f"compression failed: {exc}") from exc
-    finally:
-        if override_kf:
-            store._keyframe_interval = saved_kf
-        if override_base:
-            store._baseline = saved_base
 
 
 # --------------------------------------------------------------------------- #
@@ -218,14 +214,23 @@ def logs_index(index: int, request: Request) -> dict:
     """Random-access reconstruct entry ``index`` from its nearest keyframe.
 
     Timed **per entry** (``entries=1``) because this single-entry path is exactly what
-    the ``<100ms`` reconstruction-latency p99 gate measures. 404 on out-of-range.
+    the ``<100ms`` reconstruction-latency p99 gate measures — the timer wraps the whole
+    cache lookup, so a cache HIT records its (tiny) latency too. The reconstruct is
+    served through the bounded :class:`~app.reconstruct.ReconstructionCache`: a hot index
+    pays the delta-replay cost once, then comes back from memory (deep-copied, so the
+    answer is identical to a fresh reconstruct). An out-of-range ``index`` makes the
+    ``compute`` lambda raise ``IndexError``, which propagates out of ``get_or_compute``
+    with nothing cached for the bad key, and is mapped to a 404 here. 404 on out-of-range.
     """
     store = request.app.state.store
     metrics = request.app.state.metrics
+    recon_cache = request.app.state.recon_cache
 
     try:
         with metrics.time_block("reconstruct", entries=1):
-            entry = store.reconstruct_index(index)
+            entry = recon_cache.get_or_compute(
+                index, lambda: store.reconstruct_index(index)
+            )
         nearest = store.nearest_keyframe_index(index)
     except IndexError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -238,17 +243,27 @@ def logs_index(index: int, request: Request) -> dict:
 # --------------------------------------------------------------------------- #
 @router.get("/api/stats")
 async def stats(request: Request) -> dict:
-    """Return the three-section view: storage byte accounting, performance, system health."""
+    """Return the three-section view: storage byte accounting, performance, system health.
+
+    The reconstruction cache's occupancy + hit-rate ride along inside ``performance``
+    under a ``"cache"`` key, since cache effectiveness is a performance property
+    (it is what keeps the reconstruction-latency p99 under the gate).
+    """
     store = request.app.state.store
     metrics = request.app.state.metrics
+    recon_cache = request.app.state.recon_cache
 
     storage = store.stats()
     # Requirements naming alias: surface the delta reduction as storage_savings_percent.
     storage["storage_savings_percent"] = storage.get("delta_reduction", 0.0)
 
+    # Fold cache stats into the performance section (tidier than a 4th top-level slot).
+    snap = metrics.snapshot()
+    snap["cache"] = recon_cache.stats()
+
     return {
         "storage": storage,
-        "performance": metrics.snapshot(),
+        "performance": snap,
         "system": {
             "status": "healthy",
             "errors": metrics.errors,
@@ -259,7 +274,15 @@ async def stats(request: Request) -> dict:
 
 @router.post("/api/reset")
 async def reset(request: Request) -> dict:
-    """Clear the store (raw + encoding + stats) and the metrics registry back to empty."""
+    """Clear the store, the metrics registry, and the reconstruction cache back to empty.
+
+    Resets all three live layers together so the engine reads as freshly started: the
+    store (raw + encoding + stats), the metrics registry, and the reconstruction cache —
+    both its cached entries (now stale) and its lifetime hit/miss counters.
+    """
     request.app.state.store.reset()
     request.app.state.metrics.reset()
+    recon_cache = request.app.state.recon_cache
+    recon_cache.clear()
+    recon_cache.reset_stats()
     return {"status": "reset"}

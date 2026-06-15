@@ -28,6 +28,7 @@ from fastapi import FastAPI
 from app.api import router as api_router
 from app.encoders import EncoderConfig
 from app.metrics import MetricsRegistry
+from app.reconstruct import ReconstructionCache
 from app.settings import get_settings
 from app.store import SegmentStore
 
@@ -36,11 +37,11 @@ from app.store import SegmentStore
 async def lifespan(app: FastAPI):
     """Build the full ``app.state`` graph before serving; nothing to tear down.
 
-    Resolves the cached settings, then constructs the metrics registry and the segment
-    store (typed encoding active via ``EncoderConfig.all_on()``) and publishes all three
-    on ``app.state`` so the api handlers can read them. The store's keyframe interval,
-    baseline, and gzip-deltas flag come straight from configuration, keeping the engine's
-    behaviour env-driven.
+    Resolves the cached settings, then constructs the metrics registry, the segment
+    store (typed encoding active via ``EncoderConfig.all_on()``), and the bounded
+    reconstruction cache, and publishes all four on ``app.state`` so the api handlers can
+    read them. The store's keyframe interval, baseline, gzip-deltas flag, and the cache
+    size come straight from configuration, keeping the engine's behaviour env-driven.
     """
     settings = get_settings()
     app.state.settings = settings
@@ -51,6 +52,8 @@ async def lifespan(app: FastAPI):
         encoder_config=EncoderConfig.all_on(),  # typed encoding active
         gzip_deltas=settings.gzip_deltas,
     )
+    # Bounded LRU in front of single-entry reconstruction (size 0 disables it).
+    app.state.recon_cache = ReconstructionCache(settings.reconstruct_cache_size)
     yield
 
 
