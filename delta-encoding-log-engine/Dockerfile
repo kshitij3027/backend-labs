@@ -36,9 +36,10 @@ RUN useradd --uid 1000 --shell /bin/bash --create-home appuser
 WORKDIR /app
 
 COPY --from=builder /root/.local /home/appuser/.local
-# Runtime image ships only the application package. The dashboard tree does not
-# exist yet (added in a later commit), so it is intentionally NOT copied here.
+# Runtime image ships the application package plus the live dashboard tree
+# (templates + static assets) so the container serves GET / and /static/*.
 COPY app/ ./app/
+COPY dashboard/ ./dashboard/
 
 RUN chown -R appuser:appuser /app /home/appuser/.local
 

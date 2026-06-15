@@ -44,6 +44,41 @@ router = APIRouter()
 
 
 # --------------------------------------------------------------------------- #
+# Shared stats composer — the single source of the /api/stats document.
+# --------------------------------------------------------------------------- #
+def compose_stats(store, metrics, recon_cache) -> dict:
+    """Compose the three-section stats view (storage / performance / system).
+
+    Factored out of the ``GET /api/stats`` handler so the dashboard's WebSocket tick
+    can build the **identical** document in-process — without an HTTP self-call back
+    into the app. The handler and the tick therefore stay byte-for-byte in sync.
+
+    The ``storage`` block is the store's byte accounting plus a requirements-naming
+    alias (``storage_savings_percent`` mirrors ``delta_reduction``). The reconstruction
+    cache's occupancy + hit-rate ride inside ``performance`` under ``"cache"`` (cache
+    effectiveness is a performance property — it is what keeps the reconstruction-latency
+    p99 under the gate). ``system`` carries the health / error-gate / uptime triple.
+    """
+    storage = store.stats()
+    # Requirements naming alias: surface the delta reduction as storage_savings_percent.
+    storage["storage_savings_percent"] = storage.get("delta_reduction", 0.0)
+
+    # Fold cache stats into the performance section (tidier than a 4th top-level slot).
+    performance = metrics.snapshot()
+    performance["cache"] = recon_cache.stats()
+
+    return {
+        "storage": storage,
+        "performance": performance,
+        "system": {
+            "status": "healthy",
+            "errors": metrics.errors,
+            "uptime_seconds": metrics.uptime_seconds(),
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Liveness.
 # --------------------------------------------------------------------------- #
 @router.get("/health")
@@ -245,31 +280,17 @@ def logs_index(index: int, request: Request) -> dict:
 async def stats(request: Request) -> dict:
     """Return the three-section view: storage byte accounting, performance, system health.
 
-    The reconstruction cache's occupancy + hit-rate ride along inside ``performance``
-    under a ``"cache"`` key, since cache effectiveness is a performance property
-    (it is what keeps the reconstruction-latency p99 under the gate).
+    Delegates to :func:`compose_stats` so this HTTP handler and the dashboard's
+    in-process WebSocket tick produce the exact same document. The reconstruction
+    cache's occupancy + hit-rate ride along inside ``performance`` under a ``"cache"``
+    key, since cache effectiveness is a performance property (it is what keeps the
+    reconstruction-latency p99 under the gate).
     """
-    store = request.app.state.store
-    metrics = request.app.state.metrics
-    recon_cache = request.app.state.recon_cache
-
-    storage = store.stats()
-    # Requirements naming alias: surface the delta reduction as storage_savings_percent.
-    storage["storage_savings_percent"] = storage.get("delta_reduction", 0.0)
-
-    # Fold cache stats into the performance section (tidier than a 4th top-level slot).
-    snap = metrics.snapshot()
-    snap["cache"] = recon_cache.stats()
-
-    return {
-        "storage": storage,
-        "performance": snap,
-        "system": {
-            "status": "healthy",
-            "errors": metrics.errors,
-            "uptime_seconds": metrics.uptime_seconds(),
-        },
-    }
+    return compose_stats(
+        request.app.state.store,
+        request.app.state.metrics,
+        request.app.state.recon_cache,
+    )
 
 
 @router.post("/api/reset")

@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Delta Encoding Log Engine</title>
+  <!-- Empty data-URL icon suppresses the favicon 404 the browser would otherwise log. -->
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/dashboard.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Delta Encoding Log Engine</h1>
+    <span id="conn-status" class="pill pill--connecting">connecting…</span>
+  </header>
+
+  <main>
+    <!-- NEXT COMMIT: charts mount here (e.g. <canvas id="chart-reductions"></canvas>) -->
+    <!-- charts-seam -->
+
+    <section class="group" aria-labelledby="storage-heading">
+      <h2 id="storage-heading">Storage</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card__label">Delta reduction</div>
+          <div class="card__value" id="stat-delta-reduction">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">gzip(raw) reduction</div>
+          <div class="card__value" id="stat-gzip-raw-reduction">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">delta + gzip reduction</div>
+          <div class="card__value" id="stat-delta-plus-gzip-reduction">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Entries stored</div>
+          <div class="card__value" id="stat-count">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Keyframes</div>
+          <div class="card__value" id="stat-keyframes">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="group" aria-labelledby="performance-heading">
+      <h2 id="performance-heading">Performance</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card__label">Compress throughput</div>
+          <div class="card__value" id="stat-throughput">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Reconstruct p99</div>
+          <div class="card__value" id="stat-reconstruct-p99">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Cache hit rate</div>
+          <div class="card__value" id="stat-cache-hitrate">—</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="group" aria-labelledby="system-heading">
+      <h2 id="system-heading">System</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card__label">Errors</div>
+          <div class="card__value" id="stat-errors">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Uptime</div>
+          <div class="card__value" id="stat-uptime">—</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- NEXT COMMIT: interactive forms (generate / compress / reconstruct) mount here -->
+    <!-- forms-seam -->
+  </main>
+
+  <script src="/static/dashboard.js"></script>
+</body>
+</html>
