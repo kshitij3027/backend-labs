@@ -1,5 +1,6 @@
-/* Minimal dashboard styling: a top bar with a status pill + responsive stat cards.
-   Kept intentionally short; the next commit layers on chart + form styling. */
+/* Dashboard styling: a top bar with a status pill, responsive stat cards, two live
+   Chart.js line charts, and an interactive controls grid. Dark, compact, portfolio-grade.
+   Cards/charts/controls all wrap on narrow screens via auto-fill/minmax grids. */
 
 :root {
   --bg: #0f1419;
@@ -110,4 +111,167 @@ body {
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
+}
+
+/* --- Charts ------------------------------------------------------------- */
+/* Two side-by-side line charts on wide screens; stack on narrow ones. */
+.charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 0.85rem;
+}
+
+.chart-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 10px;
+  padding: 0.9rem 1rem 1rem;
+}
+
+.chart-card h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Fixed-height, positioned wrapper so Chart.js's responsive canvas renders crisply
+   (Chart.js sizes to the parent box; an explicit height prevents layout thrash). */
+.chart-box {
+  position: relative;
+  height: 240px;
+  width: 100%;
+}
+
+/* --- Interactive controls ---------------------------------------------- */
+.controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 0.85rem;
+  align-items: start;
+}
+
+.control-card {
+  background: var(--panel);
+  border: 1px solid var(--panel-2);
+  border-radius: 10px;
+  padding: 0.9rem 1rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.control-card h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.control-hint {
+  margin: 0;
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+}
+
+.control-row label {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.control-card input[type="number"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  width: 100%;
+  max-width: 9rem;
+  background: var(--panel-2);
+  border: 1px solid #313b48;
+  border-radius: 7px;
+  color: var(--text);
+  padding: 0.4rem 0.55rem;
+  font-size: 0.85rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.control-card input[type="number"]:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.control-card button {
+  align-self: flex-start;
+  background: var(--accent);
+  color: #fff;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.82rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.control-card button:hover {
+  filter: brightness(1.08);
+}
+
+.control-card button:active {
+  filter: brightness(0.95);
+}
+
+.control-card button.danger {
+  background: rgba(248, 81, 73, 0.16);
+  color: var(--err);
+  border-color: rgba(248, 81, 73, 0.45);
+}
+
+.control-card button.danger:hover {
+  background: rgba(248, 81, 73, 0.24);
+}
+
+/* Inline result toast under each control. Tone classes are set from dashboard.js. */
+.result {
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+  min-height: 1.1em;
+}
+
+.result.muted {
+  color: var(--muted);
+}
+
+.result.ok {
+  color: var(--ok);
+}
+
+.result.err {
+  color: var(--err);
+}
+
+/* Pretty-printed JSON for the random-access entry + nearest keyframe. */
+.logs-out {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--panel-2);
+  border-radius: 7px;
+  padding: 0.55rem 0.65rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.35;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.logs-out:empty {
+  display: none;
 }

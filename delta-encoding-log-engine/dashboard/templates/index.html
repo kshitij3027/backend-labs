@@ -7,6 +7,11 @@
   <!-- Empty data-URL icon suppresses the favicon 404 the browser would otherwise log. -->
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="/static/dashboard.css" />
+  <!-- Vendored Chart.js 4.4.1 UMD (no CDN, no build step) — exposes the global `Chart`.
+       Loaded BEFORE dashboard.js so the chart constructor is available on DOMContentLoaded. -->
+  <script src="/static/chart.umd.min.js"></script>
+  <!-- Deferred so the DOM is parsed before the dashboard wiring runs. -->
+  <script src="/static/dashboard.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -15,8 +20,20 @@
   </header>
 
   <main>
-    <!-- NEXT COMMIT: charts mount here (e.g. <canvas id="chart-reductions"></canvas>) -->
-    <!-- charts-seam -->
+    <!-- Live charts fed by the WebSocket ticks (rolling window accumulated client-side). -->
+    <section class="group" aria-labelledby="charts-heading">
+      <h2 id="charts-heading">Charts</h2>
+      <div class="charts">
+        <div class="chart-card">
+          <h3>Storage reduction over time</h3>
+          <div class="chart-box"><canvas id="chart-reduction"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Reconstruct p99 latency over time</h3>
+          <div class="chart-box"><canvas id="chart-latency"></canvas></div>
+        </div>
+      </div>
+    </section>
 
     <section class="group" aria-labelledby="storage-heading">
       <h2 id="storage-heading">Storage</h2>
@@ -76,10 +93,60 @@
       </div>
     </section>
 
-    <!-- NEXT COMMIT: interactive forms (generate / compress / reconstruct) mount here -->
-    <!-- forms-seam -->
-  </main>
+    <!-- Interactive controls — fetch the SAME-ORIGIN REST endpoints (the API and the
+         dashboard are one process on one port, so the browser never needs CORS). After
+         each action the result JSON is shown inline; the next WS tick refreshes the
+         cards + charts. -->
+    <section class="group" aria-labelledby="controls-heading">
+      <h2 id="controls-heading">Controls</h2>
+      <div class="controls">
+        <div class="control-card">
+          <h3>Generate</h3>
+          <div class="control-row">
+            <label for="gen-count">count</label>
+            <input id="gen-count" type="number" min="1" max="100000" step="1" value="1000" />
+          </div>
+          <div class="control-row">
+            <label for="gen-seed">seed</label>
+            <input id="gen-seed" type="number" step="1" placeholder="optional" />
+          </div>
+          <button id="btn-generate" type="button">Generate batch</button>
+          <span id="generate-result" class="result muted">—</span>
+        </div>
 
-  <script src="/static/dashboard.js"></script>
+        <div class="control-card">
+          <h3>Compress</h3>
+          <p class="control-hint">Delta-encode the last generated batch.</p>
+          <button id="btn-compress" type="button">Compress generated</button>
+          <span id="compress-result" class="result muted">—</span>
+        </div>
+
+        <div class="control-card">
+          <h3>Reconstruct</h3>
+          <p class="control-hint">Rebuild the whole batch and verify fidelity.</p>
+          <button id="btn-reconstruct" type="button">Reconstruct &amp; verify</button>
+          <span id="reconstruct-result" class="result muted">—</span>
+        </div>
+
+        <div class="control-card">
+          <h3>Random access</h3>
+          <div class="control-row">
+            <label for="logs-index">index</label>
+            <input id="logs-index" type="number" min="0" step="1" value="0" />
+          </div>
+          <button id="btn-logs" type="button">Fetch entry</button>
+          <span id="logs-status" class="result muted">—</span>
+          <pre id="logs-result" class="logs-out"></pre>
+        </div>
+
+        <div class="control-card">
+          <h3>Reset</h3>
+          <p class="control-hint">Clear the store, metrics, and cache.</p>
+          <button id="btn-reset" type="button" class="danger">Reset engine</button>
+          <span id="reset-result" class="result muted">—</span>
+        </div>
+      </div>
+    </section>
+  </main>
 </body>
 </html>
