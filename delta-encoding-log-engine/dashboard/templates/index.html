@@ -93,6 +93,31 @@
       </div>
     </section>
 
+    <!-- Adaptive recommender (read-only): observed field churn + the analyzer's advisory
+         keyframe-interval / compression-mode suggestions. Purely informational — these
+         do NOT drive the live encoder. -->
+    <section class="group" aria-labelledby="adaptive-heading">
+      <h2 id="adaptive-heading">Adaptive (recommendation only)</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="card__label">Observed churn</div>
+          <div class="card__value" id="stat-observed-churn">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Recommended interval</div>
+          <div class="card__value" id="stat-recommended-interval">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Current interval</div>
+          <div class="card__value" id="stat-current-interval">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Recommended mode</div>
+          <div class="card__value" id="stat-recommended-mode">—</div>
+        </div>
+      </div>
+    </section>
+
     <!-- Interactive controls — fetch the SAME-ORIGIN REST endpoints (the API and the
          dashboard are one process on one port, so the browser never needs CORS). After
          each action the result JSON is shown inline; the next WS tick refreshes the

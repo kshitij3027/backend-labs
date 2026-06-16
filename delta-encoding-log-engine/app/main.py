@@ -33,6 +33,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from app.analyzer import PatternAnalyzer
 from app.api import router as api_router
 from app.dashboard import ConnectionManager, broadcast_loop
 from app.dashboard import router as dashboard_router
@@ -77,6 +78,15 @@ async def lifespan(app: FastAPI):
     )
     # Bounded LRU in front of single-entry reconstruction (size 0 disables it).
     app.state.recon_cache = ReconstructionCache(settings.reconstruct_cache_size)
+
+    # Thin, READ-ONLY adaptive recommender: a sliding-window churn observer that only
+    # *reports* a recommended keyframe interval + compression mode (surfaced additively
+    # in /api/stats and on the WS tick). It holds no encoder reference and never mutates
+    # the store/codec — compression output is byte-identical with or without it.
+    app.state.analyzer = PatternAnalyzer(
+        window=settings.analyzer_window,
+        current_interval=settings.keyframe_interval,
+    )
 
     # Dashboard WebSocket fan-out: one manager, one stop event, one broadcast loop.
     # Created AFTER the data graph above (the loop reads it on its first tick) and BEFORE

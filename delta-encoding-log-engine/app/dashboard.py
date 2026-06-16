@@ -99,18 +99,23 @@ class ConnectionManager:
 def build_tick(app) -> dict:
     """Build one live dashboard tick from the current ``app.state`` graph.
 
-    Reads ``settings`` / ``store`` / ``metrics`` / ``recon_cache`` off ``app.state`` and
-    composes the stats document **in-process** via :func:`~app.api.compose_stats` (no HTTP
-    self-call). The envelope carries the wall-clock ``ts`` and the ``refresh_ms`` cadence
-    so the page can show liveness and self-tune. A failed stats build is caught and
-    surfaced as ``{"stats": None, "error": <str>}`` so neither the loop nor a socket dies
-    on a transient error — the page shows the error instead of going stale silently.
+    Reads ``settings`` / ``store`` / ``metrics`` / ``recon_cache`` / ``analyzer`` off
+    ``app.state`` and composes the stats document **in-process** via
+    :func:`~app.api.compose_stats` (no HTTP self-call), so the tick carries the same
+    ``analyzer`` section ``GET /api/stats`` returns. The envelope carries the wall-clock
+    ``ts`` and the ``refresh_ms`` cadence so the page can show liveness and self-tune. A
+    failed stats build is caught and surfaced as ``{"stats": None, "error": <str>}`` so
+    neither the loop nor a socket dies on a transient error — the page shows the error
+    instead of going stale silently.
     """
     settings = app.state.settings
     refresh_ms = settings.dashboard_refresh_ms
     try:
         stats = compose_stats(
-            app.state.store, app.state.metrics, app.state.recon_cache
+            app.state.store,
+            app.state.metrics,
+            app.state.recon_cache,
+            app.state.analyzer,
         )
         return {
             "type": "tick",

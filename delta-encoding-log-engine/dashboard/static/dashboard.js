@@ -243,6 +243,7 @@
     var performance = stats.performance || {};
     var system = stats.system || {};
     var cache = performance.cache || {};
+    var analyzer = stats.analyzer || {};
 
     // Storage section.
     setText("stat-delta-reduction", pct(storage.delta_reduction));
@@ -260,6 +261,17 @@
     var errors = isNum(system.errors) ? system.errors : performance.errors;
     setText("stat-errors", intOr(errors));
     setText("stat-uptime", seconds(get(system, ["uptime_seconds"])));
+
+    // Adaptive section (read-only recommendation). Guarded: if the tick omits the
+    // analyzer block entirely the helpers fall back to the placeholder. observed_churn
+    // is a 0..1 fraction shown as a percentage; the recommended mode is a string.
+    setText("stat-observed-churn", rate(analyzer.observed_churn));
+    setText("stat-recommended-interval", intOr(analyzer.recommended_keyframe_interval));
+    setText("stat-current-interval", intOr(analyzer.current_keyframe_interval));
+    setText(
+      "stat-recommended-mode",
+      typeof analyzer.recommended_mode === "string" ? analyzer.recommended_mode : DASH
+    );
 
     // Live charts: push this tick's reduction trio + reconstruct p99.
     updateCharts(storage, performance, tick.ts);

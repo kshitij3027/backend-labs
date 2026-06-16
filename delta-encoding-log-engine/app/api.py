@@ -46,8 +46,8 @@ router = APIRouter()
 # --------------------------------------------------------------------------- #
 # Shared stats composer — the single source of the /api/stats document.
 # --------------------------------------------------------------------------- #
-def compose_stats(store, metrics, recon_cache) -> dict:
-    """Compose the three-section stats view (storage / performance / system).
+def compose_stats(store, metrics, recon_cache, analyzer) -> dict:
+    """Compose the stats view (storage / performance / system / analyzer).
 
     Factored out of the ``GET /api/stats`` handler so the dashboard's WebSocket tick
     can build the **identical** document in-process — without an HTTP self-call back
@@ -57,7 +57,10 @@ def compose_stats(store, metrics, recon_cache) -> dict:
     alias (``storage_savings_percent`` mirrors ``delta_reduction``). The reconstruction
     cache's occupancy + hit-rate ride inside ``performance`` under ``"cache"`` (cache
     effectiveness is a performance property — it is what keeps the reconstruction-latency
-    p99 under the gate). ``system`` carries the health / error-gate / uptime triple.
+    p99 under the gate). ``system`` carries the health / error-gate / uptime triple. The
+    ``analyzer`` block is the thin read-only recommender's snapshot (observed churn plus
+    its advisory keyframe-interval / compression-mode suggestions) — additive and purely
+    informational; it does not reflect or alter any encoder behaviour.
     """
     storage = store.stats()
     # Requirements naming alias: surface the delta reduction as storage_savings_percent.
@@ -75,6 +78,8 @@ def compose_stats(store, metrics, recon_cache) -> dict:
             "errors": metrics.errors,
             "uptime_seconds": metrics.uptime_seconds(),
         },
+        # Read-only adaptive recommendation (additive section; never feeds the encoder).
+        "analyzer": analyzer.snapshot(),
     }
 
 
@@ -168,6 +173,11 @@ def compress(req: CompressRequest, request: Request) -> dict:
         # The compressed log changed: drop any cached reconstructions so a subsequent
         # /api/logs/{index} reflects the NEW log rather than a stale entry.
         recon_cache.clear()
+        # Read-only: let the adaptive recommender observe the SAME batch that was just
+        # compressed so its churn window reflects real data. This only feeds the
+        # recommendation surfaced in /api/stats — it does NOT change what was stored
+        # above (compression output is byte-identical with or without this call).
+        request.app.state.analyzer.observe(batch)
         return stats.to_dict()
     except HTTPException:
         # Client error already classified — re-raise without touching the counter.
@@ -290,6 +300,7 @@ async def stats(request: Request) -> dict:
         request.app.state.store,
         request.app.state.metrics,
         request.app.state.recon_cache,
+        request.app.state.analyzer,
     )
 
 
@@ -306,4 +317,7 @@ async def reset(request: Request) -> dict:
     recon_cache = request.app.state.recon_cache
     recon_cache.clear()
     recon_cache.reset_stats()
+    # Clear the adaptive recommender's observation window too, so the engine reads as
+    # freshly started (its configuration is kept; only the observed churn is dropped).
+    request.app.state.analyzer.reset()
     return {"status": "reset"}
