@@ -1,0 +1,14 @@
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.env
+*.log
+data/
+plan.md
+project_requirements.md
+.DS_Store
+htmlcov/
+.coverage

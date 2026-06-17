@@ -1,0 +1,17 @@
+# Adaptive Resource Allocation System — service topology.
+#
+# Commit 1 ships only the profile-gated `test` service so `make test` can run the
+# unit suite inside Docker. The runnable `app` plus `e2e` / `loadtest` profiles
+# arrive in later commits.
+
+services:
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the
+  # same code + requirements as the eventual app) and runs pytest in-process — no
+  # running service required. Profile-gated so it never starts on a bare
+  # `docker compose up`. Run via `make test`.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    command: ["pytest", "-q"]

@@ -1,0 +1,36 @@
+# Adaptive Resource Allocation System — default configuration.
+#
+# These values mirror the dataclass defaults in src/config.py. Precedence at load
+# time is: dataclass defaults -> this file -> environment variables (env wins).
+# Both these nested sections and flat top-level field names are accepted.
+
+dashboard:
+  host: "0.0.0.0"
+  port: 8080
+
+scaling:
+  cpu_threshold_scale_up: 75
+  cpu_threshold_scale_down: 40
+  memory_threshold_scale_up: 80
+  memory_threshold_scale_down: 50
+  util_threshold_scale_up: 75
+  util_threshold_scale_down: 40
+  min_workers: 2
+  max_workers: 20
+  cooldown_period_seconds: 60
+  scale_down_cooldown_seconds: 120
+
+monitoring:
+  interval_seconds: 5
+  history_window_minutes: 15
+  metrics_retention_hours: 24
+
+forecast:
+  alpha: 0.25
+  beta: 0.10
+  horizon_minutes: 10
+  confidence_threshold: 0.70
+
+workload:
+  base_arrival_rate: 500
+  capacity_per_worker: 400

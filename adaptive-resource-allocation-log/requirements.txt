@@ -1,0 +1,21 @@
+# Web server + real-time dashboard
+Flask==3.0.3
+Flask-SocketIO==5.3.6
+python-socketio==5.11.4
+python-engineio==4.9.1
+
+# Production-capable async server for SocketIO
+eventlet==0.36.1
+
+# Metric collection (host/container resource sampling)
+psutil==6.0.0
+
+# Numeric / prediction (load forecasting)
+numpy==2.1.1
+
+# Config
+PyYAML==6.0.2
+
+# Testing
+pytest==8.3.3
+pytest-cov==5.0.0
