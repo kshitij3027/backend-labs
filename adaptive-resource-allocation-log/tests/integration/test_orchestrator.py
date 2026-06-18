@@ -193,7 +193,14 @@ def test_snapshot_shape_before_any_tick():
     assert snap["scaling_history"] == []
     assert snap["cooldown_remaining_s"] == 0
     assert snap["anomaly"] == {"active": False, "zscore": 0.0}
-    assert snap["cost"] == {}
+    # Cost is always-populated now: zeroed integrals with peak seeded at min_workers
+    # before any tick (no longer an empty {} placeholder).
+    assert snap["cost"] == {
+        "adaptive_worker_seconds": 0.0,
+        "static_worker_seconds": 0.0,
+        "peak_workers": orch.config.min_workers,
+        "savings_pct": 0.0,
+    }
 
     workers = snap["workers"]
     assert workers["current"] == orch.config.min_workers
@@ -215,6 +222,71 @@ def test_snapshot_populated_after_ticks():
     assert snap["forecast"]  # non-empty after an orchestration tick
     assert snap["forecast"]["metric"] == "effective_utilization"
     assert snap["workers"]["backend"] == "simulated"
+
+
+# --------------------------------------------------------------------------- #
+# Cost-optimization reporting
+# --------------------------------------------------------------------------- #
+def test_snapshot_cost_block_shape_and_accumulation():
+    """After several ticks, snapshot()['cost'] has the documented keys and accumulates.
+
+    A handful of paired ticks (advancing ``now`` each time) must integrate worker-
+    seconds into ``adaptive_worker_seconds`` (> 0) while keeping ``savings_pct`` a
+    non-negative number. The keys must match the cost-report contract exactly.
+    """
+    orch = Orchestrator(fast_config())
+
+    run_ticks(orch, T0, count=5)
+    cost = orch.snapshot()["cost"]
+
+    assert set(cost.keys()) == {
+        "adaptive_worker_seconds",
+        "static_worker_seconds",
+        "peak_workers",
+        "savings_pct",
+    }
+    # Worker-seconds integrated over the (non-trivial) elapsed window.
+    assert cost["adaptive_worker_seconds"] > 0
+    assert cost["savings_pct"] >= 0
+    assert cost["peak_workers"] >= orch.config.min_workers
+
+
+def test_cost_savings_positive_when_peak_exceeds_steady_state():
+    """A brief scale-up then back to min makes savings_pct strictly positive.
+
+    The peak worker count drives the *static* baseline (a static system would have to
+    provision for the peak the whole time), while the adaptive pool spends most of the
+    window back at ``min_workers``. So the adaptive worker-seconds are well below the
+    static baseline and ``savings_pct`` must be > 0.
+    """
+    orch = Orchestrator(fast_config())
+    interval = orch.config.monitoring_interval_seconds
+    min_workers = orch.config.min_workers
+
+    t = T0
+    # A few ticks at the floor establish the steady state.
+    for _ in range(2):
+        orch.collector_tick(now=t)
+        t += interval
+
+    # Brief scale-up to a high count (drives the peak), held for a single tick.
+    orch.request_manual_scale(target=12, now=t)
+    orch.collector_tick(now=t)
+    t += interval
+
+    # Back down to the floor, then spend many ticks there so the peak dominates the
+    # static baseline while the adaptive integral stays low.
+    orch.request_manual_scale(target=min_workers, now=t)
+    for _ in range(12):
+        orch.collector_tick(now=t)
+        t += interval
+
+    cost = orch.snapshot()["cost"]
+
+    assert cost["peak_workers"] >= 12
+    # Static baseline (peak * elapsed) strictly exceeds the adaptive integral.
+    assert cost["static_worker_seconds"] > cost["adaptive_worker_seconds"]
+    assert cost["savings_pct"] > 0
 
 
 # --------------------------------------------------------------------------- #

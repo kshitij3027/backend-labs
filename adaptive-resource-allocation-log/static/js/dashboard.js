@@ -470,15 +470,18 @@
         anomalyCard.classList.toggle("card--alert", active);
       }
 
-      // Cost (placeholder block in early commits — show a friendly summary or —).
+      // Cost: adaptive-vs-static worker-second saving. Defensive — an empty/missing
+      // cost block (e.g. before any tick) degrades to the "—" placeholder, never throws.
       var cost = s.cost || {};
-      var costVal =
-        cost && typeof cost === "object" && Object.keys(cost).length
-          ? isNum(cost.hourly)
-            ? "$" + cost.hourly.toFixed(2) + "/h"
-            : JSON.stringify(cost)
+      var hasCost = cost && typeof cost === "object" && Object.keys(cost).length;
+      setText("stat-cost", hasCost && isNum(cost.savings_pct) ? cost.savings_pct + "% saved" : DASH);
+      // Optional sub-line: the underlying worker-seconds (only rendered if the element
+      // exists in the template). Shows "adaptive vs static worker·s".
+      var costSub =
+        hasCost && isNum(cost.adaptive_worker_seconds) && isNum(cost.static_worker_seconds)
+          ? cost.adaptive_worker_seconds + " vs " + cost.static_worker_seconds + " worker·s"
           : DASH;
-      setText("stat-cost", costVal);
+      setText("stat-cost-sub", costSub);
 
       // Scaling-history log.
       renderHistory(s.scaling_history);

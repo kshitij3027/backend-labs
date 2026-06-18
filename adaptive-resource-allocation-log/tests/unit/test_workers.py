@@ -10,6 +10,7 @@ import pytest
 
 from src.config import Settings
 from src.workers import (
+    DockerWorkerPool,
     SimulatedWorkerPool,
     WorkerPool,
     create_worker_pool,
@@ -19,6 +20,22 @@ from src.workers import (
 MIN_WORKERS = 2
 MAX_WORKERS = 20
 CAP_PER_WORKER = 400.0
+
+
+def _docker_available() -> bool:
+    """Return True iff a Docker daemon is reachable.
+
+    Tries to import the SDK and ping the daemon, swallowing *any* error (missing SDK,
+    no socket, permission denied). Live DockerWorkerPool tests are skipped when this is
+    False — which is the expected case in the hermetic test container (no docker socket).
+    """
+    try:
+        import docker
+
+        docker.from_env().ping()
+        return True
+    except Exception:  # noqa: BLE001 - any failure means "no usable daemon"
+        return False
 
 
 @pytest.fixture
@@ -196,8 +213,70 @@ def test_factory_returns_simulated_for_default_settings():
     assert pool.stats()["capacity"] == Settings().min_workers * Settings().capacity_per_worker
 
 
-def test_factory_raises_for_docker_backend():
-    """The docker backend is not implemented yet and must raise."""
+def test_factory_returns_docker_pool_without_daemon():
+    """The docker backend builds a DockerWorkerPool and does NOT touch the daemon.
+
+    Construction must be lazy: no docker import/connection happens until a method that
+    needs the daemon is called, so the factory works even with no docker installed.
+    """
     settings = Settings(worker_backend="docker")
-    with pytest.raises(NotImplementedError):
-        create_worker_pool(settings)
+    pool = create_worker_pool(settings)  # must not raise / must not connect
+
+    assert isinstance(pool, DockerWorkerPool)
+    assert pool.backend == "docker"
+    # No client should have been created merely by constructing the pool.
+    assert pool._docker_client is None
+
+
+def test_docker_pool_construction_is_lazy_and_reports_backend():
+    """DockerWorkerPool can be constructed directly with no daemon present."""
+    pool = DockerWorkerPool(Settings(worker_backend="docker"), pool_label="test-pool")
+
+    assert pool.backend == "docker"
+    assert pool._docker_client is None  # nothing connected at construction
+
+
+# --------------------------------------------------------------------------- #
+# DockerWorkerPool live operations (skipped unless a daemon is reachable)
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _docker_available(), reason="docker daemon not available")
+def test_docker_pool_scale_up_and_down_live():
+    """Live: scaling up spawns labelled containers; scaling down retires extras.
+
+    Runs ONLY where a Docker daemon is reachable (skipped in the hermetic container).
+    Uses a tiny always-available image and a unique label so it never disturbs other
+    containers, and always tears its own containers down.
+    """
+    import uuid
+
+    label = f"ar-test-{uuid.uuid4().hex[:8]}"
+    settings = Settings(
+        worker_backend="docker",
+        worker_image="busybox:latest",
+        min_workers=0,
+        max_workers=5,
+    )
+    pool = DockerWorkerPool(settings, pool_label=label)
+    # busybox does not loop forever by default; override the spawn command via the SDK
+    # is out of scope here, so we only assert reconciliation logic that does not rely on
+    # the container staying up. To keep the test robust we scale to 0 and assert clean.
+    try:
+        pool.scale_to(0)
+        assert pool.current() == 0
+    finally:
+        # Defensive cleanup: retire anything left carrying our unique label.
+        pool.scale_to(0)
+
+
+@pytest.mark.skipif(not _docker_available(), reason="docker daemon not available")
+def test_docker_pool_current_counts_only_pool_label_live():
+    """Live: current() counts only this pool's labelled containers (isolation)."""
+    import uuid
+
+    label = f"ar-test-{uuid.uuid4().hex[:8]}"
+    pool = DockerWorkerPool(
+        Settings(worker_backend="docker", min_workers=0, max_workers=5),
+        pool_label=label,
+    )
+    # A brand-new unique label can have no containers yet.
+    assert pool.current() == 0

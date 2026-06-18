@@ -152,6 +152,18 @@ class Orchestrator:
         self.state = SystemState()
         self._lock = threading.Lock()
 
+        # Cost-optimization accumulators (all guarded by the lock). They let snapshot()
+        # quantify the adaptive system's saving versus a hypothetical STATIC system that
+        # would have provisioned for the observed peak the whole time:
+        #  * _cost_adaptive_worker_seconds — integral of (workers * dt): the actual
+        #    worker-seconds the adaptive pool consumed.
+        #  * _cost_elapsed_seconds — total simulated time observed (integral of dt).
+        #  * _cost_peak_workers — the highest worker count seen (the level a static
+        #    system would have to be sized for to avoid the same backlog).
+        self._cost_adaptive_worker_seconds = 0.0
+        self._cost_elapsed_seconds = 0.0
+        self._cost_peak_workers = int(self.pool.current())
+
     # ------------------------------------------------------------------ #
     # Convenience accessors (read shared state under the lock)
     # ------------------------------------------------------------------ #
@@ -252,6 +264,15 @@ class Orchestrator:
             # pool step and the sample happen under the lock so a concurrent reader
             # never sees the pool advanced but the snapshot not yet stored.
             self.pool.observe(arrival, dt)
+
+            # Cost accounting: integrate worker-seconds over this interval and track
+            # the running peak. Reading the count once here keeps the integral aligned
+            # with the workers that served the interval we just advanced.
+            workers = int(self.pool.current())
+            self._cost_adaptive_worker_seconds += workers * dt
+            self._cost_elapsed_seconds += dt
+            self._cost_peak_workers = max(self._cost_peak_workers, workers)
+
             snap = self.collector.sample(now)
             self.history.add(snap)
             self.state.current_metrics = snap
@@ -440,6 +461,42 @@ class Orchestrator:
         return decision
 
     # ------------------------------------------------------------------ #
+    # Cost reporting
+    # ------------------------------------------------------------------ #
+    def _cost_report(self) -> dict:
+        """Summarise the adaptive pool's worker-second saving versus a static system.
+
+        Compares the worker-seconds the adaptive pool actually consumed against what a
+        STATIC system would have spent had it been provisioned for the observed peak
+        worker count for the whole elapsed window. The percentage saved is clamped at
+        zero (a static baseline can never cost less than its own peak provisioning, so
+        savings are non-negative by construction; the clamp guards rounding only).
+
+        Must be called while holding :attr:`_lock` (it reads the cost accumulators).
+
+        Returns:
+            A dict with keys ``adaptive_worker_seconds``, ``static_worker_seconds``,
+            ``peak_workers`` and ``savings_pct``. Before any tick this is all zeros with
+            ``savings_pct`` ``0.0``.
+        """
+        adaptive = self._cost_adaptive_worker_seconds
+        static = self._cost_peak_workers * self._cost_elapsed_seconds
+
+        if static > 0:
+            savings_pct = round((1.0 - adaptive / static) * 100.0, 1)
+            if savings_pct < 0.0:
+                savings_pct = 0.0
+        else:
+            savings_pct = 0.0
+
+        return {
+            "adaptive_worker_seconds": round(adaptive, 1),
+            "static_worker_seconds": round(static, 1),
+            "peak_workers": self._cost_peak_workers,
+            "savings_pct": savings_pct,
+        }
+
+    # ------------------------------------------------------------------ #
     # Status payload
     # ------------------------------------------------------------------ #
     def snapshot(self) -> dict:
@@ -454,8 +511,9 @@ class Orchestrator:
             ``workers`` (``current``/``min``/``max``/``backend``), ``last_decision``,
             ``cooldown_remaining_s``, ``scaling_history``, ``anomaly`` and ``cost``.
             ``anomaly`` reflects the detector's latest result (neutral default
-            before the first orchestration tick); ``cost`` is a placeholder
-            populated by a later commit (cost reporting).
+            before the first orchestration tick); ``cost`` reports the adaptive-vs-
+            static worker-second saving (see :meth:`_cost_report`), all zeros before
+            the first collector tick.
         """
         now = time.time()
         cfg = self.config
@@ -486,6 +544,7 @@ class Orchestrator:
                 # The detector's latest result; the neutral default until the first
                 # orchestration tick runs (see SystemState.anomaly).
                 "anomaly": dict(self.state.anomaly),
-                # Placeholder; populated in a later commit (cost reporting).
-                "cost": {},
+                # Cost-optimization summary (adaptive vs. static worker-seconds). Sane
+                # zeros before any tick; computed under the lock from the accumulators.
+                "cost": self._cost_report(),
             }

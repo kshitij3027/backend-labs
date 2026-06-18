@@ -26,3 +26,8 @@ pytest-cov==5.0.0
 # (python-socketio / python-engineio are already pinned above).
 requests==2.32.3
 websocket-client==1.8.0
+
+# Container orchestration (opt-in Docker worker backend)
+# Only used when USE_DOCKER=1 selects the DockerWorkerPool; imported lazily so the
+# default simulated path never needs the SDK or a running daemon.
+docker==7.1.0
