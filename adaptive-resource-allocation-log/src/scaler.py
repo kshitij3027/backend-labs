@@ -76,6 +76,7 @@ class Scaler:
         current_workers: int,
         last_action_ts: float,
         now: float | None = None,
+        anomaly: dict | None = None,
     ) -> dict:
         """Decide whether to scale up, scale down, or hold.
 
@@ -90,6 +91,14 @@ class Scaler:
                 scaling action, used for the cooldown check.
             now: Optional wall-clock timestamp (seconds). Defaults to
                 :func:`time.time`. Stamped onto the returned decision.
+            anomaly: Optional anomaly-detection result (see
+                :class:`src.patterns.AnomalyDetector`) shaped
+                ``{"active": bool, "zscore": float}``. When provided, an *active*
+                anomaly with a *positive* z-score (an upward spike) acts as an
+                extra scale-up trigger — but only if neither the reactive nor the
+                predictive branch already chose a scale-up (they take precedence).
+                Defaults to ``None``, in which case behaviour is exactly as if no
+                anomaly signal existed (fully backward-compatible).
 
         Returns:
             The canonical scaling-decision dict (see :data:`DECISION_KEYS`). The
@@ -134,9 +143,19 @@ class Scaler:
             and predicted > cfg.util_threshold_scale_up
         )
 
+        # --- 2b) Anomaly signal (scale-UP only, lowest precedence) --------------
+        # An *active* anomaly with a *positive* z-score is a sudden upward spike the
+        # reactive/predictive branches may not have caught yet. It only fires when
+        # neither of those already chose a scale-up, so observed/forecast pressure
+        # always wins the reason; an anomalous dip (negative z-score) is ignored
+        # here — removing capacity is never anomaly-driven.
+        anomaly_zscore = _as_float((anomaly or {}).get("zscore"))
+        anomaly_up = bool(anomaly) and bool(anomaly.get("active")) and anomaly_zscore > 0.0
+
         # --- 3) Combine (availability-first) ------------------------------------
         # Any scale-up signal wins over a scale-down opportunity. When reactive and
-        # predictive both fire, prefer the reactive reason (observed > forecast).
+        # predictive both fire, prefer the reactive reason (observed > forecast);
+        # the anomaly trigger sits below both.
         if reactive_up is not None or predictive_up:
             action = "scale_up"
             if reactive_up is not None:
@@ -147,6 +166,15 @@ class Scaler:
                 trigger_metric = "predicted"
                 trigger_value = predicted
                 confidence = forecast_conf
+        elif anomaly_up:
+            # Treat the spike as an aggressive scale-up. The decision surfaces the
+            # z-score as the trigger, but the worker target is sized off the SAME
+            # util-based HPA path as ``reactive_util`` (see ``_target_up``).
+            action = "scale_up"
+            reason = "anomaly"
+            trigger_metric = "anomaly_zscore"
+            trigger_value = anomaly_zscore
+            confidence = None
         elif reactive_down:
             action = "scale_down"
             reason = "reactive_util"
@@ -291,6 +319,9 @@ class Scaler:
         * ``reactive_cpu``  → cpu vs midpoint(cpu_up, cpu_down)
         * ``reactive_mem``  → mem vs midpoint(mem_up, mem_down)
         * ``reactive_util`` / ``predictive`` → util-or-predicted vs midpoint(util_up, util_down)
+        * ``anomaly`` → util vs midpoint(util_up, util_down) (same aggressive
+          util path as ``reactive_util``; the anomaly's ``trigger_value`` is a
+          z-score, so we size off the observed utilization instead)
 
         At least one worker is always added on a scale-up (``desired >=
         current_workers + 1``); final clamping to ``[min, max]`` happens in the
@@ -304,6 +335,11 @@ class Scaler:
         elif reason == "reactive_mem":
             value = mem
             target = (cfg.memory_threshold_scale_up + cfg.memory_threshold_scale_down) / 2.0
+        elif reason == "anomaly":
+            # An anomaly spike sizes off observed utilization (its trigger_value is
+            # a z-score, not a util %), using the same aggressive util target.
+            value = util
+            target = (cfg.util_threshold_scale_up + cfg.util_threshold_scale_down) / 2.0
         else:
             # reactive_util or predictive — both size against effective utilization.
             # trigger_value already holds util (reactive) or predicted (predictive).

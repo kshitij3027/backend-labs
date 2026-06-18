@@ -330,3 +330,56 @@ def test_orchestration_tick_returns_decision_schema():
     # The forecast was stored and a prediction was remembered for residual scoring.
     assert orch.forecast is not None
     assert orch._last_predicted == orch.forecast["predicted"]
+
+
+# --------------------------------------------------------------------------- #
+# Anomaly detection wiring
+# --------------------------------------------------------------------------- #
+def test_snapshot_anomaly_reflects_detector_on_sharp_spike():
+    """A sharp utilization spike makes snapshot()['anomaly'] go non-zero/active.
+
+    A long calm baseline establishes a low-variance utilization history; an abrupt
+    ramp to a huge arrival rate then injects a spike whose latest value sits many
+    sigma above that baseline. The anomaly surfaced in the status payload must
+    reflect the detector's real result — a non-zero (and at some tick active)
+    z-score during the spike — rather than the neutral placeholder.
+    """
+    # max_workers high enough that the pool cannot immediately absorb the spike
+    # (so effective utilization actually jumps), and enough head-room to climb.
+    orch = Orchestrator(fast_config(max_workers=50))
+
+    # Phase 1: ~14 calm baseline ticks. base_arrival_rate=100 over a min pool of
+    # 2 * 400 capacity => ~12.5% utilization, low and steady => low variance.
+    t = run_ticks(orch, T0, count=14)
+
+    # Before the spike the detector must NOT be active: the calm baseline has a
+    # small warm-up transient, so the latest point can carry a tiny sub-threshold
+    # (non-zero) z-score — that is correct, what matters is it does not yet fire.
+    pre = orch.snapshot()["anomaly"]
+    assert set(pre.keys()) == {"active", "zscore"}
+    assert pre["active"] is False
+
+    # Phase 2: inject a near-instantaneous ramp to a very high rate, then keep
+    # ticking. The first post-ramp tick is a sharp outlier vs the calm history.
+    interval = orch.config.monitoring_interval_seconds
+    spike_start = t + interval
+    orch.load_model.ramp(target_rate=50000.0, seconds=0.0, now=spike_start)
+
+    # Drive the spike ticks one at a time, recording the anomaly each time.
+    anomalies = []
+    tt = spike_start
+    for _ in range(6):
+        orch.collector_tick(now=tt)
+        orch.orchestration_tick(now=tt)
+        snap_anomaly = orch.snapshot()["anomaly"]
+        # The payload is always a well-formed dict with the documented keys.
+        assert set(snap_anomaly.keys()) == {"active", "zscore"}
+        assert isinstance(snap_anomaly["active"], bool)
+        assert isinstance(snap_anomaly["zscore"], float)
+        anomalies.append(snap_anomaly)
+        tt += interval
+
+    # The detector must have fired during the spike: a non-zero z-score at some
+    # tick, and the spike is sharp enough that at least one tick reads as active.
+    assert any(a["zscore"] != 0.0 for a in anomalies)
+    assert any(a["active"] for a in anomalies)

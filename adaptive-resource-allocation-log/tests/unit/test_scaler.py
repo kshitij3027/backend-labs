@@ -234,6 +234,98 @@ def test_reactive_preferred_over_predictive(scaler):
 
 
 # --------------------------------------------------------------------------- #
+# Anomaly trigger (optional, lowest-precedence scale-up)
+# --------------------------------------------------------------------------- #
+def test_anomaly_triggers_scale_up_in_dead_band(scaler):
+    """Dead-band metrics + an active positive-zscore anomaly → anomaly scale_up.
+
+    No reactive or predictive signal fires (all metrics sit in the dead-band), so
+    the optional anomaly trigger is what provokes the (aggressive) scale-up.
+    """
+    d = scaler.decide(
+        make_snapshot(cpu=50.0, mem=50.0, util=50.0),
+        make_forecast(),
+        4,
+        last_action_ts=PAST,
+        now=NOW,
+        anomaly={"active": True, "zscore": 5.0},
+    )
+    assert d["action"] == "scale_up"
+    assert d["reason"] == "anomaly"
+    assert d["trigger_metric"] == "anomaly_zscore"
+    assert d["trigger_value"] == 5.0
+    assert d["to_workers"] > d["from_workers"]
+    # An anomaly carries no forecast confidence.
+    assert d["confidence"] is None
+    assert d["cooldown_active"] is False
+
+
+def test_no_anomaly_holds_stable_backward_compat(scaler):
+    """Control: identical dead-band inputs with anomaly=None → plain stable hold.
+
+    Proves the anomaly parameter is purely additive — omitting it (or passing
+    ``None``) reproduces the pre-existing behaviour exactly.
+    """
+    d = scaler.decide(
+        make_snapshot(cpu=50.0, mem=50.0, util=50.0),
+        make_forecast(),
+        4,
+        last_action_ts=PAST,
+        now=NOW,
+        anomaly=None,
+    )
+    assert d["action"] == "hold"
+    assert d["reason"] == "stable"
+    assert d["to_workers"] == 4
+
+
+def test_reactive_preferred_over_anomaly(scaler):
+    """A reactive scale-up outranks the anomaly reason when both could fire."""
+    d = scaler.decide(
+        make_snapshot(cpu=85.0, mem=50.0, util=50.0),
+        make_forecast(),
+        4,
+        last_action_ts=PAST,
+        now=NOW,
+        anomaly={"active": True, "zscore": 9.0},
+    )
+    assert d["action"] == "scale_up"
+    assert d["reason"] == "reactive_cpu"
+
+
+def test_negative_zscore_anomaly_does_not_scale_up(scaler):
+    """An anomalous DIP (negative zscore) is not an upward spike → no scale-up."""
+    d = scaler.decide(
+        make_snapshot(cpu=50.0, mem=50.0, util=50.0),
+        make_forecast(),
+        4,
+        last_action_ts=PAST,
+        now=NOW,
+        anomaly={"active": True, "zscore": -5.0},
+    )
+    assert d["action"] == "hold"
+    assert d["reason"] == "stable"
+
+
+def test_anomaly_during_cooldown_holds_with_cooldown_reason(scaler):
+    """An anomaly inside the cooldown window is suppressed as a cooldown hold."""
+    d = scaler.decide(
+        make_snapshot(cpu=50.0, mem=50.0, util=50.0),
+        make_forecast(),
+        4,
+        last_action_ts=0.0,
+        now=10.0,  # < 60s scale-up cooldown
+        anomaly={"active": True, "zscore": 5.0},
+    )
+    assert d["action"] == "hold"
+    assert d["reason"] == "cooldown"
+    assert d["cooldown_active"] is True
+    # The would-be anomaly trigger context is preserved for display.
+    assert d["trigger_metric"] == "anomaly_zscore"
+    assert d["trigger_value"] == 5.0
+
+
+# --------------------------------------------------------------------------- #
 # Dead-band hold
 # --------------------------------------------------------------------------- #
 def test_dead_band_holds_stable(scaler):

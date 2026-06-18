@@ -42,6 +42,7 @@ from src.config import Settings
 from src.forecast import build_forecast
 from src.load_model import LoadModel
 from src.metrics import MetricCollector, RollingHistory
+from src.patterns import AnomalyDetector, PatternLearner
 from src.scaler import Scaler
 from src.workers import create_worker_pool
 
@@ -77,6 +78,9 @@ class SystemState:
             (plus manual scales), newest last.
         last_action_ts: Wall-clock timestamp of the last pool-moving action; ``0.0``
             means "no action yet" and disables the cooldown countdown.
+        anomaly: The most recent anomaly-detector result, shaped
+            ``{"active": bool, "zscore": float}``. Holds the neutral placeholder
+            until the first :meth:`Orchestrator.orchestration_tick` populates it.
         _recent_residuals: Recent absolute forecast errors feeding confidence.
         _last_collect_ts: Timestamp of the previous collector tick (for ``dt``).
         _last_predicted: Utilization the previous orchestration tick predicted,
@@ -90,6 +94,7 @@ class SystemState:
         default_factory=lambda: deque(maxlen=_SCALING_HISTORY_MAXLEN)
     )
     last_action_ts: float = 0.0
+    anomaly: dict = field(default_factory=lambda: {"active": False, "zscore": 0.0})
     _recent_residuals: Deque[float] = field(
         default_factory=lambda: deque(maxlen=_RESIDUALS_MAXLEN)
     )
@@ -134,6 +139,14 @@ class Orchestrator:
             config.history_window_minutes, config.metrics_retention_hours
         )
         self.scaler = Scaler(config)
+
+        # Adaptive analysis layers (both pure, stateless w.r.t. shared state):
+        #  * the anomaly detector flags sudden utilization spikes the threshold /
+        #    forecast logic may not have caught yet (optional scale-up trigger);
+        #  * the pattern learner accumulates a time-of-day profile so the forecast
+        #    can be pre-positioned for the level a recurring hour is known to need.
+        self.anomaly_detector = AnomalyDetector()
+        self.pattern_learner = PatternLearner()
 
         # All mutable, observable state lives behind one lock.
         self.state = SystemState()
@@ -243,6 +256,12 @@ class Orchestrator:
             self.history.add(snap)
             self.state.current_metrics = snap
 
+            # Feed the time-of-day pattern learner with the observed utilization so
+            # the next orchestration tick can pre-position capacity for this hour.
+            self.pattern_learner.observe(
+                now, float(snap.get("effective_utilization", 0.0) or 0.0)
+            )
+
             # Residual tracking: compare the previous prediction against what we just
             # observed. abs() because confidence cares about error magnitude only.
             if self.state._last_predicted is not None:
@@ -299,9 +318,26 @@ class Orchestrator:
                 beta=self.config.forecast_beta,
                 recent_residuals=recent_residuals,
             )
+
+            # Pre-positioning: nudge the forecast by the learned time-of-day factor
+            # so we provision for the level this hour is historically known to need
+            # (factor > 1 -> hotter hour -> higher predicted; < 1 -> cooler). The
+            # rest of the forecast payload is left intact.
+            factor = self.pattern_learner.seasonality_factor(now)
+            fc["seasonality_factor"] = round(factor, 3)
+            fc["predicted"] = round(fc["predicted"] * factor, 2)
+
             self.state.forecast = fc
-            # Remember this prediction so the NEXT collector tick can score it.
+            # Remember this (pre-positioned) prediction so the NEXT collector tick
+            # can score it against the observed value as a residual.
             self.state._last_predicted = fc["predicted"]
+
+            # Detect a sudden spike in recent utilization (reusing the same recent
+            # series already pulled for the forecast). The result is stored so
+            # snapshot() surfaces the real anomaly state, and is passed to the
+            # scaler as an optional (lowest-precedence) scale-up trigger.
+            anomaly = self.anomaly_detector.detect(series)
+            self.state.anomaly = anomaly
 
             current = int(self.pool.current())
             decision = self.scaler.decide(
@@ -310,6 +346,7 @@ class Orchestrator:
                 current,
                 self.state.last_action_ts,
                 now,
+                anomaly=anomaly,
             )
 
             # Only an actionable decision moves the pool and resets the cooldown clock.
@@ -416,8 +453,9 @@ class Orchestrator:
             A dict with keys ``timestamp``, ``current_metrics``, ``forecast``,
             ``workers`` (``current``/``min``/``max``/``backend``), ``last_decision``,
             ``cooldown_remaining_s``, ``scaling_history``, ``anomaly`` and ``cost``.
-            ``anomaly`` and ``cost`` are placeholders populated by later commits
-            (patterns and cost reporting respectively).
+            ``anomaly`` reflects the detector's latest result (neutral default
+            before the first orchestration tick); ``cost`` is a placeholder
+            populated by a later commit (cost reporting).
         """
         now = time.time()
         cfg = self.config
@@ -445,8 +483,9 @@ class Orchestrator:
                 "last_decision": self.state.last_decision or {},
                 "cooldown_remaining_s": cooldown_remaining_s,
                 "scaling_history": list(self.state.scaling_history),
-                # Placeholder; populated in a later commit (patterns / anomaly detection).
-                "anomaly": {"active": False, "zscore": 0.0},
+                # The detector's latest result; the neutral default until the first
+                # orchestration tick runs (see SystemState.anomaly).
+                "anomaly": dict(self.state.anomaly),
                 # Placeholder; populated in a later commit (cost reporting).
                 "cost": {},
             }
