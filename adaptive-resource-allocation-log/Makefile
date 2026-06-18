@@ -47,7 +47,7 @@ test-int:
 # the caller sees the true pass/fail.
 e2e:
 	COOLDOWN_PERIOD_SECONDS=2 docker compose up -d --build app
-	docker compose --profile e2e run --build --rm e2e; ec=$$?; docker compose down; exit $$ec
+	COOLDOWN_PERIOD_SECONDS=2 docker compose --profile e2e run --build --rm e2e; ec=$$?; docker compose down; exit $$ec
 
 # Same capture-exit-code-then-teardown pattern for the load test.
 load:
