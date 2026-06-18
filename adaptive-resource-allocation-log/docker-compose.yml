@@ -1,13 +1,40 @@
 # Adaptive Resource Allocation System — service topology.
 #
-# Commit 1 ships only the profile-gated `test` service so `make test` can run the
-# unit suite inside Docker. The runnable `app` plus `e2e` / `loadtest` profiles
-# arrive in later commits.
+# `app` is the runnable production service: a single eventlet/Flask-SocketIO
+# process on :8080 holding all state (metrics, worker pool, scaling decisions)
+# in process memory — no volume, no database. The profile-gated `test`, `e2e`,
+# and `loadtest` services drive that live stack by service name and never start
+# on a bare `docker compose up`. Run via `make up` / `make test` / `make e2e` /
+# `make load`.
 
 services:
+  # Live production service — built from the production Dockerfile and exposed on
+  # the host. The autoscaler tunables are overridable from the environment; the
+  # E2E target passes COOLDOWN_PERIOD_SECONDS=2 so the scaler reacts fast.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: adaptive-resource-allocation-app
+    ports:
+      - "${PORT:-8080}:8080"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - MIN_WORKERS=${MIN_WORKERS:-2}
+      - MAX_WORKERS=${MAX_WORKERS:-20}
+      - COOLDOWN_PERIOD_SECONDS=${COOLDOWN_PERIOD_SECONDS:-60}
+      - MONITORING_INTERVAL_SECONDS=${MONITORING_INTERVAL_SECONDS:-5}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the
-  # same code + requirements as the eventual app) and runs pytest in-process — no
-  # running service required. Profile-gated so it never starts on a bare
+  # same code + requirements as the app) and runs pytest in-process — no running
+  # service required. Profile-gated so it never starts on a bare
   # `docker compose up`. Run via `make test`.
   test:
     build:
@@ -15,3 +42,34 @@ services:
       dockerfile: Dockerfile.test
     profiles: [test]
     command: ["pytest", "-q"]
+
+  # Cross-container E2E verifier. Waits for `app` to be healthy, then drives the
+  # live server over HTTP + WebSocket by service name and walks the full
+  # monitor → forecast → scale flow. Run via `make e2e`; its exit code is the
+  # suite's pass/fail. (scripts/verify_e2e.py arrives in commit 11.)
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - APP_URL=http://app:8080
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+
+  # Containerized load test. Waits for `app` to be healthy, then drives a
+  # concurrent workload by service name and asserts the throughput / latency /
+  # error gates. Run via `make load`. (scripts/load_test.py arrives in commit 11.)
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - APP_URL=http://app:8080
+    depends_on:
+      app:
+        condition: service_healthy
+    command: ["python", "scripts/load_test.py"]
