@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Adaptive Resource Allocation</title>
+  <!-- Empty data-URL icon suppresses the favicon 404 the browser would otherwise log. -->
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="/static/css/style.css" />
+  <!-- Vendored libraries (no CDN at runtime, no build step).
+       chart.umd.min.js exposes the global `Chart`; socket.io.min.js exposes `io`.
+       Both load BEFORE dashboard.js so its constructors are available on boot. -->
+  <script src="/static/js/chart.umd.min.js"></script>
+  <script src="/static/js/socket.io.min.js"></script>
+  <!-- Deferred so the DOM is parsed before the dashboard wiring runs. -->
+  <script src="/static/js/dashboard.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <h1>Adaptive Resource Allocation</h1>
+    <span id="conn-status" class="pill pill--connecting">connecting…</span>
+  </header>
+
+  <main>
+    <!-- Stat cards — painted by status_update (Orchestrator.snapshot). -->
+    <section class="group" aria-labelledby="overview-heading">
+      <h2 id="overview-heading">Overview</h2>
+      <div class="cards">
+        <div class="card card--accent">
+          <div class="card__label">Workers</div>
+          <div class="card__value" id="stat-workers">—</div>
+          <div class="card__sub" id="stat-workers-sub">min — · max — · —</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Effective utilization</div>
+          <div class="card__value" id="stat-utilization">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">CPU</div>
+          <div class="card__value" id="stat-cpu">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Memory</div>
+          <div class="card__value" id="stat-memory">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Queue depth</div>
+          <div class="card__value" id="stat-queue">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Latency</div>
+          <div class="card__value" id="stat-latency">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Arrival rate</div>
+          <div class="card__value" id="stat-arrival">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Forecast</div>
+          <div class="card__value" id="stat-forecast">—</div>
+          <div class="card__sub" id="stat-forecast-sub">— · — · —</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Last decision</div>
+          <div class="card__value" id="stat-decision">—</div>
+          <div class="card__sub" id="stat-decision-sub">—</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Cooldown</div>
+          <div class="card__value" id="stat-cooldown">—</div>
+        </div>
+        <div class="card" id="card-anomaly">
+          <div class="card__label">Anomaly</div>
+          <div class="card__value" id="stat-anomaly">—</div>
+          <div class="card__sub" id="stat-anomaly-sub">z = —</div>
+        </div>
+        <div class="card">
+          <div class="card__label">Cost</div>
+          <div class="card__value" id="stat-cost">—</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Live charts fed by metrics_update (rolling per-field window from the server). -->
+    <section class="group" aria-labelledby="charts-heading">
+      <h2 id="charts-heading">Live charts</h2>
+      <div class="charts">
+        <div class="chart-card">
+          <h3>Effective utilization &amp; forecast</h3>
+          <div class="chart-box"><canvas id="chart-utilization"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>CPU &amp; memory</h3>
+          <div class="chart-box"><canvas id="chart-cpu-mem"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Worker count</h3>
+          <div class="chart-box"><canvas id="chart-workers"></canvas></div>
+        </div>
+        <div class="chart-card">
+          <h3>Queue depth &amp; latency</h3>
+          <div class="chart-box"><canvas id="chart-queue-latency"></canvas></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Interactive controls — fetch the SAME-ORIGIN REST endpoints (the API and the
+         dashboard are one process on one port, so the browser never needs CORS).
+         After each action the result is shown inline; the next event refreshes the
+         cards + charts. -->
+    <section class="group" aria-labelledby="controls-heading">
+      <h2 id="controls-heading">Controls</h2>
+      <div class="controls">
+        <div class="control-card">
+          <h3>Manual scaling</h3>
+          <p class="control-hint">Add or remove one worker immediately (reason: manual).</p>
+          <div class="control-row">
+            <button id="btn-scale-up" type="button">Scale up ▲</button>
+            <button id="btn-scale-down" type="button">Scale down ▼</button>
+          </div>
+        </div>
+
+        <div class="control-card">
+          <h3>Inject load</h3>
+          <p class="control-hint">Ramp the simulated arrival rate toward a target.</p>
+          <div class="control-row">
+            <label for="load-rate">arrival rate</label>
+            <input id="load-rate" type="number" min="0" step="100" value="2000" />
+          </div>
+          <div class="control-row">
+            <label for="load-seconds">ramp seconds</label>
+            <input id="load-seconds" type="number" min="0" step="1" value="10" />
+          </div>
+          <button id="btn-inject-load" type="button">Inject Load</button>
+        </div>
+
+        <div class="control-card control-card--wide">
+          <h3>Result</h3>
+          <span id="controls-result" class="result muted">—</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Scaling-history log — the bounded record of decisions that moved the pool. -->
+    <section class="group" aria-labelledby="history-heading">
+      <h2 id="history-heading">Scaling history</h2>
+      <ul id="scaling-history" class="history">
+        <li class="history-empty">No scaling actions yet.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

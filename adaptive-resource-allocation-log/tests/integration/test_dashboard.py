@@ -80,7 +80,7 @@ def test_health_ok(client):
 
 
 def test_index_returns_html(client):
-    """GET / returns 200 HTML (the inline stub when the template is absent)."""
+    """GET / returns 200 HTML — the rendered dashboard template (stub if absent)."""
     resp = client.get("/")
     assert resp.status_code == 200
     assert b"<html" in resp.data.lower()
