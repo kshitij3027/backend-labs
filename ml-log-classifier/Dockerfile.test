@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-runner image for the ML Log Classifier.
+#
+# Same base, env, and NLTK corpora as the production image so tests exercise the
+# real preprocessing path, but it COPYs the whole project (the .dockerignore keeps
+# junk out) and runs pytest as root — tests write temp files freely. Built and run
+# via `make test` / the `test` compose profile; never starts on a bare
+# `docker compose up`.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    NLTK_DATA=/usr/share/nltk_data
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies first (cached unless requirements.txt changes).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Tests need the same NLTK corpora as production.
+RUN python -m nltk.downloader -d /usr/share/nltk_data punkt stopwords
+
+# Whole project (the .dockerignore excludes .git, caches, models/, data/, etc.).
+COPY . .
+
+CMD ["pytest", "-q"]

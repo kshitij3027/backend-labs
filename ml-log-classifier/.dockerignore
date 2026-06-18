@@ -1,0 +1,16 @@
+.git
+.gitignore
+plan.md
+project_requirements.md
+README.md
+__pycache__
+*.pyc
+.pytest_cache
+.venv
+venv
+models/
+data/
+frontend/node_modules
+frontend/dist
+.DS_Store
+*.log

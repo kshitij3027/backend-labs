@@ -1,0 +1,35 @@
+# ML Log Classifier — default configuration.
+#
+# These values mirror the dataclass defaults in src/config.py. Precedence at load
+# time is: dataclass defaults -> this file -> environment variables (env wins).
+# Keys are flat and lowercase, matching the Settings field names one-to-one.
+
+# Server / dashboard
+host: "0.0.0.0"
+port: 8000
+log_level: "INFO"
+
+# Filesystem locations (mounted volumes in Docker)
+model_dir: "/app/models"
+data_dir: "/app/data"
+
+# Sample-data generation / reproducibility
+sample_size: 1000
+random_seed: 42
+
+# TF-IDF feature extraction
+tfidf_max_features: 5000
+tfidf_ngram_max: 2
+
+# Ensemble member hyperparameters (Naive Bayes + Random Forest + Gradient Boosting)
+rf_n_estimators: 100
+gb_n_estimators: 100
+ensemble_weights: [1, 2, 3]
+
+# Adaptive learning loop
+accuracy_retrain_threshold: 0.90
+drift_window: 100
+
+# Serving performance
+target_latency_ms: 100
+cache_size: 1024
