@@ -41,14 +41,24 @@ RUN useradd --uid 1000 --create-home appuser
 COPY src/ ./src/
 COPY config/ ./config/
 
+# Pre-create the volume mountpoints in the image and hand them to appuser. When a
+# fresh named volume (models:/app/models, data:/app/data) is first mounted onto an
+# existing image directory, Docker initializes it with that directory's ownership —
+# so creating them here as appuser-owned means the volumes are writable by the
+# non-root user. Without this, Docker creates the mountpoints as root and startup
+# crashes trying to persist the trained model (PermissionError on /app/models).
+RUN mkdir -p /app/models /app/data
+
 RUN chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000
 
 # Liveness probe hits the /health route. start-period gives uvicorn time to load the
-# model and bind before failures count against the container.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=5 \
+# model and bind before failures count against the container. On first boot the app
+# trains a model during startup (~10-15s) and does not serve until that completes, so
+# the grace period is 60s to avoid a spurious "unhealthy" during first-boot training.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=5 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
 # src/main.py (the ASGI app) arrives in a later commit. The image still builds fine

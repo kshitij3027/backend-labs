@@ -31,7 +31,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      # First boot trains a model during startup (~10-15s) before serving, so a
+      # 60s grace period prevents a spurious "unhealthy" during first-boot training.
+      start_period: 60s
     restart: unless-stopped
 
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the
