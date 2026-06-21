@@ -12,7 +12,7 @@ help:
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - end-to-end verifier in Docker (added in a later commit)"
 	@echo "  load       - load / performance test in Docker (added in a later commit)"
-	@echo "  ui         - React dashboard (added in a later commit)"
+	@echo "  ui         - run app + React dashboard on http://localhost:8080 (detached)"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -42,15 +42,19 @@ test-int:
 	docker compose --profile test build
 	docker compose --profile test run --rm test pytest tests/integration -q
 
-# Placeholders — the e2e / load / ui flows are wired up in later commits.
+# Placeholders — the e2e / load flows are wired up in later commits.
 e2e:
 	@echo "e2e added in a later commit"
 
 load:
 	@echo "load added in a later commit"
 
+# Bring up the backend + the nginx-served React dashboard. The dashboard waits
+# for the app healthcheck before starting (see docker-compose.yml).
 ui:
-	@echo "dashboard added in a later commit"
+	docker compose up -d --build app dashboard
+	@echo "Dashboard: http://localhost:8080"
+	@echo "API:       http://localhost:8000"
 
 clean:
 	docker compose down -v --remove-orphans
