@@ -63,6 +63,24 @@ services:
     profiles: [test]
     command: ["pytest", "-q"]
 
+  # Performance + load suite (Commit 16). Reuses the tester image (it ships
+  # `requests` and the whole project, so `scripts/` are present) but, unlike `test`,
+  # runs BLACK-BOX against the live `app` over the compose network — it waits for the
+  # app healthcheck, then runs the latency probe and the throughput probe back to
+  # back. Profile-gated so it never starts on a bare `docker compose up`. Run via
+  # `make load`.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [load]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - APP_URL=http://app:8000
+    command: ["sh", "-c", "python scripts/perf_test.py && python scripts/load_test.py"]
+
 # Named volumes keep trained models + generated datasets across container restarts.
 volumes:
   models:

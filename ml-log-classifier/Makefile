@@ -42,12 +42,21 @@ test-int:
 	docker compose --profile test build
 	docker compose --profile test run --rm test pytest tests/integration -q
 
-# Placeholders — the e2e / load flows are wired up in later commits.
+# Placeholder — the e2e flow is wired up in a later commit.
 e2e:
 	@echo "e2e added in a later commit"
 
+# Performance + load test (Commit 16), black-box in Docker against the live app:
+# bring up `app` (built), run the profile-gated `loadtest` service (which waits for
+# the app healthcheck, then runs perf_test.py + load_test.py), capture its exit
+# code, tear the stack down, and exit with that code so a failed gate fails `make`.
+# perf_test enforces p95 < 100ms; load_test enforces > 50 req/s.
 load:
-	@echo "load added in a later commit"
+	docker compose up -d --build app
+	@status=0; \
+	docker compose --profile load run --rm loadtest || status=$$?; \
+	docker compose down; \
+	exit $$status
 
 # Bring up the backend + the nginx-served React dashboard. The dashboard waits
 # for the app healthcheck before starting (see docker-compose.yml).

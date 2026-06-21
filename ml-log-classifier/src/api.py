@@ -784,6 +784,28 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
             model_version=app.state.registry.current_version,
         )
 
+    # -- Commit 16: prediction-cache effectiveness -------------------------
+
+    @app.get("/cache/stats", tags=["serving"])
+    def cache_stats() -> dict:
+        """Report the live model's prediction-cache effectiveness.
+
+        Returns the currently-served classifier's
+        :meth:`~src.ensemble.LogClassifier.cache_stats` snapshot — lifetime
+        ``hits``/``misses``, the ``hit_rate``, and the cache ``size``/``capacity``.
+        Additive and read-only: it never mutates state and is independent of the
+        metrics aggregator (the cache is internal to ``classify`` and does not
+        bypass ``metrics.record``, so ``total_classified`` still counts every call).
+        The perf/load scripts poll this to show cache warming across a run.
+
+        Raises:
+            HTTPException: ``503`` if no base model is loaded yet.
+        """
+        classifier: Optional[LogClassifier] = app.state.classifier
+        if classifier is None:
+            raise HTTPException(status_code=503, detail="model not ready")
+        return classifier.cache_stats()
+
     # -- Commit 9: on-demand background training ---------------------------
 
     def _status_snapshot() -> TrainStatusResponse:
