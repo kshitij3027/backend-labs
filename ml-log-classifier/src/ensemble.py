@@ -338,6 +338,62 @@ class LogClassifier:
         rec = _as_record(record)
         return self.classify(rec["raw_log"], rec["timestamp"] or None)
 
+    # -- introspection -----------------------------------------------------
+
+    def feature_importance(self, top_n: int = 20) -> list[dict[str, Any]]:
+        """Return the top engineered features by RandomForest importance.
+
+        Reads ``feature_importances_`` off the **severity** ensemble's RandomForest
+        member (``severity_ensemble.named_estimators_["rf"]``) and aligns those
+        scores 1:1 with the feature pipeline's ordered :attr:`FeaturePipeline.feature_names_`.
+        The pairs are sorted by importance descending and the first ``top_n`` are
+        returned as plain JSON-safe dicts — exactly the shape the dashboard's
+        feature-importance chart and ``GET /feature-importance`` consume.
+
+        This is deliberately defensive: the method **never raises** for a model that
+        is not yet fitted, is missing the RF member, exposes no importances, or whose
+        importance vector length disagrees with the feature-name list. In any of those
+        cases it simply returns an empty list, so the endpoint can degrade gracefully.
+
+        Args:
+            top_n: Maximum number of (feature, importance) pairs to return. Values
+                ``<= 0`` yield an empty list.
+
+        Returns:
+            A list of ``{"name": <feature>, "importance": <float>}`` dicts, sorted by
+            ``importance`` descending, of length ``min(top_n, n_features)`` (or empty
+            when importances are unavailable).
+        """
+        if top_n <= 0 or not self.is_fitted:
+            return []
+
+        # The RandomForest member is the only base estimator exposing
+        # ``feature_importances_``; pull it from the fitted severity ensemble.
+        named = getattr(self.severity_ensemble, "named_estimators_", None)
+        if not named or "rf" not in named:
+            return []
+        rf = named["rf"]
+        importances = getattr(rf, "feature_importances_", None)
+        if importances is None:
+            return []
+
+        names = getattr(self.features, "feature_names_", None)
+        if not names:
+            return []
+
+        # Guard against any length mismatch (e.g. a partially-restored artifact):
+        # zip to the shorter length so we never index past either sequence.
+        n = min(len(names), len(importances))
+        if n == 0:
+            return []
+
+        pairs = [
+            {"name": str(names[i]), "importance": float(importances[i])}
+            for i in range(n)
+        ]
+        pairs.sort(key=lambda d: d["importance"], reverse=True)
+        return pairs[:top_n]
+
     # -- persistence -------------------------------------------------------
 
     def save(self, dirpath: str) -> None:

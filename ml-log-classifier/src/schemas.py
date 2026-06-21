@@ -493,6 +493,44 @@ class ABConfigRequest(BaseModel):
     )
 
 
+class FeatureImportance(BaseModel):
+    """A single ``(feature, importance)`` pair for the dashboard viz.
+
+    Mirrors one entry of :meth:`src.ensemble.LogClassifier.feature_importance`.
+
+    Attributes:
+        name: The engineered feature name (e.g. ``"tfidf__timeout"`` or a dense
+            column like ``"msg_len"``).
+        importance: The RandomForest Gini importance for that feature (``>= 0``).
+    """
+
+    name: str = Field(..., description="Engineered feature name.")
+    importance: float = Field(
+        ..., description="RandomForest feature importance (>= 0)."
+    )
+
+
+class FeatureImportanceResponse(BaseModel):
+    """The payload returned by ``GET /feature-importance``.
+
+    The top-N most important engineered features (by the severity ensemble's
+    RandomForest ``feature_importances_``), already sorted descending, plus the
+    model version they were read from. Empty ``features`` when the model exposes
+    no importances (e.g. mid-train or a degenerate fit).
+
+    Attributes:
+        features: Top features sorted by importance descending (``<= top``).
+        model_version: The registry's active (champion) version id, or ``None``.
+    """
+
+    features: list[FeatureImportance] = Field(
+        ..., description="Top features by importance, sorted descending."
+    )
+    model_version: Optional[str] = Field(
+        default=None, description="Active registry version id the importances came from."
+    )
+
+
 class ModelsResponse(BaseModel):
     """The A/B + registry view returned by ``GET /models`` and the model-admin routes.
 

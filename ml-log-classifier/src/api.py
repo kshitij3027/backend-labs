@@ -83,6 +83,7 @@ from src.schemas import (
     BatchClassifyResponse,
     ClassifyRequest,
     ClassifyResponse,
+    FeatureImportanceResponse,
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
@@ -744,6 +745,44 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         except KeyError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return _models_response()
+
+    # -- Commit 15: feature-importance viz feed ----------------------------
+
+    @app.get(
+        "/feature-importance",
+        response_model=FeatureImportanceResponse,
+        tags=["serving"],
+    )
+    def feature_importance(top: int = 20) -> FeatureImportanceResponse:
+        """Return the live model's top engineered features by RF importance.
+
+        Reads the severity ensemble's RandomForest ``feature_importances_`` (aligned
+        with the feature pipeline's names) off the **currently-served** classifier and
+        returns the top ``top`` as ``{name, importance}`` pairs sorted descending. This
+        powers the dashboard's feature-importance chart. Additive and read-only — it
+        never mutates state and does not touch the existing classify/train/serving
+        routes.
+
+        Args:
+            top: Maximum number of features to return (clamped to ``>= 0``).
+
+        Returns:
+            A :class:`FeatureImportanceResponse` with the sorted features and the
+            registry's current version id (``features`` is empty when the model has
+            no importances available, e.g. mid-train).
+
+        Raises:
+            HTTPException: ``503`` if no base model is loaded yet.
+        """
+        classifier: Optional[LogClassifier] = app.state.classifier
+        if classifier is None:
+            raise HTTPException(status_code=503, detail="model not ready")
+
+        features = classifier.feature_importance(max(0, top))
+        return FeatureImportanceResponse(
+            features=features,
+            model_version=app.state.registry.current_version,
+        )
 
     # -- Commit 9: on-demand background training ---------------------------
 
