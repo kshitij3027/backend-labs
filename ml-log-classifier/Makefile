@@ -10,8 +10,8 @@ help:
 	@echo "  test       - full pytest suite in Docker (rebuilds first)"
 	@echo "  test-unit  - unit tests only in Docker"
 	@echo "  test-int   - integration tests only in Docker"
-	@echo "  e2e        - end-to-end verifier in Docker (added in a later commit)"
-	@echo "  load       - load / performance test in Docker (added in a later commit)"
+	@echo "  e2e        - full end-to-end verifier in Docker (black-box against live app)"
+	@echo "  load       - load / performance test in Docker (black-box against live app)"
 	@echo "  ui         - run app + React dashboard on http://localhost:8080 (detached)"
 	@echo "  clean      - down + remove volumes and orphans"
 
@@ -42,9 +42,17 @@ test-int:
 	docker compose --profile test build
 	docker compose --profile test run --rm test pytest tests/integration -q
 
-# Placeholder — the e2e flow is wired up in a later commit.
+# Full end-to-end verifier (Commit 17), black-box in Docker against the live app:
+# bring up `app` (built), run the profile-gated `e2e` service (which waits for the
+# app healthcheck, then runs scripts/verify_e2e.py through the whole flow), capture
+# its exit code, tear the stack down, and exit with that code so a failed check
+# fails `make`. Mirrors the `load` target.
 e2e:
-	@echo "e2e added in a later commit"
+	docker compose up -d --build app
+	@status=0; \
+	docker compose --profile e2e run --rm e2e || status=$$?; \
+	docker compose down; \
+	exit $$status
 
 # Performance + load test (Commit 16), black-box in Docker against the live app:
 # bring up `app` (built), run the profile-gated `loadtest` service (which waits for
