@@ -68,6 +68,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 from src import trainer
+from src.adaptive import DriftMonitor
 from src.config import Settings, get_config
 from src.ensemble import LogClassifier
 from src.log_generator import generate_logs
@@ -75,10 +76,13 @@ from src.metrics import ConnectionManager, MetricsAggregator
 from src.model_store import ModelRegistry
 from src.multiservice import MultiServiceClassifier
 from src.schemas import (
+    AdaptiveStatusResponse,
     BatchClassifyRequest,
     BatchClassifyResponse,
     ClassifyRequest,
     ClassifyResponse,
+    FeedbackRequest,
+    FeedbackResponse,
     HealthResponse,
     MultiServiceResponse,
     StatsResponse,
@@ -247,17 +251,37 @@ def _startup_load_or_train(app: FastAPI, cfg: Settings, auto_train: bool) -> Non
     app.state.train_lock = threading.Lock()
     app.state.last_train_metrics = None
 
+    # --- Commit 12: adaptive learning loop (Feature Area B). ---
+    # The drift monitor watches the live model's severity correctness against the
+    # ground truth ops submits via ``POST /feedback`` and decides when recent
+    # accuracy has slipped enough to auto-retrain. ``feedback_buffer`` accumulates
+    # the labeled feedback records (capped) so a triggered retrain can fold real,
+    # corrected examples into the corpus; ``feedback_lock`` guards mutations of that
+    # buffer (it is appended from the threadpool and snapshotted by the retrain
+    # launcher). The monitor itself is internally locked.
+    app.state.drift_monitor = DriftMonitor(
+        window=cfg.drift_window, threshold=cfg.accuracy_retrain_threshold
+    )
+    app.state.feedback_buffer = []
+    app.state.feedback_lock = threading.Lock()
+
     # --- Commit 11: hierarchical multi-service classifier (Feature Area A). ---
     # Loaded/trained against a SEPARATE persistence path so it never collides with
     # the base model's registry. Adds ~one model's training to the first boot only.
     _startup_load_or_multiservice(app, cfg, auto_train)
 
 
-def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None:
+def _run_training(
+    app: FastAPI,
+    count: Optional[int],
+    cv: Optional[int],
+    extra_records: Optional[list[dict]] = None,
+) -> None:
     """Background worker that retrains the model and hot-swaps it on success.
 
-    Runs in a daemon thread launched by ``POST /train``; never on the event loop.
-    The contract here is **graceful, zero-downtime retraining**:
+    Runs in a daemon thread launched by ``POST /train`` (or by ``POST /feedback``
+    when drift is detected); never on the event loop. The contract here is
+    **graceful, zero-downtime retraining**:
 
     * The currently-served ``app.state.classifier`` is left **untouched** for the
       entire duration of training, so ``/classify`` (and the batch/stream routes)
@@ -271,19 +295,32 @@ def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None
     * ``is_training`` is always cleared in ``finally`` so a failed run never wedges
       the service into a permanent "training" state and a later ``/train`` works.
 
+    The retrain corpus is the freshly-generated synthetic logs **plus** any
+    ``extra_records`` supplied. The feedback-driven (Commit 12) retrain passes the
+    current feedback buffer here so the corrected, ops-labeled examples are folded
+    into both the base and the multi-service model; the plain ``POST /train`` path
+    passes ``None`` (unchanged behaviour).
+
     Args:
         app: The FastAPI app whose ``state`` carries ``cfg`` / ``registry`` /
             ``classifier`` / ``model_status`` / ``last_train_metrics`` /
             ``is_training`` / ``train_lock``.
         count: Corpus size to generate; falls back to ``cfg.sample_size``.
         cv: Cross-validation fold count; falls back to 5.
+        extra_records: Optional labeled records (same schema as the generator's)
+            appended to the generated corpus before training — used to fold ops
+            feedback into the retrain. ``None``/empty leaves the corpus unchanged.
     """
     cfg: Settings = app.state.cfg
     try:
         n = count or cfg.sample_size
         folds = cv or 5
-        print(f"[api] /train: generating {n} logs (seed={cfg.random_seed}) and retraining ...")
-        records = generate_logs(n, cfg.random_seed)
+        extra = list(extra_records or [])
+        print(
+            f"[api] /train: generating {n} logs (seed={cfg.random_seed}) "
+            f"+ {len(extra)} feedback record(s) and retraining ..."
+        )
+        records = generate_logs(n, cfg.random_seed) + extra
         result = trainer.train(
             records=records,
             cfg=cfg,
@@ -331,6 +368,36 @@ def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None
         # Always release the training flag so the service is not wedged.
         with app.state.train_lock:
             app.state.is_training = False
+
+
+def _launch_retrain(
+    app: FastAPI,
+    count: Optional[int] = None,
+    cv: Optional[int] = None,
+    extra_records: Optional[list[dict]] = None,
+) -> None:
+    """Spawn the background retrain daemon thread (the shared launch mechanism).
+
+    Mirrors the thread launch in ``POST /train`` but additionally threads
+    ``extra_records`` through to :func:`_run_training`, so the feedback-driven
+    retrain (Commit 12) can fold the ops feedback buffer into the corpus. The
+    caller is responsible for having already flipped ``is_training``/``model_status``
+    under ``train_lock`` (so the guard is honoured exactly once, by whoever decided
+    to start the retrain).
+
+    Args:
+        app: The FastAPI app (its ``state`` is passed to the worker).
+        count: Corpus size override; ``None`` -> ``cfg.sample_size``.
+        cv: Cross-validation fold override; ``None`` -> 5.
+        extra_records: Labeled feedback records to append to the corpus, or
+            ``None`` for an unmodified generated corpus.
+    """
+    thread = threading.Thread(
+        target=_run_training,
+        args=(app, count, cv, extra_records),
+        daemon=True,
+    )
+    thread.start()
 
 
 async def _broadcast_loop(app: FastAPI) -> None:
@@ -592,12 +659,9 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
             app.state.is_training = True
             app.state.model_status = "training"
 
-        thread = threading.Thread(
-            target=_run_training,
-            args=(app, req.count, req.cv),
-            daemon=True,
-        )
-        thread.start()
+        # Shared launch path; ``extra_records=None`` keeps the plain-/train corpus
+        # unchanged (only the feedback-driven retrain folds in extra records).
+        _launch_retrain(app, count=req.count, cv=req.cv, extra_records=None)
         return _status_snapshot()
 
     @app.get("/train/status", response_model=TrainStatusResponse, tags=["training"])
@@ -611,6 +675,137 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         ``model_status`` is ``"ready"`` (with ``current_version`` advanced).
         """
         return _status_snapshot()
+
+    # -- Commit 12: adaptive learning loop (Feature Area B) ----------------
+
+    #: Fallback category attached to a feedback record when neither the request
+    #: nor the live model's prediction yields one (keeps the record's schema
+    #: rectangular for the retrain corpus).
+    _FEEDBACK_DEFAULT_CATEGORY = "APPLICATION"
+
+    #: Cap on the feedback buffer so an unbounded stream of feedback cannot grow
+    #: memory without bound; only the most-recent records are retained for the
+    #: next retrain corpus.
+    _FEEDBACK_BUFFER_MAX = 1000
+
+    # NOTE: a *synchronous* ``def`` (like ``/classify``) so FastAPI runs the
+    # blocking sklearn inference in its worker threadpool, not on the event loop.
+    @app.post("/feedback", response_model=FeedbackResponse, tags=["adaptive"])
+    def feedback(req: FeedbackRequest) -> FeedbackResponse:
+        """Submit ground-truth for a log; record drift and maybe auto-retrain.
+
+        The adaptive learning loop's single entry point. For each submission it:
+
+        1. Classifies ``req.raw_log`` with the **current** live model to recover
+           what the model *would* have predicted (``predicted_severity`` and the
+           predicted category).
+        2. Records the (predicted vs. true) severity in the
+           :class:`~src.adaptive.DriftMonitor`, which returns whether it was
+           ``correct`` and updates the rolling recent-accuracy window.
+        3. Appends a fully-labeled training record (using the *true* severity, and
+           the true category when given, else the predicted category, else a
+           default) to the capped feedback buffer, so a future retrain learns from
+           the corrected example.
+        4. If the monitor now says :meth:`~src.adaptive.DriftMonitor.should_retrain`
+           (window full **and** recent accuracy below the threshold) and no retrain
+           is already running, launches a **graceful background retrain** that folds
+           the current feedback buffer into the corpus, and marks the monitor
+           retrained (clearing its window so it re-evaluates the new model). The old
+           model keeps serving throughout; the new one is atomically swapped in only
+           on success.
+
+        Returns:
+            A :class:`FeedbackResponse` echoing the prediction vs. truth, the
+            post-update recent accuracy, and whether a retrain was triggered.
+
+        Raises:
+            HTTPException: ``503`` if no model is loaded (nothing to score against).
+        """
+        classifier: Optional[LogClassifier] = app.state.classifier
+        if classifier is None:
+            raise HTTPException(status_code=503, detail="model not ready")
+
+        # 1) What would the live model have predicted for this log?
+        prediction = classifier.classify(req.raw_log, req.timestamp)
+        predicted_severity = str(prediction["severity"])
+
+        # 2) Fold the ground truth into the drift monitor (severity is the
+        #    monitored axis) and read back correctness + the updated accuracy.
+        monitor: DriftMonitor = app.state.drift_monitor
+        correct = monitor.record(predicted_severity, req.true_severity)
+
+        # 3) Buffer a labeled record for the next retrain corpus. Use the TRUE
+        #    severity; prefer the true category, fall back to the model's predicted
+        #    category, then a default — so the record always carries every label
+        #    key the trainer/generator schema expects.
+        category = req.true_category or str(
+            prediction.get("category") or _FEEDBACK_DEFAULT_CATEGORY
+        )
+        record = {
+            "raw_log": req.raw_log,
+            "timestamp": req.timestamp or "",
+            "service": "",
+            "severity": req.true_severity,
+            "category": category,
+        }
+        with app.state.feedback_lock:
+            app.state.feedback_buffer.append(record)
+            # Keep only the most-recent records (cap memory; bounded retrain cost).
+            if len(app.state.feedback_buffer) > _FEEDBACK_BUFFER_MAX:
+                del app.state.feedback_buffer[:-_FEEDBACK_BUFFER_MAX]
+
+        # 4) Drift check → maybe launch a graceful background retrain. The
+        #    is_training flip is guarded by train_lock so a concurrent /train or a
+        #    second drifting /feedback cannot start two retrains; the loser simply
+        #    does not trigger (the monitor stays armed and will trigger on the next
+        #    feedback once a retrain slot is free).
+        retrain_triggered = False
+        if monitor.should_retrain():
+            extra_records: Optional[list[dict]] = None
+            with app.state.train_lock:
+                if not app.state.is_training:
+                    app.state.is_training = True
+                    app.state.model_status = "training"
+                    # Snapshot the buffer under the feedback lock so the retrain
+                    # thread sees a stable copy even as new feedback arrives.
+                    with app.state.feedback_lock:
+                        extra_records = list(app.state.feedback_buffer)
+                    retrain_triggered = True
+            if retrain_triggered:
+                # Re-arm the monitor BEFORE the thread runs so further feedback
+                # accumulates against the new window (prevents immediate re-trigger).
+                monitor.mark_retrained()
+                _launch_retrain(app, count=None, cv=None, extra_records=extra_records)
+                print(
+                    "[api] /feedback: recent accuracy below threshold "
+                    f"({monitor.threshold}); launched graceful background retrain "
+                    f"with {len(extra_records or [])} feedback record(s)"
+                )
+
+        return FeedbackResponse(
+            recorded=True,
+            predicted_severity=predicted_severity,
+            true_severity=req.true_severity,
+            correct=correct,
+            recent_accuracy=monitor.recent_accuracy(),
+            retrain_triggered=retrain_triggered,
+        )
+
+    @app.get(
+        "/adaptive/status",
+        response_model=AdaptiveStatusResponse,
+        tags=["adaptive"],
+    )
+    def adaptive_status() -> AdaptiveStatusResponse:
+        """Report the drift monitor's state plus whether a retrain is in flight.
+
+        Returns the monitor's :meth:`~src.adaptive.DriftMonitor.snapshot` (recent
+        accuracy, window size/capacity, threshold, lifetime feedback and retrain
+        counts, window-full flag) augmented with ``is_training`` so a client sees
+        the drift signal and the retrain lifecycle in a single call.
+        """
+        snapshot = app.state.drift_monitor.snapshot()
+        return AdaptiveStatusResponse(**snapshot, is_training=app.state.is_training)
 
     # -- Commit 9: bulk + streaming inference ------------------------------
 

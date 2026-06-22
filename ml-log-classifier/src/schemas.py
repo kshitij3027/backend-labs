@@ -269,3 +269,134 @@ class MultiServiceResponse(BaseModel):
         description="Cross-service anomaly score in [0, 1] (service ambiguity + "
         "per-service severity disagreement).",
     )
+
+
+# -- Commit 12: adaptive learning loop (Feature Area B) --------------------
+
+
+class FeedbackRequest(BaseModel):
+    """Ground-truth feedback for one log, the body for ``POST /feedback``.
+
+    Ops submits the *correct* label for a previously-seen (or replayed) log so the
+    :class:`src.adaptive.DriftMonitor` can measure how well the live model is
+    doing and, if recent accuracy has slipped, fold the example into the next
+    retrain corpus. Only the raw text and the true severity are required; the true
+    category (when known) improves the retrain signal, and ``timestamp`` feeds the
+    temporal features exactly as in :class:`ClassifyRequest`.
+
+    Attributes:
+        raw_log: The raw log line the feedback is about (must be non-empty).
+        true_severity: The ground-truth severity label from ops.
+        true_category: Optional ground-truth category label. When omitted the
+            service falls back to the model's predicted category for the retrain
+            record.
+        timestamp: Optional ISO-8601 timestamp for temporal features.
+    """
+
+    raw_log: str = Field(
+        ...,
+        min_length=1,
+        description="Raw log line the ground-truth feedback applies to.",
+        examples=["Database connection failed with timeout error"],
+    )
+    true_severity: str = Field(
+        ...,
+        description="Ground-truth severity label supplied by ops.",
+        examples=["ERROR"],
+    )
+    true_category: Optional[str] = Field(
+        default=None,
+        description="Optional ground-truth category label (falls back to the "
+        "predicted category when omitted).",
+        examples=["SYSTEM"],
+    )
+    timestamp: Optional[str] = Field(
+        default=None,
+        description="Optional ISO-8601 timestamp for temporal features.",
+        examples=["2026-06-18T12:34:56"],
+    )
+
+
+class FeedbackResponse(BaseModel):
+    """The result of recording one ground-truth feedback (``POST /feedback``).
+
+    Echoes what the live model predicted for the log versus the truth ops
+    supplied, the post-update recent accuracy of the drift monitor, and whether
+    this submission pushed accuracy below the threshold and consequently kicked
+    off a background retrain.
+
+    Attributes:
+        recorded: ``True`` once the feedback has been folded into the monitor.
+        predicted_severity: The severity the current model assigned to the log.
+        true_severity: The ground-truth severity from the request (echoed back).
+        correct: ``True`` if ``predicted_severity == true_severity``.
+        recent_accuracy: The drift monitor's recent-window accuracy *after* this
+            feedback (``1.0`` while the window is still empty).
+        retrain_triggered: ``True`` if this feedback caused a background retrain to
+            be launched (recent accuracy dropped below the threshold with a full
+            window and no retrain already running).
+    """
+
+    recorded: bool = Field(
+        ..., description="True once the feedback was recorded in the monitor."
+    )
+    predicted_severity: str = Field(
+        ..., description="Severity the current model predicted for the log."
+    )
+    true_severity: str = Field(
+        ..., description="Ground-truth severity from the request (echoed)."
+    )
+    correct: bool = Field(
+        ..., description="True if the prediction matched the ground truth."
+    )
+    recent_accuracy: float = Field(
+        ..., description="Drift-monitor recent accuracy after this feedback."
+    )
+    retrain_triggered: bool = Field(
+        ..., description="True if this feedback launched a background retrain."
+    )
+
+
+class AdaptiveStatusResponse(BaseModel):
+    """The drift-monitor snapshot plus training flag, for ``GET /adaptive/status``.
+
+    Mirrors :meth:`src.adaptive.DriftMonitor.snapshot` field-for-field and adds
+    ``is_training`` so a client can see, in one call, both the current drift signal
+    and whether an (auto- or manually-triggered) retrain is in flight.
+
+    Attributes:
+        recent_accuracy: Mean correctness over the monitor's current window
+            (``1.0`` when the window is empty).
+        window_size: Number of feedback bits currently held in the window.
+        window_capacity: The configured window size (``cfg.drift_window``).
+        threshold: The recent-accuracy floor below which a retrain is triggered.
+        total_feedback: Lifetime count of feedback submissions recorded.
+        retrains_triggered: Lifetime count of retrains the monitor has signalled.
+        is_window_full: ``True`` once ``window_size == window_capacity``.
+        is_training: ``True`` while a background retrain is in progress.
+    """
+
+    recent_accuracy: float = Field(
+        ..., description="Mean correctness over the current window (1.0 if empty)."
+    )
+    window_size: int = Field(
+        ..., description="Number of feedback bits currently in the window."
+    )
+    window_capacity: int = Field(
+        ..., description="Configured window size (cfg.drift_window)."
+    )
+    threshold: float = Field(
+        ..., description="Recent-accuracy floor that triggers a retrain."
+    )
+    total_feedback: int = Field(
+        ..., description="Lifetime number of feedback submissions recorded."
+    )
+    retrains_triggered: int = Field(
+        ..., description="Lifetime number of retrains signalled by the monitor."
+    )
+    is_window_full: bool = Field(
+        ..., description="True once the window has reached its capacity."
+    )
+    is_training: bool = Field(
+        ..., description="True while a background retrain is in progress."
+    )
