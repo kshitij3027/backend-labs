@@ -400,3 +400,127 @@ class AdaptiveStatusResponse(BaseModel):
     is_training: bool = Field(
         ..., description="True while a background retrain is in progress."
     )
+
+
+# -- Commit 13: A/B testing + graceful fallback (Feature Area C) ------------
+
+
+class ABClassifyResponse(BaseModel):
+    """The result of an A/B-routed classification (``POST /classify/ab``).
+
+    The five :class:`ClassifyResponse` fields (so the underlying model output
+    validates directly) **plus** three serving fields describing *which* version of
+    the A/B pair actually answered and whether a graceful fallback kicked in.
+
+    Attributes:
+        severity: Predicted severity label.
+        category: Predicted category label.
+        confidence: Overall confidence (mean of the two per-axis confidences).
+        severity_confidence: Max soft-voting probability for the severity axis.
+        category_confidence: Max soft-voting probability for the category axis.
+        model_version: The registry version id that actually served this request
+            (the assigned version, or the fallback version when it was used).
+        ab_group: The A/B group the request was routed to — ``"A"`` (champion) or
+            ``"B"`` (challenger).
+        fallback_used: ``True`` if the assigned version could not serve and another
+            version answered instead (graceful fallback).
+    """
+
+    severity: str = Field(..., description="Predicted severity label.")
+    category: str = Field(..., description="Predicted category label.")
+    confidence: float = Field(
+        ..., description="Overall confidence (mean of the two per-axis confidences)."
+    )
+    severity_confidence: float = Field(
+        ..., description="Max soft-voting probability for the severity axis."
+    )
+    category_confidence: float = Field(
+        ..., description="Max soft-voting probability for the category axis."
+    )
+    model_version: str = Field(
+        ..., description="Registry version id that actually served the request."
+    )
+    ab_group: str = Field(
+        ..., description='A/B group the request was routed to: "A" or "B".'
+    )
+    fallback_used: bool = Field(
+        ...,
+        description="True if the assigned version failed and a fallback answered.",
+    )
+
+
+class PromoteRequest(BaseModel):
+    """The body for ``POST /models/promote`` — promote a version to champion.
+
+    Attributes:
+        version: The registry version id to promote (make ``current`` and group A).
+    """
+
+    version: str = Field(
+        ...,
+        min_length=1,
+        description="Registry version id to promote to champion.",
+        examples=["v2"],
+    )
+
+
+class ABConfigRequest(BaseModel):
+    """The body for ``POST /models/ab`` — (re)configure the A/B router.
+
+    Every field is optional; a ``None`` field leaves that part of the router's
+    configuration unchanged. So ``{"split_b": 0.2}`` only shifts the split while
+    keeping the current champion/challenger.
+
+    Attributes:
+        a_version: New champion (group A) version id, or ``None`` to leave as-is.
+        b_version: New challenger (group B) version id, or ``None`` to leave as-is.
+        split_b: New fraction of traffic to route to B (challenger), in ``[0, 1]``,
+            or ``None`` to leave as-is.
+    """
+
+    a_version: Optional[str] = Field(
+        default=None, description="New champion (group A) version id."
+    )
+    b_version: Optional[str] = Field(
+        default=None, description="New challenger (group B) version id."
+    )
+    split_b: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="New fraction of traffic to route to group B (0..1).",
+        examples=[0.5],
+    )
+
+
+class ModelsResponse(BaseModel):
+    """The A/B + registry view returned by ``GET /models`` and the model-admin routes.
+
+    Lists every registry version (each annotated with ``is_champion`` / ``ab_group``
+    / ``serving_metrics`` by :meth:`src.serving.ABRouter.models`) alongside the
+    current A/B configuration (champion, the two group versions, and the split).
+
+    Attributes:
+        models: Annotated per-version dicts (plain dicts; see
+            :meth:`src.serving.ABRouter.models`). Empty when no model is trained.
+        champion: The registry's current (champion) version id, or ``None``.
+        a_version: The version id serving as group A, or ``None`` if unconfigured.
+        b_version: The version id serving as group B, or ``None`` if unconfigured.
+        split_b: Fraction of traffic routed to group B (challenger), in ``[0, 1]``.
+    """
+
+    models: list[dict[str, Any]] = Field(
+        ..., description="Annotated registry versions (is_champion/ab_group/metrics)."
+    )
+    champion: Optional[str] = Field(
+        default=None, description="Current champion (registry 'current') version id."
+    )
+    a_version: Optional[str] = Field(
+        default=None, description="Version id serving as group A, or None."
+    )
+    b_version: Optional[str] = Field(
+        default=None, description="Version id serving as group B, or None."
+    )
+    split_b: float = Field(
+        ..., description="Fraction of traffic routed to group B (challenger)."
+    )

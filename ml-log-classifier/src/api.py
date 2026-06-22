@@ -76,6 +76,8 @@ from src.metrics import ConnectionManager, MetricsAggregator
 from src.model_store import ModelRegistry
 from src.multiservice import MultiServiceClassifier
 from src.schemas import (
+    ABClassifyResponse,
+    ABConfigRequest,
     AdaptiveStatusResponse,
     BatchClassifyRequest,
     BatchClassifyResponse,
@@ -84,11 +86,14 @@ from src.schemas import (
     FeedbackRequest,
     FeedbackResponse,
     HealthResponse,
+    ModelsResponse,
     MultiServiceResponse,
+    PromoteRequest,
     StatsResponse,
     TrainRequest,
     TrainStatusResponse,
 )
+from src.serving import ABRouter
 
 
 #: Subdirectory of ``cfg.model_dir`` holding the multi-service classifier's
@@ -270,6 +275,18 @@ def _startup_load_or_train(app: FastAPI, cfg: Settings, auto_train: bool) -> Non
     # the base model's registry. Adds ~one model's training to the first boot only.
     _startup_load_or_multiservice(app, cfg, auto_train)
 
+    # --- Commit 13: A/B serving router (Feature Area C). ---
+    # Routes /classify/ab traffic across two registry versions (A=champion=current,
+    # B=challenger=latest) with graceful fallback and per-version serving metrics.
+    # It only *reads* the same registry (plus set_current on an explicit promote), so
+    # it is non-invasive to the base /classify path. ``set_default_from_registry`` is
+    # a no-op when nothing is trained, leaving the router unconfigured but usable.
+    app.state.ab_router = ABRouter(registry, split_b=0.5)
+    try:
+        app.state.ab_router.set_default_from_registry()
+    except Exception as exc:  # noqa: BLE001 - never block startup on the A/B router
+        print(f"[api] A/B router default config skipped ({exc!r}); starting unconfigured")
+
 
 def _run_training(
     app: FastAPI,
@@ -342,6 +359,22 @@ def _run_training(
             f"[api] /train: hot-swapped to new model version '{result['version']}' "
             f"(severity_test_acc={result['metrics'].get('severity_test_accuracy')})"
         )
+
+        # --- Commit 13: make the freshly-trained version the A/B CHALLENGER. ---
+        # A faithful A/B flow: a new version does NOT immediately take all traffic.
+        # The champion (group A) keeps serving its share until an explicit promote;
+        # the new version becomes group B (challenger) so it can be compared on live
+        # traffic first. Guarded so an A/B-router hiccup never breaks the base swap.
+        router = getattr(app.state, "ab_router", None)
+        if router is not None:
+            try:
+                router.configure(b_version=app.state.registry.latest())
+                print(
+                    f"[api] /train: set new version '{result['version']}' as A/B "
+                    "challenger (group B)"
+                )
+            except Exception as ab_exc:  # noqa: BLE001 - never break the hot-swap
+                print(f"[api] /train: A/B challenger update skipped: {ab_exc!r}")
 
         # --- Commit 11: also retrain + hot-swap the multi-service model. ---
         # Built from the SAME freshly-generated corpus, then atomically swapped and
@@ -604,6 +637,113 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
                 for k, v in (model.severity_classes_by_service_ or {}).items()
             },
         }
+
+    # -- Commit 13: A/B testing + graceful fallback (Feature Area C) --------
+
+    def _models_response() -> ModelsResponse:
+        """Build a :class:`ModelsResponse` from the current A/B router + registry.
+
+        Shared by ``GET /models`` and the model-admin routes so they all return the
+        same view (the annotated version list plus the live A/B configuration). Safe
+        when nothing is trained — the list is empty and the version ids are ``None``.
+        """
+        router: ABRouter = app.state.ab_router
+        return ModelsResponse(
+            models=router.models(),
+            champion=app.state.registry.current_version,
+            a_version=router.a_version,
+            b_version=router.b_version,
+            split_b=router.split_b,
+        )
+
+    # NOTE: a *synchronous* ``def`` (like ``/classify``) so FastAPI runs the blocking
+    # sklearn inference in its worker threadpool, not on the event loop.
+    @app.post(
+        "/classify/ab", response_model=ABClassifyResponse, tags=["serving"]
+    )
+    def classify_ab(req: ClassifyRequest) -> ABClassifyResponse:
+        """Classify a log via the A/B router, with graceful fallback.
+
+        The router assigns the request to group A (champion) or B (challenger) per the
+        configured split and serves that version's classifier. If the assigned version
+        cannot serve (mid-swap, missing, or raising) it **transparently falls back** to
+        the other group's classifier and then the live champion, so the client gets a
+        valid classification whenever *any* model works. The response carries the three
+        extra serving keys (``model_version`` / ``ab_group`` / ``fallback_used``), and
+        the classification is recorded in the metrics aggregator like every other path.
+
+        Raises:
+            HTTPException: ``503`` if **no** model can serve the request (nothing
+                trained yet, or every version is unavailable).
+        """
+        router: ABRouter = app.state.ab_router
+        try:
+            result = router.classify(req.raw_log, req.timestamp)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        # Record in the shared aggregator (authoritative classified-count), like the
+        # other classify paths. The extra A/B keys are ignored by the aggregator.
+        app.state.metrics.record(result, req.raw_log)
+        return result
+
+    @app.get("/models", response_model=ModelsResponse, tags=["serving"])
+    def list_models() -> ModelsResponse:
+        """List every registry version with A/B annotations + per-version metrics.
+
+        Returns the annotated version list (each with ``is_champion`` / ``ab_group`` /
+        ``serving_metrics``) plus the current A/B configuration (champion and the two
+        group version ids and the split). Safe before any model is trained — the
+        ``models`` list is empty and the version ids are ``None``.
+        """
+        return _models_response()
+
+    @app.post("/models/promote", response_model=ModelsResponse, tags=["serving"])
+    def promote_model(req: PromoteRequest) -> ModelsResponse:
+        """Promote a version to champion (make it ``current`` and group A).
+
+        Repoints the registry's ``current`` at ``req.version`` and installs it as the
+        A/B champion (group A), refreshing the router's cache; the challenger (group B)
+        is left untouched. Returns the updated :class:`ModelsResponse`.
+
+        Raises:
+            HTTPException: ``404`` if ``req.version`` is not a known registry version.
+        """
+        router: ABRouter = app.state.ab_router
+        try:
+            router.promote(req.version)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"unknown model version: {req.version!r}"
+            ) from exc
+        # Keep app.state / the metrics aggregator's current_version in lockstep with
+        # the promotion so /stats, /metrics and /train/status all agree.
+        app.state.metrics.set_status(
+            current_version=app.state.registry.current_version
+        )
+        return _models_response()
+
+    @app.post("/models/ab", response_model=ModelsResponse, tags=["serving"])
+    def configure_ab(req: ABConfigRequest) -> ModelsResponse:
+        """(Re)configure the A/B router: champion, challenger, and/or split.
+
+        Any field left unset keeps its current value. Validates supplied version ids
+        against the registry (loading + caching their classifiers) and clamps the
+        split to ``[0, 1]``. Returns the updated :class:`ModelsResponse`.
+
+        Raises:
+            HTTPException: ``400`` if a supplied version id is unknown to the registry.
+        """
+        router: ABRouter = app.state.ab_router
+        try:
+            router.configure(
+                a_version=req.a_version,
+                b_version=req.b_version,
+                split_b=req.split_b,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _models_response()
 
     # -- Commit 9: on-demand background training ---------------------------
 
