@@ -36,9 +36,22 @@ the moment it finishes starting:
 * Permissive CORS is enabled so the browser dashboard (served from a different
   origin) can call the API directly.
 
-Out of scope for this module (later commits): the live-metrics WebSocket, the
-metrics aggregator, multi-service hierarchical classification, the adaptive
-retraining loop and A/B serving.
+* Live metrics + dashboard streaming (Commit 10):
+  - ``app.state.metrics`` (:class:`src.metrics.MetricsAggregator`) is now the
+    **single source of truth** for ``total_classified``: every classify path
+    (``/classify``, ``/classify/batch``, ``/classify/stream``) reports each
+    classified log via ``metrics.record(result, raw_log)`` instead of bumping the
+    old counter, and ``GET /stats`` reads the total/status from it.
+  - ``GET /metrics`` — a plain REST mirror returning the latest aggregator
+    :meth:`~src.metrics.MetricsAggregator.snapshot` (easy to poll/test without a
+    socket).
+  - ``WS /ws/metrics`` — the dashboard's live feed. A single background
+    broadcaster task (:func:`_broadcast_loop`, started in the lifespan) is the
+    **only** periodic sender; each connection gets one immediate snapshot on
+    connect, then merely ``receive``-s to detect disconnect.
+
+Out of scope for this module (later commits): multi-service hierarchical
+classification, the adaptive retraining loop and A/B serving.
 """
 
 from __future__ import annotations
@@ -49,7 +62,7 @@ import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -57,6 +70,7 @@ from src import trainer
 from src.config import Settings, get_config
 from src.ensemble import LogClassifier
 from src.log_generator import generate_logs
+from src.metrics import ConnectionManager, MetricsAggregator
 from src.model_store import ModelRegistry
 from src.schemas import (
     BatchClassifyRequest,
@@ -68,6 +82,11 @@ from src.schemas import (
     TrainRequest,
     TrainStatusResponse,
 )
+
+
+#: How often (seconds) the background broadcaster pushes a metrics snapshot to
+#: every connected ``/ws/metrics`` client.
+BROADCAST_INTERVAL_SEC = 1.0
 
 
 class Counter:
@@ -143,6 +162,21 @@ def _startup_load_or_train(app: FastAPI, cfg: Settings, auto_train: bool) -> Non
     app.state.cfg = cfg
     app.state.counter = Counter()
 
+    # --- Commit 10: live-metrics aggregator + WebSocket fan-out. ---
+    # The aggregator is the single source of truth for ``total_classified`` and the
+    # snapshot the dashboard renders; seed its status/version from the model we just
+    # loaded or trained so ``/metrics`` agrees with ``/stats`` from the first request.
+    metrics = MetricsAggregator()
+    metrics.set_status(
+        model_status=app.state.model_status,
+        current_version=registry.current_version,
+    )
+    app.state.metrics = metrics
+    app.state.ws_manager = ConnectionManager()
+    # The broadcaster task itself is created in the lifespan (it needs a running
+    # event loop); record a placeholder so shutdown can reference it unconditionally.
+    app.state.broadcaster_task = None
+
     # --- Commit 9: on-demand background training state. ---
     # ``is_training`` / ``model_status`` transitions are guarded by ``train_lock``
     # so a double-submit cannot both observe ``is_training == False`` and start two
@@ -196,6 +230,11 @@ def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None
         app.state.classifier = result["classifier"]
         app.state.last_train_metrics = result["metrics"]
         app.state.model_status = "ready"
+        # Keep the metrics aggregator's status/version in lockstep with app.state so
+        # ``/metrics``, ``/stats`` and ``/train/status`` all agree post-swap.
+        app.state.metrics.set_status(
+            model_status="ready", current_version=app.state.registry.current_version
+        )
         print(
             f"[api] /train: hot-swapped to new model version '{result['version']}' "
             f"(severity_test_acc={result['metrics'].get('severity_test_accuracy')})"
@@ -203,11 +242,44 @@ def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None
     except Exception as exc:  # noqa: BLE001 - background thread must not crash silently
         # Keep the OLD classifier (no downtime); just report and restore status.
         print(f"[api] /train: training FAILED, keeping previous model: {exc!r}")
-        app.state.model_status = "ready" if app.state.classifier is not None else "untrained"
+        restored = "ready" if app.state.classifier is not None else "untrained"
+        app.state.model_status = restored
+        app.state.metrics.set_status(model_status=restored)
     finally:
         # Always release the training flag so the service is not wedged.
         with app.state.train_lock:
             app.state.is_training = False
+
+
+async def _broadcast_loop(app: FastAPI) -> None:
+    """Periodically push the live metrics snapshot to every WebSocket client.
+
+    This is the **single** periodic sender for ``/ws/metrics`` (the connection
+    endpoint only sends one immediate snapshot and otherwise just reads), so no two
+    coroutines ever contend to send on the same socket. Started as an asyncio task
+    in the lifespan and cancelled on shutdown.
+
+    Every :data:`BROADCAST_INTERVAL_SEC` it reads
+    :meth:`MetricsAggregator.snapshot` (which is taken under the aggregator's lock,
+    safe to call from the event-loop thread while classify threads mutate it) and
+    fans it out via :meth:`ConnectionManager.broadcast`. Per-iteration exceptions
+    are swallowed (logged) so a transient failure never kills the loop and silently
+    stops all dashboard updates; a :class:`asyncio.CancelledError` is allowed to
+    propagate so shutdown can stop the task cleanly.
+
+    Args:
+        app: The FastAPI app whose ``state`` carries ``metrics`` and ``ws_manager``.
+    """
+    while True:
+        try:
+            snapshot = app.state.metrics.snapshot()
+            await app.state.ws_manager.broadcast(snapshot)
+        except asyncio.CancelledError:
+            # Shutdown requested — stop the loop.
+            raise
+        except Exception as exc:  # noqa: BLE001 - never let the loop die silently
+            print(f"[api] /ws/metrics broadcaster iteration failed: {exc!r}")
+        await asyncio.sleep(BROADCAST_INTERVAL_SEC)
 
 
 def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastAPI:
@@ -237,8 +309,17 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
     async def lifespan(app: FastAPI):
         # --- startup: load an existing model or train a fresh one. ---
         _startup_load_or_train(app, settings, auto_train)
+        # Start the periodic metrics broadcaster (needs the running event loop).
+        app.state.broadcaster_task = asyncio.create_task(_broadcast_loop(app))
         yield
-        # --- shutdown: nothing to tear down (no background tasks in C8). ---
+        # --- shutdown: stop the broadcaster task cleanly. ---
+        task = getattr(app.state, "broadcaster_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     app = FastAPI(
         title="ML Log Classifier",
@@ -276,10 +357,13 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
 
         Returns the number of logs classified since process start and the model
         lifecycle status (``"ready"`` / ``"untrained"``), matching the spec's
-        ``{"total_classified": 0, "model_status": "ready"}`` shape.
+        ``{"total_classified": 0, "model_status": "ready"}`` shape. As of Commit 10
+        the total comes from the metrics aggregator (the single source of truth);
+        ``model_status`` is read from ``app.state`` which is kept in lockstep with
+        the aggregator on every training transition.
         """
         return StatsResponse(
-            total_classified=app.state.counter.value,
+            total_classified=app.state.metrics.total_classified,
             model_status=app.state.model_status,
         )
 
@@ -291,8 +375,9 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         """Classify a single raw log line into severity + category + confidence.
 
         Runs the loaded :class:`LogClassifier` on ``req.raw_log`` (and the optional
-        ``req.timestamp``), increments the classified-count, and returns the
-        structured result.
+        ``req.timestamp``), records the classification in the metrics aggregator
+        (which owns the authoritative classified-count), and returns the structured
+        result.
 
         Raises:
             HTTPException: ``503`` if no model is loaded (e.g. started with
@@ -303,7 +388,7 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
             raise HTTPException(status_code=503, detail="model not ready")
 
         result = classifier.classify(req.raw_log, req.timestamp)
-        app.state.counter.increment()
+        app.state.metrics.record(result, req.raw_log)
         return result
 
     # -- Commit 9: on-demand background training ---------------------------
@@ -391,8 +476,9 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         """Classify a list of logs in a single vectorized pass.
 
         Delegates to :meth:`LogClassifier.classify_batch` (one feature transform +
-        one predict per axis for the whole batch), increments the classified-count
-        by the number of results, and returns the results plus their count.
+        one predict per axis for the whole batch), records each result in the
+        metrics aggregator (one ``record`` call per classified log, paired with its
+        originating ``raw_log``), and returns the results plus their count.
 
         Args:
             req: A :class:`BatchClassifyRequest` carrying a non-empty ``logs`` list.
@@ -410,7 +496,10 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         results = classifier.classify_batch(
             [{"raw_log": r.raw_log, "timestamp": r.timestamp} for r in req.logs]
         )
-        app.state.counter.increment(len(results))
+        # One record per classified log, paired with its source raw_log (results and
+        # req.logs are in the same order, same length).
+        for log, result in zip(req.logs, results):
+            app.state.metrics.record(result, log.raw_log)
         return BatchClassifyResponse(results=results, count=len(results))
 
     # NOTE: the ONLY ``async def`` route. It must not block the event loop, so each
@@ -424,8 +513,8 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         that yields one compact JSON object per input log (same five keys as
         :class:`ClassifyResponse`) in input order. Each log is classified on the
         event loop's default executor (``run_in_executor``) so the blocking sklearn
-        inference never stalls the loop while the response streams. The
-        classified-count is incremented once per emitted line.
+        inference never stalls the loop while the response streams. Each emitted line
+        is recorded once in the metrics aggregator (the authoritative count).
 
         The ``503`` check is performed **before** returning the streaming response
         so a missing model surfaces as a normal error status rather than a broken
@@ -450,9 +539,52 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
                 result = await loop.run_in_executor(
                     None, classifier.classify, item.raw_log, item.timestamp
                 )
-                app.state.counter.increment()
+                app.state.metrics.record(result, item.raw_log)
                 yield json.dumps(result) + "\n"
 
         return StreamingResponse(_gen(), media_type="application/x-ndjson")
+
+    # -- Commit 10: live metrics (REST mirror + WebSocket feed) ------------
+
+    @app.get("/metrics", tags=["metrics"])
+    def metrics() -> dict:
+        """Return the latest live-metrics snapshot as plain JSON (REST mirror).
+
+        Identical payload to what the ``/ws/metrics`` WebSocket streams, but pull-
+        based — handy for one-off polling, smoke tests and any client that does not
+        speak WebSocket. See :meth:`src.metrics.MetricsAggregator.snapshot` for the
+        full shape (total, severity/category/service distributions, average
+        confidence, throughput, recent predictions, model status/version, uptime).
+        """
+        return app.state.metrics.snapshot()
+
+    # NOTE: the only WebSocket route. It does NOT send periodically itself — the
+    # background :func:`_broadcast_loop` is the sole periodic sender, so there is no
+    # concurrent send on the same socket. This handler only sends ONE immediate
+    # snapshot (so the dashboard paints instantly) and then blocks on
+    # ``receive_text`` purely to detect client disconnect.
+    @app.websocket("/ws/metrics")
+    async def metrics_ws(websocket: WebSocket) -> None:
+        """Stream live metrics snapshots to a dashboard client.
+
+        On connect the socket is accepted, registered with the
+        :class:`~src.metrics.ConnectionManager`, and immediately sent one current
+        snapshot so the UI renders without waiting for the next broadcast tick.
+        Thereafter the periodic broadcaster pushes updates every
+        :data:`BROADCAST_INTERVAL_SEC`; this coroutine just awaits
+        ``receive_text()`` to keep the connection open and notice when the client
+        goes away, at which point it deregisters the socket.
+        """
+        manager: ConnectionManager = app.state.ws_manager
+        await manager.connect(websocket)
+        try:
+            # Paint-on-connect: one immediate snapshot (sent before the broadcaster
+            # could race on this freshly-registered socket).
+            await websocket.send_json(app.state.metrics.snapshot())
+            # Block until the client disconnects; the broadcaster does the sending.
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            manager.disconnect(websocket)
 
     return app
