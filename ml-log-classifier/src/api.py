@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -72,16 +73,24 @@ from src.ensemble import LogClassifier
 from src.log_generator import generate_logs
 from src.metrics import ConnectionManager, MetricsAggregator
 from src.model_store import ModelRegistry
+from src.multiservice import MultiServiceClassifier
 from src.schemas import (
     BatchClassifyRequest,
     BatchClassifyResponse,
     ClassifyRequest,
     ClassifyResponse,
     HealthResponse,
+    MultiServiceResponse,
     StatsResponse,
     TrainRequest,
     TrainStatusResponse,
 )
+
+
+#: Subdirectory of ``cfg.model_dir`` holding the multi-service classifier's
+#: persisted artifacts (kept separate from the base model's registry so neither
+#: clobbers the other).
+MULTISERVICE_SUBDIR = "multiservice"
 
 
 #: How often (seconds) the background broadcaster pushes a metrics snapshot to
@@ -114,6 +123,58 @@ class Counter:
         """The current count (read under the lock)."""
         with self._lock:
             return self._value
+
+
+def _multiservice_dir(cfg: Settings) -> str:
+    """Return the directory holding the multi-service classifier artifacts."""
+    return os.path.join(cfg.model_dir, MULTISERVICE_SUBDIR)
+
+
+def _startup_load_or_multiservice(app: FastAPI, cfg: Settings, auto_train: bool) -> None:
+    """Populate ``app.state`` with a ready (or untrained) multi-service classifier.
+
+    Mirrors :func:`_startup_load_or_train` but for the **hierarchical** Feature-Area-A
+    model, persisted under a *separate* path (``<cfg.model_dir>/multiservice``) so it
+    never collides with the base model's versioned registry:
+
+    1. If that directory exists, load it via
+       :meth:`MultiServiceClassifier.load` and mark ``"ready"``.
+    2. Else if ``auto_train``, fit a fresh :class:`MultiServiceClassifier` on the
+       generated corpus, :meth:`~MultiServiceClassifier.save` it to that path, and
+       mark ``"ready"``. (This adds ~one model's training to the FIRST boot only;
+       it is cached on disk afterwards. Tiny estimators keep tests fast.)
+    3. Else leave ``app.state.multiservice = None`` and mark ``"untrained"``.
+
+    On any load/train failure the service still starts: the multi-service model is
+    left ``None``/``"untrained"`` (the base ``/classify`` path is unaffected).
+    """
+    ms_dir = _multiservice_dir(cfg)
+    model: Optional[MultiServiceClassifier] = None
+    status = "untrained"
+    try:
+        if os.path.isdir(ms_dir):
+            model = MultiServiceClassifier.load(ms_dir, cfg=cfg)
+            status = "ready"
+            print(f"[api] loaded persisted multi-service model from {ms_dir}")
+        elif auto_train:
+            print(
+                f"[api] no persisted multi-service model; training a fresh one "
+                f"into {ms_dir} ..."
+            )
+            records = generate_logs(cfg.sample_size, cfg.random_seed)
+            model = MultiServiceClassifier(cfg).fit(records)
+            model.save(ms_dir)
+            status = "ready"
+            print("[api] trained and persisted multi-service model")
+        else:
+            print("[api] no persisted multi-service model and auto_train disabled")
+    except Exception as exc:  # noqa: BLE001 - never block startup on the multi-svc model
+        print(f"[api] multi-service model unavailable ({exc!r}); continuing untrained")
+        model = None
+        status = "untrained"
+
+    app.state.multiservice = model
+    app.state.multiservice_status = status
 
 
 def _startup_load_or_train(app: FastAPI, cfg: Settings, auto_train: bool) -> None:
@@ -186,6 +247,11 @@ def _startup_load_or_train(app: FastAPI, cfg: Settings, auto_train: bool) -> Non
     app.state.train_lock = threading.Lock()
     app.state.last_train_metrics = None
 
+    # --- Commit 11: hierarchical multi-service classifier (Feature Area A). ---
+    # Loaded/trained against a SEPARATE persistence path so it never collides with
+    # the base model's registry. Adds ~one model's training to the first boot only.
+    _startup_load_or_multiservice(app, cfg, auto_train)
+
 
 def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None:
     """Background worker that retrains the model and hot-swaps it on success.
@@ -239,6 +305,22 @@ def _run_training(app: FastAPI, count: Optional[int], cv: Optional[int]) -> None
             f"[api] /train: hot-swapped to new model version '{result['version']}' "
             f"(severity_test_acc={result['metrics'].get('severity_test_accuracy')})"
         )
+
+        # --- Commit 11: also retrain + hot-swap the multi-service model. ---
+        # Built from the SAME freshly-generated corpus, then atomically swapped and
+        # re-saved to the multi-service path. Graceful: a failure here keeps the
+        # previous multi-service model (and never affects the base swap above).
+        try:
+            ms_model = MultiServiceClassifier(cfg).fit(records)
+            ms_model.save(_multiservice_dir(cfg))
+            app.state.multiservice = ms_model  # atomic ref swap on success only
+            app.state.multiservice_status = "ready"
+            print("[api] /train: hot-swapped multi-service model")
+        except Exception as ms_exc:  # noqa: BLE001 - keep the old multi-svc model
+            print(
+                f"[api] /train: multi-service retrain FAILED, keeping previous: "
+                f"{ms_exc!r}"
+            )
     except Exception as exc:  # noqa: BLE001 - background thread must not crash silently
         # Keep the OLD classifier (no downtime); just report and restore status.
         print(f"[api] /train: training FAILED, keeping previous model: {exc!r}")
@@ -390,6 +472,71 @@ def create_app(cfg: Optional[Settings] = None, auto_train: bool = True) -> FastA
         result = classifier.classify(req.raw_log, req.timestamp)
         app.state.metrics.record(result, req.raw_log)
         return result
+
+    # -- Commit 11: hierarchical multi-service classification --------------
+
+    # NOTE: a *synchronous* ``def`` (like ``/classify``) so FastAPI runs the
+    # blocking sklearn inference in its worker threadpool, not on the event loop.
+    @app.post(
+        "/classify/service",
+        response_model=MultiServiceResponse,
+        tags=["inference"],
+    )
+    def classify_service(req: ClassifyRequest) -> MultiServiceResponse:
+        """Classify a log HIERARCHICALLY: service → its severity model + anomaly.
+
+        Runs the loaded :class:`MultiServiceClassifier` on ``req.raw_log`` (and the
+        optional ``req.timestamp``): it predicts the **service**, applies that
+        service's own severity model, predicts the global category, and computes a
+        cross-service ``anomaly_score`` from ensemble voting. The result is recorded
+        in the metrics aggregator — and because it carries a ``service`` key, this is
+        what populates the ``service_distribution`` in ``GET /metrics``.
+
+        This is additive: the base ``POST /classify`` (and its 5-key response) is
+        unchanged.
+
+        Raises:
+            HTTPException: ``503`` if the multi-service model is not ready (e.g.
+                started with ``auto_train=False`` and nothing persisted yet).
+        """
+        model: Optional[MultiServiceClassifier] = app.state.multiservice
+        if model is None:
+            raise HTTPException(status_code=503, detail="multi-service model not ready")
+
+        result = model.classify(req.raw_log, req.timestamp)
+        # Populates service_distribution (result carries a ``service`` key).
+        app.state.metrics.record(result, req.raw_log)
+        return result
+
+    @app.get("/services", tags=["inference"])
+    def services() -> dict:
+        """List the services the multi-service classifier knows + its readiness.
+
+        Safe to call before the multi-service model is trained: returns an empty
+        ``services`` list and ``status == "untrained"`` in that case. When ready it
+        reports the service labels and, per service, the severity classes that
+        service's model can emit.
+
+        Returns:
+            ``{"services": [...], "status": <str>,
+               "per_service_severity_classes": {service: [severity, ...]}}``.
+        """
+        model: Optional[MultiServiceClassifier] = app.state.multiservice
+        status = getattr(app.state, "multiservice_status", "untrained")
+        if model is None:
+            return {
+                "services": [],
+                "status": status,
+                "per_service_severity_classes": {},
+            }
+        return {
+            "services": list(model.services_ or []),
+            "status": status,
+            "per_service_severity_classes": {
+                k: list(v)
+                for k, v in (model.severity_classes_by_service_ or {}).items()
+            },
+        }
 
     # -- Commit 9: on-demand background training ---------------------------
 

@@ -223,3 +223,49 @@ class BatchClassifyResponse(BaseModel):
         ..., description="One classification result per input log, in order."
     )
     count: int = Field(..., description="Number of results (== len(results)).")
+
+
+class MultiServiceResponse(BaseModel):
+    """The hierarchical multi-service result returned by ``POST /classify/service``.
+
+    Mirrors :meth:`src.multiservice.MultiServiceClassifier.classify` key-for-key
+    (Feature Area A): the predicted service, the **service-specific** severity, the
+    global category, each with its own soft-voting confidence, plus the overall
+    confidence and a cross-service anomaly score.
+
+    Attributes:
+        service: Predicted source service (``"web"`` / ``"database"`` / ``"cache"``).
+        service_confidence: Max soft-voting probability for the service axis.
+        severity: Predicted severity from the predicted service's own model.
+        severity_confidence: Max soft-voting probability for the severity axis.
+        category: Predicted (global) category label.
+        category_confidence: Max soft-voting probability for the category axis.
+        confidence: Overall confidence (mean of the three per-axis confidences),
+            rounded to 4 decimals.
+        anomaly_score: Cross-service anomaly score in ``[0, 1]`` (high when the
+            service is ambiguous and/or the per-service severity models disagree),
+            rounded to 4 decimals.
+    """
+
+    service: str = Field(..., description="Predicted source service.")
+    service_confidence: float = Field(
+        ..., description="Max soft-voting probability for the service axis."
+    )
+    severity: str = Field(
+        ..., description="Predicted severity (from the predicted service's model)."
+    )
+    severity_confidence: float = Field(
+        ..., description="Max soft-voting probability for the severity axis."
+    )
+    category: str = Field(..., description="Predicted (global) category label.")
+    category_confidence: float = Field(
+        ..., description="Max soft-voting probability for the category axis."
+    )
+    confidence: float = Field(
+        ..., description="Overall confidence (mean of the three per-axis confidences)."
+    )
+    anomaly_score: float = Field(
+        ...,
+        description="Cross-service anomaly score in [0, 1] (service ambiguity + "
+        "per-service severity disagreement).",
+    )
