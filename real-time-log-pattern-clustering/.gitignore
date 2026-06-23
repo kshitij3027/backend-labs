@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Clustering artifacts (fitted models, embeddings, vectorizers)
+models/*
+!models/.gitkeep
+*.pkl
+*.joblib
+*.npz
+data/*.csv
+data/*.jsonl
+!data/sample.jsonl
+!data/.gitkeep
+
+# Frontend (React + Vite)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log
+logs/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Planning docs (per repo convention)
+plan.md
+project_requirements.md
