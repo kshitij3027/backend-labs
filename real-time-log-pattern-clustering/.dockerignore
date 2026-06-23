@@ -36,6 +36,9 @@ data/*.csv
 data/*.jsonl
 data/*.pkl
 data/*.npz
+# The committed sample corpus is a fixture the C4 tests load from /app/data; keep it
+# in the build context (all other generated *.jsonl artifacts stay excluded above).
+!data/sample.jsonl
 
 # Frontend (added in a later commit)
 frontend/node_modules
