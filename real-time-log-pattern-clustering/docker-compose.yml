@@ -1,0 +1,50 @@
+# Real-Time Log Pattern Clustering — service topology (Commit 1).
+#
+# `app` is the runnable production service: a single uvicorn/FastAPI process on :8000.
+# Fitted models and generated data persist on named volumes so they survive restarts.
+#
+# The profile-gated `test` service runs the pytest suite and never starts on a bare
+# `docker compose up`. Redis, the nginx dashboard, the load-test and the E2E verifier
+# services are added in later commits. Run via `make up` / `make test`.
+
+services:
+  # Live production service — built from the production Dockerfile and exposed on the
+  # host. Tunable knobs (log level, config path) are overridable from the environment.
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rt-log-clustering-app
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - CONFIG_PATH=/app/config/config.yaml
+    volumes:
+      - models:/app/models
+      - data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free, so the app is healthy as soon as uvicorn binds;
+      # the 60s grace period is a safe margin for image start-up.
+      start_period: 60s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
+  # code + requirements as the app, plus the tests) and runs pytest in-process — no
+  # running service required. Profile-gated so it never starts on a bare
+  # `docker compose up`. Run via `make test`.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    command: ["pytest", "-q"]
+
+# Named volumes keep fitted models + generated datasets across container restarts.
+volumes:
+  models:
+  data:

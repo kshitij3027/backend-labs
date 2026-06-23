@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-runner image for the Real-Time Log Pattern Clustering engine.
+#
+# Same base, env, build toolchain, and NLTK corpora as the production image so tests
+# exercise the real preprocessing path, but it additionally COPYs the test suite,
+# pytest config, scripts/ and data/ and runs pytest as root (tests write temp files
+# freely). Built and run via `make test` / the `test` compose profile; it never
+# starts on a bare `docker compose up`.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    NLTK_DATA=/usr/share/nltk_data
+
+WORKDIR /app
+
+# Build toolchain so hdbscan==0.8.40 compiles, plus curl (parity with production).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        python3-dev \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies first (cached unless requirements.txt changes).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Tests need the same NLTK corpora as production.
+RUN python -m nltk.downloader -d /usr/share/nltk_data punkt stopwords punkt_tab \
+    || python -m nltk.downloader -d /usr/share/nltk_data punkt stopwords
+
+# App code, default config, the test suite + its config, and the (currently empty)
+# scripts/ and data/ dirs used by later E2E / load commits.
+COPY src/ ./src/
+COPY config/ ./config/
+COPY tests/ ./tests/
+COPY pytest.ini ./
+COPY scripts/ ./scripts/
+COPY data/ ./data/
+
+# Pre-create the writable runtime dirs (tests may persist artifacts here).
+RUN mkdir -p /app/models
+
+CMD ["pytest", "-q"]

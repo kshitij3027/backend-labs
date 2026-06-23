@@ -1,0 +1,51 @@
+# Real-Time Log Pattern Clustering Engine — default configuration.
+#
+# Every knob here corresponds to project_requirements.md §7 (Configurable
+# Parameters). Values are deep-merged over the Pydantic model defaults in
+# src/config.py, so any section/field may be partially overridden. A small set of
+# operational knobs (REDIS_HOST, REDIS_PORT, REDIS_DB, API_HOST, API_PORT,
+# API_DEBUG, LOG_LEVEL) can additionally be overridden via environment variables,
+# which take precedence over the values below.
+
+# --- Clustering algorithms ---
+kmeans:
+  n_clusters: 8
+  max_iter: 300
+  random_state: 42
+
+dbscan:
+  eps: 0.3
+  min_samples: 5
+
+hdbscan:
+  min_cluster_size: 10
+  min_samples: 5
+
+# --- Feature extraction ---
+text_features:
+  max_features: 1000
+  ngram_range: [1, 2]
+
+temporal_features:
+  time_windows: [1, 5, 15, 60]
+
+behavioral_features:
+  frequency_threshold: 0.01
+
+# --- Streaming engine ---
+realtime:
+  batch_size: 100
+  update_interval: 30
+  max_clusters: 50
+
+# --- Redis (cluster state / streaming) ---
+redis:
+  host: localhost
+  port: 6379
+  db: 0
+
+# --- API / server ---
+api:
+  host: 0.0.0.0
+  port: 8000
+  debug: true
