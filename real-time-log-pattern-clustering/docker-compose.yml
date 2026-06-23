@@ -20,9 +20,14 @@ services:
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - CONFIG_PATH=/app/config/config.yaml
+      # Reach Redis over the compose network by service name (not localhost).
+      - REDIS_HOST=redis
     volumes:
       - models:/app/models
       - data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 10s
@@ -31,6 +36,21 @@ services:
       # /health is dependency-free, so the app is healthy as soon as uvicorn binds;
       # the 60s grace period is a safe margin for image start-up.
       start_period: 60s
+    restart: unless-stopped
+
+  # Cluster-state / anomaly-history backend for the StateStore. Persistence is disabled
+  # (--save "" / --appendonly no) so it behaves as an ephemeral cache; the engine falls
+  # back to in-memory state if it is ever unreachable. No host port is published — it is
+  # internal to the compose network, which avoids clashing with a host-local Redis.
+  redis:
+    image: redis:7-alpine
+    container_name: rt-log-clustering-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
     restart: unless-stopped
 
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
@@ -42,6 +62,13 @@ services:
       context: .
       dockerfile: Dockerfile.test
     profiles: [test]
+    # `compose run test` starts depends_on services, so the integration suite can reach
+    # Redis at host `redis`. The memory-only unit tests ignore it.
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      redis:
+        condition: service_healthy
     command: ["pytest", "-q"]
 
 # Named volumes keep fitted models + generated datasets across container restarts.
