@@ -71,6 +71,41 @@ services:
         condition: service_healthy
     command: ["pytest", "-q"]
 
+  # Performance + load suite (Commit 13). Reuses the tester image (it ships `requests`,
+  # `websocket-client`, and the whole project, so `scripts/` are present) but, unlike
+  # `test`, runs BLACK-BOX against the live `app` over the compose network — it waits
+  # for the app healthcheck, then runs the latency gates (perf_test.py) and the
+  # throughput gate (load_test.py) back to back. Profile-gated so it never starts on a
+  # bare `docker compose up`. Run via `make load`.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [load]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - APP_URL=http://app:8000
+    command: ["sh", "-c", "python scripts/perf_test.py && python scripts/load_test.py"]
+
+  # Full black-box end-to-end verifier (Commit 13). Reuses the tester image and runs
+  # `scripts/verify_e2e.py` against the live `app` over the compose network — exercising
+  # the entire flow (health -> cluster -> cluster/batch -> stats -> clusters -> patterns/
+  # anomalies/scatter/config -> WebSocket snapshot). Waits for the app healthcheck first.
+  # Profile-gated so it never starts on a bare `docker compose up`. Run via `make e2e`.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      - APP_URL=http://app:8000
+    command: ["python", "scripts/verify_e2e.py"]
+
 # Named volumes keep fitted models + generated datasets across container restarts.
 volumes:
   models:
