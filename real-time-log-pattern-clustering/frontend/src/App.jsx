@@ -1,5 +1,6 @@
 import { useClusterStream } from "./hooks/useWebSocket.js";
 import StatCards from "./components/StatCards.jsx";
+import ClusterScatter from "./components/ClusterScatter.jsx";
 
 // Top-level dashboard shell: header + live connection indicator, then the
 // headline stat cards driven by the shared `/ws/stream` snapshot. The cluster
@@ -42,20 +43,12 @@ export default function App() {
         {/* Headline metrics — live from the WS snapshot. */}
         <StatCards snapshot={snapshot} />
 
-        {/* Placeholder where the C15–C17 visualization panels (cluster scatter,
-            pattern timeline, anomaly alerts, drill-down) will mount. */}
-        <section className="section">
-          <div className="placeholder">
-            <span className="placeholder__pulse" aria-hidden="true" />
-            <div className="placeholder__text">
-              <strong>Cluster visualizations coming online…</strong>
-              <span>
-                Cluster scatter, pattern timeline, anomaly alerts and drill-down
-                land here next.
-              </span>
-            </div>
-          </div>
-        </section>
+        {/* Live cluster scatter — PCA-2D projection coloured by cluster, with
+            algorithm tabs. Refetches as `stats.total_processed` advances. */}
+        <ClusterScatter snapshot={snapshot} />
+
+        {/* C16/C17 panels (pattern timeline, anomaly alerts, drill-down) mount
+            below here next. */}
       </main>
     </div>
   );

@@ -268,54 +268,98 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
 }
 
-/* ----------------------------------------------------------- placeholder -- */
+/* ------------------------------------------------------------- panels ----- */
 
-.placeholder {
+/* Generic content panel (cluster scatter and the C16/C17 panels share this).
+   Same card surface as the stat cards so the dashboard reads as one system. */
+.panel {
+  background: linear-gradient(180deg, var(--card-2), var(--card));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+  box-shadow: var(--shadow);
+}
+
+.panel__head {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 28px 22px;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
-  background: linear-gradient(180deg, rgba(110, 168, 255, 0.05), transparent);
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.panel__title {
+  margin: 0;
+}
+
+.panel__error {
+  margin-bottom: 10px;
+  font-size: 0.8rem;
+  color: var(--bad);
+}
+
+/* ------------------------------------------------------------- tab bar ----- */
+
+/* Clean segmented control for switching algorithms. */
+.tab-bar {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-soft);
+}
+
+.tab {
+  appearance: none;
+  border: 0;
+  background: transparent;
   color: var(--text-dim);
+  font: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  text-transform: lowercase;
+  padding: 6px 14px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 0.15s ease, background 0.15s ease;
 }
 
-.placeholder__pulse {
-  width: 14px;
-  height: 14px;
-  flex: 0 0 auto;
-  border-radius: 50%;
-  background: var(--accent);
-  box-shadow: 0 0 0 0 rgba(110, 168, 255, 0.55);
-  animation: pulse-blue 1.8s infinite;
-}
-
-@keyframes pulse-blue {
-  0% {
-    box-shadow: 0 0 0 0 rgba(110, 168, 255, 0.5);
-  }
-  70% {
-    box-shadow: 0 0 0 10px rgba(110, 168, 255, 0);
-  }
-  100% {
-    box-shadow: 0 0 0 0 rgba(110, 168, 255, 0);
-  }
-}
-
-.placeholder__text {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.placeholder__text strong {
+.tab:hover {
   color: var(--text);
-  font-weight: 650;
 }
 
-.placeholder__text span {
-  font-size: 0.86rem;
+.tab--active {
+  color: #0b1020;
+  background: linear-gradient(135deg, var(--accent-clusters), var(--accent-throughput));
+  box-shadow: 0 2px 10px rgba(56, 189, 248, 0.3);
+}
+
+.tab--active:hover {
+  color: #0b1020;
+}
+
+/* ------------------------------------------------------------ chart area --- */
+
+.chart-area {
+  height: 360px;
+  position: relative;
+}
+
+.empty-state {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.9rem;
+}
+
+.muted {
   color: var(--text-faint);
 }
 
@@ -327,5 +371,11 @@ body {
   }
   .stat-card__value {
     font-size: 1.9rem;
+  }
+  .panel__head {
+    align-items: flex-start;
+  }
+  .chart-area {
+    height: 320px;
   }
 }
