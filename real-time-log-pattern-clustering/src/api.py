@@ -19,7 +19,7 @@ its threadpool: the engine is internally thread-safe (one ``RLock``) and the skl
 is CPU-bound, so keeping it off the event loop preserves concurrency. Endpoints guard with
 ``503`` until the engine is warmed.
 
-Routes (this commit):
+Routes:
 
 * ``GET  /health``                          — liveness + readiness (warming/ok).
 * ``POST /cluster``                          — cluster one log.
@@ -32,22 +32,41 @@ Routes (this commit):
 * ``GET  /anomalies``                        — recent anomaly alerts.
 * ``GET  /scatter/{algorithm}``              — 2-D scatter points for the dashboard.
 * ``GET  /config``                           — the resolved configuration.
+* ``WS   /ws/stream``                        — live snapshot stream for the dashboard (C12).
 * ``GET  /``                                 — service banner.
 
-The metrics WebSocket and the background broadcaster / periodic refit loop arrive in C12.
+Commit 12 adds the live layer on top of the C11 REST surface: a :class:`ConnectionManager`,
+the ``/ws/stream`` WebSocket, and **one** background task launched in the lifespan that every
+``broadcast_interval`` seconds (a) fans a stats/quality/patterns/anomalies snapshot out to all
+connected dashboards and best-effort persists it, and (b) triggers the engine's periodic
+sliding-window refit when due — running that CPU-bound, synchronous refit in a threadpool
+executor so the event loop is never blocked. The broadcaster survives transient errors so the
+live feed keeps running.
 """
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from src.config import AppConfig, load_config
 from src.demo import load_corpus
 from src.engine import ClusteringEngine
+from src.metrics import ConnectionManager, build_snapshot_payload
 from src.schemas import (
     AnomalyAlert,
     ClusterAssignment,
@@ -57,6 +76,8 @@ from src.schemas import (
     StatsSnapshot,
 )
 from src.state import create_state_store
+
+logger = logging.getLogger(__name__)
 
 #: Service version reported by ``/health``. Bump as the engine evolves.
 APP_VERSION = "0.1.0"
@@ -82,12 +103,13 @@ def _build_lifespan(
     config: AppConfig | None,
     warmup_logs: "list | None",
     warmup_n: int,
+    broadcast_interval: float,
 ):
-    """Build the lifespan context manager, capturing the warm-up parameters.
+    """Build the lifespan context manager, capturing the warm-up / broadcast parameters.
 
     Keeping the parameters in a closure (rather than reading globals) lets ``create_app``
-    spin up independent apps — with different warm-up batches — in the same process, which
-    is exactly what the test suite needs.
+    spin up independent apps — with different warm-up batches and broadcast cadences — in the
+    same process, which is exactly what the test suite needs.
     """
 
     @asynccontextmanager
@@ -117,12 +139,75 @@ def _build_lifespan(
         except Exception:  # noqa: BLE001 - persistence is best-effort, never fatal
             pass
 
+        # 4) Live layer: one WebSocket registry + one background broadcaster task that
+        #    fans snapshots out, persists them, and triggers periodic refits when due.
+        app.state.manager = ConnectionManager()
+        app.state._bcast_task = asyncio.create_task(
+            _broadcast_loop(app, broadcast_interval)
+        )
+
         yield
 
-        # Shutdown: release the Redis client if one was opened.
+        # Shutdown: stop the broadcaster (await it, swallowing the cancellation) before
+        # releasing the Redis client so no in-flight persist/refit outlives the app.
+        task: asyncio.Task = app.state._bcast_task
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
         app.state.state_store.close()
 
     return lifespan
+
+
+async def _broadcast_loop(app: FastAPI, interval: float) -> None:
+    """Periodically broadcast a live snapshot and trigger refits — the single live task.
+
+    Runs for the app's lifetime (cancelled on shutdown). Every ``interval`` seconds it:
+
+    1. Builds the live payload via :func:`~src.metrics.build_snapshot_payload` and broadcasts
+       it (as one JSON string) to every connected dashboard.
+    2. Best-effort persists the stats + patterns to the state store (so a dashboard reading
+       Redis directly stays fresh).
+    3. If :meth:`~src.engine.ClusteringEngine.should_refit` is due, runs the **synchronous**,
+       CPU-bound :meth:`~src.engine.ClusteringEngine.refit` in the default threadpool executor
+       via ``loop.run_in_executor`` — so the event loop (and other connections) are never
+       blocked by the sklearn re-fit.
+
+    The whole body is wrapped so any transient error is logged and the loop continues: the
+    live feed must never die because of one bad cycle. Only :class:`asyncio.CancelledError`
+    (raised on shutdown) breaks out.
+
+    Args:
+        app: The FastAPI app whose ``state`` holds the engine / manager / state store.
+        interval: Seconds to sleep between broadcasts (tests shrink this for speed).
+    """
+    loop = asyncio.get_running_loop()
+    manager: ConnectionManager = app.state.manager
+    engine: ClusteringEngine = app.state.engine
+    state_store = app.state.state_store
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            payload = build_snapshot_payload(engine)
+            await manager.broadcast(json.dumps(payload, default=str))
+
+            # Persist best-effort (the store never raises, but guard anyway).
+            try:
+                state_store.save_stats(payload["stats"])
+                state_store.save_patterns(payload["patterns"])
+            except Exception:  # noqa: BLE001 - persistence is best-effort, never fatal
+                logger.debug("broadcast loop: state persist failed", exc_info=True)
+
+            # Run the CPU-bound, synchronous refit off the event loop when due.
+            if engine.should_refit():
+                await loop.run_in_executor(None, engine.refit)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one bad cycle must not kill the live feed
+            logger.warning("broadcast loop cycle failed; continuing", exc_info=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +249,7 @@ def create_app(
     config: AppConfig | None = None,
     warmup_logs: "list | None" = None,
     warmup_n: int = 600,
+    broadcast_interval: float = 1.5,
 ) -> FastAPI:
     """Build and return the FastAPI application.
 
@@ -176,16 +262,19 @@ def create_app(
             here to keep startup fast. When ``None`` the corpus (or its generated fallback)
             is loaded and the first ``warmup_n`` logs are used.
         warmup_n: Number of corpus logs to warm up on when ``warmup_logs`` is ``None``.
+        broadcast_interval: Seconds between live-snapshot broadcasts on ``/ws/stream`` (also
+            the periodic-refit poll cadence). Defaults to ``1.5``; tests shrink it for speed.
 
     Returns:
-        A configured :class:`fastapi.FastAPI` instance. The engine, config and state store
-        are attached to ``app.state`` during the lifespan (so warm-up runs when the app is
+        A configured :class:`fastapi.FastAPI` instance. The engine, config, state store,
+        WebSocket :class:`~src.metrics.ConnectionManager` and the background broadcaster task
+        are attached to ``app.state`` during the lifespan (so they spin up when the app is
         entered as a context / served by uvicorn or wrapped in ``TestClient(app)``).
     """
     app = FastAPI(
         title="Real-Time Log Pattern Clustering",
         version=APP_VERSION,
-        lifespan=_build_lifespan(config, warmup_logs, warmup_n),
+        lifespan=_build_lifespan(config, warmup_logs, warmup_n, broadcast_interval),
     )
 
     # Permissive CORS so the dashboard (different origin) can call the API directly.
@@ -294,6 +383,32 @@ def create_app(
         """Return recent buffered points projected to 2-D, coloured by ``algorithm``."""
         _require_algorithm(algorithm)
         return engine.scatter_points(algorithm, limit)
+
+    # --------------------------------------------------------------- websocket
+
+    @app.websocket("/ws/stream")
+    async def ws_stream(websocket: WebSocket) -> None:
+        """Live snapshot stream for the dashboard.
+
+        On connect the client is registered and immediately sent the current snapshot (so the
+        UI paints without waiting a full broadcast interval); thereafter the single background
+        broadcaster pushes a fresh snapshot every ``broadcast_interval`` seconds. Inbound
+        frames are read and ignored (a keepalive channel) until the client disconnects, at
+        which point the socket is deregistered.
+        """
+        manager: ConnectionManager = websocket.app.state.manager
+        await manager.connect(websocket)
+        try:
+            # Immediate first paint — don't make the dashboard wait for the next tick.
+            initial = build_snapshot_payload(websocket.app.state.engine)
+            await websocket.send_text(json.dumps(initial, default=str))
+            while True:
+                # Keepalive: ignore whatever the client sends; we only push.
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+        finally:
+            manager.disconnect(websocket)
 
     # ------------------------------------------------------------------- config
 
