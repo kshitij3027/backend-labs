@@ -77,6 +77,42 @@ export async function getAnomalies(limit = 50) {
 }
 
 /**
+ * GET batch-mined recurring temporal patterns (nightly error spike, weekday
+ * service bursts, business-hours degradation, hourly volume peaks).
+ * @returns {Promise<Array>} list of `{kind, description, window, metric, count}`
+ */
+export async function getTemporalPatterns() {
+  return getJSON("/patterns/temporal");
+}
+
+/**
+ * GET batch-mined performance patterns: response-time `bands` (fast→critical)
+ * plus bottleneck `signatures` (slowest services/endpoints by p95).
+ * @returns {Promise<object>} `{bands, signatures, total_with_latency}`
+ */
+export async function getPerformancePatterns() {
+  return getJSON("/patterns/performance");
+}
+
+/**
+ * GET behavioral cohorts: per-entity (source_ip/service) profiles clustered into
+ * named groups (security-suspect / error-heavy / high-volume / normal).
+ * @returns {Promise<object>} `{groups, entities}`
+ */
+export async function getBehavioralPatterns() {
+  return getJSON("/patterns/behavioral");
+}
+
+/**
+ * GET sequence anomaly mining: per-entity event sequences scored against a normal
+ * n-gram model, with flagged anomalous entities.
+ * @returns {Promise<object>} `{analyzed, window, model_ngrams, anomalies}`
+ */
+export async function getSequencePatterns() {
+  return getJSON("/patterns/sequence");
+}
+
+/**
  * GET recent buffered points projected to 2-D for one algorithm's scatter plot.
  * @param {string} algo algorithm name
  * @param {number} [limit=500]

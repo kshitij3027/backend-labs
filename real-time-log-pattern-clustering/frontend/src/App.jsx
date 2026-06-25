@@ -6,6 +6,7 @@ import QualityMetrics from "./components/QualityMetrics.jsx";
 import AnomalyAlerts from "./components/AnomalyAlerts.jsx";
 import IngestForm from "./components/IngestForm.jsx";
 import ClusterDetail from "./components/ClusterDetail.jsx";
+import PatternPanels from "./components/PatternPanels.jsx";
 
 // Top-level dashboard shell: header + live connection indicator, then the
 // headline stat cards driven by the shared `/ws/stream` snapshot. The cluster
@@ -51,6 +52,10 @@ export default function App() {
         {/* Live cluster scatter — PCA-2D projection coloured by cluster, with
             algorithm tabs. Refetches as `stats.total_processed` advances. */}
         <ClusterScatter snapshot={snapshot} />
+
+        {/* Discovered patterns (full width) — batch-mined Temporal / Performance
+            / Behavioral / Sequence views, each behind a tab hitting /patterns/*. */}
+        <PatternPanels />
 
         {/* Pattern evolution timeline (wide) beside the cluster-quality tiles.
             Collapses to a single column on narrow viewports. */}

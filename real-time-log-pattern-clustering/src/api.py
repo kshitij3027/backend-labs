@@ -69,7 +69,9 @@ from src.config import AppConfig, load_config
 from src.demo import load_corpus
 from src.engine import ClusteringEngine
 from src.metrics import ConnectionManager, build_snapshot_payload
+from src.patterns.behavioral import mine_behavioral_patterns
 from src.patterns.performance import mine_performance_patterns
+from src.patterns.sequence import detect_sequence_anomalies
 from src.patterns.temporal import mine_temporal_patterns
 from src.schemas import (
     AnomalyAlert,
@@ -403,6 +405,40 @@ def create_app(
         if not corpus:
             raise HTTPException(status_code=503, detail="corpus not loaded")
         return mine_performance_patterns(corpus)
+
+    @app.get("/patterns/behavioral")
+    def patterns_behavioral(
+        request: Request, engine: ClusteringEngine = Depends(_get_engine)
+    ) -> dict:
+        """Cluster the warm-up corpus into behavior cohorts (Feature Area D).
+
+        Builds a per-entity (source_ip, else service) behavioral profile and clusters those
+        profiles into named cohorts (security-suspect / error-heavy / high-volume / normal),
+        surfacing the brute-force "bad IP" pool as a high-error / security-suspect group.
+        Returns ``503`` while the engine is warming (via the dependency) or if the corpus is
+        unavailable.
+        """
+        corpus = getattr(request.app.state, "corpus", None)
+        if not corpus:
+            raise HTTPException(status_code=503, detail="corpus not loaded")
+        return mine_behavioral_patterns(corpus)
+
+    @app.get("/patterns/sequence")
+    def patterns_sequence(
+        request: Request, engine: ClusteringEngine = Depends(_get_engine)
+    ) -> dict:
+        """Mine the warm-up corpus for anomalous event sequences (Feature Area B).
+
+        Groups the corpus into per-entity event-token sequences, fits a normal n-gram model on
+        the batch as a mostly-normal baseline, and flags entities whose sliding-window
+        sequences are dominated by rare/unseen transitions (attack/error bursts). Returns
+        ``503`` while the engine is warming (via the dependency) or if the corpus is
+        unavailable.
+        """
+        corpus = getattr(request.app.state, "corpus", None)
+        if not corpus:
+            raise HTTPException(status_code=503, detail="corpus not loaded")
+        return detect_sequence_anomalies(corpus)
 
     # ---------------------------------------------------------------- anomalies
 

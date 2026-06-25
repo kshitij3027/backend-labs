@@ -1015,6 +1015,204 @@ body {
   color: var(--accent-processed);
 }
 
+/* ---------------------------------------------------- discovered patterns - */
+
+/* PatternPanels: a tab bar + a Refresh button on the right of the panel head,
+   then one of four lightweight tables below. The tables are CSS-grid "rows"
+   (.prow) so columns align without an actual <table>, matching the dark theme. */
+
+/* Right-side cluster of controls in the panel head (tab bar + refresh). */
+.panel__head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Small secondary button reused for the per-tab Refresh affordance. */
+.btn-refresh {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.btn-refresh:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.btn-refresh:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* Scrollable body so a long pattern list never blows out the panel height. */
+.pattern-body {
+  max-height: 420px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+/* Vertical stack used by the multi-section views (performance/behavioral/seq). */
+.pstack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.psub {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.psub__title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.01em;
+}
+
+.psub__meta {
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--text-faint);
+}
+
+.psub__meta--lead {
+  margin-bottom: 2px;
+}
+
+/* The lightweight grid "table" + its rows. Each view sets the column template
+   on its row modifier (.prow--temporal etc.) so columns suit that view. */
+.ptable {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.prow {
+  display: grid;
+  align-items: center;
+  gap: 6px 12px;
+  padding: 8px 10px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  font-size: 0.8rem;
+  color: var(--text-dim);
+}
+
+/* Header rows are quieter and carry the column captions. */
+.prow--head {
+  background: transparent;
+  border-color: transparent;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  color: var(--text-faint);
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* Per-view column templates. */
+.prow--temporal {
+  grid-template-columns: 132px 1fr 132px 56px 52px;
+}
+.prow--perf {
+  grid-template-columns: 1fr 70px 80px 80px;
+}
+.prow--sig {
+  grid-template-columns: 1fr 80px 70px;
+}
+.prow--behav {
+  grid-template-columns: 132px 70px 70px 70px 1.4fr;
+}
+.prow--seq {
+  grid-template-columns: 160px 60px 1fr;
+}
+
+.pcell {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Numeric cells: right-aligned, tabular figures so columns line up. */
+.pcell--num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.pcell--score {
+  font-weight: 700;
+  color: var(--accent-anomalies);
+}
+
+/* The description / target / examples cells may wrap to two lines rather than
+   truncate hard, so the meaning stays readable. */
+.pcell--desc,
+.pcell--examples,
+.pcell--target {
+  white-space: normal;
+  color: var(--text-dim);
+}
+
+.pcell--target {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.76rem;
+  color: var(--text);
+}
+
+.pcell--window {
+  color: var(--text-faint);
+  font-size: 0.76rem;
+}
+
+/* Wrapping chip rows (sequence sample events, behavioral examples). */
+.pcell--events {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  white-space: normal;
+}
+
+/* A red-tinted chip for suspect cohorts / bad-actor labels. */
+.chip--bad {
+  background: rgba(251, 113, 133, 0.16);
+  border-color: rgba(251, 113, 133, 0.45);
+  color: var(--accent-anomalies);
+}
+
+/* Compact monospace chip for event tokens (e.g. "ERROR:5xx"). */
+.chip--ev {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 0.66rem;
+  letter-spacing: 0;
+}
+
+/* Inline (non-absolute) empty state used inside the scrollable pattern body. */
+.empty-inline {
+  padding: 18px 4px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.86rem;
+}
+
 /* --------------------------------------------------------------- mobile --- */
 
 /* Collapse the timeline + quality row to a single column before the chart and
@@ -1022,6 +1220,18 @@ body {
 @media (max-width: 860px) {
   .grid-2 {
     grid-template-columns: 1fr;
+  }
+  /* Tighten the pattern-row column templates so they stay readable (rather than
+     clipped) on small screens; columns shrink uniformly, no cells are dropped so
+     header captions always line up with their data. */
+  .prow--temporal {
+    grid-template-columns: 96px 1fr 90px 46px 44px;
+  }
+  .prow--behav {
+    grid-template-columns: 110px 56px 56px 56px 1fr;
+  }
+  .prow--seq {
+    grid-template-columns: 120px 50px 1fr;
   }
 }
 
