@@ -4,6 +4,8 @@ import ClusterScatter from "./components/ClusterScatter.jsx";
 import PatternTimeline from "./components/PatternTimeline.jsx";
 import QualityMetrics from "./components/QualityMetrics.jsx";
 import AnomalyAlerts from "./components/AnomalyAlerts.jsx";
+import IngestForm from "./components/IngestForm.jsx";
+import ClusterDetail from "./components/ClusterDetail.jsx";
 
 // Top-level dashboard shell: header + live connection indicator, then the
 // headline stat cards driven by the shared `/ws/stream` snapshot. The cluster
@@ -60,8 +62,14 @@ export default function App() {
         {/* Live anomaly alerts feed — full width below the timeline/quality row. */}
         <AnomalyAlerts snapshot={snapshot} />
 
-        {/* C17 panels (cluster drill-down + manual ingest form) mount below
-            here next. */}
+        {/* Manual ingest form (compose a log → POST /cluster → live per-algo
+            results) beside the cluster drill-down (browse an algorithm's
+            clusters → inspect representative + example lines). Collapses to a
+            single column on narrow viewports via .grid-2. */}
+        <div className="grid-2">
+          <IngestForm />
+          <ClusterDetail snapshot={snapshot} />
+        </div>
       </main>
     </div>
   );

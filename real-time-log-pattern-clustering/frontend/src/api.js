@@ -46,6 +46,20 @@ export async function getClusters(algo) {
 }
 
 /**
+ * GET detail for a single cluster of one algorithm (member count, representative,
+ * example lines, confidence stats). The cluster id can be -1 (noise / new), so it
+ * is URL-encoded.
+ * @param {string} algo algorithm name
+ * @param {number|string} id cluster id (may be -1)
+ * @returns {Promise<object>}
+ */
+export async function getClusterDetail(algo, id) {
+  return getJSON(
+    `/clusters/${encodeURIComponent(algo)}/${encodeURIComponent(id)}`,
+  );
+}
+
+/**
  * GET every discovered pattern (count descending).
  * @returns {Promise<Array>}
  */

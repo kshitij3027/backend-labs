@@ -575,6 +575,446 @@ body {
   white-space: nowrap;
 }
 
+/* ----------------------------------------------------- cluster drill-down - */
+
+/* Two-pane drill-down: a scrollable cluster list on the left, the selected
+   cluster's detail on the right. Fixed band height keeps it aligned with the
+   ingest form beside it; both panes scroll independently. */
+.drill {
+  display: grid;
+  grid-template-columns: minmax(170px, 0.9fr) 1.6fr;
+  gap: 14px;
+  height: 360px;
+}
+
+.cluster-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.cluster-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "name size"
+    "type type";
+  align-items: center;
+  gap: 4px 8px;
+  width: 100%;
+  text-align: left;
+  appearance: none;
+  cursor: pointer;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+  color: var(--text-dim);
+  font: inherit;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.cluster-row:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.cluster-row--active {
+  background: var(--card-2);
+  border-left-color: var(--accent-clusters);
+  color: var(--text);
+}
+
+.cluster-row__name {
+  grid-area: name;
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.cluster-row__size {
+  grid-area: size;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--accent-clusters);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.cluster-row__type {
+  grid-area: type;
+  justify-self: start;
+}
+
+.cluster-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 14px 15px;
+}
+
+.cluster-detail__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.cluster-detail__title {
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.cluster-detail__stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+}
+
+.kv {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.kv__label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.kv__value {
+  font-size: 0.95rem;
+  font-weight: 750;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.cluster-detail__rep,
+.cluster-detail__examples {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cluster-detail__rep-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.cluster-detail__rep-line {
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent-patterns);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+  font-family: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo,
+    Consolas, monospace;
+  font-size: 0.8rem;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.example-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.example-line code {
+  display: block;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  font-family: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo,
+    Consolas, monospace;
+  font-size: 0.76rem;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.drill-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 0.88rem;
+}
+
+.drill-empty--detail {
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--radius-sm);
+}
+
+/* ---------------------------------------------------------- ingest form --- */
+
+.ingest-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.form-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-row label {
+  font-size: 0.74rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.form-row__opt {
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-faint);
+}
+
+.ingest-form input,
+.ingest-form select,
+.ingest-form textarea {
+  width: 100%;
+  appearance: none;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 11px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.86rem;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ingest-form textarea {
+  resize: vertical;
+  min-height: 64px;
+  font-family: "SFMono-Regular", ui-monospace, "JetBrains Mono", Menlo,
+    Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+
+.ingest-form input::placeholder,
+.ingest-form textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.ingest-form input:focus,
+.ingest-form select:focus,
+.ingest-form textarea:focus {
+  outline: none;
+  border-color: var(--accent-clusters);
+  box-shadow: 0 0 0 3px rgba(129, 140, 248, 0.22);
+}
+
+/* Custom dropdown caret for the dark <select>. */
+.ingest-form select {
+  background-image: linear-gradient(45deg, transparent 50%, var(--text-dim) 50%),
+    linear-gradient(135deg, var(--text-dim) 50%, transparent 50%);
+  background-position: calc(100% - 18px) 50%, calc(100% - 13px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 32px;
+  cursor: pointer;
+}
+
+.ingest-form select option {
+  background: var(--card);
+  color: var(--text);
+}
+
+/* ----------------------------------------------------------- buttons ------ */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--card-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  border-radius: var(--radius-sm);
+  padding: 10px 16px;
+  cursor: pointer;
+  transition: transform 0.12s ease, border-color 0.15s ease, background 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.btn:hover {
+  border-color: var(--accent-clusters);
+}
+
+.btn:active {
+  transform: translateY(1px);
+}
+
+.btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.btn--primary {
+  align-self: flex-start;
+  border-color: transparent;
+  color: #0b1020;
+  background: linear-gradient(135deg, var(--accent-clusters), var(--accent-throughput));
+  box-shadow: 0 4px 14px rgba(56, 189, 248, 0.28);
+}
+
+.btn--primary:hover {
+  border-color: transparent;
+  filter: brightness(1.05);
+}
+
+.btn--ghost {
+  background: var(--bg-soft);
+}
+
+.btn--sm {
+  padding: 5px 11px;
+  font-size: 0.76rem;
+}
+
+.preset-bar {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* -------------------------------------------------------- ingest result --- */
+
+.ingest-result {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ingest-result__masked {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ingest-result__badges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.result-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.result-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--accent-clusters);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+}
+
+.result-row--anomaly {
+  border-left-color: var(--accent-anomalies);
+}
+
+.result-row__algo {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text);
+  min-width: 64px;
+  text-transform: lowercase;
+}
+
+.result-row__cluster {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.result-row__conf {
+  margin-left: auto;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--accent-clusters);
+  font-variant-numeric: tabular-nums;
+}
+
+.result-row__ok {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--ok);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Status badges shared by the result rows + the top-level assignment summary. */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.badge--anomaly {
+  background: rgba(251, 113, 133, 0.16);
+  border: 1px solid rgba(251, 113, 133, 0.45);
+  color: var(--accent-anomalies);
+}
+
+.badge--new {
+  background: rgba(251, 191, 36, 0.16);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  color: var(--accent-processed);
+}
+
 /* --------------------------------------------------------------- mobile --- */
 
 /* Collapse the timeline + quality row to a single column before the chart and
@@ -600,5 +1040,20 @@ body {
   }
   .chart-area--timeline {
     height: 260px;
+  }
+  /* Stack the drill-down panes and let the band grow instead of cramping the
+     list + detail side by side; stack the form's service/level pair too. */
+  .drill {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+  .cluster-list {
+    max-height: 200px;
+  }
+  .cluster-detail {
+    max-height: 340px;
+  }
+  .form-grid {
+    grid-template-columns: 1fr;
   }
 }
