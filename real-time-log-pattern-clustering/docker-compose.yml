@@ -53,6 +53,22 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # React + WebSocket dashboard (Commit 14). A multi-stage image builds the Vite
+  # SPA and serves it from nginx, which reverse-proxies `/api` and `/ws/stream` to
+  # the `app` service over the compose network (so the browser only talks to nginx).
+  # Waits for `app` to be healthy before starting. Brought up via `make ui`.
+  dashboard:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: rt-log-clustering-dashboard
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
   # code + requirements as the app, plus the tests) and runs pytest in-process — no
   # running service required. Profile-gated so it never starts on a bare

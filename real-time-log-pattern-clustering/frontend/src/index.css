@@ -1,0 +1,331 @@
+/* Real-Time Log Pattern Clustering — dashboard theme.
+ *
+ * A clean, modern, DARK showcase theme. Colours, radii and spacing are driven
+ * by CSS custom properties so later panels (C15–C17) inherit the palette. The
+ * layout is a single centered column of full-width sections; the stat cards use
+ * an auto-fitting responsive grid. */
+
+:root {
+  /* Surfaces */
+  --bg: #0b1020;
+  --bg-soft: #0f1630;
+  --card: #141c38;
+  --card-2: #18223f;
+  --border: #243056;
+  --border-soft: #1c264a;
+
+  /* Text */
+  --text: #eef2ff;
+  --text-dim: #9aa6cc;
+  --text-faint: #6b7799;
+
+  /* Accents (per-card + chrome) */
+  --accent: #6ea8ff;
+  --accent-throughput: #38bdf8; /* sky */
+  --accent-clusters: #818cf8; /* indigo */
+  --accent-patterns: #34d399; /* emerald */
+  --accent-anomalies: #fb7185; /* rose */
+  --accent-processed: #fbbf24; /* amber */
+
+  /* Status */
+  --ok: #34d399;
+  --bad: #fb7185;
+
+  /* Shape & motion */
+  --radius: 14px;
+  --radius-sm: 10px;
+  --shadow: 0 10px 30px rgba(2, 6, 23, 0.55);
+  --gap: 18px;
+  --maxw: 1280px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 12% -10%, #16224a 0%, transparent 55%),
+    radial-gradient(1000px 500px at 100% 0%, #1a1740 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+/* ----------------------------------------------------------------- layout -- */
+
+.app {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 28px clamp(16px, 4vw, 40px) 64px;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 22px;
+  margin-bottom: 26px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.app__logo {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-clusters), var(--accent-throughput));
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset,
+    0 8px 22px rgba(56, 189, 248, 0.35);
+  position: relative;
+}
+
+.app__logo::after {
+  /* tiny "cluster of dots" mark */
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    radial-gradient(3px 3px at 13px 14px, rgba(11, 16, 32, 0.9) 50%, transparent 51%),
+    radial-gradient(3px 3px at 27px 16px, rgba(11, 16, 32, 0.9) 50%, transparent 51%),
+    radial-gradient(3px 3px at 20px 28px, rgba(11, 16, 32, 0.9) 50%, transparent 51%);
+}
+
+.app__title {
+  margin: 0;
+  font-size: clamp(1.15rem, 2.4vw, 1.6rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.app__subtitle {
+  margin: 3px 0 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+/* ----------------------------------------------------- connection badge --- */
+
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.conn__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.conn__dot--up {
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6);
+  animation: pulse 1.8s infinite;
+}
+
+.conn__dot--down {
+  background: var(--bad);
+  box-shadow: 0 0 8px rgba(251, 113, 133, 0.7);
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 8px rgba(52, 211, 153, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
+  }
+}
+
+/* ------------------------------------------------------------ stat cards -- */
+
+.stat-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: var(--gap);
+  margin-bottom: var(--gap);
+}
+
+.stat-card {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--card-2), var(--card));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 18px 20px;
+  box-shadow: var(--shadow);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+}
+
+.stat-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border);
+}
+
+/* Accent rail on the left edge, coloured per metric. */
+.stat-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  background: var(--accent);
+  opacity: 0.9;
+}
+
+.stat-card[data-accent="throughput"]::before { background: var(--accent-throughput); }
+.stat-card[data-accent="clusters"]::before { background: var(--accent-clusters); }
+.stat-card[data-accent="patterns"]::before { background: var(--accent-patterns); }
+.stat-card[data-accent="anomalies"]::before { background: var(--accent-anomalies); }
+.stat-card[data-accent="processed"]::before { background: var(--accent-processed); }
+
+.stat-card__label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.stat-card__value {
+  margin-top: 10px;
+  font-size: clamp(1.7rem, 3.2vw, 2.3rem);
+  font-weight: 750;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-card__hint {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+}
+
+/* -------------------------------------------------------------- sections -- */
+
+.app__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.section {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 20px;
+}
+
+.section__title {
+  margin: 0 0 14px;
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.grid {
+  display: grid;
+  gap: var(--gap);
+}
+
+.grid--2 {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+/* ----------------------------------------------------------- placeholder -- */
+
+.placeholder {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 28px 22px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(180deg, rgba(110, 168, 255, 0.05), transparent);
+  color: var(--text-dim);
+}
+
+.placeholder__pulse {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 rgba(110, 168, 255, 0.55);
+  animation: pulse-blue 1.8s infinite;
+}
+
+@keyframes pulse-blue {
+  0% {
+    box-shadow: 0 0 0 0 rgba(110, 168, 255, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(110, 168, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(110, 168, 255, 0);
+  }
+}
+
+.placeholder__text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.placeholder__text strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.placeholder__text span {
+  font-size: 0.86rem;
+  color: var(--text-faint);
+}
+
+/* --------------------------------------------------------------- mobile --- */
+
+@media (max-width: 560px) {
+  .app__header {
+    align-items: flex-start;
+  }
+  .stat-card__value {
+    font-size: 1.9rem;
+  }
+}

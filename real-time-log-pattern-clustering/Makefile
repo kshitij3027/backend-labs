@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs test test-unit test-int e2e load clean
+.PHONY: help build up down logs test test-unit test-int e2e load ui clean
 
 help:
 	@echo "Real-Time Log Pattern Clustering — make targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - full end-to-end verifier in Docker (black-box against live app)"
 	@echo "  load       - latency + throughput gates in Docker (black-box against live app)"
+	@echo "  ui         - run app + React dashboard on http://localhost:8080 (detached)"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -65,6 +66,13 @@ load:
 	docker compose --profile load run --rm loadtest || status=$$?; \
 	docker compose down; \
 	exit $$status
+
+# Bring up the backend + the nginx-served React dashboard. The dashboard waits
+# for the app healthcheck before starting (see docker-compose.yml).
+ui:
+	docker compose up -d --build app dashboard
+	@echo "Dashboard: http://localhost:8080"
+	@echo "API:       http://localhost:8000"
 
 clean:
 	docker compose down -v --remove-orphans
