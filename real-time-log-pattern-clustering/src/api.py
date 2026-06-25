@@ -29,6 +29,8 @@ Routes:
 * ``GET  /clusters/{algorithm}``             — one algorithm's cluster summaries.
 * ``GET  /clusters/{algorithm}/{cluster_id}``— drill-down detail for one cluster.
 * ``GET  /patterns``                         — discovered patterns.
+* ``GET  /patterns/temporal``                — batch-mined recurring temporal patterns (C18).
+* ``GET  /patterns/performance``             — batch-mined latency bands + bottlenecks (C18).
 * ``GET  /anomalies``                        — recent anomaly alerts.
 * ``GET  /scatter/{algorithm}``              — 2-D scatter points for the dashboard.
 * ``GET  /config``                           — the resolved configuration.
@@ -67,6 +69,8 @@ from src.config import AppConfig, load_config
 from src.demo import load_corpus
 from src.engine import ClusteringEngine
 from src.metrics import ConnectionManager, build_snapshot_payload
+from src.patterns.performance import mine_performance_patterns
+from src.patterns.temporal import mine_temporal_patterns
 from src.schemas import (
     AnomalyAlert,
     ClusterAssignment,
@@ -121,7 +125,8 @@ def _build_lifespan(
         # 2) Build + warm the engine SYNCHRONOUSLY so the app only serves once ready.
         engine = ClusteringEngine(cfg)
         if warmup_logs is not None:
-            batch = list(warmup_logs)
+            corpus = list(warmup_logs)
+            batch = corpus
         else:
             # load_corpus falls back to generated logs when the corpus file is absent
             # (e.g. the minimal app image), so warm-up always has data.
@@ -129,6 +134,10 @@ def _build_lifespan(
             batch = corpus[:warmup_n]
         engine.warm_up(batch)
         app.state.engine = engine
+        # Keep the warm-up corpus around so the batch pattern-mining endpoints
+        # (/patterns/temporal, /patterns/performance) can mine the same logs the engine warmed
+        # on. (When an explicit warmup batch was injected, that *is* the corpus.)
+        app.state.corpus = corpus
 
         # 3) State store (never raises; degrades to in-memory). Persist an initial
         #    snapshot best-effort so a dashboard reading Redis directly has something.
@@ -361,6 +370,39 @@ def create_app(
     def patterns(engine: ClusteringEngine = Depends(_get_engine)) -> list[PatternRecord]:
         """Return every discovered pattern (count descending)."""
         return engine.get_patterns()
+
+    # --------------------------------------------------- batch pattern mining (C18)
+
+    @app.get("/patterns/temporal")
+    def patterns_temporal(
+        request: Request, engine: ClusteringEngine = Depends(_get_engine)
+    ) -> list:
+        """Mine the warm-up corpus for recurring temporal patterns.
+
+        Groups the loaded corpus by hour-of-day / weekday and surfaces patterns such as the
+        nightly 02:00 error spike, weekday service bursts, business-hours performance
+        degradation, and hourly volume peaks. Returns ``503`` while the engine is warming (via
+        the dependency) or if the corpus is unavailable.
+        """
+        corpus = getattr(request.app.state, "corpus", None)
+        if not corpus:
+            raise HTTPException(status_code=503, detail="corpus not loaded")
+        return mine_temporal_patterns(corpus)
+
+    @app.get("/patterns/performance")
+    def patterns_performance(
+        request: Request, engine: ClusteringEngine = Depends(_get_engine)
+    ) -> dict:
+        """Mine the warm-up corpus for performance patterns: latency bands + bottlenecks.
+
+        Clusters response times into fast/normal/slow/critical bands and flags the slowest
+        services/endpoints as bottleneck signatures. Returns ``503`` while the engine is warming
+        (via the dependency) or if the corpus is unavailable.
+        """
+        corpus = getattr(request.app.state, "corpus", None)
+        if not corpus:
+            raise HTTPException(status_code=503, detail="corpus not loaded")
+        return mine_performance_patterns(corpus)
 
     # ---------------------------------------------------------------- anomalies
 
