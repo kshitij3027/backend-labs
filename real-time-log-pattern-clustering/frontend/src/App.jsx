@@ -1,6 +1,9 @@
 import { useClusterStream } from "./hooks/useWebSocket.js";
 import StatCards from "./components/StatCards.jsx";
 import ClusterScatter from "./components/ClusterScatter.jsx";
+import PatternTimeline from "./components/PatternTimeline.jsx";
+import QualityMetrics from "./components/QualityMetrics.jsx";
+import AnomalyAlerts from "./components/AnomalyAlerts.jsx";
 
 // Top-level dashboard shell: header + live connection indicator, then the
 // headline stat cards driven by the shared `/ws/stream` snapshot. The cluster
@@ -47,8 +50,18 @@ export default function App() {
             algorithm tabs. Refetches as `stats.total_processed` advances. */}
         <ClusterScatter snapshot={snapshot} />
 
-        {/* C16/C17 panels (pattern timeline, anomaly alerts, drill-down) mount
-            below here next. */}
+        {/* Pattern evolution timeline (wide) beside the cluster-quality tiles.
+            Collapses to a single column on narrow viewports. */}
+        <div className="grid-2">
+          <PatternTimeline snapshot={snapshot} />
+          <QualityMetrics snapshot={snapshot} />
+        </div>
+
+        {/* Live anomaly alerts feed — full width below the timeline/quality row. */}
+        <AnomalyAlerts snapshot={snapshot} />
+
+        {/* C17 panels (cluster drill-down + manual ingest form) mount below
+            here next. */}
       </main>
     </div>
   );
