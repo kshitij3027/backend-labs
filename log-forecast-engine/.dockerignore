@@ -1,0 +1,49 @@
+# Keep junk and bulky artifacts out of the build context / image. The Dockerfile and
+# Dockerfile.test copy only what they need (src/, config/, tests/, pytest.ini,
+# scripts/), so be careful not to exclude scripts/.gitkeep.
+
+# VCS / planning docs
+.git
+.gitignore
+*.md
+plan.md
+project_requirements.md
+
+# Python caches / build artifacts
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+build
+dist
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Secrets / env
+.env
+
+# Fitted models + generated datasets (the dirs themselves are kept via .gitkeep, but
+# their heavyweight contents must never enter the build context).
+models/*
+!models/.gitkeep
+data/*
+!data/.gitkeep
+
+# Frontend (added in a later commit)
+frontend/node_modules
+frontend/dist
+node_modules
+
+# OS / logs
+.DS_Store
+*.log

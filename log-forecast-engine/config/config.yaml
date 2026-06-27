@@ -1,0 +1,46 @@
+# Predictive Log Analytics Engine — default configuration.
+#
+# Every knob here corresponds to project_requirements.md §7 (Configurable
+# Parameters). Values are merged over the pydantic-settings model defaults in
+# src/config.py; environment variables (the uppercased field name, e.g. API_PORT)
+# take final precedence over anything set here.
+#
+# Ensemble note: this build ships a 4-model lightweight ensemble (ARIMA, exponential
+# smoothing, linear regression, XGBoost). Prophet and LSTM are intentionally dropped,
+# so the weights below cover only those four members and sum to 1.0.
+
+# --- Identity / server ---
+app_name: log-forecast-engine
+api_host: 0.0.0.0
+api_port: 8000
+log_level: INFO
+
+# --- Persistence / cache ---
+database_url: postgresql+psycopg2://forecast:forecast@postgres:5432/forecast
+redis_url: redis://redis:6379/0
+
+# --- Scheduling cadence ---
+prediction_interval_min: 5       # generate predictions every 5 minutes
+retrain_interval_hr: 6           # retrain models every 6 hours
+
+# --- Forecast horizon ---
+default_horizon_min: 60          # default forecast horizon (minutes)
+horizon_min_steps: 1             # minimum custom-horizon steps (= 5 min)
+horizon_max_steps: 288           # maximum custom-horizon steps (= 24 hr)
+
+# --- Training ---
+training_window_days: 7          # sliding training window size (days)
+
+# --- Confidence / deploy thresholds ---
+high_confidence_threshold: 0.85  # >85% -> high tier (auto-action)
+medium_confidence_threshold: 0.65  # 65-85% -> medium tier (notify)
+accuracy_deploy_threshold: 0.6   # models below this accuracy are not deployed
+
+# --- Ensemble member weights (sum to 1.0) ---
+weight_arima: 0.3
+weight_exp_smoothing: 0.2
+weight_linear: 0.2
+weight_xgboost: 0.3
+
+# --- Dashboard ---
+dashboard_poll_interval_sec: 30  # frontend polling interval (seconds)

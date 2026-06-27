@@ -1,0 +1,44 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-runner image for the Predictive Log Analytics Engine.
+#
+# Same base, env, and build toolchain as the production image so tests exercise the
+# real code path, but it additionally COPYs the test suite, pytest config and the
+# scripts/ dir, and runs pytest as root (tests write temp files freely). Built and
+# run via `make test` / the `test` compose profile; it never starts on a bare
+# `docker compose up`.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Build toolchain (parity with production: statsmodels / sklearn / xgboost), libgomp1
+# for XGBoost's OpenMP runtime, plus curl.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libgomp1 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies first (cached unless requirements.txt changes).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# App code, default config, the test suite + its config, and the scripts/ dir used by
+# later E2E / load commits.
+COPY src/ ./src/
+COPY config/ ./config/
+COPY tests/ ./tests/
+COPY pytest.ini ./
+COPY scripts/ ./scripts/
+
+# Pre-create the writable runtime dirs (tests may persist artifacts here).
+RUN mkdir -p /app/models /app/data
+
+CMD ["pytest", "-q"]
