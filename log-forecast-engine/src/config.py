@@ -2,13 +2,19 @@
 
 Configuration precedence (lowest to highest):
 
-    Pydantic field defaults  ->  YAML file (config/config.yaml)  ->  environment
+    field defaults  ->  YAML file (config/config.yaml)  ->  .env  ->  environment
 
 Every knob below maps to ``project_requirements.md`` §7 (Configurable Parameters).
 Defaults live on the :class:`Settings` model (pydantic-settings v2 ``BaseSettings``).
 An optional ``config/config.yaml`` may override any field — it is merged over the
 model defaults — and finally environment variables (the uppercased field name) win
-over both, courtesy of ``BaseSettings``.
+over both.
+
+This precedence is enforced via pydantic-settings v2 source customization
+(:meth:`Settings.settings_customise_sources`): the source tuple is ordered so that
+init kwargs > env > dotenv > YAML > file secrets. This is the correct fix for the
+classic trap where passing YAML values as explicit ``Settings(**yaml)`` constructor
+kwargs gives them the *highest* priority and silently shadows environment variables.
 
 Use :func:`get_settings` (LRU-cached) at call sites so the config is parsed once per
 process. The loader is defensive: a missing or malformed YAML file never crashes
@@ -23,14 +29,13 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Any
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-try:
-    import yaml
-except ImportError:  # pragma: no cover - yaml is a hard dependency, guard anyway
-    yaml = None  # type: ignore[assignment]
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+    YamlConfigSettingsSource,
+)
 
 
 # Candidate YAML locations tried (in order) when no explicit path / CONFIG_PATH is
@@ -102,6 +107,45 @@ class Settings(BaseSettings):
             "xgboost": self.weight_xgboost,
         }
 
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Order config sources so env vars beat YAML (the precedence contract).
+
+        Highest priority first: init kwargs > environment > .env > YAML > secrets.
+        Sources earlier in the returned tuple win, so the YAML source sits *below*
+        ``env_settings``/``dotenv_settings`` — this is what makes ``REDIS_URL``,
+        ``DATABASE_URL``, ``API_PORT``, etc. on the compose services override the
+        values in ``config/config.yaml`` instead of being silently shadowed.
+
+        The YAML path is resolved at construction time (see ``load_settings``) and
+        threaded through via the private ``_yaml_path`` init kwarg so explicit paths,
+        ``CONFIG_PATH``, and the container/repo fallbacks all still work. A missing
+        file is tolerated: ``YamlConfigSettingsSource`` yields an empty mapping rather
+        than raising when ``yaml_file`` does not exist.
+        """
+        yaml_path = None
+        # ``init_settings`` holds the kwargs passed to ``Settings(...)``. Pull our
+        # private path hint out of it without exposing it as a real model field.
+        init_kwargs = getattr(init_settings, "init_kwargs", None)
+        if isinstance(init_kwargs, dict):
+            yaml_path = init_kwargs.get("_yaml_path")
+
+        yaml_source = YamlConfigSettingsSource(settings_cls, yaml_file=yaml_path)
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            yaml_source,
+            file_secret_settings,
+        )
+
 
 def _resolve_config_path(config_path: str | None) -> str | None:
     """Pick the YAML path to load.
@@ -121,34 +165,18 @@ def _resolve_config_path(config_path: str | None) -> str | None:
     return None
 
 
-def _load_yaml(config_path: str | None) -> dict[str, Any]:
-    """Parse the YAML file into a flat dict of overrides.
-
-    Returns an empty dict if the path is missing/unreadable/malformed or yaml is
-    unavailable — a bad config file must never crash startup.
-    """
-    if not config_path or yaml is None or not os.path.isfile(config_path):
-        return {}
-    try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh)
-    except (OSError, yaml.YAMLError):  # type: ignore[union-attr]
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def load_settings(config_path: str | None = None) -> Settings:
-    """Build :class:`Settings` applying defaults -> YAML -> environment precedence.
+    """Build :class:`Settings` with defaults -> YAML -> .env -> environment precedence.
 
-    YAML values seed the model's kwargs; environment variables (read by
-    ``BaseSettings``) still take final precedence over those YAML-supplied values.
-    Unknown YAML keys are ignored (``extra="ignore"``).
+    The YAML file is loaded by a dedicated pydantic-settings source ranked *below*
+    the environment sources (see :meth:`Settings.settings_customise_sources`), so
+    environment variables take final precedence over YAML — the documented contract.
+    The resolved YAML path is threaded through via the private ``_yaml_path`` init
+    kwarg; it is not a model field (``extra="ignore"`` drops it). A missing config
+    file is tolerated and simply contributes nothing.
     """
-    overrides = _load_yaml(_resolve_config_path(config_path))
-    # Only pass through keys that are real Settings fields so a stray YAML key cannot
-    # raise; env vars still override these via BaseSettings resolution order.
-    valid = {k: v for k, v in overrides.items() if k in Settings.model_fields}
-    return Settings(**valid)
+    yaml_path = _resolve_config_path(config_path)
+    return Settings(_yaml_path=yaml_path)
 
 
 @lru_cache(maxsize=1)

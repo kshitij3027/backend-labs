@@ -119,3 +119,59 @@ class MetricQueryResponse(BaseModel):
     metric_name: str
     count: int
     points: list[MetricPoint]
+
+
+class ForecastResponse(BaseModel):
+    """A generated forecast, matching ``project_requirements.md`` §8.
+
+    This is the canonical shape produced by
+    :func:`src.prediction_service.generate_prediction`, persisted (column-by-column)
+    via :func:`src.db.repository.save_forecast`, cached in Redis by
+    :mod:`src.clients.redis`, and returned directly by the forecast API (C11).
+
+    The §8 sample shows the core fields (``timestamp``, ``forecast_horizon_minutes``,
+    ``ensemble_prediction``, ``ensemble_confidence``, ``individual_forecasts``,
+    ``alert_level``); the remaining fields surface the ensemble internals
+    (per-step future ``step_timestamps``, prediction-interval ``lower`` / ``upper``,
+    aggregate scalar ``confidence``, ``weights_used``, ``failed_models``) plus a
+    ``cached`` flag the read path sets when serving from Redis.
+
+    All arrays (``ensemble_prediction``, ``ensemble_confidence``, ``lower``,
+    ``upper``, ``step_timestamps`` and each list in ``individual_forecasts``) are
+    parallel and ``horizon_steps`` long.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    metric_name: str
+    # When the forecast was generated (ISO-8601 UTC on serialisation).
+    timestamp: datetime
+    forecast_horizon_minutes: int
+    horizon_steps: int
+    # ISO-8601 timestamp string for each predicted step.
+    step_timestamps: list[str] = Field(default_factory=list)
+
+    ensemble_prediction: list[float] = Field(default_factory=list)
+    ensemble_confidence: list[float] = Field(default_factory=list)
+    individual_forecasts: dict[str, list[float]] = Field(default_factory=dict)
+
+    # Ensemble prediction interval (parallel to ``ensemble_prediction``).
+    lower: list[float] = Field(default_factory=list)
+    upper: list[float] = Field(default_factory=list)
+
+    alert_level: str = "low"
+    # Aggregate scalar confidence used to derive ``alert_level``.
+    confidence: float = 0.0
+    weights_used: dict[str, float] = Field(default_factory=dict)
+    failed_models: list[str] = Field(default_factory=list)
+
+    # True when this payload was served from the Redis cache (set by the API /
+    # read path); the generation path leaves it False.
+    cached: bool = False
+    # Optional human-readable note (e.g. why a degraded result was returned).
+    note: str | None = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def _tz_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
