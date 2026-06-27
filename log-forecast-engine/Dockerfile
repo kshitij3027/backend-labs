@@ -43,6 +43,11 @@ RUN useradd --uid 1000 --create-home appuser
 COPY src/ ./src/
 COPY config/ ./config/
 
+# CLI helpers (e.g. `python -m scripts.seed`, run as `make seed`). The whole dir is
+# copied so the `scripts` package resolves under WORKDIR /app; entrypoint.sh also
+# landing here is harmless since the ENTRYPOINT uses /usr/local/bin/entrypoint.sh.
+COPY scripts/ ./scripts/
+
 # Migrations + Alembic config + entrypoint so `alembic upgrade head` can run in
 # the container (the entrypoint applies migrations before starting the app).
 COPY migrations/ ./migrations/

@@ -9,7 +9,40 @@ routers (predictions, forecast, metrics, models, retrain) onto the app produced 
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+import math
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+from src.routers import metrics as metrics_router
+
+
+def _sanitize(obj: Any) -> Any:
+    """Recursively make ``obj`` JSON-serializable.
+
+    FastAPI's default validation handler echoes the rejected ``input`` back into
+    the error body. When a client POSTs raw ``NaN`` / ``Infinity`` / ``-Infinity``
+    JSON tokens, that input is a non-finite float, and ``json.dumps`` raises
+    ``ValueError: Out of range float values are not JSON compliant`` — turning a
+    clean 422 into a 500. Replace non-finite floats with their string repr and,
+    defensively, any other non-serializable leaf with its ``repr``.
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj):
+            return "NaN"
+        if math.isinf(obj):
+            return "Infinity" if obj > 0 else "-Infinity"
+        return obj
+    if isinstance(obj, dict):
+        return {key: _sanitize(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(item) for item in obj]
+    if obj is None or isinstance(obj, (str, int, bool)):
+        return obj
+    # Anything else (e.g. exotic objects in the error context) -> safe string.
+    return repr(obj)
 
 #: Reported in the /health payload and (later) elsewhere. Bumped per release.
 SERVICE_VERSION = "0.1.0"
@@ -33,6 +66,21 @@ def create_app() -> FastAPI:
         ),
     )
 
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """Return a clean 422 for request validation errors.
+
+        Mirrors FastAPI's default 422 shape (a list of error dicts under
+        ``detail``) but sanitizes the echoed ``input`` so non-finite floats
+        (``NaN`` / ``Infinity`` / ``-Infinity``) don't crash ``json.dumps`` and
+        surface as a 500. Ordinary errors (missing field, wrong type) are
+        unchanged.
+        """
+        sanitized = [_sanitize(error) for error in exc.errors()]
+        return JSONResponse(status_code=422, content={"detail": sanitized})
+
     @app.get("/health", tags=["system"])
     async def health() -> dict[str, str]:
         """Liveness probe.
@@ -46,6 +94,10 @@ def create_app() -> FastAPI:
             "service": SERVICE_NAME,
             "version": SERVICE_VERSION,
         }
+
+    # Metric ingestion (POST /metrics) + read-back (GET /metrics/{metric_name}).
+    # Later commits add the predictions / forecast / models / analytics routers.
+    app.include_router(metrics_router.router)
 
     return app
 
