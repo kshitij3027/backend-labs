@@ -43,6 +43,13 @@ RUN useradd --uid 1000 --create-home appuser
 COPY src/ ./src/
 COPY config/ ./config/
 
+# Migrations + Alembic config + entrypoint so `alembic upgrade head` can run in
+# the container (the entrypoint applies migrations before starting the app).
+COPY migrations/ ./migrations/
+COPY alembic.ini ./
+COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 # Pre-create the volume mountpoints in the image and hand them to appuser. When a
 # fresh named volume (models:/app/models, data:/app/data) is first mounted onto an
 # existing image directory, Docker initializes it with that directory's ownership —
@@ -61,4 +68,8 @@ EXPOSE 8000
 HEALTHCHECK --interval=10s --timeout=5s --start-period=60s --retries=5 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
+# Entrypoint runs `alembic upgrade head` then exec's the CMD (uvicorn). This makes
+# the schema self-applying on container start for clean E2E runs. Override the
+# entrypoint (e.g. for the worker/beat services in later commits) as needed.
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["python", "-m", "uvicorn", "src.api:app", "--host", "0.0.0.0", "--port", "8000"]

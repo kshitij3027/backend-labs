@@ -38,6 +38,11 @@ COPY tests/ ./tests/
 COPY pytest.ini ./
 COPY scripts/ ./scripts/
 
+# Migrations + Alembic config so integration tests can `alembic upgrade head`
+# against the Postgres service before exercising the repository.
+COPY migrations/ ./migrations/
+COPY alembic.ini ./
+
 # Pre-create the writable runtime dirs (tests may persist artifacts here).
 RUN mkdir -p /app/models /app/data
 
