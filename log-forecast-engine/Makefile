@@ -1,10 +1,13 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs migrate seed test test-unit test-int clean
+.PHONY: help build up up-all worker beat down logs migrate seed test test-unit test-int clean
 
 help:
 	@echo "Predictive Log Analytics Engine — make targets:"
 	@echo "  build      - build all images (api + test)"
-	@echo "  up         - run the API live on http://localhost:8000 (detached, with postgres + redis)"
+	@echo "  up         - run the full runtime (api + worker + beat, detached, with postgres + redis)"
+	@echo "  up-all     - alias for up (api + worker + beat)"
+	@echo "  worker     - start the Celery worker only (detached)"
+	@echo "  beat       - start the Celery beat scheduler only (detached)"
 	@echo "  down       - stop and remove the stack"
 	@echo "  logs       - tail the api logs"
 	@echo "  migrate    - apply Alembic migrations against Postgres in Docker"
@@ -18,9 +21,21 @@ help:
 build:
 	docker compose build
 
+# Bring up the full runtime: api + worker + beat (postgres + redis come up as deps).
 up:
-	docker compose up -d --build api
-	@echo "API: http://localhost:8000"
+	docker compose up -d --build api worker beat
+	@echo "API: http://localhost:8000 (worker + beat running)"
+
+# Explicit alias for the full stack.
+up-all: up
+
+# Start the Celery worker on its own (builds if needed; deps come up automatically).
+worker:
+	docker compose up -d --build worker
+
+# Start the Celery beat scheduler on its own (only ONE beat instance should run).
+beat:
+	docker compose up -d --build beat
 
 down:
 	docker compose down

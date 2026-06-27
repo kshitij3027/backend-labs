@@ -78,6 +78,80 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # Celery worker — runs the forecast/retrain tasks dispatched by Beat. Reuses the
+  # shared production image; the `command:` overrides the default CMD (uvicorn) so
+  # the same entrypoint.sh applies Alembic migrations (idempotent) and then
+  # `exec`s the celery worker instead of the API. Waits for postgres + redis healthy
+  # and for the api to be healthy (guaranteeing migrations have already run).
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: log-forecast-worker
+    command:
+      ["celery", "-A", "src.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://forecast:forecast@postgres:5432/forecast
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - models:/app/models
+      - data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # The shared image's HEALTHCHECK probes the HTTP /health endpoint, but the worker
+    # runs Celery (no listener on :8000) so that probe would fail forever. Override it
+    # with a Celery liveness ping. The plain `inspect ping` (no `-d <node>`) pings all
+    # reachable workers and returns non-zero if none reply, which is the robust form
+    # here (avoids depending on the exact node name / $HOSTNAME).
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A src.celery_app inspect ping || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+
+  # Celery Beat — the single scheduler that emits periodic forecast/retrain tasks
+  # on the cadence defined in src/celery_app.py (from settings). Only ONE beat
+  # instance should ever run. Reuses the shared image with a `command:` override.
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: log-forecast-beat
+    command: ["celery", "-A", "src.celery_app", "beat", "--loglevel=info"]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://forecast:forecast@postgres:5432/forecast
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - models:/app/models
+      - data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    # Beat exposes no inspectable ping, and the base image (python:3.11-slim) has no
+    # procps/pgrep/ps for a process check — adding procps just for this would bloat the
+    # image. So disable the inherited HTTP healthcheck rather than let beat be marked
+    # unhealthy forever. Beat liveness is instead covered by `restart: unless-stopped`.
+    healthcheck:
+      disable: true
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
   # code + requirements as the api, plus the tests) and runs pytest. Profile-gated so
   # it never starts on a bare `docker compose up`. Run via `make test`. Integration

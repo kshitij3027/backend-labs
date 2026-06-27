@@ -104,6 +104,16 @@ def get_metrics(
     return list(session.scalars(stmt).all())
 
 
+def list_metric_names(session: Session) -> list[str]:
+    """Return the distinct metric names present in the metrics table, sorted.
+
+    Used by the scheduled Celery tasks to discover which metrics to forecast /
+    retrain. An empty table yields an empty list (the tasks then no-op).
+    """
+    stmt = select(Metric.metric_name).distinct().order_by(Metric.metric_name.asc())
+    return list(session.scalars(stmt).all())
+
+
 def get_latest_metrics(session: Session, metric_name: str, n: int) -> list[Metric]:
     """Return the ``n`` most recent metric points, ordered oldest-first.
 
