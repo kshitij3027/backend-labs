@@ -175,3 +175,119 @@ class ForecastResponse(BaseModel):
     @classmethod
     def _tz_aware(cls, v: datetime) -> datetime:
         return _ensure_utc(v)
+
+
+# --------------------------------------------------------------------------- #
+# C11 API surface: models / config / health / retrain / app-metrics
+# --------------------------------------------------------------------------- #
+class ModelInfo(BaseModel):
+    """One ensemble member's current state (for ``GET /models``)."""
+
+    # protected_namespaces=() silences Pydantic v2's ``model_*`` field warning.
+    model_config = ConfigDict(from_attributes=True, protected_namespaces=())
+
+    model_name: str
+    version: int = 1
+    weight: float = 0.0
+    accuracy: float | None = None
+    is_deployed: bool = False
+    last_trained_at: datetime | None = None
+
+
+class ModelsResponse(BaseModel):
+    """Response for ``GET /models`` — the ensemble roster + deployed count."""
+
+    count: int
+    deployed_count: int
+    models: list[ModelInfo] = Field(default_factory=list)
+
+
+class ForecastHistoryItem(BaseModel):
+    """A compact summary of one past forecast (``GET /forecast/{metric}/history``)."""
+
+    id: int
+    created_at: datetime
+    horizon_minutes: int
+    horizon_steps: int
+    alert_level: str
+    ensemble_prediction: list[float] = Field(default_factory=list)
+    step_timestamps: list[str] = Field(default_factory=list)
+
+
+class ForecastHistoryResponse(BaseModel):
+    """Response for ``GET /forecast/{metric}/history``."""
+
+    metric_name: str
+    count: int
+    items: list[ForecastHistoryItem] = Field(default_factory=list)
+    # Recent per-model accuracy from the feedback ledger (best-effort; may be empty).
+    recent_accuracy: dict[str, float] = Field(default_factory=dict)
+
+
+class RetrainResponse(BaseModel):
+    """Response for ``POST /retrain`` (202 Accepted)."""
+
+    status: str
+    metric: str | None = None
+    # Set when enqueued via a Celery broker; ``None`` when run inline (no broker).
+    task_id: str | None = None
+    mode: str  # "async" (broker) | "background" (FastAPI BackgroundTasks)
+
+
+class ConfigResponse(BaseModel):
+    """Response for ``GET /config`` and ``PUT /config``.
+
+    Carries the *mutable* runtime overrides (weights / thresholds / alert
+    settings) plus the *static* settings the dashboard needs (intervals + horizon
+    bounds) for context. Only the mutable fields can be changed via ``PUT``.
+    """
+
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_weights: dict[str, float]
+    high_confidence_threshold: float
+    medium_confidence_threshold: float
+    alert_settings: dict[str, object] = Field(default_factory=dict)
+    # Static, read-only context (echoed for the dashboard; not updatable here).
+    prediction_interval_min: int
+    default_horizon_min: int
+    horizon_min_steps: int
+    horizon_max_steps: int
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Partial update body for ``PUT /config`` (all fields optional)."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    model_weights: dict[str, float] | None = None
+    high_confidence_threshold: float | None = None
+    medium_confidence_threshold: float | None = None
+    alert_settings: dict[str, object] | None = None
+
+
+class SubsystemHealth(BaseModel):
+    """Per-subsystem health booleans for ``GET /health``."""
+
+    database: bool = False
+    redis: bool = False
+
+
+class HealthResponse(BaseModel):
+    """Enhanced ``GET /health`` payload (always 200; degraded reported in-body)."""
+
+    status: str  # "ok" | "degraded"
+    service: str
+    version: str
+    deployed_models: int = 0
+    subsystems: SubsystemHealth
+    performance: dict[str, object] = Field(default_factory=dict)
+
+
+class AppMetricsResponse(BaseModel):
+    """Application metrics JSON for ``GET /metrics`` (accuracy / timings / resource)."""
+
+    prediction_accuracy: dict[str, float] = Field(default_factory=dict)
+    processing_times: dict[str, object] = Field(default_factory=dict)
+    resource_usage: dict[str, object] = Field(default_factory=dict)
+    counts: dict[str, int] = Field(default_factory=dict)

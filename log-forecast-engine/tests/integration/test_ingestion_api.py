@@ -174,8 +174,16 @@ def test_post_blank_name_rejected(client: TestClient) -> None:
     assert resp.status_code == 422
 
 
-def test_no_bare_get_metrics_route(client: TestClient) -> None:
-    """C2 intentionally registers no bare ``GET /metrics`` (reserved for C11)."""
+def test_bare_get_metrics_is_app_metrics_json(client: TestClient) -> None:
+    """C11 added the bare ``GET /metrics`` as the application-metrics JSON endpoint.
+
+    The data router still deliberately does not register it (that route lives on
+    the system router); this confirms the bare path resolves to the analytics JSON
+    and does NOT collide with ``GET /metrics/{metric_name}``.
+    """
     resp = client.get("/metrics")
-    # FastAPI returns 404 (no route) or 405; either confirms no data route here.
-    assert resp.status_code in (404, 405)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Shape of AppMetricsResponse, not MetricQueryResponse.
+    assert "prediction_accuracy" in body
+    assert "resource_usage" in body

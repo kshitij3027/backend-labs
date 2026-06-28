@@ -16,7 +16,11 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from src import observability
+from src.routers import config as config_router
+from src.routers import forecast as forecast_router
 from src.routers import metrics as metrics_router
+from src.routers import system as system_router
 
 
 def _sanitize(obj: Any) -> Any:
@@ -56,6 +60,9 @@ def create_app() -> FastAPI:
         A configured :class:`FastAPI` instance exposing ``GET /health``. Future
         commits register additional routers on this same instance.
     """
+    # Configure structured logging once at startup (best-effort; never crashes).
+    observability.configure_logging()
+
     app = FastAPI(
         title="Predictive Log Analytics Engine",
         version=SERVICE_VERSION,
@@ -65,6 +72,9 @@ def create_app() -> FastAPI:
             "time-series models."
         ),
     )
+
+    # Time every request + record count/latency to Prometheus (guarded internally).
+    app.add_middleware(observability.PrometheusMiddleware)
 
     @app.exception_handler(RequestValidationError)
     async def _validation_exception_handler(
@@ -81,22 +91,16 @@ def create_app() -> FastAPI:
         sanitized = [_sanitize(error) for error in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": sanitized})
 
-    @app.get("/health", tags=["system"])
-    async def health() -> dict[str, str]:
-        """Liveness probe.
-
-        Dependency-free in this build, so the service is healthy as soon as uvicorn
-        binds. Later commits extend this to report model status, Redis connectivity,
-        and performance metrics.
-        """
-        return {
-            "status": "ok",
-            "service": SERVICE_NAME,
-            "version": SERVICE_VERSION,
-        }
-
-    # Metric ingestion (POST /metrics) + read-back (GET /metrics/{metric_name}).
-    # Later commits add the predictions / forecast / models / analytics routers.
+    # Router include order matters for the /metrics path split (see
+    # src.observability / src.routers.system docstrings):
+    #   * system router first — owns enhanced GET /health, the application-metrics
+    #     GET /metrics (JSON), and the literal GET /metrics/prometheus (text).
+    #   * metrics router after — POST /metrics (ingest) + GET /metrics/{metric_name}
+    #     (data read). Declaring /metrics/prometheus before /metrics/{metric_name}
+    #     keeps the literal route winning over the parametrised one.
+    app.include_router(system_router.router)
+    app.include_router(forecast_router.router)
+    app.include_router(config_router.router)
     app.include_router(metrics_router.router)
 
     return app

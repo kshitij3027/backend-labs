@@ -190,6 +190,9 @@ def generate_prediction(
     use_multi_window: bool = False,
     persist: bool = True,
     cache: bool = True,
+    weights: dict[str, float] | None = None,
+    high_threshold: float | None = None,
+    medium_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Generate a forecast for ``metric_name`` and (optionally) persist + cache it.
 
@@ -214,6 +217,18 @@ def generate_prediction(
        ``cache`` -> :func:`src.clients.redis.cache_prediction` (best-effort).
 
     Returns the forecast dict (``cached=False``).
+
+    Runtime-config overrides (C11, Feature Area B)
+    ----------------------------------------------
+    ``weights`` overrides the ensemble member weights for *this* call (defaults to
+    ``settings.model_weights``). ``high_threshold`` / ``medium_threshold`` override
+    the alert-tier cut-offs: when either is supplied the ``alert_level`` returned by
+    the ensemble (computed with the static settings thresholds) is **re-derived**
+    from the aggregate ``confidence`` via :func:`src.ensemble.alert_level` using the
+    supplied thresholds — so the dashboard can adjust alert sensitivity without a
+    restart. These three params are backward-compatible (all default to ``None`` =
+    previous behaviour); the forecast routes pass values from
+    :mod:`src.runtime_config`.
     """
     settings = get_settings()
     now = datetime.now(timezone.utc)
@@ -268,7 +283,8 @@ def generate_prediction(
     data_quality = features.data_quality_score(series)
     pattern_stability = features.pattern_stability_score(series)
     recent_accuracy = _recent_accuracy(session)
-    weights = dict(settings.model_weights)
+    # Runtime-config override (C11): caller-supplied weights win over settings.
+    weights = dict(weights) if weights else dict(settings.model_weights)
 
     # --- 3 + 5. Fit models and run the ensemble ----------------------------
     if use_multi_window:
@@ -322,6 +338,17 @@ def generate_prediction(
         "cached": False,
         "note": None,
     }
+
+    # --- 6b. Runtime alert-threshold override (C11) ------------------------
+    # The ensemble already tiered the alert with the static settings thresholds.
+    # If the caller supplied runtime thresholds, re-derive the tier from the same
+    # aggregate confidence so /config changes take effect without a restart.
+    if high_threshold is not None or medium_threshold is not None:
+        payload["alert_level"] = ensemble_mod.alert_level(
+            payload["confidence"],
+            high=high_threshold,
+            medium=medium_threshold,
+        )
 
     # --- 7. Persist + cache -------------------------------------------------
     if persist:
