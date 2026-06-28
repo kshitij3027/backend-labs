@@ -74,6 +74,13 @@ celery_app.conf.beat_schedule = {
         "task": "tasks.run_scheduled_retrain",
         "schedule": timedelta(hours=int(_settings.retrain_interval_hr)),
     },
+    # Feedback loop (C10): validate past forecasts against freshly-arrived actuals,
+    # adjust per-model weights and trigger retraining on accuracy breaches. Runs at
+    # the prediction cadence so each new batch of actuals is scored promptly.
+    "feedback-all-metrics": {
+        "task": "tasks.run_scheduled_feedback",
+        "schedule": timedelta(minutes=int(_settings.prediction_interval_min)),
+    },
 }
 
 # Conventional alias so `celery -A src.celery_app worker` (which looks for `app`

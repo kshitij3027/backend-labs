@@ -36,7 +36,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
-from src import prediction_service, validation
+from src import feedback, prediction_service, validation
 from src.celery_app import celery_app
 from src.config import get_settings
 from src.db import repository
@@ -292,9 +292,63 @@ def run_scheduled_retrain() -> dict[str, Any]:
     return {"metrics": summaries, "count": len(summaries)}
 
 
+# --------------------------------------------------------------------------- #
+# Feedback tasks (C10) — close the validation loop
+# --------------------------------------------------------------------------- #
+@celery_app.task(name="tasks.run_feedback")
+def run_feedback(metric_name: str) -> dict[str, Any]:
+    """Run the full feedback loop for ``metric_name`` (validate -> reweight -> retrain).
+
+    Delegates to :func:`src.feedback.run_feedback_cycle`, which compares past
+    forecasts against observed actuals, persists per-model accuracy records,
+    adjusts the ensemble weights in ``ModelMetadata``, and triggers a retrain when
+    recent accuracy has dropped below the deploy threshold. Owns its own session
+    and never raises (graceful degradation); on error returns
+    ``{metric_name, error}``.
+    """
+    session = SessionLocal()
+    try:
+        return feedback.run_feedback_cycle(session, metric_name)
+    except Exception as exc:  # noqa: BLE001 - never crash the worker on one metric
+        logger.exception("run_feedback failed for %r", metric_name)
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"metric_name": metric_name, "error": str(exc)}
+    finally:
+        session.close()
+
+
+@celery_app.task(name="tasks.run_scheduled_feedback")
+def run_scheduled_feedback() -> dict[str, Any]:
+    """Run the feedback loop for every known metric (the periodic validation job).
+
+    Discovers distinct metric names and runs :func:`run_feedback` synchronously for
+    each. Per-metric failures are recorded in the per-metric summary and never
+    abort the loop.
+    """
+    session = SessionLocal()
+    try:
+        metric_names = repository.list_metric_names(session)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("run_scheduled_feedback: could not list metrics")
+        return {"metrics": [], "count": 0, "error": str(exc)}
+    finally:
+        session.close()
+
+    summaries: list[dict[str, Any]] = []
+    for name in metric_names:
+        summaries.append(run_feedback(name))
+
+    return {"metrics": summaries, "count": len(summaries)}
+
+
 __all__ = [
     "run_forecast",
     "run_scheduled_forecasts",
     "run_retrain",
     "run_scheduled_retrain",
+    "run_feedback",
+    "run_scheduled_feedback",
 ]
