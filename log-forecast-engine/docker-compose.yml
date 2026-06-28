@@ -50,7 +50,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: log-forecast-api
+    # No container_name: Docker refuses `--scale api=N` (N>1) when a custom
+    # container_name is set. Omitting it lets Compose name replicas
+    # `<project>-api-1/2/...` so the service scales freely. Other services keep
+    # their fixed names since only `api` needs to scale.
     ports:
       - "${API_PORT:-8000}:8000"
     env_file:
@@ -169,8 +172,12 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      # nginx:alpine ships wget; a 200 on / means the SPA is being served.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ >/dev/null 2>&1 || exit 1"]
+      # nginx:alpine ships wget; a 200 on / means the SPA is being served. Target
+      # 127.0.0.1 (not localhost): inside the container `localhost` can resolve to
+      # IPv6 ::1, and the check would fail if nginx weren't listening on IPv6. nginx
+      # now also `listen [::]:80;` (see frontend/nginx.conf), but 127.0.0.1 is the
+      # belt-and-suspenders form.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -195,6 +202,60 @@ services:
       redis:
         condition: service_healthy
     command: ["pytest", "-q"]
+
+  # Black-box end-to-end verifier (C13). Reuses the tester image (it ships src/ +
+  # scripts/) and runs scripts/verify_e2e.py against the LIVE api over the compose
+  # network — exercising the whole flow (ingest -> on-demand forecast -> structured
+  # §8 payload -> /predictions/health/metrics/models). Waits for the api healthcheck
+  # (and postgres/redis healthy) first. Profile-gated so it never starts on a bare
+  # `docker compose up`. Run via `make e2e`.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - API_BASE_URL=http://api:8000
+      - DATABASE_URL=postgresql+psycopg2://forecast:forecast@postgres:5432/forecast
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["python", "scripts/verify_e2e.py"]
+
+  # Performance + load gates (C13). Reuses the tester image and runs perf_test.py
+  # (latency / per-forecast timing gate) followed by load_test.py (throughput +
+  # memory under concurrent load) against the LIVE api. Thresholds are env-tunable
+  # (see the script docstrings) so the gates stay CI-safe. Waits for the api
+  # healthcheck first. Profile-gated; run via `make load`.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - API_BASE_URL=http://api:8000
+      - DATABASE_URL=postgresql+psycopg2://forecast:forecast@postgres:5432/forecast
+      - REDIS_URL=redis://redis:6379/0
+      # Hard gates (stable across hosts):
+      - PERF_MAX_SERVE_MS=${PERF_MAX_SERVE_MS:-2000}
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-20}
+      - LOAD_MAX_ERROR_RATE=${LOAD_MAX_ERROR_RATE:-0.0}
+      # Lenient / reported ceilings:
+      - PERF_MAX_COMPUTE_MS=${PERF_MAX_COMPUTE_MS:-5000}
+      - LOAD_MAX_RSS_MB=${LOAD_MAX_RSS_MB:-1024}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["sh", "-lc", "python scripts/perf_test.py && python scripts/load_test.py"]
 
 # Named volumes keep the Postgres data + fitted models + generated datasets across
 # container restarts.
