@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up up-all worker beat down logs migrate seed test test-unit test-int clean
+.PHONY: help build up up-all worker beat dashboard ui down logs migrate seed test test-unit test-int clean
 
 help:
 	@echo "Predictive Log Analytics Engine — make targets:"
@@ -8,6 +8,8 @@ help:
 	@echo "  up-all     - alias for up (api + worker + beat)"
 	@echo "  worker     - start the Celery worker only (detached)"
 	@echo "  beat       - start the Celery beat scheduler only (detached)"
+	@echo "  dashboard  - build + start the React dashboard (nginx) only (detached)"
+	@echo "  ui         - bring up api + dashboard (detached); open http://localhost:8080"
 	@echo "  down       - stop and remove the stack"
 	@echo "  logs       - tail the api logs"
 	@echo "  migrate    - apply Alembic migrations against Postgres in Docker"
@@ -36,6 +38,16 @@ worker:
 # Start the Celery beat scheduler on its own (only ONE beat instance should run).
 beat:
 	docker compose up -d --build beat
+
+# Build + start the React dashboard (served by nginx). Its api dependency comes
+# up automatically (depends_on api: service_healthy).
+dashboard:
+	docker compose up -d --build dashboard
+
+# Bring up the API + dashboard together (postgres + redis come up as deps).
+ui:
+	docker compose up -d --build api dashboard
+	@echo "Dashboard: http://localhost:8080  (API: http://localhost:8000)"
 
 down:
 	docker compose down

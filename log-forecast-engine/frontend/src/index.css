@@ -1,0 +1,473 @@
+/* Predictive Log Analytics Engine — dashboard theme.
+ *
+ * Clean, modern, DARK showcase theme. Colours, radii and spacing are driven by
+ * CSS custom properties. The layout is a centered column of responsive cards. */
+
+:root {
+  /* Surfaces */
+  --bg: #0b1020;
+  --bg-soft: #0f1630;
+  --card: #141c38;
+  --card-2: #18223f;
+  --border: #243056;
+  --border-soft: #1c264a;
+
+  /* Text */
+  --text: #eef2ff;
+  --text-dim: #9aa6cc;
+  --text-faint: #6b7799;
+
+  /* Accents */
+  --accent: #6ea8ff;
+  --accent-2: #818cf8;
+  --actual: #38bdf8;   /* sky — actual observed series */
+  --pred: #a78bfa;     /* violet — ensemble prediction */
+  --band: #6366f1;     /* indigo — confidence band */
+
+  /* Confidence tiers (green / yellow / red) */
+  --green: #34d399;
+  --yellow: #fbbf24;
+  --red: #fb7185;
+
+  /* Status */
+  --ok: #34d399;
+  --bad: #fb7185;
+
+  /* Per-model line palette (cycled) */
+  --m0: #38bdf8;
+  --m1: #34d399;
+  --m2: #fbbf24;
+  --m3: #f472b6;
+  --m4: #a78bfa;
+
+  /* Shape & motion */
+  --radius: 14px;
+  --radius-sm: 10px;
+  --shadow: 0 10px 30px rgba(2, 6, 23, 0.55);
+  --gap: 18px;
+  --maxw: 1320px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 12% -10%, #16224a 0%, transparent 55%),
+    radial-gradient(1000px 500px at 100% 0%, #1a1740 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+/* ----------------------------------------------------------------- layout -- */
+
+.app {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 28px clamp(16px, 4vw, 40px) 64px;
+}
+
+.app__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding-bottom: 18px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-width: 0;
+}
+
+.app__logo {
+  width: 42px;
+  height: 42px;
+  flex: 0 0 auto;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--accent-2), var(--actual));
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06) inset,
+    0 8px 22px rgba(56, 189, 248, 0.35);
+}
+
+.app__title {
+  margin: 0;
+  font-size: clamp(1.15rem, 2.4vw, 1.6rem);
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.app__subtitle {
+  margin: 2px 0 0;
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+/* Header controls (metric / horizon selectors + refresh indicator) */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.control label {
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+select,
+input[type="number"],
+input[type="text"] {
+  background: var(--card-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 0.9rem;
+  outline: none;
+}
+
+select:focus,
+input:focus {
+  border-color: var(--accent);
+}
+
+button {
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  color: #0b1020;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 9px 16px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: filter 0.15s ease;
+}
+
+button:hover {
+  filter: brightness(1.08);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.ghost {
+  background: var(--card-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+/* Auto-refresh indicator */
+.refresh {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: var(--text-dim);
+}
+
+.refresh__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6);
+}
+
+.refresh__dot.pulsing {
+  animation: pulse 1.2s ease-out;
+}
+
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6); }
+  100% { box-shadow: 0 0 0 10px rgba(52, 211, 153, 0); }
+}
+
+/* ------------------------------------------------------------------ grid --- */
+
+.app__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--gap);
+}
+
+@media (max-width: 900px) {
+  .grid-2 {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ------------------------------------------------------------------ card --- */
+
+.card {
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 20px 20px;
+}
+
+.card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.card__title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+}
+
+.card__hint {
+  color: var(--text-faint);
+  font-size: 0.78rem;
+}
+
+.muted {
+  color: var(--text-dim);
+  font-size: 0.85rem;
+}
+
+.empty {
+  color: var(--text-faint);
+  font-size: 0.85rem;
+  padding: 24px 0;
+  text-align: center;
+}
+
+/* ----------------------------------------------------------------- badges -- */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.badge--green { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+.badge--yellow { background: rgba(251, 191, 36, 0.15); color: var(--yellow); }
+.badge--red { background: rgba(251, 113, 133, 0.15); color: var(--red); }
+.badge--neutral { background: rgba(154, 166, 204, 0.15); color: var(--text-dim); }
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.dot--up { background: var(--ok); }
+.dot--down { background: var(--bad); }
+
+/* ------------------------------------------------------- confidence panel -- */
+
+.conf {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.conf__gauge {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.conf__value {
+  font-size: 2.6rem;
+  font-weight: 800;
+  line-height: 1;
+}
+.conf__value--green { color: var(--green); }
+.conf__value--yellow { color: var(--yellow); }
+.conf__value--red { color: var(--red); }
+
+.conf__bar {
+  height: 10px;
+  border-radius: 999px;
+  background: var(--bg-soft);
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+}
+.conf__bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.4s ease;
+}
+.fill--green { background: var(--green); }
+.fill--yellow { background: var(--yellow); }
+.fill--red { background: var(--red); }
+
+/* ------------------------------------------------------------------ stats -- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+}
+.stat__label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+.stat__value {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-top: 4px;
+}
+
+/* ------------------------------------------------------------------ table -- */
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+th, td {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+th {
+  color: var(--text-faint);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+}
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* --------------------------------------------------------------- controls -- */
+
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.field label {
+  font-size: 0.85rem;
+  color: var(--text-dim);
+}
+.field input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+.field .field__val {
+  width: 56px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.save-msg {
+  font-size: 0.82rem;
+  margin-top: 8px;
+}
+.save-msg--ok { color: var(--green); }
+.save-msg--err { color: var(--red); }
+
+/* ------------------------------------------------------------ drill-down -- */
+
+.factors {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.factor {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 0.85rem;
+}
+.factor__label { color: var(--text-dim); }
+.factor__val { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.tag {
+  background: var(--bg-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 2px 9px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+/* ------------------------------------------------------- recharts tooltip -- */
+
+.recharts-default-tooltip {
+  background: var(--card-2) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-sm) !important;
+}
+
+.banner {
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  color: var(--yellow);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  font-size: 0.85rem;
+}

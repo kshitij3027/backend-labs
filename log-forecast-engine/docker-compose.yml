@@ -152,6 +152,31 @@ services:
       disable: true
     restart: unless-stopped
 
+  # Dashboard — React + Vite + Recharts SPA built multi-stage and served by nginx.
+  # nginx reverse-proxies /api -> api:8000 (see frontend/nginx.conf), so the browser
+  # only ever talks to nginx and there is no CORS / hardcoded backend host. Built
+  # with `context: .` (project root) + `dockerfile: frontend/Dockerfile` so the
+  # Dockerfile's COPY paths carry the `frontend/` prefix. Waits for the api to be
+  # healthy before coming up.
+  dashboard:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: log-forecast-dashboard
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      # nginx:alpine ships wget; a 200 on / means the SPA is being served.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:80/ >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
   # code + requirements as the api, plus the tests) and runs pytest. Profile-gated so
   # it never starts on a bare `docker compose up`. Run via `make test`. Integration
