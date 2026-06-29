@@ -19,6 +19,9 @@ sqlalchemy==2.0.36
 psycopg2-binary==2.9.10      # PostgreSQL driver
 alembic==1.14.0              # schema migrations
 
+# ── Vector store ─────────────────────────────────────────
+pgvector==0.3.6              # pgvector.sqlalchemy.Vector column type (pgvector ANN)
+
 # ── Caching ──────────────────────────────────────────────
 redis==5.2.1                 # recommendation / embedding cache
 

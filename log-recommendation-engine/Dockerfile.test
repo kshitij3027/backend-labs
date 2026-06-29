@@ -47,6 +47,11 @@ COPY tests/ ./tests/
 COPY pytest.ini ./
 COPY scripts/ ./scripts/
 
+# Alembic config + migrations so the integration tests can apply the schema
+# (`alembic upgrade head`, invoked programmatically from the integration conftest).
+COPY migrations/ ./migrations/
+COPY alembic.ini ./
+
 # Pre-create the writable runtime dirs (tests may persist artifacts here).
 RUN mkdir -p /app/data /app/.cache
 

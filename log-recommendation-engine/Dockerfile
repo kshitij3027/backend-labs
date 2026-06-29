@@ -67,6 +67,12 @@ COPY scripts/ ./scripts/
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# Alembic config + migration scripts so the baked image can run `alembic upgrade
+# head` at container start (the entrypoint invokes it once alembic.ini is present).
+# Copied BEFORE the chown/USER lines below so they end up owned by appuser.
+COPY migrations/ ./migrations/
+COPY alembic.ini ./
+
 # Pre-create the volume mountpoints + cache dir in the image and hand everything to
 # appuser. Doing this (and especially the recursive chown) BEFORE `USER appuser`
 # ensures the baked model cache under /app/.cache is readable at runtime, and that a
