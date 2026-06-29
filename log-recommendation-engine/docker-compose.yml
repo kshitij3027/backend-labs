@@ -1,0 +1,108 @@
+# Log Recommendation Engine — service topology (Commit C1).
+#
+# `api` is the runnable production service: a single uvicorn/FastAPI process on :8000.
+# It depends on `postgres` (incident corpus + pgvector embeddings) and `redis`
+# (recommendation / embedding cache), both of which expose healthchecks so `api`
+# only starts once they are ready.
+#
+# The profile-gated `test` service runs the pytest suite and never starts on a bare
+# `docker compose up`. The dashboard, e2e and loadtest services are added in later
+# commits. This project has NO scheduler, so there is no worker/beat/celery service.
+# Run via `make up` / `make test`.
+
+services:
+  # PostgreSQL with pgvector — durable store for the incident corpus, embeddings
+  # (vector(384) column, added in C2), served-recommendation rows, and feedback.
+  # The pgvector/pgvector:pg16 image ships the `vector` extension. Internal to the
+  # compose network; the host port is commented out to avoid clashing with a
+  # host-local Postgres.
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: log-recommend-postgres
+    environment:
+      - POSTGRES_USER=recommend
+      - POSTGRES_PASSWORD=recommend
+      - POSTGRES_DB=recommend
+    # ports:
+    #   - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U recommend -d recommend"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Redis — recommendation + embedding cache. Persistence is disabled so it behaves
+  # as an ephemeral cache. Internal to the compose network.
+  redis:
+    image: redis:7-alpine
+    container_name: log-recommend-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Live production API — built from the production Dockerfile and exposed on the host.
+  # Reaches Postgres/Redis over the compose network by service name (not localhost).
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # No container_name: Docker refuses `--scale api=N` (N>1) when a custom
+    # container_name is set. Omitting it lets Compose name replicas
+    # `<project>-api-1/2/...` so the service scales freely (see C23). Other services
+    # keep their fixed names since only `api` needs to scale.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free, so the app is healthy as soon as uvicorn binds;
+      # the 60s grace period is a safe margin for image start-up + model load.
+      start_period: 60s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
+  # code + requirements + baked model as the api, plus the tests) and runs pytest.
+  # Profile-gated so it never starts on a bare `docker compose up`. Run via
+  # `make test`. Integration tests (added later) reach Postgres/Redis by service name.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["pytest", "-q"]
+
+# Named volumes keep the Postgres data + generated datasets across container restarts.
+volumes:
+  pgdata:
+  data:

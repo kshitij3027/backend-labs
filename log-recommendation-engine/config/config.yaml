@@ -1,0 +1,47 @@
+# Log Recommendation Engine — default configuration.
+#
+# Every knob here maps to a field on the pydantic-settings model in src/config.py.
+# Values are merged over the model defaults; environment variables (the uppercased
+# field name, e.g. API_PORT, WEIGHT_SEMANTIC) take final precedence over anything
+# set here. Most ranking knobs are unused in C1 (the skeleton) but are declared now
+# so the full tunable surface exists from the start and later commits only wire it.
+
+# --- Identity / server ---
+app_name: log-recommendation-engine
+api_host: 0.0.0.0
+api_port: 8000
+log_level: INFO
+
+# --- Persistence / cache (compose service names) ---
+database_url: postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
+redis_url: redis://redis:6379/0
+
+# --- Embeddings ---
+embedding_model: all-MiniLM-L6-v2  # sentence-transformers model baked into the image
+embedding_dim: 384                 # output dimensionality of all-MiniLM-L6-v2
+
+# --- Retrieval / ranking ---
+top_k: 5                # number of ranked suggestions returned
+candidate_k: 50         # pgvector K-NN candidate pool before re-ranking
+weight_semantic: 0.6    # weight on cosine semantic similarity in the blend
+weight_contextual: 0.4  # weight on the combined contextual signal in the blend
+weight_feedback: 0.2    # weight on the smoothed net-helpfulness feedback boost
+
+# --- Contextual signal weights (combine into the single contextual score) ---
+ctx_weight_service: 0.4   # exact service match
+ctx_weight_severity: 0.2  # severity ordinal proximity
+ctx_weight_tags: 0.25     # tag Jaccard overlap
+ctx_weight_recency: 0.15  # recency half-life decay
+recency_half_life_days: 30  # age (days) at which the recency signal halves
+
+# --- Feedback loop / exploration / diversity ---
+epsilon_explore: 0.1       # prob. of promoting a strong-but-unproven candidate
+diversity_threshold: 0.9   # drop near-duplicate resolutions above this similarity
+feedback_smoothing: 2.0    # Laplace smoothing term in the net-helpfulness ratio
+
+# --- Confidence thresholds ---
+high_confidence_threshold: 0.75    # >0.75 -> high-confidence suggestion tier
+medium_confidence_threshold: 0.5   # 0.5-0.75 -> medium-confidence tier
+
+# --- Dashboard ---
+dashboard_poll_interval_sec: 15  # frontend polling interval (seconds)

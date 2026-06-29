@@ -1,0 +1,32 @@
+# ── Web API ──────────────────────────────────────────────
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-multipart==0.0.20      # form parsing for API/dashboard uploads
+
+# ── Semantic similarity / embeddings ─────────────────────
+sentence-transformers==3.3.1  # dense incident embeddings
+numpy==2.1.3                  # vector math / cosine similarity
+scikit-learn==1.6.0          # cosine similarity, feature scaling, metrics
+
+# ── Contextual similarity / data handling ────────────────
+pandas==2.2.3
+PyYAML==6.0.2                 # config overrides / ranking weights
+
+# ── Persistence ──────────────────────────────────────────
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10      # PostgreSQL driver
+alembic==1.14.0              # schema migrations
+
+# ── Caching ──────────────────────────────────────────────
+redis==5.2.1                 # recommendation / embedding cache
+
+# ── Observability ────────────────────────────────────────
+prometheus-client==0.21.1
+structlog==24.4.0
+
+# ── Testing ──────────────────────────────────────────────
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1                # async test client for the API

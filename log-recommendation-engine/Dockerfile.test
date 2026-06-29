@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-runner image for the Log Recommendation Engine.
+#
+# Same base, env, build toolchain, and baked embedding model as the production image
+# so tests exercise the real code path, but it additionally COPYs the test suite,
+# pytest config and the scripts/ dir, and runs pytest as root (tests write temp files
+# freely). Built and run via `make test` / the `test` compose profile; it never
+# starts on a bare `docker compose up`.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+# Same cache locations as the production image so the baked model resolves offline.
+ENV HF_HOME=/app/.cache/hf \
+    SENTENCE_TRANSFORMERS_HOME=/app/.cache/st
+
+WORKDIR /app
+
+# Build toolchain (parity with production: sentence-transformers / sklearn / numpy),
+# libgomp1 for the OpenMP runtime, plus curl.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libgomp1 \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies first (cached unless requirements.txt changes).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Bake the embedding model into the tester image too (parity with production; keeps
+# offline model-dependent tests deterministic). Runs after pip install so
+# sentence-transformers is available.
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# App code, default config, the test suite + its config, and the scripts/ dir used by
+# later E2E / load commits.
+COPY src/ ./src/
+COPY config/ ./config/
+COPY tests/ ./tests/
+COPY pytest.ini ./
+COPY scripts/ ./scripts/
+
+# Pre-create the writable runtime dirs (tests may persist artifacts here).
+RUN mkdir -p /app/data /app/.cache
+
+CMD ["pytest", "-q"]
