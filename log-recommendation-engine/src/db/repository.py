@@ -139,6 +139,26 @@ def list_incidents(
     return list(session.scalars(stmt).all())
 
 
+def count_incidents(
+    session: Session,
+    *,
+    service: str | None = None,
+    severity: str | None = None,
+) -> int:
+    """Return the total number of incidents matching the given filters.
+
+    Uses the same ``service`` / ``severity`` exact-match predicates as
+    :func:`list_incidents` (but ignores pagination) so a paginated response can
+    report an accurate ``total`` alongside the current page.
+    """
+    stmt = select(func.count()).select_from(Incident)
+    if service is not None:
+        stmt = stmt.where(Incident.service == service)
+    if severity is not None:
+        stmt = stmt.where(Incident.severity == severity)
+    return int(session.scalar(stmt) or 0)
+
+
 def set_incident_embedding(
     session: Session,
     incident_id: int,

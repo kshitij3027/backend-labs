@@ -38,10 +38,12 @@ logs:
 migrate:
 	docker compose run --rm --entrypoint alembic api upgrade head
 
-# Generate a synthetic incident corpus and ingest it (arrives in C3). Runs a
-# throwaway api container. Override args, e.g. `make seed ARGS="--count 200"`.
+# Generate a synthetic incident corpus and ingest it. Runs a throwaway api
+# container that shares Postgres with the running stack (the api entrypoint
+# migrates on start; this one-off `run` hits the same migrated DB). Override args,
+# e.g. `make seed ARGS="--count 200"`.
 seed:
-	@echo "seed: available from commit C3"
+	docker compose run --rm api python -m scripts.seed $(ARGS)
 
 # Bring up the API + dashboard together (dashboard arrives in C15).
 ui:

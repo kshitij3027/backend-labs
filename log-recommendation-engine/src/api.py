@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from src import observability
+from src.routers import incidents as incidents_router
 
 #: Reported in the /health payload and (later) elsewhere. Bumped per release.
 SERVICE_VERSION = "0.1.0"
@@ -51,6 +52,10 @@ def create_app() -> FastAPI:
             "service": SERVICE_NAME,
             "version": SERVICE_VERSION,
         }
+
+    # Incident-corpus routes (C3). Later commits register recommend / feedback /
+    # config / system routers on this same app.
+    app.include_router(incidents_router.router)
 
     return app
 
