@@ -19,6 +19,7 @@ redis_url: redis://redis:6379/0
 # --- Embeddings ---
 embedding_model: all-MiniLM-L6-v2  # sentence-transformers model baked into the image
 embedding_dim: 384                 # output dimensionality of all-MiniLM-L6-v2
+embedding_cache_ttl_sec: 86400     # Redis embedding-cache TTL (seconds; 24h)
 
 # --- Retrieval / ranking ---
 top_k: 5                # number of ranked suggestions returned
