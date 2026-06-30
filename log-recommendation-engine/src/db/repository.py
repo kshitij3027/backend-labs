@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
+import numpy as np
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -222,6 +223,50 @@ def delete_incident(
     else:
         session.flush()
     return True
+
+
+def knn_by_embedding(
+    session: Session,
+    query_vec: "np.ndarray | Sequence[float]",
+    *,
+    k: int,
+    service: str | None = None,
+    severities: Sequence[str] | None = None,
+) -> list[tuple[Incident, float]]:
+    """Return the ``k`` nearest incidents to ``query_vec`` by **cosine distance**.
+
+    The heart of C6 semantic retrieval. Builds a KNN ``SELECT`` that orders rows by
+    ``embedding <=> :query_vec`` (pgvector's ``cosine_distance`` — the operator the
+    HNSW ``vector_cosine_ops`` index accelerates), so Postgres can serve this from
+    the ANN index rather than a sequential scan.
+
+    * Incidents whose ``embedding IS NULL`` are excluded — a NULL vector cannot be
+      scored (these are rows the C5 backfill has not reached yet).
+    * ``service`` (exact match) and ``severities`` (``severity IN (...)``) are
+      **optional, additive** hard pre-filters, applied only when provided. No
+      auto-widening happens here (that is C9's concern).
+
+    Returns a list of ``(incident, distance)`` tuples ordered by ``distance``
+    ascending (nearest first), at most ``k`` long. ``distance`` is the cosine
+    distance in ``[0, 2]``; callers convert it to a similarity via ``1 - distance``
+    (see :func:`src.retrieval.retrieve_candidates`).
+
+    ``query_vec`` may be a NumPy array or a plain float sequence; pgvector's
+    ``Vector`` bind handles both. It must have the configured dimensionality (384)
+    or Postgres raises a dimension-mismatch error.
+    """
+    # ``list(...)`` normalises a NumPy array (or any sequence) into the plain list
+    # of floats that pgvector's Vector bind expects.
+    vec = list(query_vec)
+    distance = Incident.embedding.cosine_distance(vec).label("distance")
+    stmt = select(Incident, distance).where(Incident.embedding.is_not(None))
+    if service is not None:
+        stmt = stmt.where(Incident.service == service)
+    if severities:
+        stmt = stmt.where(Incident.severity.in_(list(severities)))
+    stmt = stmt.order_by(distance.asc()).limit(k)
+    rows = session.execute(stmt).all()
+    return [(incident, float(dist)) for incident, dist in rows]
 
 
 # --------------------------------------------------------------------------- #
