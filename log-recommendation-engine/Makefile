@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs migrate seed ui scale test test-unit test-int e2e load clean
+.PHONY: help build up down logs migrate seed backfill ui scale test test-unit test-int e2e load clean
 
 help:
 	@echo "Log Recommendation Engine — make targets:"
@@ -9,6 +9,7 @@ help:
 	@echo "  logs       - tail the api logs"
 	@echo "  migrate    - apply Alembic migrations against Postgres in Docker (no-op until C2)"
 	@echo "  seed       - generate + ingest a synthetic incident corpus in Docker (from C3)"
+	@echo "  backfill   - compute embeddings for NULL-embedded incidents in Docker (from C5)"
 	@echo "  ui         - bring up api + dashboard (from C15)"
 	@echo "  scale      - scale the api behind the dashboard's nginx (from C23)"
 	@echo "  test       - full pytest suite in Docker (rebuilds first)"
@@ -44,6 +45,13 @@ migrate:
 # e.g. `make seed ARGS="--count 200"`.
 seed:
 	docker compose run --rm api python -m scripts.seed $(ARGS)
+
+# Backfill embeddings for any incidents left NULL-embedded (rows inserted before
+# C5, or while the embedding service was unavailable). Runs a throwaway api
+# container against the same migrated DB. Override args, e.g.
+# `make backfill ARGS="--batch-size 128"`.
+backfill:
+	docker compose run --rm api python -m scripts.backfill_embeddings $(ARGS)
 
 # Bring up the API + dashboard together (dashboard arrives in C15).
 ui:

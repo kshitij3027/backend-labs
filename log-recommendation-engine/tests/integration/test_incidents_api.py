@@ -1,4 +1,4 @@
-"""Integration tests for the C3 incident-corpus API (:mod:`src.routers.incidents`).
+"""Integration tests for the incident-corpus API (:mod:`src.routers.incidents`).
 
 Run against the REAL migrated Postgres (the ``db_session`` fixture in
 ``conftest.py`` gives a transaction that is rolled back on teardown). The FastAPI
@@ -7,9 +7,12 @@ Run against the REAL migrated Postgres (the ``db_session`` fixture in
 afterwards.
 
 Coverage:
-  * ``POST /incidents`` valid → **201**, body ``has_embedding == False``;
-  * the persisted row's ``embedding IS NULL`` (queried back via the session);
-  * ``GET /incidents/{id}`` round-trips it; unknown id → **404**;
+  * ``POST /incidents`` valid → **201**, body ``has_embedding == True`` (C5
+    embeds on ingest);
+  * the persisted row's ``embedding`` is non-null with 384 dims (queried back via
+    the session);
+  * ``GET /incidents/{id}`` round-trips it (also ``has_embedding == True``);
+    unknown id → **404**;
   * ``GET /incidents?service=`` / ``?severity=`` filter correctly and ``total``
     reflects the full match count (not just the page);
   * blank / invalid-severity bodies → **422**.
@@ -70,10 +73,10 @@ def _payload(**overrides: object) -> dict:
 # --------------------------------------------------------------------------- #
 # POST /incidents
 # --------------------------------------------------------------------------- #
-def test_post_incident_returns_201_no_embedding(
+def test_post_incident_returns_201_with_embedding(
     client: TestClient, db_session: Session, unique: str
 ) -> None:
-    """A valid POST → 201, ``has_embedding == False``, and the row is NULL-embedded."""
+    """A valid POST → 201, ``has_embedding == True``, row embedded with 384 dims (C5)."""
     resp = client.post("/incidents", json=_payload(service=f"orders-{unique}"))
     assert resp.status_code == 201, resp.text
     body = resp.json()
@@ -82,16 +85,20 @@ def test_post_incident_returns_201_no_embedding(
     assert body["service"] == f"orders-{unique}"
     assert body["severity"] == "high"
     assert body["tags"] == ["db", "timeout"]
-    assert body["has_embedding"] is False
+    assert body["has_embedding"] is True
     # The vector is never serialised.
     assert "embedding" not in body
 
-    # Confirm the *persisted* row has a NULL embedding (C3 never computes vectors).
-    embedding = db_session.execute(
-        text("SELECT embedding FROM incidents WHERE id = :id"),
+    # Confirm the *persisted* row carries a non-null 384-dim vector (C5 embeds on ingest).
+    row = db_session.execute(
+        text(
+            "SELECT embedding IS NOT NULL, vector_dims(embedding) "
+            "FROM incidents WHERE id = :id"
+        ),
         {"id": body["id"]},
-    ).scalar()
-    assert embedding is None
+    ).one()
+    assert row[0] is True  # embedding IS NOT NULL
+    assert row[1] == 384  # vector_dims(embedding)
 
 
 def test_post_incident_trims_and_dedupes_tags(
@@ -144,7 +151,7 @@ def test_get_incident_by_id_roundtrips(
     assert fetched["id"] == created["id"]
     assert fetched["title"] == f"T-{unique}"
     assert fetched["service"] == f"svc-{unique}"
-    assert fetched["has_embedding"] is False
+    assert fetched["has_embedding"] is True
 
 
 def test_get_unknown_incident_returns_404(client: TestClient) -> None:

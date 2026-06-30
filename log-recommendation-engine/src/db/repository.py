@@ -159,6 +159,27 @@ def count_incidents(
     return int(session.scalar(stmt) or 0)
 
 
+def get_incidents_missing_embedding(
+    session: Session,
+    *,
+    limit: int = 500,
+) -> list[Incident]:
+    """Return incidents whose ``embedding IS NULL``, oldest-id first.
+
+    Used by the C5 backfill (``scripts.backfill_embeddings``) to page through the
+    rows that still need a vector computed. Ordered by ``id`` (ascending) so a
+    resumable batch loop makes steady forward progress; ``limit`` caps the page
+    size.
+    """
+    stmt = (
+        select(Incident)
+        .where(Incident.embedding.is_(None))
+        .order_by(Incident.id.asc())
+        .limit(limit)
+    )
+    return list(session.scalars(stmt).all())
+
+
 def set_incident_embedding(
     session: Session,
     incident_id: int,

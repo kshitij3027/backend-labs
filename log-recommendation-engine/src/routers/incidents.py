@@ -1,9 +1,10 @@
 """Incident-corpus routes — the historical knowledge base a new incident is
 matched against.
 
-* ``POST /incidents`` — add one resolved incident to the corpus. In C3 the row is
-  created with ``embedding = NULL`` (vectors are computed by the embedding service
-  in C5), so ``has_embedding`` on the returned payload is ``False`` here.
+* ``POST /incidents`` — add one resolved incident to the corpus. From C5 the
+  MiniLM embedding is computed on ingest and persisted with the row, so
+  ``has_embedding`` on the returned payload is ``True`` and the incident is
+  immediately searchable.
 * ``GET  /incidents`` — list the corpus, paginated and optionally filtered by
   ``service`` / ``severity``. ``total`` is the full match count (ignoring
   pagination) so a UI can page through it.
@@ -19,9 +20,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from src import embeddings, observability
 from src.db import repository
 from src.db.session import get_db
 from src.schemas import SEVERITIES, IncidentCreate, IncidentList, IncidentOut
+
+logger = observability.get_logger(__name__)
 
 router = APIRouter(prefix="/incidents", tags=["incidents"])
 
@@ -36,13 +40,31 @@ def create_incident(
     body: IncidentCreate,
     db: Session = Depends(get_db),
 ) -> IncidentOut:
-    """Persist one resolved incident and return it.
+    """Persist one resolved incident (with its embedding) and return it.
 
-    The incident is stored with ``embedding = NULL`` (C3 does not compute
-    vectors — that is the embedding service's job in C5). Invalid input (blank
-    title/description/resolution, or a ``severity`` outside the canonical set) is
-    rejected at the schema boundary with HTTP 422.
+    From C5 the MiniLM embedding is computed on ingest from the incident's
+    ``title`` / ``description`` / ``tags`` (via the same
+    :func:`src.embeddings.build_incident_text` used for queries, so corpus and
+    query vectors are comparable) and stored alongside the row — the returned
+    ``has_embedding`` is therefore ``True``.
+
+    Invalid input (blank title/description/resolution, or a ``severity`` outside
+    the canonical set) is rejected at the schema boundary with HTTP 422. If the
+    embedding service is unavailable the request fails loudly with HTTP 503
+    rather than silently persisting a NULL-embedded (unsearchable) row — full
+    graceful degradation is deferred to C21.
     """
+    try:
+        embedding = embeddings.embed_incident(
+            body.title, body.description, body.tags
+        )
+    except Exception as exc:  # noqa: BLE001 - surface as a clear 503
+        logger.error("embedding computation failed on ingest", error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="embedding service unavailable",
+        ) from exc
+
     incident = repository.add_incident(
         db,
         title=body.title,
@@ -51,7 +73,7 @@ def create_incident(
         severity=body.severity,
         tags=body.tags,
         resolution=body.resolution,
-        embedding=None,  # explicit: embeddings are computed in C5, not here.
+        embedding=embedding,  # C5: MiniLM vector computed on ingest.
         commit=True,
     )
     return IncidentOut.from_orm_incident(incident)
