@@ -32,6 +32,7 @@ A TTL is always set on writes; it defaults to ``settings.embedding_cache_ttl_sec
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any
 
 import numpy as np
@@ -51,6 +52,11 @@ _client: "Any | None" = None
 
 # Namespace prefix for embedding-cache keys.
 _EMB_KEY_PREFIX = "emb:"
+
+# Namespace prefix for the /recommend response cache (C9). A recommendation is a
+# JSON document keyed by the stable hash of the normalised query, so an identical
+# repeated query can be served without re-embedding / re-retrieving / re-ranking.
+_REC_KEY_PREFIX = "rec:"
 
 # numpy dtype the cache serialises to/from. Kept in one place so the write
 # (``tobytes``) and read (``frombuffer``) sides can never drift apart.
@@ -105,10 +111,28 @@ def _default_ttl_seconds() -> int:
         return 86400
 
 
+def _default_recommendation_ttl_seconds() -> int:
+    """Default /recommend response-cache TTL from settings (seconds); fallback 1h."""
+    try:
+        return int(get_settings().recommendation_cache_ttl_sec)
+    except Exception:  # noqa: BLE001
+        return 3600
+
+
 def embedding_key(text: str) -> str:
     """Return the cache key for ``text``: ``"emb:" + sha256(text).hexdigest()``."""
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"{_EMB_KEY_PREFIX}{digest}"
+
+
+def recommendation_key(query_hash: str) -> str:
+    """Return the /recommend cache key for a query hash: ``"rec:" + query_hash``.
+
+    The recommendation service already computes a stable SHA-256 hash of the
+    normalised query, so this is a simple namespaced prefix rather than a second
+    hash.
+    """
+    return f"{_REC_KEY_PREFIX}{query_hash}"
 
 
 # --------------------------------------------------------------------------- #
@@ -169,6 +193,61 @@ def cache_set_embedding(
         logger.warning("Redis embedding-cache write failed: %s", exc)
 
 
+# --------------------------------------------------------------------------- #
+# Recommendation response cache (C9) — JSON documents, graceful degradation
+# --------------------------------------------------------------------------- #
+def cache_get_recommendation(query_hash: str) -> "dict[str, Any] | None":
+    """Return the cached /recommend response for ``query_hash``, or ``None``.
+
+    The stored value is a UTF-8 JSON document (bytes, since the shared client is
+    binary-safe). Any failure — Redis down, a miss, or a malformed payload — is
+    swallowed and ``None`` is returned so the caller recomputes the recommendation.
+    """
+    client = get_redis()
+    if client is None:
+        return None
+    try:
+        raw = client.get(recommendation_key(query_hash))
+    except Exception as exc:  # noqa: BLE001 - read failures degrade to a miss
+        logger.warning("Redis recommendation-cache read failed: %s", exc)
+        return None
+    if not raw:
+        return None
+    try:
+        # The client is binary-safe, so ``raw`` is bytes; json.loads accepts them.
+        data = json.loads(raw)
+    except Exception as exc:  # noqa: BLE001 - malformed payload -> treat as a miss
+        logger.warning("malformed cached recommendation: %s", exc)
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def cache_set_recommendation(
+    query_hash: str, payload: "dict[str, Any]", ttl: int | None = None
+) -> None:
+    """Serialise ``payload`` to JSON and cache it under ``query_hash``'s key.
+
+    ``ttl`` defaults to ``settings.recommendation_cache_ttl_sec`` (1h). No-ops
+    (logging a warning) if Redis is unavailable or the write/serialisation fails —
+    a cache miss just recomputes the recommendation, so a write failure is harmless.
+    """
+    client = get_redis()
+    if client is None:
+        return
+    ttl_seconds = ttl if ttl is not None else _default_recommendation_ttl_seconds()
+    try:
+        blob = json.dumps(payload).encode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - non-serialisable payload -> skip caching
+        logger.warning("could not serialise recommendation for cache: %s", exc)
+        return
+    try:
+        client.set(recommendation_key(query_hash), blob, ex=ttl_seconds)
+    except Exception as exc:  # noqa: BLE001 - Redis down must not break the flow
+        logger.warning("Redis recommendation-cache write failed: %s", exc)
+
+
 def ping() -> bool:
     """Health check: ``True`` if Redis answers a PING, ``False`` otherwise.
 
@@ -190,5 +269,8 @@ __all__ = [
     "embedding_key",
     "cache_get_embedding",
     "cache_set_embedding",
+    "recommendation_key",
+    "cache_get_recommendation",
+    "cache_set_recommendation",
     "ping",
 ]

@@ -144,3 +144,138 @@ class IncidentList(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# --------------------------------------------------------------------------- #
+# Recommendation surface (C9): POST /recommend request / response
+# --------------------------------------------------------------------------- #
+class RecommendRequest(BaseModel):
+    """Request body for ``POST /recommend`` — a new (unresolved) incident to match.
+
+    The ``title`` / ``description`` / ``tags`` are embedded (via the same canonical
+    document text as the corpus) and used for semantic retrieval; ``service`` /
+    ``severity`` / ``tags`` additionally feed the *contextual* signals that softly
+    reward same-service / close-severity / shared-tag matches.
+
+    Filtering policy
+    ----------------
+    By default the search is **pure semantic** and the contextual signals act as
+    soft *preferences* (no hard filtering). Set ``restrict_service`` /
+    ``restrict_severity`` to turn ``service`` / ``severity`` into hard *constraints*
+    (an exact pre-filter before the K-NN). When a hard filter is too narrow to fill
+    ``top_k``, the service widens the search by dropping it (see
+    :func:`src.recommendation_service.recommend`).
+    """
+
+    title: str = Field(..., min_length=1, max_length=256)
+    description: str = Field(..., min_length=1)
+    service: str | None = Field(default=None, max_length=128)
+    severity: str | None = Field(default=None)
+    tags: list[str] = Field(default_factory=list)
+    #: Optional per-request override of the configured ``top_k`` (1–50).
+    top_k: int | None = Field(default=None, ge=1, le=50)
+    #: Hard-constrain retrieval to ``service`` (else it is only a soft signal).
+    restrict_service: bool = False
+    #: Hard-constrain retrieval to ``severity`` (else it is only a soft signal).
+    restrict_severity: bool = False
+
+    @field_validator("title", "description")
+    @classmethod
+    def _not_blank(cls, v: str) -> str:
+        """Reject whitespace-only title/description (they carry the query meaning)."""
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
+
+    @field_validator("service")
+    @classmethod
+    def _service_blank_to_none(cls, v: str | None) -> str | None:
+        """Normalise a blank/whitespace ``service`` to ``None`` (no soft signal)."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped or None
+
+    @field_validator("severity")
+    @classmethod
+    def _severity_known(cls, v: str | None) -> str | None:
+        """Validate ``severity`` (when given) is within the canonical vocabulary.
+
+        A blank string normalises to ``None``; any non-empty value must be one of
+        :data:`SEVERITIES` (case-insensitively) or the request is rejected with 422.
+        """
+        if v is None:
+            return None
+        stripped = v.strip().lower()
+        if not stripped:
+            return None
+        if stripped not in SEVERITIES:
+            raise ValueError(
+                "severity must be one of " + ", ".join(SEVERITIES)
+            )
+        return stripped
+
+    @field_validator("tags")
+    @classmethod
+    def _clean_tags(cls, v: list[str]) -> list[str]:
+        """Trim tags, drop blanks, de-duplicate while preserving order."""
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for tag in v:
+            t = tag.strip()
+            if t and t not in seen:
+                seen.add(t)
+                cleaned.append(t)
+        return cleaned
+
+
+class QueryEcho(BaseModel):
+    """The normalised query facets echoed back on a recommendation response."""
+
+    title: str
+    description: str
+    service: str | None = None
+    severity: str | None = None
+    tags: list[str] = Field(default_factory=list)
+
+
+class Suggestion(BaseModel):
+    """One ranked suggestion: the matched incident + its **resolution** and scores.
+
+    ``resolution`` is the whole point of a suggestion — it is the fix that resolved
+    the matched historical incident. ``score`` is the final blended relevance;
+    ``semantic`` / ``contextual`` / ``feedback`` are the individual blended signals
+    (``feedback`` is a ``0.0`` stub until C11), and ``breakdown`` carries the full
+    per-signal detail (contextual sub-signals + the blend weights used) so the
+    suggestion is self-explaining in the UI.
+    """
+
+    incident_id: int
+    title: str
+    service: str
+    severity: str
+    tags: list[str] = Field(default_factory=list)
+    resolution: str
+    score: float
+    semantic: float
+    contextual: float
+    feedback: float
+    breakdown: dict = Field(default_factory=dict)
+
+
+class RecommendResponse(BaseModel):
+    """Response for ``POST /recommend`` — the served ranked suggestions.
+
+    ``recommendation_id`` is the persisted :class:`~src.db.models.Recommendation`
+    row id; C10 feedback references it (together with a suggestion's
+    ``incident_id``) to attribute a vote to a real prior result. ``cached`` is
+    ``True`` when the whole response was served from the Redis recommendation cache
+    (an identical prior query), ``False`` when freshly computed.
+    """
+
+    recommendation_id: int
+    query: QueryEcho
+    suggestions: list[Suggestion] = Field(default_factory=list)
+    count: int
+    cached: bool = False

@@ -70,6 +70,7 @@ class Settings(BaseSettings):
     embedding_model: str = "all-MiniLM-L6-v2"
     embedding_dim: int = 384
     embedding_cache_ttl_sec: int = 86400  # Redis embedding-cache TTL (24h)
+    recommendation_cache_ttl_sec: int = 3600  # Redis /recommend response cache TTL (1h)
 
     # --- Retrieval / ranking ---
     top_k: int = 5
