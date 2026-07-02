@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from src import observability
+from src.routers import feedback as feedback_router
 from src.routers import incidents as incidents_router
 from src.routers import recommend as recommend_router
 
@@ -54,11 +55,13 @@ def create_app() -> FastAPI:
             "version": SERVICE_VERSION,
         }
 
-    # Incident-corpus routes (C3). Later commits register feedback / config /
-    # system routers on this same app.
+    # Incident-corpus routes (C3). Later commits register config / system routers
+    # on this same app.
     app.include_router(incidents_router.router)
     # Recommendation route (C9): POST /recommend — the core deliverable.
     app.include_router(recommend_router.router)
+    # Feedback route (C10): POST /feedback — records votes into the learned aggregate.
+    app.include_router(feedback_router.router)
 
     return app
 

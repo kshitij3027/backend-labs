@@ -16,9 +16,11 @@ Every mutating helper accepts ``commit: bool = False``:
 
 Read helpers never write.
 
-Scope (C2): incidents are implemented in full (create / get / list / set
-embedding / delete / bulk). The recommendation, feedback and suggestion-score
-helpers are thin, correct primitives that later commits (C9–C11) extend.
+Scope: incidents are implemented in full (create / get / list / set embedding /
+delete / bulk). The recommendation helpers (C9) persist and fetch a served result;
+the feedback + suggestion-score helpers (C10) insert a raw vote and upsert the
+learned ``(query_pattern, incident_id)`` aggregate that the feedback-driven
+re-ranking (C11) reads.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.db.models import Feedback, Incident, Recommendation, SuggestionScore
@@ -295,7 +298,7 @@ def get_recommendation(
 
 
 # --------------------------------------------------------------------------- #
-# Feedback (votes) — thin; extended in C10
+# Feedback (votes) — the raw event log behind the learned aggregate (C10)
 # --------------------------------------------------------------------------- #
 def add_feedback(
     session: Session,
@@ -317,8 +320,19 @@ def add_feedback(
 
 
 # --------------------------------------------------------------------------- #
-# SuggestionScore (learned aggregate) — thin; extended in C10/C11
+# SuggestionScore (learned aggregate) — the C11 re-ranking signal
 # --------------------------------------------------------------------------- #
+def get_suggestion_score(
+    session: Session, query_pattern: str, incident_id: int
+) -> SuggestionScore | None:
+    """Return the aggregate for one ``(query_pattern, incident_id)`` pair (or ``None``).
+
+    Composite-PK point lookup. Used by :func:`upsert_suggestion_score` (get-or-create)
+    and available to C11 when it needs a single pair's tally.
+    """
+    return session.get(SuggestionScore, (query_pattern, incident_id))
+
+
 def upsert_suggestion_score(
     session: Session,
     *,
@@ -329,8 +343,17 @@ def upsert_suggestion_score(
 ) -> SuggestionScore:
     """Increment the helpful / unhelpful tally for a ``(pattern, incident)`` pair.
 
-    Creates the aggregate row on first vote, otherwise bumps the relevant counter
-    and refreshes ``updated_at``.
+    Get-or-create over the composite primary key: creates the aggregate row on the
+    first vote (with the voted counter at 1), otherwise bumps the relevant counter
+    and refreshes ``updated_at``. This is the write half of the C10 feedback loop —
+    every vote lands here so the ``(pattern -> incident)`` signal C11 reads stays
+    current.
+
+    Concurrency: two votes for the same brand-new pair could each see ``None`` and
+    try to insert, tripping the PK on the second flush. We handle that simply — on
+    an :class:`~sqlalchemy.exc.IntegrityError` we roll back, re-fetch the now-present
+    row and increment it — so a duplicate insert degrades to an increment rather than
+    a 500.
     """
     score = session.get(SuggestionScore, (query_pattern, incident_id))
     if score is None:
@@ -341,12 +364,18 @@ def upsert_suggestion_score(
             unhelpful_count=0 if helpful else 1,
         )
         session.add(score)
+        try:
+            session.flush()
+        except IntegrityError:
+            # A concurrent vote created the row first: recover by incrementing it.
+            session.rollback()
+            score = session.get(SuggestionScore, (query_pattern, incident_id))
+            if score is None:  # pragma: no cover - defensive; row must exist now
+                raise
+            _bump_score(score, helpful)
     else:
-        if helpful:
-            score.helpful_count += 1
-        else:
-            score.unhelpful_count += 1
-        score.updated_at = func.now()
+        _bump_score(score, helpful)
+
     if commit:
         session.commit()
         session.refresh(score)
@@ -355,10 +384,24 @@ def upsert_suggestion_score(
     return score
 
 
+def _bump_score(score: SuggestionScore, helpful: bool) -> None:
+    """Increment the relevant counter on an existing aggregate and touch ``updated_at``."""
+    if helpful:
+        score.helpful_count += 1
+    else:
+        score.unhelpful_count += 1
+    score.updated_at = func.now()
+
+
 def get_suggestion_scores(
     session: Session, query_pattern: str
 ) -> list[SuggestionScore]:
-    """Return all learned aggregate rows for a given ``query_pattern``."""
+    """Return all learned aggregate rows for a given ``query_pattern``.
+
+    The read half of the feedback loop: C11 calls this with the current query's
+    pattern to fold each candidate's ``(helpful_count, unhelpful_count)`` into a
+    feedback boost/dampen term before re-ranking.
+    """
     stmt = select(SuggestionScore).where(
         SuggestionScore.query_pattern == query_pattern
     )

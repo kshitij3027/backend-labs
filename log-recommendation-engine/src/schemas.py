@@ -279,3 +279,41 @@ class RecommendResponse(BaseModel):
     suggestions: list[Suggestion] = Field(default_factory=list)
     count: int
     cached: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# Feedback surface (C10): POST /feedback request / response
+# --------------------------------------------------------------------------- #
+class FeedbackRequest(BaseModel):
+    """Request body for ``POST /feedback`` — one helpful / not-helpful vote.
+
+    A vote references a real prior served result: ``recommendation_id`` (the
+    :class:`~src.db.models.Recommendation` returned by ``POST /recommend``) and
+    ``incident_id`` (one of that recommendation's suggested incidents). The endpoint
+    validates the pair — an unknown ``recommendation_id`` is a 404, and an
+    ``incident_id`` that was not one of that recommendation's suggestions is a 400 —
+    so the learned aggregate can only ever be built from votes on suggestions that
+    were actually served.
+    """
+
+    recommendation_id: int = Field(..., ge=1)
+    incident_id: int = Field(..., ge=1)
+    helpful: bool
+
+
+class FeedbackResponse(BaseModel):
+    """Response for ``POST /feedback`` — the post-update aggregate for the voted pair.
+
+    ``recorded`` is ``True`` when the vote was persisted. ``query_pattern`` is the
+    bucket the vote was aggregated under (derived from the recommendation's stored
+    ``service`` / ``severity`` / ``tags`` facets). ``helpful_count`` /
+    ``unhelpful_count`` are the **cumulative** tallies for that
+    ``(query_pattern, incident_id)`` pair *after* applying this vote — the learned
+    signal the feedback-driven re-ranking (C11) reads.
+    """
+
+    recorded: bool
+    query_pattern: str
+    incident_id: int
+    helpful_count: int
+    unhelpful_count: int
