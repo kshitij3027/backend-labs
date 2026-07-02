@@ -40,7 +40,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from src import embeddings, feedback, observability
+from src import embeddings, feedback, observability, runtime_config
 from src.clients import redis as redis_client
 from src.config import get_settings
 from src.db import repository
@@ -59,9 +59,21 @@ logger = observability.get_logger(__name__)
 # --------------------------------------------------------------------------- #
 # Query hashing (stable cache / dedup key)
 # --------------------------------------------------------------------------- #
-def _effective_top_k(req: RecommendRequest) -> int:
-    """Resolve the effective ``top_k`` for this request (override or config default)."""
-    return req.top_k if req.top_k is not None else get_settings().top_k
+def _effective_top_k(req: RecommendRequest, default_top_k: int | None = None) -> int:
+    """Resolve the effective ``top_k`` for this request (override or config default).
+
+    An explicit ``req.top_k`` always wins. Otherwise the default is ``default_top_k``
+    when supplied — the recommendation pipeline passes the *runtime* ``top_k`` from
+    :func:`src.runtime_config.get_effective_config` so a ``PUT /config`` retunes the
+    page size — falling back to the static ``settings.top_k`` (used by
+    :func:`compute_query_hash`, where the exact runtime value is not load-bearing for
+    the cache key because the config *version* already scopes it).
+    """
+    if req.top_k is not None:
+        return req.top_k
+    if default_top_k is not None:
+        return default_top_k
+    return get_settings().top_k
 
 
 def compute_query_hash(req: RecommendRequest) -> str:
@@ -102,18 +114,26 @@ def compute_query_hash(req: RecommendRequest) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _cache_key(query_hash: str, feedback_epoch: int) -> str:
-    """Fold the pattern's feedback epoch into the recommendation cache key.
+def _cache_key(query_hash: str, feedback_epoch: int, config_version: int) -> str:
+    """Fold the config version + pattern feedback epoch into the recommendation cache key.
 
-    Returns ``"<epoch>:<query_hash>"``. The Redis helpers prefix ``"rec:"`` onto this,
-    so the stored key is ``rec:<epoch>:<query_hash>`` (see the C11 note on
-    :func:`recommend`). Because the epoch is bumped on every vote for the query's
-    pattern, an identical query issued *after* a vote resolves to a different key and
-    therefore MISSES — forcing a recompute that reflects the new feedback — while the
-    old entry simply expires by TTL. When the epoch is ``0`` (no votes yet, or Redis
-    unavailable) the key is ``0:<query_hash>``, stable across repeated queries.
+    Returns ``"<config_version>:<feedback_epoch>:<query_hash>"``. The Redis helpers
+    prefix ``"rec:"`` onto this, so the stored key is
+    ``rec:<config_version>:<feedback_epoch>:<query_hash>``. Two independent
+    invalidation axes are folded in:
+
+    * **config_version** (C12) — bumped by every ``PUT /config``; a retune of the
+      weights / epsilon / diversity / thresholds / top_k therefore changes *every*
+      key at once, so the next identical query MISSES and recomputes under the new
+      config (a live retune with no restart), fleet-wide.
+    * **feedback_epoch** (C11) — bumped by every vote for the query's pattern; a vote
+      changes the key for just that pattern, forcing a recompute with the fresh
+      feedback.
+
+    Either counter being ``0`` (no change yet, or Redis unavailable) simply yields the
+    base key, stable across repeated queries; stranded old entries expire by TTL.
     """
-    return f"{feedback_epoch}:{query_hash}"
+    return f"{config_version}:{feedback_epoch}:{query_hash}"
 
 
 # --------------------------------------------------------------------------- #
@@ -232,7 +252,8 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     5. **Persist** a :class:`~src.db.models.Recommendation` row whose ``query_json``
        holds the request facets plus the returned suggestion ``incident_id``s (so
        C10 feedback can validate a suggestion belongs to a real prior result).
-    6. **Cache** the built response under ``rec:<epoch>:<hash>`` and return it.
+    6. **Cache** the built response under ``rec:<config_version>:<epoch>:<hash>`` and
+       return it (so a ``PUT /config`` or a vote invalidates it — see :func:`_cache_key`).
 
     An empty corpus / no candidates yields an empty (``count=0``) response — still
     persisted and cached — rather than an error.
@@ -240,15 +261,23 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     settings = get_settings()
     query_hash = compute_query_hash(req)
 
+    # Effective runtime config (C12): static defaults overlaid with any live overrides
+    # pushed via PUT /config (shared across replicas via Redis; static-only if Redis is
+    # down). The ranker's weights / epsilon / diversity / top_k / half-life all come
+    # from here, and the config *version* scopes the cache below.
+    effective = runtime_config.get_effective_config()
+    config_version = runtime_config.get_config_version()
+
     # The query's feedback bucket — same normalisation the write side uses in
     # src.feedback so the read pattern and the vote's write pattern are identical.
     pattern = feedback.query_pattern(req.service, req.severity, req.tags)
 
     # 1. Cache check (best-effort; a down cache just falls through to recompute).
-    #    The cache key embeds the pattern's feedback epoch, so a post-vote identical
-    #    query resolves to a new key and MISSES here (recomputing with fresh feedback).
+    #    The cache key embeds the global config version *and* the pattern's feedback
+    #    epoch, so either a PUT /config or a vote makes an identical query MISS here
+    #    (recomputing under the fresh config / feedback).
     feedback_epoch = redis_client.get_feedback_epoch(pattern)
-    cache_key = _cache_key(query_hash, feedback_epoch)
+    cache_key = _cache_key(query_hash, feedback_epoch, config_version)
     cached = redis_client.cache_get_recommendation(cache_key)
     if cached is not None:
         response = _response_from_cache(cached, req)
@@ -257,6 +286,7 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
                 "recommendation cache hit",
                 query_hash=query_hash,
                 feedback_epoch=feedback_epoch,
+                config_version=config_version,
             )
             return response
         # A malformed/incompatible cache entry falls through to a fresh compute.
@@ -268,7 +298,8 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     )
     query_vec = embeddings.embed_text_cached(query_text)
 
-    top_k = _effective_top_k(req)
+    # Runtime-tunable page size (an explicit req.top_k still wins over the config).
+    top_k = _effective_top_k(req, default_top_k=int(effective["top_k"]))
 
     # 3. Retrieve candidates (soft-by-default; hard filter + widen only on restrict).
     candidates = _retrieve_with_widening(
@@ -287,6 +318,11 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     }
 
     # 4. Re-rank the candidate pool down to top_k, now folding the feedback term in.
+    #    All ranking knobs (blend weights, recency half-life, diversity threshold and
+    #    ε-exploration probability) come from the effective runtime config so a live
+    #    PUT /config retunes the ranking on the very next request. The exploration rng
+    #    is left as the ranker's module default (production randomness); tests inject a
+    #    deterministic one directly against rank_candidates.
     ranked = rank_candidates(
         candidates,
         QueryContext(
@@ -294,8 +330,16 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
             severity=req.severity,
             tags=list(req.tags or []),
         ),
+        weights={
+            "semantic": effective["weight_semantic"],
+            "contextual": effective["weight_contextual"],
+            "feedback": effective["weight_feedback"],
+        },
         top_k=top_k,
+        half_life_days=float(effective["recency_half_life_days"]),
         feedback_scores=feedback_scores,
+        diversity_threshold=float(effective["diversity_threshold"]),
+        epsilon=float(effective["epsilon_explore"]),
     )
 
     suggestions = [_to_suggestion(r) for r in ranked]
@@ -334,6 +378,7 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
         recommendation_id=recommendation.id,
         query_hash=query_hash,
         feedback_epoch=feedback_epoch,
+        config_version=config_version,
         candidates=len(candidates),
         suggestions=len(suggestions),
         top_semantic=suggestions[0].semantic if suggestions else None,

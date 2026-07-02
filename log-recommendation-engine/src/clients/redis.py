@@ -65,6 +65,18 @@ _REC_KEY_PREFIX = "rec:"
 # feedback (old entries just expire by TTL).
 _FB_EPOCH_KEY_PREFIX = "fbver:"
 
+# Global runtime-config version counter (C12). A single monotonically increasing
+# integer, bumped on every PUT /config, that is folded into the recommendation cache
+# key alongside the feedback epoch. A config change therefore changes every cache key
+# and forces the next /recommend to MISS and recompute under the new weights/epsilon/
+# thresholds — a live retune with no restart. Fault tolerant: reads default to 0.
+_CONFIG_VERSION_KEY = "cfgver"
+
+# Redis hash holding the live runtime-config overrides (C12). A single shared hash so
+# every replica reads the same tuned values; the recommendation service overlays these
+# over the static settings via :mod:`src.runtime_config`. Fault tolerant on read/write.
+_RUNTIME_CONFIG_KEY = "runtime_config"
+
 # numpy dtype the cache serialises to/from. Kept in one place so the write
 # (``tobytes``) and read (``frombuffer``) sides can never drift apart.
 _EMB_DTYPE = np.float32
@@ -316,6 +328,106 @@ def bump_feedback_epoch(pattern: str) -> None:
         logger.warning("Redis feedback-epoch bump failed: %s", exc)
 
 
+# --------------------------------------------------------------------------- #
+# Runtime config (C12) — global version counter + shared overrides hash
+# --------------------------------------------------------------------------- #
+def get_config_version() -> int:
+    """Return the current global runtime-config version (``0`` if unset/unavailable).
+
+    Read-through for the recommendation cache key: the version is folded into the key
+    so a ``PUT /config`` (which bumps it) yields fresh keys and thus cache MISSes,
+    making a retune take effect on the next ``/recommend`` without a restart. Fault
+    tolerant — Redis down, a missing key, or a non-integer value all degrade to ``0``,
+    never raising.
+    """
+    client = get_redis()
+    if client is None:
+        return 0
+    try:
+        raw = client.get(_CONFIG_VERSION_KEY)
+    except Exception as exc:  # noqa: BLE001 - read failures degrade to version 0
+        logger.warning("Redis config-version read failed: %s", exc)
+        return 0
+    if raw is None:
+        return 0
+    try:
+        # Binary-safe client -> value is bytes; int() accepts a numeric byte string.
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning("malformed config version (%r): %s", raw, exc)
+        return 0
+
+
+def bump_config_version() -> int:
+    """Increment the global runtime-config version (INCR) and return the new value.
+
+    Called after a ``PUT /config`` writes new overrides: the INCR changes the value
+    :func:`get_config_version` returns, so the next ``/recommend`` builds a different
+    cache key and MISSes (recomputing under the new config). ``INCR`` on a missing key
+    creates it at ``1``. Fault tolerant — if Redis is unavailable or the write fails a
+    warning is logged and ``0`` is returned; the override write itself already handles
+    that case, so a failed bump only means the stale cache lingers until its TTL.
+    """
+    client = get_redis()
+    if client is None:
+        return 0
+    try:
+        return int(client.incr(_CONFIG_VERSION_KEY))
+    except Exception as exc:  # noqa: BLE001 - Redis down must not break /config
+        logger.warning("Redis config-version bump failed: %s", exc)
+        return 0
+
+
+def get_runtime_config() -> "dict[str, str]":
+    """Return the shared runtime-config overrides hash as ``{field: raw_str}``.
+
+    The values are the raw string forms written by :func:`set_runtime_config`
+    (numbers stringified); the caller (:mod:`src.runtime_config`) coerces them back to
+    the correct types and validates ranges. Fault tolerant — Redis down, a missing
+    hash, or a read error all degrade to an empty dict, so callers transparently fall
+    back to the static settings defaults.
+    """
+    client = get_redis()
+    if client is None:
+        return {}
+    try:
+        raw = client.hgetall(_RUNTIME_CONFIG_KEY)
+    except Exception as exc:  # noqa: BLE001 - read failures degrade to no overrides
+        logger.warning("Redis runtime-config read failed: %s", exc)
+        return {}
+    if not raw:
+        return {}
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        # Binary-safe client -> keys/values are bytes; decode to str for the caller.
+        k = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        v = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+        result[k] = v
+    return result
+
+
+def set_runtime_config(updates: "dict[str, Any]") -> None:
+    """Merge ``updates`` into the shared runtime-config overrides hash (HSET).
+
+    Values are stored as their ``str`` form (the hash is a flat string map);
+    :func:`get_runtime_config` reads them back and :mod:`src.runtime_config` coerces
+    and validates them. This is a *merge* (HSET of the given fields), so unrelated
+    previously-set overrides are preserved. No-ops (logging a warning) if Redis is
+    unavailable or the write fails — the caller decides whether to still bump the
+    version; a lost write just means the override never takes effect.
+    """
+    client = get_redis()
+    if client is None:
+        return
+    if not updates:
+        return
+    mapping = {str(k): str(v) for k, v in updates.items()}
+    try:
+        client.hset(_RUNTIME_CONFIG_KEY, mapping=mapping)
+    except Exception as exc:  # noqa: BLE001 - Redis down must not break /config
+        logger.warning("Redis runtime-config write failed: %s", exc)
+
+
 def ping() -> bool:
     """Health check: ``True`` if Redis answers a PING, ``False`` otherwise.
 
@@ -343,5 +455,9 @@ __all__ = [
     "feedback_epoch_key",
     "get_feedback_epoch",
     "bump_feedback_epoch",
+    "get_config_version",
+    "bump_config_version",
+    "get_runtime_config",
+    "set_runtime_config",
     "ping",
 ]

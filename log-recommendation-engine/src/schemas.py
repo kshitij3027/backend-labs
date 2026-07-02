@@ -317,3 +317,45 @@ class FeedbackResponse(BaseModel):
     incident_id: int
     helpful_count: int
     unhelpful_count: int
+
+
+# --------------------------------------------------------------------------- #
+# Runtime config surface (C12): GET / PUT /config
+# --------------------------------------------------------------------------- #
+class ConfigUpdate(BaseModel):
+    """Request body for ``PUT /config`` — a *partial* set of runtime-tunable knobs.
+
+    Every field is optional; only the ones supplied are overridden (a merge over the
+    current effective config). The keys mirror the tunable subset in
+    :data:`src.runtime_config.TUNABLE_KEYS`. Basic bounds are advertised here for the
+    OpenAPI schema, but the authoritative validation (and the 422 on violation) lives
+    in :func:`src.runtime_config.set_overrides`, which also rejects an all-empty body.
+
+    Extra / unknown keys are **forbidden** (``extra="forbid"``) so a typo'd field is a
+    422 at the schema boundary rather than a silently-ignored no-op.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    weight_semantic: float | None = Field(default=None, ge=0.0)
+    weight_contextual: float | None = Field(default=None, ge=0.0)
+    weight_feedback: float | None = Field(default=None, ge=0.0)
+    epsilon_explore: float | None = Field(default=None, ge=0.0, le=1.0)
+    diversity_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    recency_half_life_days: float | None = Field(default=None, gt=0.0)
+    top_k: int | None = Field(default=None, ge=1)
+    high_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    medium_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class ConfigResponse(BaseModel):
+    """Response for ``GET | PUT /config`` — the current effective runtime config.
+
+    ``version`` is the global config version (bumped by every successful ``PUT``, folded
+    into the recommendation cache key so a retune invalidates cached results). ``config``
+    is the full effective tunable map (static defaults overlaid with any live Redis
+    overrides) — the exact values the next ``/recommend`` will rank with.
+    """
+
+    version: int
+    config: dict

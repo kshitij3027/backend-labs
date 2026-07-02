@@ -51,6 +51,7 @@ _BREAKDOWN_KEYS = {
     "semantic",
     "contextual",
     "feedback",
+    "base",  # C12: feedback-free semantic+contextual signal, now carried in the breakdown.
     "contextual_detail",
     "weights",
 }

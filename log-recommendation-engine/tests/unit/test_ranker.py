@@ -314,11 +314,13 @@ def test_rank_breakdown_contract() -> None:
     )
     bd = result.breakdown
 
-    # Exact top-level key set.
+    # Exact top-level key set. ``base`` (the feedback-free semantic+contextual signal)
+    # was added to the breakdown in C12 alongside the exploration/diversity guards.
     assert set(bd) == {
         "semantic",
         "contextual",
         "feedback",
+        "base",
         "contextual_detail",
         "weights",
     }
@@ -326,6 +328,10 @@ def test_rank_breakdown_contract() -> None:
     # feedback stub is 0.0; weights echo what was passed in.
     assert bd["feedback"] == 0.0
     assert bd["weights"] == _W
+    # ``base`` == w_sem*semantic + w_ctx*contextual (no feedback term).
+    assert bd["base"] == pytest.approx(
+        _W["semantic"] * result.semantic + _W["contextual"] * result.contextual
+    )
 
     # breakdown["semantic"] mirrors the (clamped) semantic on the suggestion.
     assert bd["semantic"] == result.semantic

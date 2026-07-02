@@ -16,6 +16,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from src import observability
+from src.routers import config as config_router
 from src.routers import feedback as feedback_router
 from src.routers import incidents as incidents_router
 from src.routers import recommend as recommend_router
@@ -62,6 +63,8 @@ def create_app() -> FastAPI:
     app.include_router(recommend_router.router)
     # Feedback route (C10): POST /feedback — records votes into the learned aggregate.
     app.include_router(feedback_router.router)
+    # Runtime config routes (C12): GET/PUT /config — live retuning of ranking knobs.
+    app.include_router(config_router.router)
 
     return app
 
