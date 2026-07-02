@@ -65,10 +65,11 @@ scale:
 # run the suite in a throwaway container. Exit status propagates so a failed test
 # fails `make test`; the stack is torn down afterwards regardless.
 test:
+	docker compose down -v --remove-orphans >/dev/null 2>&1 || true
 	docker compose build test
 	@status=0; \
 	docker compose --profile test run --rm test pytest -q || status=$$?; \
-	docker compose down; \
+	docker compose down -v; \
 	exit $$status
 
 test-unit:

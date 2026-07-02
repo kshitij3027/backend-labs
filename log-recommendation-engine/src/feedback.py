@@ -37,6 +37,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src import observability
+from src.clients import redis as redis_client
+from src.config import get_settings
 from src.db import repository
 from src.db.models import Feedback, SuggestionScore
 
@@ -110,6 +112,40 @@ def query_pattern(
     return f"{svc}|{sev}|{tags_part}"
 
 
+# --------------------------------------------------------------------------- #
+# Net helpfulness — the smoothed feedback signal C11 folds into the blend
+# --------------------------------------------------------------------------- #
+def net_help(
+    helpful_count: int,
+    unhelpful_count: int,
+    *,
+    smoothing: float | None = None,
+) -> float:
+    """Return the Laplace-smoothed **net helpfulness** for a ``(pattern, incident)`` tally.
+
+    Defined as::
+
+        (helpful - unhelpful) / (helpful + unhelpful + smoothing)
+
+    ``smoothing`` defaults to ``settings.feedback_smoothing`` (a positive constant),
+    so the denominator is never zero: with **no votes** the result is exactly ``0.0``
+    (a neutral, no-evidence signal). The magnitude grows with the *net* margin and
+    the *volume* of votes — a lone +1 vote is damped toward 0 by the smoothing, while
+    a large, lopsided tally approaches ±1. The value is strictly bounded to the open
+    interval within ``[-1, 1]`` (it can only reach the endpoints in the limit), which
+    is exactly the range the ranker's feedback term expects: a positive value *boosts*
+    a proven fix, a negative value *sinks* an unhelpful one, weighted by
+    ``settings.weight_feedback`` in the blend.
+    """
+    smoothing_val = (
+        float(smoothing) if smoothing is not None else float(get_settings().feedback_smoothing)
+    )
+    denom = helpful_count + unhelpful_count + smoothing_val
+    if denom <= 0:  # defensive: only possible with a non-positive smoothing override
+        return 0.0
+    return (helpful_count - unhelpful_count) / denom
+
+
 def _pattern_from_recommendation(query_json: dict[str, Any]) -> str:
     """Derive the query pattern from a recommendation's stored facets.
 
@@ -150,6 +186,11 @@ def record_feedback(
     5. Upsert the ``(pattern, incident_id)``
        :class:`~src.db.models.SuggestionScore`, incrementing ``helpful_count`` (or
        ``unhelpful_count``) and bumping ``updated_at``.
+    6. Bump the per-pattern **feedback epoch** in Redis so C11's recommendation cache
+       for this pattern is invalidated — the next identical ``/recommend`` misses the
+       cache and re-ranks with the fresh vote (see
+       :func:`src.clients.redis.bump_feedback_epoch`). Best-effort: a Redis outage is
+       swallowed and never blocks recording the vote.
 
     Returns the ``(feedback_row, suggestion_score_row)`` pair. The ``SuggestionScore``
     reflects the *post-update* tally for that ``(pattern, incident)``. Commits before
@@ -197,11 +238,19 @@ def record_feedback(
         unhelpful_count=score.unhelpful_count,
     )
 
+    # Invalidate the recommendation cache for this pattern: bumping the epoch changes
+    # the cache key every identical /recommend for this pattern folds in, forcing a
+    # MISS + re-rank so the vote is reflected immediately (rather than after the
+    # response-cache TTL). Best-effort — bump_feedback_epoch swallows Redis errors, so
+    # a cache outage must not undo the durable vote we just committed.
+    redis_client.bump_feedback_epoch(pattern)
+
     return feedback, score
 
 
 __all__ = [
     "query_pattern",
+    "net_help",
     "record_feedback",
     "FeedbackError",
     "RecommendationNotFoundError",

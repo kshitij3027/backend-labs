@@ -9,14 +9,17 @@ sorted best-first and truncated to ``top_k``, each carrying a per-signal
 ``breakdown`` so the endpoint (C9) and the dashboard can explain *why* a
 suggestion ranked where it did.
 
-Scope (C8)
-----------
+Scope (C8 + C11)
+----------------
 Pure re-ranking only: **no** database, **no** Redis, **no** embeddings and **no**
 HTTP endpoint. :func:`rank_candidates` receives candidates a caller already
 retrieved and never performs I/O, which keeps it deterministic and cheap to
-unit-test. The **feedback** signal is deliberately a hard ``0.0`` stub here — the
-smoothed net-helpfulness boost is wired in C11 (it will read ``suggestion_scores``);
-nothing in this module reads feedback state.
+unit-test. The **feedback** signal is supplied *by the caller* as a
+``feedback_scores`` mapping (``incident_id -> net_help``, C11): the composition root
+in :mod:`src.recommendation_service` reads the per-pattern ``suggestion_scores`` and
+passes the smoothed net-helpfulness in. When that mapping is omitted the feedback
+term is ``0.0`` for every candidate, so this module still performs no I/O and behaves
+exactly as it did in C8.
 
 Blend convention
 ----------------
@@ -173,6 +176,7 @@ def rank_candidates(
     top_k: int | None = None,
     half_life_days: float | None = None,
     now: datetime | None = None,
+    feedback_scores: dict[int, float] | None = None,
 ) -> list[RankedSuggestion]:
     """Re-rank retrieved ``candidates`` by a blended relevance score, best-first.
 
@@ -183,16 +187,27 @@ def rank_candidates(
     2. computes the structured ``contextual`` score of ``query`` vs the candidate
        via :func:`src.contextual.contextual_score` (threading ``half_life_days`` /
        ``now`` through to the recency signal);
-    3. sets ``feedback = 0.0`` (a stub in C8 — wired in C11);
+    3. looks up the candidate's **net-helpfulness feedback** term from
+       ``feedback_scores`` by ``incident_id`` (``0.0`` when absent — no votes for
+       this ``(pattern, incident)``);
     4. blends them with :func:`blended_score`.
 
     The list is then sorted by blended ``score`` **descending**, tie-broken by
     ``semantic`` descending then ``incident_id`` ascending for a stable,
     reproducible order, and truncated to ``top_k`` (default ``settings.top_k``).
 
+    ``feedback_scores`` maps ``incident_id -> net_help`` (each already smoothed and
+    bounded in ``[-1, 1]`` by :func:`src.feedback.net_help`), so the caller
+    (:mod:`src.recommendation_service`) folds the learned per-pattern signal into the
+    blend. It is **not** re-clamped here: a strong ±feedback term can nudge the final
+    ``score`` slightly outside ``[0, 1]``, which is fine — only the *ordering*
+    matters, and the deterministic tie-break keeps it stable. When ``None`` / empty,
+    every feedback term is ``0.0`` and this behaves exactly as the pre-C11 ranker.
+
     Pure: no DB / Redis / embedding access. ``weights`` overrides the config blend
     weights (see :func:`blended_score`); an empty ``candidates`` list yields ``[]``.
     """
+    feedback_by_incident = feedback_scores or {}
     # Resolve blend weights once (not per candidate) — same weights label the whole
     # ranking and ride along in every breakdown.
     blend_weights = _resolve_blend_weights(weights)
@@ -213,7 +228,9 @@ def rank_candidates(
             now=now,
         )
 
-        feedback = 0.0  # C8 stub; the smoothed net-helpfulness boost lands in C11.
+        # Per-candidate learned feedback (C11): smoothed net-helpfulness for this
+        # (query pattern, incident), already bounded [-1, 1]; 0.0 when no votes exist.
+        feedback = feedback_by_incident.get(cand.incident_id, 0.0)
 
         score = blended_score(
             semantic, contextual_val, feedback, weights=blend_weights

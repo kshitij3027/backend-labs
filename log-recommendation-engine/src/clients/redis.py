@@ -58,6 +58,13 @@ _EMB_KEY_PREFIX = "emb:"
 # repeated query can be served without re-embedding / re-retrieving / re-ranking.
 _REC_KEY_PREFIX = "rec:"
 
+# Namespace prefix for the per-pattern feedback epoch (C11). A monotonically
+# increasing integer counter, one per query pattern, that is folded into the
+# recommendation cache key. Each vote INCRs it, which changes the cache key for that
+# pattern and forces the next identical /recommend to MISS and re-rank with the fresh
+# feedback (old entries just expire by TTL).
+_FB_EPOCH_KEY_PREFIX = "fbver:"
+
 # numpy dtype the cache serialises to/from. Kept in one place so the write
 # (``tobytes``) and read (``frombuffer``) sides can never drift apart.
 _EMB_DTYPE = np.float32
@@ -248,6 +255,67 @@ def cache_set_recommendation(
         logger.warning("Redis recommendation-cache write failed: %s", exc)
 
 
+# --------------------------------------------------------------------------- #
+# Feedback epoch (C11) — per-pattern cache-invalidation counter
+# --------------------------------------------------------------------------- #
+def feedback_epoch_key(pattern: str) -> str:
+    """Return the Redis key holding the feedback epoch for ``pattern``.
+
+    ``"fbver:" + sha256(pattern)`` — the query pattern (``service|severity|tags``)
+    is hashed so the key stays bounded and printable regardless of how many / how
+    long the tags are, mirroring the embedding/recommendation key scheme. Identical
+    patterns therefore share one counter, which is exactly what lets a vote on a
+    pattern invalidate every cached ``/recommend`` for that same pattern.
+    """
+    digest = hashlib.sha256(pattern.encode("utf-8")).hexdigest()
+    return f"{_FB_EPOCH_KEY_PREFIX}{digest}"
+
+
+def get_feedback_epoch(pattern: str) -> int:
+    """Return the current feedback epoch for ``pattern`` (``0`` if unset / unavailable).
+
+    Read-through for the recommendation cache key: the epoch is folded into the key so
+    a change (a vote bumped it) produces a fresh key and thus a cache MISS. Fault
+    tolerant — Redis down, a missing key, or a non-integer value all degrade to ``0``
+    (treat as "no votes yet, serve/populate the base cache"), never raising.
+    """
+    client = get_redis()
+    if client is None:
+        return 0
+    try:
+        raw = client.get(feedback_epoch_key(pattern))
+    except Exception as exc:  # noqa: BLE001 - read failures degrade to epoch 0
+        logger.warning("Redis feedback-epoch read failed: %s", exc)
+        return 0
+    if raw is None:
+        return 0
+    try:
+        # Binary-safe client -> value is bytes; int() accepts a numeric byte string.
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning("malformed feedback epoch (%r): %s", raw, exc)
+        return 0
+
+
+def bump_feedback_epoch(pattern: str) -> None:
+    """Increment the feedback epoch for ``pattern`` (INCR), invalidating its cache.
+
+    Called after a vote is recorded for ``pattern``: the INCR changes the value
+    :func:`get_feedback_epoch` returns, so the next identical ``/recommend`` builds a
+    different cache key and MISSes (recomputing with the new feedback). ``INCR`` on a
+    missing key creates it at ``1``, so no initialisation is needed. No-ops (logging a
+    warning) if Redis is unavailable or the write fails — a failed bump only means the
+    stale cache lingers until its TTL, which must never break recording the vote.
+    """
+    client = get_redis()
+    if client is None:
+        return
+    try:
+        client.incr(feedback_epoch_key(pattern))
+    except Exception as exc:  # noqa: BLE001 - Redis down must not break feedback
+        logger.warning("Redis feedback-epoch bump failed: %s", exc)
+
+
 def ping() -> bool:
     """Health check: ``True`` if Redis answers a PING, ``False`` otherwise.
 
@@ -272,5 +340,8 @@ __all__ = [
     "recommendation_key",
     "cache_get_recommendation",
     "cache_set_recommendation",
+    "feedback_epoch_key",
+    "get_feedback_epoch",
+    "bump_feedback_epoch",
     "ping",
 ]

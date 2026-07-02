@@ -22,11 +22,15 @@ Design notes
   shared tags are *rewarded*, not *required*). A caller opts into hard constraints
   with ``restrict_service`` / ``restrict_severity``; if a hard filter is too narrow
   to fill ``top_k`` we widen by re-retrieving without it (logged).
-* **Feedback is still 0.** The feedback blend term is a stub until C11; nothing
-  here reads feedback state.
+* **Feedback closes the loop (C11).** The learned per-pattern ``suggestion_scores``
+  are folded into ranking as a smoothed net-helpfulness term, and the response cache
+  is **epoch-invalidated per pattern** so a vote changes the very next identical
+  ``/recommend`` (the cache key embeds the pattern's feedback epoch, which every vote
+  bumps — see :func:`src.clients.redis.get_feedback_epoch`).
 * **Fault tolerance.** The Redis cache is best-effort on both read and write — if
-  Redis is down we simply recompute and return ``cached=False``. An empty corpus /
-  no candidates returns an empty (``count=0``) response, never a 500.
+  Redis is down we simply recompute and return ``cached=False`` (the epoch read also
+  degrades to ``0``, so the base cache key is used). An empty corpus / no candidates
+  returns an empty (``count=0``) response, never a 500.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ import json
 
 from sqlalchemy.orm import Session
 
-from src import embeddings, observability
+from src import embeddings, feedback, observability
 from src.clients import redis as redis_client
 from src.config import get_settings
 from src.db import repository
@@ -96,6 +100,20 @@ def compute_query_hash(req: RecommendRequest) -> str:
     }
     blob = json.dumps(normalised, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _cache_key(query_hash: str, feedback_epoch: int) -> str:
+    """Fold the pattern's feedback epoch into the recommendation cache key.
+
+    Returns ``"<epoch>:<query_hash>"``. The Redis helpers prefix ``"rec:"`` onto this,
+    so the stored key is ``rec:<epoch>:<query_hash>`` (see the C11 note on
+    :func:`recommend`). Because the epoch is bumped on every vote for the query's
+    pattern, an identical query issued *after* a vote resolves to a different key and
+    therefore MISSES — forcing a recompute that reflects the new feedback — while the
+    old entry simply expires by TTL. When the epoch is ``0`` (no votes yet, or Redis
+    unavailable) the key is ``0:<query_hash>``, stable across repeated queries.
+    """
+    return f"{feedback_epoch}:{query_hash}"
 
 
 # --------------------------------------------------------------------------- #
@@ -199,18 +217,22 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
 
     Pipeline
     --------
-    1. **Cache check** — build a stable ``query_hash`` and look up ``rec:<hash>`` in
-       Redis. On a hit, return the cached response with ``cached=True`` (fault
-       tolerant: Redis down simply skips the cache).
+    1. **Cache check** — build a stable ``query_hash``, read this query pattern's
+       **feedback epoch** from Redis and fold it into the cache key
+       (``rec:<epoch>:<hash>``), then look it up. On a hit, return the cached response
+       with ``cached=True``. Because a vote bumps the pattern's epoch, the key changes
+       after a vote and the next identical query MISSES here and recomputes (fault
+       tolerant: Redis down skips the cache and the epoch degrades to ``0``).
     2. **Embed** the query (via the Redis-backed embedding cache read-through).
     3. **Retrieve** ``candidate_k`` candidates by pgvector cosine K-NN — hard-filtered
        only for the ``restrict_*`` flags, widening if a hard filter is too narrow.
-    4. **Rank** the candidates by the blended semantic + contextual (+ 0 feedback)
-       score, truncated to the effective ``top_k``.
+    4. **Rank** the candidates by the blended semantic + contextual + feedback score
+       (feedback = the per-pattern smoothed net-helpfulness read in step 3.5),
+       truncated to the effective ``top_k``.
     5. **Persist** a :class:`~src.db.models.Recommendation` row whose ``query_json``
        holds the request facets plus the returned suggestion ``incident_id``s (so
        C10 feedback can validate a suggestion belongs to a real prior result).
-    6. **Cache** the built response under ``rec:<hash>`` and return it.
+    6. **Cache** the built response under ``rec:<epoch>:<hash>`` and return it.
 
     An empty corpus / no candidates yields an empty (``count=0``) response — still
     persisted and cached — rather than an error.
@@ -218,12 +240,24 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     settings = get_settings()
     query_hash = compute_query_hash(req)
 
+    # The query's feedback bucket — same normalisation the write side uses in
+    # src.feedback so the read pattern and the vote's write pattern are identical.
+    pattern = feedback.query_pattern(req.service, req.severity, req.tags)
+
     # 1. Cache check (best-effort; a down cache just falls through to recompute).
-    cached = redis_client.cache_get_recommendation(query_hash)
+    #    The cache key embeds the pattern's feedback epoch, so a post-vote identical
+    #    query resolves to a new key and MISSES here (recomputing with fresh feedback).
+    feedback_epoch = redis_client.get_feedback_epoch(pattern)
+    cache_key = _cache_key(query_hash, feedback_epoch)
+    cached = redis_client.cache_get_recommendation(cache_key)
     if cached is not None:
         response = _response_from_cache(cached, req)
         if response is not None:
-            logger.debug("recommendation cache hit", query_hash=query_hash)
+            logger.debug(
+                "recommendation cache hit",
+                query_hash=query_hash,
+                feedback_epoch=feedback_epoch,
+            )
             return response
         # A malformed/incompatible cache entry falls through to a fresh compute.
 
@@ -245,7 +279,14 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
         top_k=top_k,
     )
 
-    # 4. Re-rank the candidate pool down to top_k (feedback term is 0 until C11).
+    # 3.5. Learned feedback for this pattern: incident_id -> smoothed net-helpfulness.
+    #      Absent incidents implicitly score 0.0 in the ranker (no votes -> neutral).
+    feedback_scores = {
+        ss.incident_id: feedback.net_help(ss.helpful_count, ss.unhelpful_count)
+        for ss in repository.get_suggestion_scores(session, pattern)
+    }
+
+    # 4. Re-rank the candidate pool down to top_k, now folding the feedback term in.
     ranked = rank_candidates(
         candidates,
         QueryContext(
@@ -254,6 +295,7 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
             tags=list(req.tags or []),
         ),
         top_k=top_k,
+        feedback_scores=feedback_scores,
     )
 
     suggestions = [_to_suggestion(r) for r in ranked]
@@ -291,15 +333,18 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
         "recommendation served",
         recommendation_id=recommendation.id,
         query_hash=query_hash,
+        feedback_epoch=feedback_epoch,
         candidates=len(candidates),
         suggestions=len(suggestions),
         top_semantic=suggestions[0].semantic if suggestions else None,
     )
 
-    # 6. Cache the response (best-effort). Store the full payload incl. the
-    #    recommendation_id so a cache hit reconstructs an identical response.
+    # 6. Cache the response under the epoch-scoped key (best-effort). Storing under
+    #    rec:<epoch>:<hash> means a later vote (which bumps the epoch) leaves this
+    #    entry stranded to expire by TTL while the next query recomputes fresh. The
+    #    full payload incl. recommendation_id is stored so a hit rebuilds identically.
     redis_client.cache_set_recommendation(
-        query_hash,
+        cache_key,
         _response_to_cache(response),
         ttl=settings.recommendation_cache_ttl_sec,
     )
