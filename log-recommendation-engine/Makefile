@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs migrate seed backfill ui scale test test-unit test-int e2e load clean
+.PHONY: help build up down logs migrate seed backfill ui dashboard scale test test-unit test-int e2e load clean
 
 help:
 	@echo "Log Recommendation Engine — make targets:"
@@ -10,7 +10,8 @@ help:
 	@echo "  migrate    - apply Alembic migrations against Postgres in Docker (no-op until C2)"
 	@echo "  seed       - generate + ingest a synthetic incident corpus in Docker (from C3)"
 	@echo "  backfill   - compute embeddings for NULL-embedded incidents in Docker (from C5)"
-	@echo "  ui         - bring up api + dashboard (from C15)"
+	@echo "  ui         - bring up postgres + redis + api + dashboard (detached); print the URL"
+	@echo "  dashboard  - build + (re)start just the dashboard container (detached)"
 	@echo "  scale      - scale the api behind the dashboard's nginx (from C23)"
 	@echo "  test       - full pytest suite in Docker (rebuilds first)"
 	@echo "  test-unit  - unit tests only in Docker"
@@ -53,9 +54,19 @@ seed:
 backfill:
 	docker compose run --rm api python -m scripts.backfill_embeddings $(ARGS)
 
-# Bring up the API + dashboard together (dashboard arrives in C15).
+# Bring up the full runtime + web dashboard, detached. Compose starts postgres +
+# redis (healthy deps of api), then api, then the dashboard once api is healthy.
+# nginx inside the dashboard reverse-proxies /api → api:8000.
 ui:
-	@echo "ui: available from commit C15"
+	docker compose up -d --build postgres redis api dashboard
+	@echo "Dashboard: http://localhost:$${DASHBOARD_PORT:-8080}"
+	@echo "API:       http://localhost:$${API_PORT:-8000}  (GET /health)"
+
+# Build + (re)start just the dashboard container, detached (assumes api is up, or
+# brings it up as a healthy dependency via compose).
+dashboard:
+	docker compose up -d --build dashboard
+	@echo "Dashboard: http://localhost:$${DASHBOARD_PORT:-8080}"
 
 # Horizontal API scaling behind the dashboard's nginx (arrives in C23).
 scale:

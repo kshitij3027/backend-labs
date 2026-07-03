@@ -83,6 +83,29 @@ services:
       start_period: 60s
     restart: unless-stopped
 
+  # Web dashboard (C15) — a React+Vite SPA built multi-stage and served by nginx,
+  # which reverse-proxies `/api/*` to the `api` service (per-request DNS so it
+  # round-robins across scaled `api` replicas; see frontend/nginx.conf). Build
+  # context is the PROJECT ROOT so the Dockerfile's COPY paths carry the
+  # `frontend/` prefix. Lives in the DEFAULT profile (not test/e2e/loadtest), and
+  # only starts once `api` is healthy. No container_name so it never clashes.
+  dashboard:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${DASHBOARD_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
   # code + requirements + baked model as the api, plus the tests) and runs pytest.
   # Profile-gated so it never starts on a bare `docker compose up`. Run via
