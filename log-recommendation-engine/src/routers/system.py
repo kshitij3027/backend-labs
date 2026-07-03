@@ -26,6 +26,8 @@ dependency failing to connect.
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
@@ -179,3 +181,61 @@ def health() -> HealthResponse:
         ),
         corpus_size=corpus_size,
     )
+
+
+def _refresh_corpus_size_gauge() -> None:
+    """Best-effort: set the ``corpus_size`` Prometheus gauge from the live count.
+
+    Opens its own short-lived session (like ``/health``) so a DB outage surfaces as a
+    swallowed error rather than a 500 on the metrics scrape. Any failure — DB down,
+    prometheus_client missing — is ignored: the gauge simply keeps its last value and
+    the exposition still succeeds.
+    """
+    session: Session | None = None
+    try:
+        session = SessionLocal()
+        observability.set_corpus_size(repository.count_incidents(session))
+    except Exception:  # noqa: BLE001 - metrics scrape must never raise
+        pass
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+@router.get(
+    "/metrics",
+    summary="Prometheus text exposition",
+    include_in_schema=False,
+)
+def metrics() -> Any:
+    """Prometheus **text** exposition (``text/plain; version=0.0.4``).
+
+    Refreshes the best-effort ``corpus_size`` gauge from the live incident count
+    (ignoring DB errors) and then returns the full registry dump. Always answers
+    200 while the process is alive — even if prometheus_client is unavailable (empty
+    body) or the DB is down (stale gauge) — so a scraper never sees a 5xx here.
+    """
+    _refresh_corpus_size_gauge()
+    return observability.metrics_endpoint()
+
+
+@router.get(
+    "/metrics/json",
+    summary="Key metrics as a JSON snapshot",
+    status_code=status.HTTP_200_OK,
+)
+def metrics_json() -> dict[str, Any]:
+    """A small JSON snapshot of the key counters/gauges for a lightweight dashboard.
+
+    Reports the recommend count, per-cache hit/miss tallies (embedding +
+    recommendation), feedback helpful/unhelpful counts, and the corpus size — the
+    same figures as the Prometheus exposition but as plain JSON for a consumer that
+    does not parse the text format. The corpus-size gauge is refreshed best-effort
+    first (DB errors ignored). Every value degrades to ``0`` on error, so this never
+    raises regardless of prometheus_client / DB state.
+    """
+    _refresh_corpus_size_gauge()
+    return observability.metrics_snapshot()

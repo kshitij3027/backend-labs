@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 
 from sqlalchemy.orm import Session
 
@@ -258,6 +259,25 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     An empty corpus / no candidates yields an empty (``count=0``) response — still
     persisted and cached — rather than an error.
     """
+    # Time the whole pipeline (both the cache-hit and fresh-compute paths) and record
+    # it once on exit via the ``finally``. ``RECOMMEND_REQUESTS_TOTAL`` counts every
+    # invocation (hit or miss); ``RECOMMEND_LATENCY`` observes the wall-clock time. The
+    # cache hit/miss for the *recommendation* cache is recorded at the decision point
+    # below. All of this is best-effort and never affects the returned response.
+    _t0 = time.perf_counter()
+    try:
+        return _recommend_inner(session, req)
+    finally:
+        observability.record_recommend(time.perf_counter() - _t0)
+
+
+def _recommend_inner(session: Session, req: RecommendRequest) -> RecommendResponse:
+    """Core recommendation pipeline (see :func:`recommend` for the full contract).
+
+    Split out so :func:`recommend` can time the entire call (including the early
+    cache-hit return) with a single ``finally`` and record the latency/counter
+    metrics exactly once, without threading a timer through every return path.
+    """
     settings = get_settings()
     query_hash = compute_query_hash(req)
 
@@ -282,6 +302,7 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     if cached is not None:
         response = _response_from_cache(cached, req)
         if response is not None:
+            observability.record_cache("recommendation", True)
             logger.debug(
                 "recommendation cache hit",
                 query_hash=query_hash,
@@ -290,6 +311,10 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
             )
             return response
         # A malformed/incompatible cache entry falls through to a fresh compute.
+
+    # A recomputation is now committed to (true miss, Redis down, or an unusable
+    # cached entry) — record the recommendation-cache miss before recomputing.
+    observability.record_cache("recommendation", False)
 
     # 2. Embed the query (read-through embedding cache). build_incident_text is the
     #    same canonical doc text used for corpus incidents, so vectors are comparable.

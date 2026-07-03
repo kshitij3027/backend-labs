@@ -228,6 +228,10 @@ def record_feedback(
         commit=commit,
     )
 
+    # Metrics: count the vote by outcome (feedback_total{helpful="true"|"false"}).
+    # Best-effort and after validation, so only genuinely-recorded votes are counted.
+    observability.record_feedback(helpful)
+
     logger.info(
         "feedback recorded",
         recommendation_id=recommendation_id,

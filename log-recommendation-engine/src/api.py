@@ -48,6 +48,12 @@ def create_app() -> FastAPI:
         ),
     )
 
+    # Prometheus request middleware (C14): times every request and records the count
+    # + latency against the matched route's path *template* (bounded cardinality).
+    # The metric singletons live at module scope in ``observability`` so repeated
+    # ``create_app()`` calls (e.g. across tests) never re-register a collector.
+    app.add_middleware(observability.PrometheusMiddleware)
+
     # Incident-corpus routes (C3): search / filter / fetch the corpus.
     app.include_router(incidents_router.router)
     # Recommendation route (C9): POST /recommend — the core deliverable.

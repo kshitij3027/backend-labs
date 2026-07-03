@@ -168,13 +168,16 @@ def cache_get_embedding(text: str) -> "np.ndarray | None":
     """
     client = get_redis()
     if client is None:
+        observability.record_cache("embedding", False)
         return None
     try:
         raw = client.get(embedding_key(text))
     except Exception as exc:  # noqa: BLE001 - read failures degrade to a miss
         logger.warning("Redis embedding-cache read failed: %s", exc)
+        observability.record_cache("embedding", False)
         return None
     if not raw:
+        observability.record_cache("embedding", False)
         return None
     try:
         # copy=True (via np.array) so the result is writable and independent of
@@ -182,9 +185,12 @@ def cache_get_embedding(text: str) -> "np.ndarray | None":
         vec = np.array(np.frombuffer(raw, dtype=_EMB_DTYPE))
     except Exception as exc:  # noqa: BLE001 - malformed buffer -> treat as a miss
         logger.warning("malformed cached embedding: %s", exc)
+        observability.record_cache("embedding", False)
         return None
     if vec.size == 0:
+        observability.record_cache("embedding", False)
         return None
+    observability.record_cache("embedding", True)
     return vec
 
 
