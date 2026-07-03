@@ -28,7 +28,7 @@ from __future__ import annotations
 from typing import Any, Iterable, Mapping, Sequence
 
 import numpy as np
-from sqlalchemy import func, select
+from sqlalchemy import func, literal, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -120,6 +120,47 @@ def get_incident(session: Session, incident_id: int) -> Incident | None:
     return session.get(Incident, incident_id)
 
 
+def _incident_filters(
+    stmt: "Any",
+    *,
+    service: str | None,
+    severity: str | None,
+    q: str | None,
+    tags: Sequence[str] | None,
+) -> "Any":
+    """Apply the shared, *composable* incident filter predicates to ``stmt``.
+
+    Single source of truth for :func:`list_incidents` / :func:`count_incidents` so
+    the page query and its ``total`` count can never drift apart. All filters are
+    optional and additive (ANDed together when more than one is given):
+
+    * ``service`` / ``severity`` — exact-match.
+    * ``q`` — case-insensitive substring (``ILIKE '%q%'``) over ``title`` **or**
+      ``description`` (surrounding whitespace is stripped; a blank ``q`` is ignored).
+    * ``tags`` — Postgres array **overlap** (``&&``): match incidents whose ``tags``
+      share at least one element with the requested list (blanks dropped; an all-blank
+      list is ignored).
+    """
+    if service is not None:
+        stmt = stmt.where(Incident.service == service)
+    if severity is not None:
+        stmt = stmt.where(Incident.severity == severity)
+    if q is not None:
+        needle = q.strip()
+        if needle:
+            like = f"%{needle}%"
+            stmt = stmt.where(
+                Incident.title.ilike(like) | Incident.description.ilike(like)
+            )
+    if tags:
+        wanted = [t.strip() for t in tags if t and t.strip()]
+        if wanted:
+            # Postgres array overlap (``&&``): row matches if its tags share ANY
+            # element with ``wanted``. ``.overlap`` maps to the ``&&`` operator.
+            stmt = stmt.where(Incident.tags.overlap(wanted))
+    return stmt
+
+
 def list_incidents(
     session: Session,
     *,
@@ -127,17 +168,20 @@ def list_incidents(
     offset: int = 0,
     service: str | None = None,
     severity: str | None = None,
+    q: str | None = None,
+    tags: Sequence[str] | None = None,
 ) -> list[Incident]:
-    """Return incidents newest-first, optionally filtered by service/severity.
+    """Return incidents newest-first, filtered by any of the optional predicates.
 
-    ``limit``/``offset`` paginate; ``service`` and ``severity`` (when given) are
-    exact-match filters.
+    ``limit``/``offset`` paginate. ``service`` / ``severity`` are exact-match; ``q``
+    is a case-insensitive substring over title+description (ILIKE); ``tags`` matches
+    incidents whose ``tags`` array overlaps the requested tags. Filters are additive
+    (see :func:`_incident_filters`).
     """
     stmt = select(Incident)
-    if service is not None:
-        stmt = stmt.where(Incident.service == service)
-    if severity is not None:
-        stmt = stmt.where(Incident.severity == severity)
+    stmt = _incident_filters(
+        stmt, service=service, severity=severity, q=q, tags=tags
+    )
     stmt = stmt.order_by(Incident.created_at.desc(), Incident.id.desc())
     stmt = stmt.limit(limit).offset(offset)
     return list(session.scalars(stmt).all())
@@ -148,18 +192,19 @@ def count_incidents(
     *,
     service: str | None = None,
     severity: str | None = None,
+    q: str | None = None,
+    tags: Sequence[str] | None = None,
 ) -> int:
     """Return the total number of incidents matching the given filters.
 
-    Uses the same ``service`` / ``severity`` exact-match predicates as
-    :func:`list_incidents` (but ignores pagination) so a paginated response can
-    report an accurate ``total`` alongside the current page.
+    Uses the exact same predicates as :func:`list_incidents` (via
+    :func:`_incident_filters`) but ignores pagination, so a paginated response can
+    report an accurate ``total`` for the full filtered result set.
     """
     stmt = select(func.count()).select_from(Incident)
-    if service is not None:
-        stmt = stmt.where(Incident.service == service)
-    if severity is not None:
-        stmt = stmt.where(Incident.severity == severity)
+    stmt = _incident_filters(
+        stmt, service=service, severity=severity, q=q, tags=tags
+    )
     return int(session.scalar(stmt) or 0)
 
 
@@ -406,3 +451,109 @@ def get_suggestion_scores(
         SuggestionScore.query_pattern == query_pattern
     )
     return list(session.scalars(stmt).all())
+
+
+# --------------------------------------------------------------------------- #
+# Aggregate / stats helpers (C13) — powers GET /stats and the deep /health count
+# --------------------------------------------------------------------------- #
+def count_embedded_incidents(session: Session) -> int:
+    """Return how many incidents carry a (non-null) embedding — i.e. are searchable."""
+    stmt = (
+        select(func.count())
+        .select_from(Incident)
+        .where(Incident.embedding.is_not(None))
+    )
+    return int(session.scalar(stmt) or 0)
+
+
+def incident_counts_by_service(session: Session) -> dict[str, int]:
+    """Return ``{service: incident_count}`` over the whole corpus (``GROUP BY service``)."""
+    stmt = (
+        select(Incident.service, func.count())
+        .group_by(Incident.service)
+        .order_by(func.count().desc())
+    )
+    return {service: int(count) for service, count in session.execute(stmt).all()}
+
+
+def incident_counts_by_severity(session: Session) -> dict[str, int]:
+    """Return ``{severity: incident_count}`` over the whole corpus (``GROUP BY severity``)."""
+    stmt = (
+        select(Incident.severity, func.count())
+        .group_by(Incident.severity)
+        .order_by(func.count().desc())
+    )
+    return {severity: int(count) for severity, count in session.execute(stmt).all()}
+
+
+def feedback_totals(session: Session) -> tuple[int, int, int]:
+    """Return ``(total, helpful, unhelpful)`` raw feedback-vote counts.
+
+    A single grouped scan over ``feedback.helpful``: the helpful / unhelpful splits are
+    read off the ``True`` / ``False`` buckets and summed for the total (so
+    ``helpful + unhelpful == total`` by construction).
+    """
+    stmt = select(Feedback.helpful, func.count()).group_by(Feedback.helpful)
+    helpful = 0
+    unhelpful = 0
+    for is_helpful, count in session.execute(stmt).all():
+        if is_helpful:
+            helpful = int(count)
+        else:
+            unhelpful = int(count)
+    return helpful + unhelpful, helpful, unhelpful
+
+
+def count_recommendations(session: Session) -> int:
+    """Return the number of persisted (served) recommendation rows."""
+    stmt = select(func.count()).select_from(Recommendation)
+    return int(session.scalar(stmt) or 0)
+
+
+def top_patterns(
+    session: Session, *, limit: int = 5
+) -> list[tuple[str, int, int]]:
+    """Return the busiest learned query-pattern buckets by *total* votes.
+
+    Sums each ``query_pattern``'s helpful / unhelpful counts across every incident in
+    that bucket (``GROUP BY query_pattern``), ordered by total votes descending.
+    Returns up to ``limit`` ``(query_pattern, helpful, unhelpful)`` tuples — the input
+    for :class:`~src.schemas.StatsResponse.top_patterns`.
+    """
+    helpful_sum = func.coalesce(func.sum(SuggestionScore.helpful_count), 0)
+    unhelpful_sum = func.coalesce(func.sum(SuggestionScore.unhelpful_count), 0)
+    stmt = (
+        select(SuggestionScore.query_pattern, helpful_sum, unhelpful_sum)
+        .group_by(SuggestionScore.query_pattern)
+        .order_by((helpful_sum + unhelpful_sum).desc())
+        .limit(limit)
+    )
+    return [
+        (pattern, int(helpful), int(unhelpful))
+        for pattern, helpful, unhelpful in session.execute(stmt).all()
+    ]
+
+
+def database_ready(session: Session) -> bool:
+    """Return ``True`` if a trivial ``SELECT 1`` succeeds (a liveness probe of the DB).
+
+    Never raises — any error (connection down, etc.) degrades to ``False`` so the deep
+    ``/health`` endpoint can report DB status without failing the request.
+    """
+    try:
+        return int(session.scalar(select(literal(1)))) == 1
+    except Exception:  # noqa: BLE001 - health probe must never raise
+        return False
+
+
+def vector_extension_present(session: Session) -> bool:
+    """Return ``True`` if the pgvector ``vector`` extension is installed.
+
+    Queries ``pg_extension`` for ``extname = 'vector'``. Never raises — any error
+    degrades to ``False`` (the deep ``/health`` treats this as an optional sub-field).
+    """
+    try:
+        stmt = text("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
+        return session.execute(stmt).first() is not None
+    except Exception:  # noqa: BLE001 - health probe must never raise
+        return False

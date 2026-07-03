@@ -359,3 +359,86 @@ class ConfigResponse(BaseModel):
 
     version: int
     config: dict
+
+
+# --------------------------------------------------------------------------- #
+# Stats surface (C13): GET /stats — corpus / feedback rollups
+# --------------------------------------------------------------------------- #
+class PatternStat(BaseModel):
+    """One learned ``query_pattern`` bucket's helpful / unhelpful tally.
+
+    A row of the ``top_patterns`` list on :class:`StatsResponse`: the query-pattern
+    key the feedback aggregate is grouped by, plus its summed helpful / unhelpful
+    votes across every incident in that bucket.
+    """
+
+    query_pattern: str
+    helpful: int
+    unhelpful: int
+
+
+class StatsResponse(BaseModel):
+    """Response for ``GET /stats`` — an at-a-glance summary of the whole system.
+
+    Rolls up the durable corpus + feedback state so a dashboard can show coverage
+    and learning progress without paging through the raw rows:
+
+    * ``corpus_size`` — total incidents; ``embedded_count`` — how many carry a
+      (non-null) vector and are therefore semantically searchable.
+    * ``by_service`` / ``by_severity`` — incident counts grouped by each facet.
+    * ``feedback_total`` / ``feedback_helpful`` / ``feedback_unhelpful`` — raw vote
+      tallies (``helpful + unhelpful == total``).
+    * ``recommendations_served`` — how many recommendations have been persisted.
+    * ``top_patterns`` — the busiest learned query-pattern buckets (by total votes).
+    """
+
+    corpus_size: int
+    embedded_count: int
+    by_service: dict[str, int] = Field(default_factory=dict)
+    by_severity: dict[str, int] = Field(default_factory=dict)
+    feedback_total: int
+    feedback_helpful: int
+    feedback_unhelpful: int
+    recommendations_served: int
+    top_patterns: list[PatternStat] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Deep health surface (C13): GET /health — per-subsystem readiness
+# --------------------------------------------------------------------------- #
+class ComponentsHealth(BaseModel):
+    """Per-subsystem readiness booleans reported by the deep ``GET /health``.
+
+    Each flag is the result of a fast, failure-tolerant probe (any error degrades
+    to ``False`` — the health check never raises):
+
+    * ``database`` — a ``SELECT 1`` against Postgres succeeded.
+    * ``vector_extension`` — the pgvector ``vector`` extension is installed (only
+      meaningful when ``database`` is ``True``).
+    * ``redis`` — Redis answered a ``PING``.
+    * ``embedding_model`` — the model singleton is **already loaded** in this
+      process (a cheap inspection of the ``lru_cache`` — the check never forces a
+      load, so a cold-but-healthy process legitimately reports ``False`` here).
+    """
+
+    database: bool = False
+    vector_extension: bool = False
+    redis: bool = False
+    embedding_model: bool = False
+
+
+class HealthResponse(BaseModel):
+    """Response for the deep ``GET /health`` — liveness + per-component readiness.
+
+    ``status`` is ``"ok"`` only when every *required* dependency (database, redis)
+    is up, else ``"degraded"``. The endpoint always returns **HTTP 200** while the
+    process is alive (so the container healthcheck stays green); a degraded stack is
+    reported in this body rather than via a non-2xx status. ``corpus_size`` is a
+    best-effort incident count (``0`` when the database is unreachable).
+    """
+
+    status: Literal["ok", "degraded"]
+    service: str
+    version: str
+    components: ComponentsHealth
+    corpus_size: int = 0

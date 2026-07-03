@@ -95,6 +95,9 @@ services:
     environment:
       - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
       - REDIS_URL=redis://redis:6379/0
+      # Deterministic tests: disable stochastic ε-exploration in the test
+      # profile (exploration is unit-tested directly by injecting epsilon/rng).
+      - EPSILON_EXPLORE=0
     depends_on:
       postgres:
         condition: service_healthy

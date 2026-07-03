@@ -96,13 +96,30 @@ def list_incidents(
             "Exact-match filter on severity; one of " + ", ".join(SEVERITIES) + "."
         ),
     ),
+    q: str | None = Query(
+        default=None,
+        description=(
+            "Case-insensitive substring search (ILIKE) over the incident's title "
+            "and description."
+        ),
+    ),
+    tags: list[str] | None = Query(
+        default=None,
+        description=(
+            "Repeatable tag filter (e.g. ?tags=db&tags=timeout). Matches incidents "
+            "whose tags array overlaps ANY of the requested tags."
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> IncidentList:
     """Return a page of incidents (newest-first) plus the total match count.
 
-    ``limit`` (1–200) and ``offset`` paginate; ``service`` / ``severity`` (when
-    given) are exact-match filters. ``total`` counts every matching row so the
-    caller can page through the full result set.
+    ``limit`` (1–200) and ``offset`` paginate. All filters are optional and additive
+    (ANDed): ``service`` / ``severity`` are exact-match, ``q`` is a case-insensitive
+    substring over title+description (ILIKE), and ``tags`` matches any incident whose
+    ``tags`` array **overlaps** the requested tags (repeat the param for several
+    tags). ``total`` counts every matching row (ignoring pagination) so the caller can
+    page through the full filtered result set.
     """
     rows = repository.list_incidents(
         db,
@@ -110,8 +127,12 @@ def list_incidents(
         offset=offset,
         service=service,
         severity=severity,
+        q=q,
+        tags=tags,
     )
-    total = repository.count_incidents(db, service=service, severity=severity)
+    total = repository.count_incidents(
+        db, service=service, severity=severity, q=q, tags=tags
+    )
     items = [IncidentOut.from_orm_incident(r) for r in rows]
     return IncidentList(items=items, total=total, limit=limit, offset=offset)
 

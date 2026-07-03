@@ -1,14 +1,14 @@
 """FastAPI application factory for the Log Recommendation Engine.
 
-This module is intentionally minimal for the C1 skeleton: it wires a single
-dependency-free ``GET /health`` route so the container healthcheck and the test
-suite have something concrete to assert against. Later commits attach the real
-routers (incidents, recommend, feedback, config, system) onto the app produced by
-:func:`create_app`, so the structure here is deliberately router-ready.
+This module wires the FastAPI app and attaches every router (incidents, recommend,
+feedback, config, system). The application factory :func:`create_app` is the single
+place routers are registered, so the structure here stays thin and router-ready.
 
-``GET /health`` is a pure liveness probe in C1 — it must NOT touch Postgres or Redis
-(a deep readiness ``/health`` reporting per-subsystem booleans arrives in C13). This
-keeps the healthcheck green the instant uvicorn binds.
+``GET /health`` is a **deep** readiness probe from C13 (defined on the system router):
+it reports per-subsystem status (database / redis / embedding_model) and the corpus
+size, yet **always returns HTTP 200 while the process is alive** so the container
+healthcheck stays green the instant uvicorn binds — a degraded dependency is signalled
+in the body, not via a non-2xx status.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from src.routers import config as config_router
 from src.routers import feedback as feedback_router
 from src.routers import incidents as incidents_router
 from src.routers import recommend as recommend_router
+from src.routers import system as system_router
 
 #: Reported in the /health payload and (later) elsewhere. Bumped per release.
 SERVICE_VERSION = "0.1.0"
@@ -47,17 +48,7 @@ def create_app() -> FastAPI:
         ),
     )
 
-    @app.get("/health", tags=["system"])
-    async def health() -> dict[str, str]:
-        """Liveness probe — dependency-free (does not touch Postgres/Redis in C1)."""
-        return {
-            "status": "ok",
-            "service": SERVICE_NAME,
-            "version": SERVICE_VERSION,
-        }
-
-    # Incident-corpus routes (C3). Later commits register config / system routers
-    # on this same app.
+    # Incident-corpus routes (C3): search / filter / fetch the corpus.
     app.include_router(incidents_router.router)
     # Recommendation route (C9): POST /recommend — the core deliverable.
     app.include_router(recommend_router.router)
@@ -65,6 +56,8 @@ def create_app() -> FastAPI:
     app.include_router(feedback_router.router)
     # Runtime config routes (C12): GET/PUT /config — live retuning of ranking knobs.
     app.include_router(config_router.router)
+    # System routes (C13): GET /stats (corpus/feedback rollup) + deep GET /health.
+    app.include_router(system_router.router)
 
     return app
 
