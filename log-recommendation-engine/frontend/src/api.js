@@ -65,42 +65,50 @@ export function getStats() {
   return getJSON("/stats");
 }
 
-// --------------------------------------------------------------------------- //
-// Stubs wired to the UI in later commits. Defined now so C16/C17 need only build
-// components, not touch the client. Each mirrors the real API contract.
-// --------------------------------------------------------------------------- //
-
 /**
  * POST /recommend — rank incident recommendations for a query (wired in C16).
- * @param {object} body {query, service?, severity?, top_k?, ...}
- * @returns {Promise<object>} RecommendResponse
+ * @param {object} body {title, description, service?, severity?, tags?, top_k?, ...}
+ * @returns {Promise<object>} RecommendResponse — {recommendation_id, count, cached, suggestions}
  */
 export function postRecommend(body) {
   return postJSON("/recommend", "POST", body);
 }
 
+// --------------------------------------------------------------------------- //
+// Feedback + runtime config (C17). These close the loop in the dashboard: a vote
+// records feedback and a config edit retunes the ranking, both taking effect on
+// the very next /recommend. `postJSON` surfaces a 422 body's `detail` in the
+// thrown Error message, so callers can show the backend's validation reason.
+// --------------------------------------------------------------------------- //
+
 /**
  * POST /feedback — record a helpful / unhelpful vote on a served recommendation (C17).
- * @param {object} body {recommendation_id, incident_id, helpful, ...}
- * @returns {Promise<object>} FeedbackResponse
+ * The vote references a real prior result: `recommendation_id` (from the last
+ * RecommendResponse) and an `incident_id` that was one of that recommendation's
+ * suggestions. The response echoes the post-update aggregate for that pair.
+ * @param {object} body {recommendation_id, incident_id, helpful}
+ * @returns {Promise<object>} FeedbackResponse — {recorded, query_pattern, incident_id, helpful_count, unhelpful_count} (201)
  */
 export function postFeedback(body) {
   return postJSON("/feedback", "POST", body);
 }
 
 /**
- * GET /config — current runtime ranking config (weights, thresholds, top_k) (C17).
- * @returns {Promise<object>} ConfigResponse
+ * GET /config — current effective runtime ranking config + its global version (C17).
+ * @returns {Promise<object>} ConfigResponse — {version, config:{weight_semantic, weight_contextual, weight_feedback, epsilon_explore, diversity_threshold, recency_half_life_days, top_k, high_confidence_threshold, medium_confidence_threshold}}
  */
 export function getConfig() {
   return getJSON("/config");
 }
 
 /**
- * PUT /config — partial runtime update, no restart. Send only fields to change (C17).
- * @param {object} partial {weight_semantic?, weight_contextual?, weight_feedback?, top_k?, ...}
- * @returns {Promise<object>} the new effective ConfigResponse
+ * PUT /config — partial runtime update, no restart. Send only the fields to change;
+ * an out-of-range or unknown key is rejected with 422 (its `detail` is folded into
+ * the thrown Error message). On success the version bumps and the new effective
+ * config is returned — the next /recommend recomputes under it.
+ * @param {object} updates {weight_semantic?, weight_contextual?, weight_feedback?, epsilon_explore?, diversity_threshold?, ...}
+ * @returns {Promise<object>} the new effective ConfigResponse — {version, config}
  */
-export function putConfig(partial) {
-  return postJSON("/config", "PUT", partial);
+export function putConfig(updates) {
+  return postJSON("/config", "PUT", updates);
 }

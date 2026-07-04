@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   BarChart,
   Bar,
@@ -31,8 +32,15 @@ const CTX_SIGNALS = [
 // signal (semantic / contextual / feedback = weight × raw value), which is exactly
 // how the backend composes the score. Raw per-signal values and the contextual
 // sub-signals ride along underneath for the curious.
-export default function SuggestionCard({ suggestion, rank }) {
+//
+// C17 adds a feedback footer: 👍 / 👎 buttons that call `onVote(incident_id, helpful)`.
+// The parent (App) records the vote (POST /feedback with the current recommendation_id)
+// and then re-runs the query so the re-rank is visible. While a vote is in flight the
+// buttons disable; when it resolves we show a small "recorded" ack (with the returned
+// helpful/unhelpful tallies when the parent hands them back).
+export default function SuggestionCard({ suggestion, rank, onVote }) {
   const {
+    incident_id,
     title,
     service,
     severity,
@@ -48,6 +56,35 @@ export default function SuggestionCard({ suggestion, rank }) {
   const weights = breakdown.weights || {};
   const explored = Boolean(breakdown.explored);
   const ctxDetail = breakdown.contextual_detail || {};
+
+  // Local vote lifecycle for THIS card. `voting` disables both buttons while the
+  // POST + re-run round-trips; `ack` holds the outcome to render underneath.
+  const [voting, setVoting] = useState(false);
+  const [ack, setAck] = useState(null); // {helpful, counts?: {helpful_count, unhelpful_count}, error?}
+
+  async function vote(helpful) {
+    if (voting || typeof onVote !== "function" || incident_id == null) return;
+    setVoting(true);
+    setAck(null);
+    try {
+      // Parent returns the FeedbackResponse (or undefined) — surface its tallies.
+      const res = await onVote(incident_id, helpful);
+      setAck({
+        helpful,
+        counts:
+          res && (res.helpful_count != null || res.unhelpful_count != null)
+            ? {
+                helpful_count: res.helpful_count,
+                unhelpful_count: res.unhelpful_count,
+              }
+            : null,
+      });
+    } catch (e) {
+      setAck({ helpful, error: e?.message || "Vote failed." });
+    } finally {
+      setVoting(false);
+    }
+  }
 
   // Weighted contribution of each signal to the blended score: weight × raw value.
   // `feedback` is bounded [-1, 1] so its contribution can be negative — the chart
@@ -183,6 +220,55 @@ export default function SuggestionCard({ suggestion, rank }) {
           </div>
         )}
       </div>
+
+      {/* Feedback footer (C17): vote on whether this suggestion was useful. The
+          vote is recorded against the current recommendation_id and then the query
+          is re-run so the re-rank shows immediately. Hidden if no handler wired. */}
+      {typeof onVote === "function" && (
+        <div className="vote">
+          <span className="vote__prompt">Was this helpful?</span>
+          <div className="vote__buttons">
+            <button
+              type="button"
+              className="vote__btn vote__btn--up"
+              onClick={() => vote(true)}
+              disabled={voting}
+              aria-label="Mark this suggestion helpful"
+            >
+              👍 Helpful
+            </button>
+            <button
+              type="button"
+              className="vote__btn vote__btn--down"
+              onClick={() => vote(false)}
+              disabled={voting}
+              aria-label="Mark this suggestion not helpful"
+            >
+              👎 Not helpful
+            </button>
+          </div>
+
+          {voting && <span className="vote__status">Recording…</span>}
+
+          {ack && !ack.error && (
+            <span className="vote__ack" role="status">
+              ✓ Recorded {ack.helpful ? "helpful" : "not helpful"}
+              {ack.counts
+                ? ` · ${fmt(ack.counts.helpful_count, 0)}👍 / ${fmt(
+                    ack.counts.unhelpful_count,
+                    0,
+                  )}👎`
+                : ""}
+            </span>
+          )}
+
+          {ack && ack.error && (
+            <span className="vote__ack vote__ack--err" role="alert">
+              {ack.error}
+            </span>
+          )}
+        </div>
+      )}
     </article>
   );
 }

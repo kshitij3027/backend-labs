@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getHealth, getStats, postRecommend, DEFAULT_POLL_MS } from "./api.js";
+import {
+  getHealth,
+  getStats,
+  postRecommend,
+  postFeedback,
+  getConfig,
+  putConfig,
+  DEFAULT_POLL_MS,
+} from "./api.js";
 import RecommendForm from "./components/RecommendForm.jsx";
 import SuggestionList from "./components/SuggestionList.jsx";
+import ControlsPanel from "./components/ControlsPanel.jsx";
+import StatsPanel from "./components/StatsPanel.jsx";
 
 // Poll cadence for the status strip. A constant for now; C17 may adopt a value
 // supplied by GET /config.
@@ -25,11 +35,13 @@ function ComponentPill({ label, ok }) {
   );
 }
 
-// Top-level dashboard SHELL (C15). Proves the wiring end-to-end: a single polling
-// loop fetches GET /health + GET /stats through nginx's /api proxy and renders
-// service status, per-component readiness, and corpus size. The recommend form +
-// suggestion cards arrive in C16; feedback + runtime controls in C17. Every field
-// read is defensive so the tree paints on first render, before any fetch resolves.
+// Top-level dashboard (C15 shell → C16 recommend → C17 feedback loop + controls).
+// A single polling loop fetches GET /health + GET /stats through nginx's /api proxy
+// and renders service status, per-component readiness, corpus size, and (C17) a live
+// stats panel. C16 adds the recommend form + ranked suggestion cards. C17 closes the
+// loop: 👍/👎 votes on a suggestion POST /feedback then RE-RUN the last query so the
+// re-rank is visible, and runtime sliders PUT /config then re-run so the new weighting
+// takes effect. Every field read is defensive so the tree paints before any fetch.
 export default function App() {
   const [health, setHealth] = useState(null);
   const [stats, setStats] = useState(null);
@@ -44,12 +56,23 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false);
   const [recError, setRecError] = useState(null);
 
-  // Handle a form submission: assemble already done in the form; here we own the
-  // fetch lifecycle. On failure we keep the prior result visible but surface the
-  // error, so a bad query doesn't wipe out a good previous answer.
+  // C17: the last submitted query body, kept so a vote or a config change can
+  // silently RE-RUN the identical query and surface the re-rank / new weighting.
+  const [lastQuery, setLastQuery] = useState(null);
+
+  // C17: current effective runtime config + its version (seeded on mount from
+  // GET /config, re-seeded after each successful PUT). Drives the ControlsPanel.
+  const [config, setConfig] = useState(null);
+  const [configVersion, setConfigVersion] = useState(null);
+
+  // Handle a form submission: assembly happens in the form; here we own the fetch
+  // lifecycle. We remember the body as `lastQuery` so votes / config edits can
+  // re-run it. On failure we keep the prior result visible but surface the error,
+  // so a bad query doesn't wipe out a good previous answer.
   const handleRecommend = useCallback(async (body) => {
     setSubmitting(true);
     setRecError(null);
+    setLastQuery(body);
     try {
       const res = await postRecommend(body);
       setResult(res);
@@ -62,6 +85,8 @@ export default function App() {
 
   // Refetch health + stats. Isolated with allSettled so one failing endpoint
   // never blanks the other, and a total outage flips `reachable` without throwing.
+  // Defined before the vote handler so that handler can call it to tick the stats
+  // panel the instant a vote lands, rather than waiting for the next poll.
   const refresh = useCallback(async () => {
     setPulsing(true);
     const [h, s] = await Promise.allSettled([getHealth(), getStats()]);
@@ -77,6 +102,77 @@ export default function App() {
     setTimeout(() => setPulsing(false), 1000);
   }, []);
 
+  // Silent re-run of the last query (no spinner-blanking, no lastQuery churn). Used
+  // after a vote or a config change so the re-rank / new weighting appears in place.
+  // A feedback-epoch / config-version bump makes the response `cached:false` with the
+  // new order. Errors bubble to the caller; the current result is left intact.
+  const rerunLastQuery = useCallback(async () => {
+    if (!lastQuery) return;
+    setSubmitting(true);
+    try {
+      const res = await postRecommend(lastQuery);
+      setResult(res);
+      setRecError(null);
+    } finally {
+      setSubmitting(false);
+    }
+  }, [lastQuery]);
+
+  // C17 vote handler passed to each SuggestionCard. Record the vote against the
+  // CURRENT recommendation_id + the card's incident_id, then re-run the last query
+  // so the live re-rank shows. Returns the FeedbackResponse so the card can display
+  // the updated helpful/unhelpful tallies. A re-run failure is swallowed here (the
+  // vote itself succeeded and stats will still refresh) but leaves recError set so
+  // the user knows the list may be stale; the vote ack still renders.
+  const handleVote = useCallback(
+    async (incidentId, helpful) => {
+      const recId = result?.recommendation_id;
+      if (recId == null) {
+        throw new Error("No active recommendation to attach feedback to.");
+      }
+      const fb = await postFeedback({
+        recommendation_id: recId,
+        incident_id: incidentId,
+        helpful,
+      });
+      // Re-rank: re-run the same query. Don't let a transient re-run error mask the
+      // fact that the vote itself was recorded — surface it without throwing.
+      try {
+        await rerunLastQuery();
+      } catch (e) {
+        setRecError(
+          (e?.message || "Re-run after vote failed.") +
+            " (your vote was still recorded)",
+        );
+      }
+      // Refresh the stats panel so the vote counters tick immediately, not on the
+      // next poll tick.
+      refresh();
+      return fb;
+    },
+    [result, rerunLastQuery, refresh],
+  );
+
+  // C17 config-apply handler passed to ControlsPanel. PUT only the changed fields,
+  // re-seed the panel from the new effective config (bumps the version pill), then
+  // re-run the last query (if any) so the new weighting is visible. Throws on a 422
+  // so the panel can show the backend `detail`.
+  const handleApplyConfig = useCallback(
+    async (updates) => {
+      const res = await putConfig(updates); // may throw (422 detail in message)
+      if (res && res.config) setConfig(res.config);
+      if (res && res.version != null) setConfigVersion(res.version);
+      // Reflect the new weighting in the visible results.
+      try {
+        await rerunLastQuery();
+      } catch {
+        /* keep the applied config even if the re-run hiccups */
+      }
+      return res;
+    },
+    [rerunLastQuery],
+  );
+
   // Polling loop: fire immediately on mount, then on interval.
   const saved = useRef(refresh);
   saved.current = refresh;
@@ -84,6 +180,25 @@ export default function App() {
     saved.current();
     const id = setInterval(() => saved.current(), POLL_MS);
     return () => clearInterval(id);
+  }, []);
+
+  // C17: seed the runtime config once on mount so the ControlsPanel sliders reflect
+  // the live values. A failure just leaves the panel in its "unavailable" state —
+  // the rest of the dashboard is unaffected (no throw escapes).
+  useEffect(() => {
+    let alive = true;
+    getConfig()
+      .then((res) => {
+        if (!alive || !res) return;
+        if (res.config) setConfig(res.config);
+        if (res.version != null) setConfigVersion(res.version);
+      })
+      .catch(() => {
+        /* config panel shows "unavailable"; dashboard keeps working */
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const status = health?.status ?? (reachable ? "unknown" : "unreachable");
@@ -170,6 +285,7 @@ export default function App() {
         </section>
 
         {/* Recommend UI (C16): incident form (left) + ranked suggestions (right).
+            The list gets the C17 vote handler so 👍/👎 records feedback and re-ranks.
             Collapses to a single column on narrow viewports. */}
         <div className="recommend-grid">
           <RecommendForm onSubmit={handleRecommend} submitting={submitting} />
@@ -177,7 +293,19 @@ export default function App() {
             result={result}
             submitting={submitting}
             error={recError}
+            onVote={handleVote}
           />
+        </div>
+
+        {/* Insights row (C17): runtime ranking controls + the live corpus/feedback
+            stats panel side by side, collapsing to one column when narrow. */}
+        <div className="insights-grid">
+          <ControlsPanel
+            config={config}
+            version={configVersion}
+            onApply={handleApplyConfig}
+          />
+          <StatsPanel stats={stats} lastUpdated={lastUpdated} pollMs={POLL_MS} />
         </div>
       </main>
     </div>

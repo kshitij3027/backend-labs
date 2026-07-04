@@ -10,8 +10,10 @@ import SuggestionCard from "./SuggestionCard.jsx";
 //                  query matched nothing.
 //
 // `result` is the raw RecommendResponse. `recommendation_id` is surfaced here (and
-// kept in App state) because C17's feedback votes reference it.
-export default function SuggestionList({ result, submitting, error }) {
+// kept in App state) because C17's feedback votes reference it. `onVote` is the C17
+// per-card vote handler (App records the vote against `recommendation_id`, then
+// re-runs the query to show the live re-rank); it is passed straight to each card.
+export default function SuggestionList({ result, submitting, error, onVote }) {
   if (error) {
     return (
       <section className="card results">
@@ -86,6 +88,7 @@ export default function SuggestionList({ result, submitting, error }) {
               key={`${s.incident_id}-${i}`}
               suggestion={s}
               rank={i + 1}
+              onVote={onVote}
             />
           ))}
         </div>

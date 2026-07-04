@@ -773,3 +773,388 @@ button:disabled {
   color: var(--text-faint);
   opacity: 0.75;
 }
+
+/* ================================================================= C17 ===== */
+/* Feedback loop + runtime controls: vote buttons, the ranking-controls panel
+   (sliders + Apply), and the corpus/feedback stats panel. */
+
+/* ------------------------------------------------------ ghost / secondary -- */
+/* A quiet secondary button (Reset / non-primary actions) — the primary gradient
+   button is defined earlier; this overrides it to a subtle outline. */
+button.ghost {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  border-color: var(--border);
+}
+
+button.ghost:hover:not(:disabled) {
+  filter: none;
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* ----------------------------------------------------------- vote footer -- */
+
+.vote {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.vote__prompt {
+  font-size: 12px;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+
+.vote__buttons {
+  display: inline-flex;
+  gap: 8px;
+}
+
+/* Compact, non-gradient vote buttons (override the default primary button look). */
+.vote__btn {
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  font-weight: 600;
+  font-size: 12.5px;
+  padding: 6px 12px;
+}
+
+.vote__btn:hover:not(:disabled) {
+  filter: none;
+}
+
+.vote__btn--up:hover:not(:disabled) {
+  color: var(--ok);
+  border-color: rgba(52, 211, 153, 0.5);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.vote__btn--down:hover:not(:disabled) {
+  color: var(--bad);
+  border-color: rgba(251, 113, 133, 0.5);
+  background: rgba(251, 113, 133, 0.08);
+}
+
+.vote__status {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.vote__ack {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.vote__ack--err {
+  color: var(--bad);
+  font-weight: 500;
+}
+
+/* --------------------------------------------------------- insights layout -- */
+/* Controls (left) + stats (right); single column when narrow. */
+.insights-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 860px) {
+  .insights-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ----------------------------------------------------- ranking controls -- */
+
+.controls__list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.control__top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.control__label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.control__val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: right;
+}
+
+/* Highlight a value the user has moved but not yet applied. */
+.control__val--dirty {
+  color: var(--accent);
+}
+
+.control__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* Range inputs — themed track + thumb across the three panels that use them. */
+.control__range,
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(9, 13, 28, 0.7);
+  border: 1px solid var(--border);
+  outline: none;
+  cursor: pointer;
+}
+
+.control__range::-webkit-slider-thumb,
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), #818cf8);
+  border: 2px solid var(--card);
+  box-shadow: 0 1px 4px rgba(2, 6, 23, 0.6);
+}
+
+.control__range::-moz-range-thumb,
+input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--card);
+}
+
+.control__range:focus-visible,
+input[type="range"]:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(110, 168, 255, 0.16);
+}
+
+.controls__actions {
+  margin-top: 16px;
+  align-items: center;
+}
+
+.controls__pending {
+  font-size: 12px;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* -------------------------------------------------------------- stats panel -- */
+
+.stats__grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+@media (max-width: 520px) {
+  .stats__grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.statbox {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(9, 13, 28, 0.35);
+}
+
+.statbox__val {
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.statbox__lab {
+  font-size: 11px;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.stats__section {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.stats__secthead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stats__secttitle {
+  display: block;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+}
+
+.stats__secthead .stats__secttitle {
+  margin-bottom: 0;
+}
+
+.stats__pct {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.stats__none {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+/* Helpful vs unhelpful share bar. */
+.fbbar {
+  display: flex;
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(9, 13, 28, 0.6);
+  border: 1px solid var(--border);
+  margin: 6px 0 8px;
+}
+
+.fbbar__seg {
+  height: 100%;
+  transition: width 0.35s ease;
+}
+
+.fbbar__seg--up {
+  background: var(--ok);
+}
+
+.fbbar__seg--down {
+  background: var(--bad);
+}
+
+.fbbar__legend {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.fb-up {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.fb-down {
+  color: var(--bad);
+  font-weight: 600;
+}
+
+/* Compact distribution rows (by_service / by_severity). */
+.stats__dist {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.stats__distitem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+}
+
+.stats__distkey {
+  color: var(--text-dim);
+}
+
+.stats__distval {
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Learned query patterns list. */
+.patterns {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.pattern {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(9, 13, 28, 0.3);
+}
+
+.pattern__name {
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+}
+
+.pattern__counts {
+  display: inline-flex;
+  gap: 10px;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
