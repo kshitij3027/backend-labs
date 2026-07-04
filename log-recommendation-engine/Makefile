@@ -97,9 +97,22 @@ test-int:
 	docker compose down; \
 	exit $$status
 
-# Full black-box end-to-end verifier (arrives in C18).
+# Full black-box end-to-end verifier (C18) in Docker against the LIVE api.
+#
+# Builds + brings up postgres + redis + api and WAITS for them to be healthy
+# (`--wait`), then runs the profile-gated `e2e` service (Dockerfile.test image) which
+# executes scripts/verify_e2e.py — seeding a controlled corpus over HTTP and asserting
+# the full loop (seed -> recommend -> feedback -> recommend -> re-rank shift), plus
+# /stats and /metrics. The verifier's exit code is captured; the stack is torn down
+# regardless; and `make e2e` exits with that code so ANY failed assertion fails the
+# target (exit-code propagation). Determinism is guaranteed inside the verifier itself
+# (it PUTs /config epsilon_explore=0 first), so no api env override is needed here.
 e2e:
-	@echo "e2e: available from commit C18"
+	docker compose up -d --build --wait postgres redis api
+	@status=0; \
+	docker compose --profile e2e run --rm e2e || status=$$?; \
+	docker compose down; \
+	exit $$status
 
 # Latency + throughput + memory gates (arrive in C19/C20).
 load:

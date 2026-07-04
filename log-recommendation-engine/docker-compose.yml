@@ -128,6 +128,41 @@ services:
         condition: service_healthy
     command: ["pytest", "-q"]
 
+  # Black-box end-to-end verifier (C18). Reuses the tester image (Dockerfile.test ships
+  # src/ + scripts/ + httpx) and runs scripts/verify_e2e.py against the LIVE api over the
+  # compose network — driving the WHOLE loop over HTTP only: seed a controlled corpus ->
+  # recommend (ranked, scored, with resolutions) -> feedback -> recommend again -> assert
+  # the re-rank shift (an up-voted incident overtakes a down-voted one). It is fully
+  # self-seeding, so it needs no `make seed`. Profile-gated so it never starts on a bare
+  # `docker compose up`. Run via `make e2e`.
+  #
+  # Determinism note: the verifier's FIRST action (after health) is
+  # `PUT /config {"epsilon_explore": 0}`, which disables ε-exploration on the *live* api
+  # fleet-wide and bumps the config version (clean, un-cached baseline) — so the re-rank
+  # ordering assertion is stable WITHOUT any change to the `api` service here. The
+  # EPSILON_EXPLORE=0 below only affects this container's own process (it imports nothing
+  # that ranks); it is set for parity with the `test` profile and to document intent.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - E2E_BASE_URL=http://api:8000
+      - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
+      - REDIS_URL=redis://redis:6379/0
+      # Deterministic re-rank is enforced by the verifier (PUT /config epsilon_explore=0
+      # against the live api); this env is parity-only and harmless.
+      - EPSILON_EXPLORE=0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
 # Named volumes keep the Postgres data + generated datasets across container restarts.
 volumes:
   pgdata:
