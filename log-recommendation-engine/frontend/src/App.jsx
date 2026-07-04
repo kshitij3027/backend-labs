@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getHealth, getStats, DEFAULT_POLL_MS } from "./api.js";
+import { getHealth, getStats, postRecommend, DEFAULT_POLL_MS } from "./api.js";
+import RecommendForm from "./components/RecommendForm.jsx";
+import SuggestionList from "./components/SuggestionList.jsx";
 
 // Poll cadence for the status strip. A constant for now; C17 may adopt a value
 // supplied by GET /config.
@@ -34,6 +36,29 @@ export default function App() {
   const [lastUpdated, setLastUpdated] = useState(null);
   const [pulsing, setPulsing] = useState(false);
   const [reachable, setReachable] = useState(true);
+
+  // Recommend cycle (C16): the current POST /recommend result, whether a request
+  // is in flight, and the last error. `result` is the raw RecommendResponse; its
+  // `recommendation_id` is kept here because C17's feedback votes reference it.
+  const [result, setResult] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [recError, setRecError] = useState(null);
+
+  // Handle a form submission: assemble already done in the form; here we own the
+  // fetch lifecycle. On failure we keep the prior result visible but surface the
+  // error, so a bad query doesn't wipe out a good previous answer.
+  const handleRecommend = useCallback(async (body) => {
+    setSubmitting(true);
+    setRecError(null);
+    try {
+      const res = await postRecommend(body);
+      setResult(res);
+    } catch (e) {
+      setRecError(e?.message || "Recommendation request failed.");
+    } finally {
+      setSubmitting(false);
+    }
+  }, []);
 
   // Refetch health + stats. Isolated with allSettled so one failing endpoint
   // never blanks the other, and a total outage flips `reachable` without throwing.
@@ -144,15 +169,16 @@ export default function App() {
           </div>
         </section>
 
-        {/* Placeholder for the recommend form + suggestion cards (C16). */}
-        <section className="card placeholder">
-          <h2 className="placeholder__title">Recommend UI</h2>
-          <p className="placeholder__text">
-            Query form and ranked suggestion cards arrive in C16; feedback and
-            runtime controls in C17. This shell verifies the dashboard → nginx →
-            API wiring via <code>/api/health</code> and <code>/api/stats</code>.
-          </p>
-        </section>
+        {/* Recommend UI (C16): incident form (left) + ranked suggestions (right).
+            Collapses to a single column on narrow viewports. */}
+        <div className="recommend-grid">
+          <RecommendForm onSubmit={handleRecommend} submitting={submitting} />
+          <SuggestionList
+            result={result}
+            submitting={submitting}
+            error={recError}
+          />
+        </div>
       </main>
     </div>
   );
