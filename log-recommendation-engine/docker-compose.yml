@@ -163,18 +163,19 @@ services:
         condition: service_healthy
     command: ["python", "-m", "scripts.verify_e2e"]
 
-  # Load / performance harness (C19+). Reuses the tester image (Dockerfile.test ships
+  # Load / performance harness (C19 + C20). Reuses the tester image (Dockerfile.test ships
   # src/ + scripts/ + httpx) and runs the perf/load scripts against the LIVE api over
   # the compose network — black-box, HTTP only. C19 adds the recommend-path latency gate
-  # (scripts/perf_test.py, hard-gating p95); C20 extends it with a throughput/memory
-  # load test on the SAME service. The `command` here is only a generic default; the
-  # actual script is chosen by the caller (`make load` runs `python -m scripts.perf_test`
-  # in this profile), so C20 can add its script WITHOUT changing this service.
+  # (scripts/perf_test.py, hard-gating p95); C20 adds the concurrent throughput + error-rate
+  # gate (scripts/load_test.py) on the SAME service. The `command` here is only a generic
+  # default; the actual script(s) are chosen by the caller — `make load` runs
+  # `sh -lc "python -m scripts.perf_test && python -m scripts.load_test"` in this profile —
+  # so both gates run in one throwaway container without changing this service.
   # Profile-gated so it never starts on a bare `docker compose up`. Run via `make load`.
   #
   # EPSILON_EXPLORE=0 mirrors the test/e2e profiles: it only affects this container's own
-  # process (which imports nothing that ranks) and documents intent — the perf script
-  # additionally PUTs /config epsilon_explore=0 against the LIVE api so timing reflects the
+  # process (which imports nothing that ranks) and documents intent — both scripts
+  # additionally PUT /config epsilon_explore=0 against the LIVE api so timing reflects the
   # deterministic (non-exploring) compute path.
   loadtest:
     build:
@@ -183,11 +184,19 @@ services:
     profiles: [loadtest]
     environment:
       - PERF_BASE_URL=http://api:8000
+      - LOAD_BASE_URL=http://api:8000
       - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
       - REDIS_URL=redis://redis:6379/0
       - EPSILON_EXPLORE=0
-      # Hard gate (stable across hosts; generous so it is not flaky on a loaded host).
+      # C19 hard gate: single-request recommend p95 ceiling (ms). Generous so it is not
+      # flaky on a loaded host; overridable from the host env.
       - PERF_MAX_RECOMMEND_MS=${PERF_MAX_RECOMMEND_MS:-2000}
+      # C20 hard gates: concurrent throughput floor (RPS) and max allowed error rate.
+      # RPS floor is conservative (single uvicorn worker + CPU-bound embedding bounds it);
+      # error rate defaults to 0.0 (no request may fail). MAX_RSS_MB is reported-only.
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-15}
+      - LOAD_MAX_ERROR_RATE=${LOAD_MAX_ERROR_RATE:-0.0}
+      - LOAD_MAX_RSS_MB=${LOAD_MAX_RSS_MB:-1024}
     depends_on:
       postgres:
         condition: service_healthy

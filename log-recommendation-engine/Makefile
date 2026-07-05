@@ -17,7 +17,7 @@ help:
 	@echo "  test-unit  - unit tests only in Docker"
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - full end-to-end verifier in Docker (from C18)"
-	@echo "  load       - recommend-path latency gate in Docker (C19; +throughput/memory in C20)"
+	@echo "  load       - perf (C19 p95 latency) + concurrent load (C20 RPS/error-rate) gates in Docker"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -110,24 +110,30 @@ test-int:
 e2e:
 	docker compose up -d --build --wait postgres redis api
 	@status=0; \
-	docker compose --profile e2e run --rm e2e || status=$$?; \
+	docker compose --profile e2e run --rm --build e2e || status=$$?; \
 	docker compose down; \
 	exit $$status
 
-# Recommend-path latency gate (C19) in Docker against the LIVE api.
+# Recommend-path perf + concurrent load gates (C19 + C20) in Docker against the LIVE api.
 #
 # Builds + brings up postgres + redis + api and WAITS for them to be healthy
 # (`--wait`), then runs the profile-gated `loadtest` service (Dockerfile.test image)
-# which executes scripts/perf_test.py — seeding a corpus over HTTP (if small), warming
-# up (discarding the MiniLM model-load call), then timing PERF_SAMPLES varied
-# POST /recommend calls and HARD-GATING the p95 under PERF_MAX_RECOMMEND_MS. The
-# script's exit code is captured; the stack is torn down regardless; and `make load`
-# exits with that code so a blown p95 gate fails the target (exit-code propagation).
-# (C20 extends this to also run scripts/load_test.py for throughput + memory.)
+# for BOTH scripts, in one throwaway container:
+#   1. scripts/perf_test  (C19) — seed (if small), warm up (discard the MiniLM load),
+#      time PERF_SAMPLES *serial* varied POST /recommend calls, HARD-GATE p95 under
+#      PERF_MAX_RECOMMEND_MS  (single-request latency tail).
+#   2. scripts/load_test  (C20) — drive LOAD_REQUESTS *concurrent* POST /recommend
+#      (semaphore LOAD_CONCURRENCY), HARD-GATE throughput (RPS >= LOAD_MIN_RPS) and
+#      error_rate (<= LOAD_MAX_ERROR_RATE); latency percentiles + a best-effort memory
+#      figure are reported (memory NEVER gates).
+# They run as `perf_test && load_test`, so the load test only runs if perf passed AND a
+# failure in EITHER script makes the `sh -lc` exit non-zero. That status is captured; the
+# stack is torn down regardless; and `make load` exits with it — so a blown p95 (C19) OR a
+# blown throughput/error-rate gate (C20) fails the target (exit-code propagation).
 load:
 	docker compose up -d --build --wait postgres redis api
 	@status=0; \
-	docker compose --profile loadtest run --rm loadtest python -m scripts.perf_test || status=$$?; \
+	docker compose --profile loadtest run --rm --build loadtest sh -lc "python -m scripts.perf_test && python -m scripts.load_test" || status=$$?; \
 	docker compose down; \
 	exit $$status
 
