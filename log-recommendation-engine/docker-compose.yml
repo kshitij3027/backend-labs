@@ -163,6 +163,40 @@ services:
         condition: service_healthy
     command: ["python", "-m", "scripts.verify_e2e"]
 
+  # Load / performance harness (C19+). Reuses the tester image (Dockerfile.test ships
+  # src/ + scripts/ + httpx) and runs the perf/load scripts against the LIVE api over
+  # the compose network — black-box, HTTP only. C19 adds the recommend-path latency gate
+  # (scripts/perf_test.py, hard-gating p95); C20 extends it with a throughput/memory
+  # load test on the SAME service. The `command` here is only a generic default; the
+  # actual script is chosen by the caller (`make load` runs `python -m scripts.perf_test`
+  # in this profile), so C20 can add its script WITHOUT changing this service.
+  # Profile-gated so it never starts on a bare `docker compose up`. Run via `make load`.
+  #
+  # EPSILON_EXPLORE=0 mirrors the test/e2e profiles: it only affects this container's own
+  # process (which imports nothing that ranks) and documents intent — the perf script
+  # additionally PUTs /config epsilon_explore=0 against the LIVE api so timing reflects the
+  # deterministic (non-exploring) compute path.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - PERF_BASE_URL=http://api:8000
+      - DATABASE_URL=postgresql+psycopg2://recommend:recommend@postgres:5432/recommend
+      - REDIS_URL=redis://redis:6379/0
+      - EPSILON_EXPLORE=0
+      # Hard gate (stable across hosts; generous so it is not flaky on a loaded host).
+      - PERF_MAX_RECOMMEND_MS=${PERF_MAX_RECOMMEND_MS:-2000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.perf_test"]
+
 # Named volumes keep the Postgres data + generated datasets across container restarts.
 volumes:
   pgdata:

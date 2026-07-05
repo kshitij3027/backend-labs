@@ -17,7 +17,7 @@ help:
 	@echo "  test-unit  - unit tests only in Docker"
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - full end-to-end verifier in Docker (from C18)"
-	@echo "  load       - latency + throughput + memory gates in Docker (from C19/C20)"
+	@echo "  load       - recommend-path latency gate in Docker (C19; +throughput/memory in C20)"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -114,9 +114,22 @@ e2e:
 	docker compose down; \
 	exit $$status
 
-# Latency + throughput + memory gates (arrive in C19/C20).
+# Recommend-path latency gate (C19) in Docker against the LIVE api.
+#
+# Builds + brings up postgres + redis + api and WAITS for them to be healthy
+# (`--wait`), then runs the profile-gated `loadtest` service (Dockerfile.test image)
+# which executes scripts/perf_test.py — seeding a corpus over HTTP (if small), warming
+# up (discarding the MiniLM model-load call), then timing PERF_SAMPLES varied
+# POST /recommend calls and HARD-GATING the p95 under PERF_MAX_RECOMMEND_MS. The
+# script's exit code is captured; the stack is torn down regardless; and `make load`
+# exits with that code so a blown p95 gate fails the target (exit-code propagation).
+# (C20 extends this to also run scripts/load_test.py for throughput + memory.)
 load:
-	@echo "load: available from commit C19"
+	docker compose up -d --build --wait postgres redis api
+	@status=0; \
+	docker compose --profile loadtest run --rm loadtest python -m scripts.perf_test || status=$$?; \
+	docker compose down; \
+	exit $$status
 
 clean:
 	docker compose down -v --remove-orphans
