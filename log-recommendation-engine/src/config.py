@@ -71,6 +71,12 @@ class Settings(BaseSettings):
     embedding_dim: int = 384
     embedding_cache_ttl_sec: int = 86400  # Redis embedding-cache TTL (24h)
     recommendation_cache_ttl_sec: int = 3600  # Redis /recommend response cache TTL (1h)
+    # Load the embedding model in a background thread on startup (C21) so the ~90 MB
+    # load happens once off the request path instead of lazily on the first
+    # /recommend. Non-blocking (a daemon thread), so uvicorn still binds immediately
+    # and /health stays responsive. Set WARMUP_ON_STARTUP=false to disable (tests do
+    # this to keep startup instant/deterministic).
+    warmup_on_startup: bool = True
 
     # --- Retrieval / ranking ---
     top_k: int = 5

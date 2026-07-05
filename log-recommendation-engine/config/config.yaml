@@ -21,6 +21,7 @@ embedding_model: all-MiniLM-L6-v2  # sentence-transformers model baked into the 
 embedding_dim: 384                 # output dimensionality of all-MiniLM-L6-v2
 embedding_cache_ttl_sec: 86400     # Redis embedding-cache TTL (seconds; 24h)
 recommendation_cache_ttl_sec: 3600 # Redis /recommend response cache TTL (seconds; 1h)
+warmup_on_startup: true            # load the model in a bg thread on boot (env: WARMUP_ON_STARTUP)
 
 # --- Retrieval / ranking ---
 top_k: 5                # number of ranked suggestions returned

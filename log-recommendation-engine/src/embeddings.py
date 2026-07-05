@@ -176,6 +176,32 @@ def embed_query(
     return embed_text(build_incident_text(title, description, tags))
 
 
+def warmup() -> bool:
+    """Eagerly load the model singleton and run one tiny encode; never raises.
+
+    Called from a background daemon thread at app startup (see
+    :func:`src.api.create_app`) so the ~90 MB model load happens *once, off the
+    request path* rather than lazily inside the first ``/recommend`` (cold-start
+    latency spike). It simply forces :func:`get_model` to populate its ``lru_cache``
+    and encodes a throwaway string to page the weights in.
+
+    Returns ``True`` on success and ``False`` on any failure (the model cache is
+    baked into the image, so a failure here is unexpected — a missing/corrupt cache
+    or an OOM — and is logged, never propagated). Because it fills the same
+    ``lru_cache`` that :func:`src.routers.system._embedding_model_loaded` inspects,
+    ``/health.components.embedding_model`` flips to ``True`` once this completes,
+    with no request having been served.
+    """
+    try:
+        get_model()  # populate the lru_cache singleton (heavy load happens here)
+        embed_text("warmup")  # tiny encode to page the weights in
+        logger.info("embedding model warmup complete")
+        return True
+    except Exception as exc:  # noqa: BLE001 - warmup must never crash startup
+        logger.warning("embedding model warmup failed: %s", exc)
+        return False
+
+
 def embed_text_cached(text: str) -> np.ndarray:
     """Return the embedding for ``text``, using the Redis cache as a read-through.
 
@@ -203,6 +229,7 @@ def embed_text_cached(text: str) -> np.ndarray:
 
 __all__ = [
     "get_model",
+    "warmup",
     "build_incident_text",
     "embed_texts",
     "embed_text",

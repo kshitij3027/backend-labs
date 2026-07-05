@@ -121,6 +121,10 @@ services:
       # Deterministic tests: disable stochastic ε-exploration in the test
       # profile (exploration is unit-tested directly by injecting epsilon/rng).
       - EPSILON_EXPLORE=0
+      # Don't spawn the startup model-warmup thread during tests — it would race
+      # the health test's embedding_model false→true assertion. Warmup is verified
+      # separately (embeddings.warmup() + the startup handler) in its own tests.
+      - WARMUP_ON_STARTUP=false
     depends_on:
       postgres:
         condition: service_healthy

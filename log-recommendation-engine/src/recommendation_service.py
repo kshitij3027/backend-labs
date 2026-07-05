@@ -39,6 +39,7 @@ import hashlib
 import json
 import time
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from src import embeddings, feedback, observability, runtime_config
@@ -55,6 +56,21 @@ from src.schemas import (
 )
 
 logger = observability.get_logger(__name__)
+
+
+class RecommendationUnavailableError(Exception):
+    """The recommendation pipeline could not reach its durable backing store.
+
+    Raised when a database / pgvector failure (a :class:`sqlalchemy.exc.SQLAlchemyError`
+    such as a lost connection, the ``vector`` extension being absent, or a query
+    error) breaks the retrieval or persistence step. The router maps this to a clean
+    **HTTP 503** ("recommendation temporarily unavailable") instead of letting the raw
+    driver error surface as an unhandled 500.
+
+    This is deliberately distinct from the **empty-corpus / no-candidate** case, which
+    is *not* an error: that returns a normal ``200`` with ``count=0``. A 503 means the
+    store is unreachable; ``count=0`` means the store is fine but has nothing to match.
+    """
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +274,17 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
 
     An empty corpus / no candidates yields an empty (``count=0``) response — still
     persisted and cached — rather than an error.
+
+    Graceful degradation (C21)
+    --------------------------
+    * **Redis down** — every cache op is fault-tolerant (read -> miss, epoch -> ``0``,
+      write -> no-op), so the pipeline still embeds, retrieves, ranks, persists and
+      returns ``cached=False``. Nothing here assumes Redis is up.
+    * **Database / pgvector down** — a :class:`~sqlalchemy.exc.SQLAlchemyError` from the
+      retrieval or persistence step is caught, the (broken) session is rolled back, and
+      a :class:`RecommendationUnavailableError` is raised for the router to map to a
+      clean **503** — never an unhandled 500. The no-candidate case is *not* caught
+      (it does not raise), so it stays a normal ``200`` with ``count=0``.
     """
     # Time the whole pipeline (both the cache-hit and fresh-compute paths) and record
     # it once on exit via the ``finally``. ``RECOMMEND_REQUESTS_TOTAL`` counts every
@@ -267,6 +294,19 @@ def recommend(session: Session, req: RecommendRequest) -> RecommendResponse:
     _t0 = time.perf_counter()
     try:
         return _recommend_inner(session, req)
+    except SQLAlchemyError as exc:
+        # A DB outage / pgvector failure broke retrieval or persistence. Roll back so
+        # the request-scoped session is not left in a failed-transaction state (the
+        # get_db dependency only closes it), then surface a domain error the router
+        # turns into a clean 503 instead of the raw driver error escaping as a 500.
+        try:
+            session.rollback()
+        except Exception:  # noqa: BLE001 - best-effort; rollback may also fail if the
+            pass          # connection is gone. We still translate to a 503 below.
+        logger.warning("recommendation unavailable (database/pgvector error): %s", exc)
+        raise RecommendationUnavailableError(
+            "recommendation temporarily unavailable"
+        ) from exc
     finally:
         observability.record_recommend(time.perf_counter() - _t0)
 
@@ -455,4 +495,4 @@ def _response_from_cache(
     return response
 
 
-__all__ = ["recommend", "compute_query_hash"]
+__all__ = ["recommend", "compute_query_hash", "RecommendationUnavailableError"]

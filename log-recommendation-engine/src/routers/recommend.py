@@ -14,7 +14,7 @@ empty (``count=0``) response, not an error.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from src import observability, recommendation_service
@@ -50,5 +50,20 @@ def recommend(
     query returns quickly with ``cached=True``. Invalid input (blank
     title/description, an unknown ``severity``, ``top_k`` outside 1–50) is rejected
     at the schema boundary with HTTP 422.
+
+    Degradation (C21): a database / pgvector outage surfaces as a clean **503**
+    ("recommendation temporarily unavailable"), not an unhandled 500. An *empty
+    corpus* (no matches) is **not** an error — it returns a normal 200 with
+    ``count=0`` and ``suggestions=[]``. Redis being down simply bypasses the cache
+    (the response comes back ``cached=false``).
     """
-    return recommendation_service.recommend(db, body)
+    try:
+        return recommendation_service.recommend(db, body)
+    except recommendation_service.RecommendationUnavailableError as exc:
+        # DB / pgvector unreachable — degrade to a 503 with a helpful message rather
+        # than leaking the raw SQLAlchemy error as a 500. The service already rolled
+        # the session back before raising.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="recommendation temporarily unavailable",
+        ) from exc
