@@ -22,7 +22,7 @@ Conventions
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -72,6 +72,66 @@ class IncidentCreate(BaseModel):
     @classmethod
     def _clean_tags(cls, v: list[str]) -> list[str]:
         """Trim tags and drop blanks, preserving order (deduplicated)."""
+        seen: set[str] = set()
+        cleaned: list[str] = []
+        for tag in v:
+            t = tag.strip()
+            if t and t not in seen:
+                seen.add(t)
+                cleaned.append(t)
+        return cleaned
+
+
+class IncidentUpdate(BaseModel):
+    """Request body for ``PUT /incidents/{id}`` — a *partial* update of one incident.
+
+    Every field is optional; only the ones supplied are applied (a merge over the
+    stored row). A supplied free-text field (``title`` / ``description`` / ``service``
+    / ``resolution``) must be non-blank (whitespace-only is rejected with 422), and a
+    supplied ``severity`` must be one of :data:`SEVERITIES`. ``tags``, when supplied,
+    is trimmed / de-blanked / de-duplicated (an explicit ``[]`` clears the tags).
+
+    Because ``None`` means "leave unchanged", the router distinguishes a supplied field
+    from an omitted one via ``model_dump(exclude_unset=True)``. Re-embedding on the
+    ``PUT`` path is triggered only when one of the *text* fields that feed
+    :func:`src.embeddings.build_incident_text` — ``title`` / ``description`` / ``tags``
+    — is among the supplied fields; a pure ``service`` / ``severity`` / ``resolution``
+    edit does not change the embedded document text and so skips re-embedding.
+
+    Extra / unknown keys are **forbidden** (``extra="forbid"``) so a typo'd field is a
+    422 at the schema boundary rather than a silently-ignored no-op.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, min_length=1, max_length=256)
+    description: Optional[str] = Field(default=None, min_length=1)
+    service: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    severity: Optional[Severity] = None
+    tags: Optional[list[str]] = None
+    resolution: Optional[str] = Field(default=None, min_length=1)
+
+    @field_validator("title", "description", "service", "resolution")
+    @classmethod
+    def _not_blank(cls, v: Optional[str]) -> Optional[str]:
+        """Reject whitespace-only text for a *supplied* free-text field (None passes)."""
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
+
+    @field_validator("tags")
+    @classmethod
+    def _clean_tags(cls, v: Optional[list[str]]) -> Optional[list[str]]:
+        """Trim tags and drop blanks (preserving order, de-duplicated); None passes.
+
+        An explicit empty list is preserved (it clears the incident's tags); ``None``
+        means "leave the tags unchanged".
+        """
+        if v is None:
+            return None
         seen: set[str] = set()
         cleaned: list[str] = []
         for tag in v:

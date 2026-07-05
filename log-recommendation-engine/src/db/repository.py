@@ -252,19 +252,80 @@ def set_incident_embedding(
     return incident
 
 
+_INCIDENT_MUTABLE_FIELDS = frozenset(
+    {"title", "description", "service", "severity", "tags", "resolution"}
+)
+
+
+def update_incident(
+    session: Session,
+    incident_id: int,
+    *,
+    fields: Mapping[str, Any],
+    commit: bool = False,
+) -> Incident | None:
+    """Apply the given ``fields`` to an incident and return it (or ``None``).
+
+    ``fields`` is a *partial* mapping (from ``IncidentUpdate.model_dump(exclude_unset=
+    True)``): only the keys present are written, so an omitted field is left unchanged.
+    Only the known mutable columns
+    (:data:`_INCIDENT_MUTABLE_FIELDS` — ``title`` / ``description`` / ``service`` /
+    ``severity`` / ``tags`` / ``resolution``) are applied; any other key is ignored
+    (the schema layer already forbids unknown fields, this is defence in depth). The
+    ``embedding`` is **not** touched here — the caller re-embeds separately when a text
+    field changed (see the ``PUT`` route), keeping this a pure column write.
+
+    Returns ``None`` if no incident with ``incident_id`` exists. Follows the repository
+    transaction convention: flushes by default, commits + refreshes when ``commit=True``.
+    """
+    incident = session.get(Incident, incident_id)
+    if incident is None:
+        return None
+    for key, value in fields.items():
+        if key not in _INCIDENT_MUTABLE_FIELDS:
+            continue
+        if key == "tags":
+            setattr(incident, key, list(value) if value is not None else [])
+        else:
+            setattr(incident, key, value)
+    if commit:
+        session.commit()
+        session.refresh(incident)
+    else:
+        session.flush()
+    return incident
+
+
 def delete_incident(
     session: Session,
     incident_id: int,
     *,
     commit: bool = False,
 ) -> bool:
-    """Delete the incident with ``incident_id``.
+    """Delete the incident with ``incident_id``, cleaning up its dependent rows first.
 
-    Returns ``True`` if a row was deleted, ``False`` if none existed.
+    ``Feedback`` and ``SuggestionScore`` both carry a ``incident_id`` foreign key to
+    this row, so they are deleted **first** (in the same transaction) to satisfy the FK
+    constraints before the incident itself is removed — otherwise Postgres would reject
+    the incident delete. (``Recommendation`` rows are intentionally left: they reference
+    incidents only inside their opaque ``query_json`` payload, not via a FK, so they are
+    a historical log that need not be purged and cannot break the delete.)
+
+    Returns ``True`` if the incident existed and was deleted, ``False`` if none existed
+    (in which case no dependent rows are touched). Follows the repository transaction
+    convention: flushes by default, commits when ``commit=True`` — so the dependent-row
+    deletes and the incident delete land atomically.
     """
     incident = session.get(Incident, incident_id)
     if incident is None:
         return False
+    # Remove FK-dependent rows first (bulk deletes, no ORM instances needed).
+    session.query(Feedback).filter(
+        Feedback.incident_id == incident_id
+    ).delete(synchronize_session=False)
+    session.query(SuggestionScore).filter(
+        SuggestionScore.incident_id == incident_id
+    ).delete(synchronize_session=False)
     session.delete(incident)
     if commit:
         session.commit()

@@ -72,6 +72,15 @@ _FB_EPOCH_KEY_PREFIX = "fbver:"
 # thresholds — a live retune with no restart. Fault tolerant: reads default to 0.
 _CONFIG_VERSION_KEY = "cfgver"
 
+# Global corpus epoch counter (C22). A single monotonically increasing integer, bumped
+# on every corpus mutation (POST create / PUT update / DELETE), that is folded into the
+# recommendation cache key alongside the config version and feedback epoch. Because the
+# cached recommendations reference the corpus by content, any create/update/delete could
+# change what a query should return; bumping this epoch changes *every* cache key at once
+# so the next /recommend MISSES and recomputes against the mutated corpus (stale entries
+# expire by TTL). Fault tolerant: reads default to 0, bumps degrade to a no-op.
+_CORPUS_EPOCH_KEY = "corpusver"
+
 # Redis hash holding the live runtime-config overrides (C12). A single shared hash so
 # every replica reads the same tuned values; the recommendation service overlays these
 # over the static settings via :mod:`src.runtime_config`. Fault tolerant on read/write.
@@ -384,6 +393,58 @@ def bump_config_version() -> int:
         return 0
 
 
+# --------------------------------------------------------------------------- #
+# Corpus epoch (C22) — global cache-invalidation counter for corpus mutations
+# --------------------------------------------------------------------------- #
+def get_corpus_epoch() -> int:
+    """Return the current global corpus epoch (``0`` if unset / unavailable).
+
+    Read-through for the recommendation cache key: the epoch is folded into the key so
+    a corpus mutation (create / update / delete, each of which bumps it) yields fresh
+    keys and thus cache MISSes, making the change visible on the next ``/recommend``
+    without a restart. Fault tolerant — Redis down, a missing key, or a non-integer
+    value all degrade to ``0`` (treat as "no mutations yet, serve/populate the base
+    cache"), never raising.
+    """
+    client = get_redis()
+    if client is None:
+        return 0
+    try:
+        raw = client.get(_CORPUS_EPOCH_KEY)
+    except Exception as exc:  # noqa: BLE001 - read failures degrade to epoch 0
+        logger.warning("Redis corpus-epoch read failed: %s", exc)
+        return 0
+    if raw is None:
+        return 0
+    try:
+        # Binary-safe client -> value is bytes; int() accepts a numeric byte string.
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning("malformed corpus epoch (%r): %s", raw, exc)
+        return 0
+
+
+def bump_corpus_epoch() -> None:
+    """Increment the global corpus epoch (INCR), invalidating cached recommendations.
+
+    Called after any corpus mutation is committed (``POST /incidents`` create,
+    ``PUT /incidents/{id}`` update, ``DELETE /incidents/{id}``): the INCR changes the
+    value :func:`get_corpus_epoch` returns, so the next ``/recommend`` builds a
+    different cache key and MISSes (recomputing against the mutated corpus). ``INCR`` on
+    a missing key creates it at ``1``, so no initialisation is needed. No-ops (logging a
+    warning) if Redis is unavailable or the write fails — a failed bump only means the
+    stale recommendation cache lingers until its TTL, which must never break the corpus
+    mutation itself (the durable DB write is what matters).
+    """
+    client = get_redis()
+    if client is None:
+        return
+    try:
+        client.incr(_CORPUS_EPOCH_KEY)
+    except Exception as exc:  # noqa: BLE001 - Redis down must not break the mutation
+        logger.warning("Redis corpus-epoch bump failed: %s", exc)
+
+
 def get_runtime_config() -> "dict[str, str]":
     """Return the shared runtime-config overrides hash as ``{field: raw_str}``.
 
@@ -463,6 +524,8 @@ __all__ = [
     "bump_feedback_epoch",
     "get_config_version",
     "bump_config_version",
+    "get_corpus_epoch",
+    "bump_corpus_epoch",
     "get_runtime_config",
     "set_runtime_config",
     "ping",

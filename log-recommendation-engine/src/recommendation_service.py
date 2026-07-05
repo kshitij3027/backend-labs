@@ -131,14 +131,24 @@ def compute_query_hash(req: RecommendRequest) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def _cache_key(query_hash: str, feedback_epoch: int, config_version: int) -> str:
-    """Fold the config version + pattern feedback epoch into the recommendation cache key.
+def _cache_key(
+    query_hash: str,
+    feedback_epoch: int,
+    config_version: int,
+    corpus_epoch: int,
+) -> str:
+    """Fold corpus epoch + config version + pattern feedback epoch into the cache key.
 
-    Returns ``"<config_version>:<feedback_epoch>:<query_hash>"``. The Redis helpers
-    prefix ``"rec:"`` onto this, so the stored key is
-    ``rec:<config_version>:<feedback_epoch>:<query_hash>``. Two independent
-    invalidation axes are folded in:
+    Returns ``"<corpus_epoch>:<config_version>:<feedback_epoch>:<query_hash>"``. The
+    Redis helpers prefix ``"rec:"`` onto this, so the stored key is
+    ``rec:<corpus_epoch>:<config_version>:<feedback_epoch>:<query_hash>``. Three
+    independent invalidation axes are folded in:
 
+    * **corpus_epoch** (C22) — bumped by every corpus mutation (``POST`` create,
+      ``PUT`` update, ``DELETE``); because a cached recommendation references the corpus
+      by content, any add/edit/remove could change what a query should return, so this
+      changes *every* key at once and the next identical query MISSES and recomputes
+      against the mutated corpus.
     * **config_version** (C12) — bumped by every ``PUT /config``; a retune of the
       weights / epsilon / diversity / thresholds / top_k therefore changes *every*
       key at once, so the next identical query MISSES and recomputes under the new
@@ -147,10 +157,10 @@ def _cache_key(query_hash: str, feedback_epoch: int, config_version: int) -> str
       changes the key for just that pattern, forcing a recompute with the fresh
       feedback.
 
-    Either counter being ``0`` (no change yet, or Redis unavailable) simply yields the
+    Any counter being ``0`` (no change yet, or Redis unavailable) simply yields the
     base key, stable across repeated queries; stranded old entries expire by TTL.
     """
-    return f"{config_version}:{feedback_epoch}:{query_hash}"
+    return f"{corpus_epoch}:{config_version}:{feedback_epoch}:{query_hash}"
 
 
 # --------------------------------------------------------------------------- #
@@ -328,16 +338,24 @@ def _recommend_inner(session: Session, req: RecommendRequest) -> RecommendRespon
     effective = runtime_config.get_effective_config()
     config_version = runtime_config.get_config_version()
 
+    # Global corpus epoch (C22): bumped by any incident create/update/delete. Folded
+    # into the cache key below so a corpus mutation invalidates every cached
+    # recommendation (fault tolerant: degrades to 0 when Redis is down).
+    corpus_epoch = redis_client.get_corpus_epoch()
+
     # The query's feedback bucket — same normalisation the write side uses in
     # src.feedback so the read pattern and the vote's write pattern are identical.
     pattern = feedback.query_pattern(req.service, req.severity, req.tags)
 
     # 1. Cache check (best-effort; a down cache just falls through to recompute).
-    #    The cache key embeds the global config version *and* the pattern's feedback
-    #    epoch, so either a PUT /config or a vote makes an identical query MISS here
-    #    (recomputing under the fresh config / feedback).
+    #    The cache key embeds the global corpus epoch, the global config version *and*
+    #    the pattern's feedback epoch, so a corpus mutation, a PUT /config or a vote all
+    #    make an identical query MISS here (recomputing under the fresh corpus / config /
+    #    feedback).
     feedback_epoch = redis_client.get_feedback_epoch(pattern)
-    cache_key = _cache_key(query_hash, feedback_epoch, config_version)
+    cache_key = _cache_key(
+        query_hash, feedback_epoch, config_version, corpus_epoch
+    )
     cached = redis_client.cache_get_recommendation(cache_key)
     if cached is not None:
         response = _response_from_cache(cached, req)
@@ -348,6 +366,7 @@ def _recommend_inner(session: Session, req: RecommendRequest) -> RecommendRespon
                 query_hash=query_hash,
                 feedback_epoch=feedback_epoch,
                 config_version=config_version,
+                corpus_epoch=corpus_epoch,
             )
             return response
         # A malformed/incompatible cache entry falls through to a fresh compute.
@@ -444,6 +463,7 @@ def _recommend_inner(session: Session, req: RecommendRequest) -> RecommendRespon
         query_hash=query_hash,
         feedback_epoch=feedback_epoch,
         config_version=config_version,
+        corpus_epoch=corpus_epoch,
         candidates=len(candidates),
         suggestions=len(suggestions),
         top_semantic=suggestions[0].semantic if suggestions else None,
