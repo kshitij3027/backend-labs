@@ -495,10 +495,17 @@ class HealthResponse(BaseModel):
     process is alive (so the container healthcheck stays green); a degraded stack is
     reported in this body rather than via a non-2xx status. ``corpus_size`` is a
     best-effort incident count (``0`` when the database is unreachable).
+
+    ``instance`` is the serving process's hostname (``socket.gethostname()``). Under
+    ``docker compose --scale api=N`` each replica runs in its own container with a
+    unique hostname/container id, so repeated ``/api/health`` calls through the
+    dashboard's nginx return **different** ``instance`` values across replicas — making
+    the per-request Docker-DNS round-robin observable (see docker-compose.scale.yml).
     """
 
     status: Literal["ok", "degraded"]
     service: str
     version: str
+    instance: str
     components: ComponentsHealth
     corpus_size: int = 0

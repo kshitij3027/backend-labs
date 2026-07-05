@@ -68,9 +68,24 @@ dashboard:
 	docker compose up -d --build dashboard
 	@echo "Dashboard: http://localhost:$${DASHBOARD_PORT:-8080}"
 
-# Horizontal API scaling behind the dashboard's nginx (arrives in C23).
+# Horizontal API scaling behind the dashboard's nginx (C23).
+#
+# Layers docker-compose.scale.yml on top of the base file: the override empties the
+# api's host-port publishing (`ports: !reset []`) so N>1 replicas don't collide on the
+# single host port. `--scale api=$(N)` starts N api containers (works because api has NO
+# container_name); `--wait` blocks until postgres, redis, api and dashboard are all
+# healthy. Clients reach the load-balanced api ONLY through the dashboard's nginx, which
+# re-resolves `api` per request via Docker DNS and round-robins across the replicas
+# (frontend/nginx.conf). Override the replica count with `make scale N=5`.
+#
+# NOTE: :8080 (the default DASHBOARD_PORT) may already be taken on the host — run with
+# an override, e.g. `DASHBOARD_PORT=8081 make scale N=3`, then hit :8081/api/health.
+N ?= 3
 scale:
-	@echo "scale: available from commit C23"
+	docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build --wait \
+		--scale api=$(N) postgres redis api dashboard
+	@echo "Load-balanced API via dashboard: http://localhost:$${DASHBOARD_PORT:-8080}/api/health"
+	@echo "Scaled api replicas: $(N)"
 
 # Rebuild the tester image first so a stale image can never mask a code change, then
 # run the suite in a throwaway container. Exit status propagates so a failed test

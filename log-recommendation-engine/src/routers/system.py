@@ -26,6 +26,7 @@ dependency failing to connect.
 
 from __future__ import annotations
 
+import socket
 from typing import Any
 
 from fastapi import APIRouter, Depends, status
@@ -128,6 +129,10 @@ def health() -> HealthResponse:
     * ``embedding_model`` — the model singleton is already loaded (cheap ``lru_cache``
       inspection; never forces a load — see :func:`_embedding_model_loaded`).
     * ``corpus_size`` — best-effort incident count (``0`` when the DB is down).
+    * ``instance`` — the serving process's hostname (``socket.gethostname()``). Under
+      ``--scale api=N`` each replica has a unique container hostname, so repeated
+      ``/api/health`` calls through the dashboard's nginx surface different values —
+      making the Docker-DNS round-robin observable (see docker-compose.scale.yml).
 
     ``status`` is ``"ok"`` only when the **required** dependencies (database, redis) are
     both up, else ``"degraded"``. The endpoint **always returns HTTP 200** while the
@@ -173,6 +178,9 @@ def health() -> HealthResponse:
         status=overall,
         service=_SERVICE_NAME,
         version=_SERVICE_VERSION,
+        # Serving replica's hostname/container id — distinct per scaled `api` replica,
+        # so round-robin through the dashboard's nginx is observable in the response.
+        instance=socket.gethostname(),
         components=ComponentsHealth(
             database=database_ok,
             vector_extension=vector_ok,
