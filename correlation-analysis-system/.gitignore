@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Env
+.env
+.env.local
+
+# Node / React dashboard
+node_modules/
+dist/
+build/
+.npm/
+
+# Docker
+*.pid
+
+# Redis
+dump.rdb
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Planning
+plan.md
+project_requirements.md

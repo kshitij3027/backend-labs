@@ -1,0 +1,44 @@
+# Keep junk and bulky artifacts out of the build context / image. The Dockerfile
+# copies only src/ (+ requirements.txt) and Dockerfile.test additionally copies
+# tests/ + pytest.ini, so most of this is belt-and-braces.
+
+# VCS / planning docs
+.git
+.gitignore
+*.md
+README.md
+plan.md
+project_requirements.md
+
+# Python caches / build artifacts
+__pycache__
+*.py[cod]
+*.pyc
+*$py.class
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+build
+dist
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Secrets / env
+.env
+
+# Frontend (added in C9; node_modules must never enter the backend build context)
+frontend/node_modules
+frontend/dist
+node_modules
+
+# OS / logs
+.DS_Store
+*.log

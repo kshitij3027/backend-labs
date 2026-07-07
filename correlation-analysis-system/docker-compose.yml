@@ -1,0 +1,74 @@
+# Correlation Analysis System — service topology (Commit C1).
+#
+# `backend` is the runnable production service: a single uvicorn/FastAPI process on
+# :8000 that (from C3) also hosts the log-generation + correlation-detection pipeline
+# as an asyncio task. It depends on `redis` (event mirror, pattern baselines, alert
+# pub/sub), which exposes a healthcheck so `backend` only starts once it is ready.
+#
+# The profile-gated `test` service runs the pytest suite and never starts on a bare
+# `docker compose up`. The frontend (C9) and e2e/loadtest (C8) services are added in
+# later commits. Run via `make up` / `make test`.
+
+services:
+  # Redis — shared state (recent events/correlations, learned patterns, alerts).
+  # Persistence is disabled so it behaves as an ephemeral cache. The host port is
+  # published so the test agent can probe keys with a host-side redis-cli.
+  redis:
+    image: redis:7-alpine
+    container_name: correlation-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Live production API — built from the production Dockerfile and exposed on the
+  # host. Reaches Redis over the compose network by service name (not localhost).
+  # No container_name (sibling convention: leaves compose free to name/scale it).
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free, so the app is healthy as soon as uvicorn binds;
+      # 20s is a safe margin for image start-up.
+      start_period: 20s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
+  # code + requirements as the backend, plus the tests) and runs pytest. Profile-gated
+  # so it never starts on a bare `docker compose up`. Run via `make test`.
+  # Integration tests (from C3) reach Redis by service name.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      # Deterministic tests: never start the background pipeline in the test
+      # process — tests drive ticks/requests explicitly.
+      - PIPELINE_ENABLED=false
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["pytest", "-q"]
