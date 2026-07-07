@@ -1,6 +1,6 @@
 """Unit tests for CorrelationEngine initialization (spec area: engine initialization).
 
-A freshly built engine must register exactly the C4+C5 detectors, honor
+A freshly built engine must register exactly the C4-C6 detectors, honor
 injected settings, and expose empty-but-well-shaped read models: the
 spec-verbatim zeroed stats payload, empty recent/timeline lists, and an
 all-zero 5x5 matrix.
@@ -25,6 +25,7 @@ def test_registers_expected_detectors():
         "session_based",
         "error_cascade",
         "user_based",
+        "metric_based",
     }
 
 

@@ -4,8 +4,8 @@ lifetime counters, the 10-minute timeline, the 5x5 source matrix — plus the
 Redis persistence hand-off.
 
 C4 registered the temporal + session detectors; C5 added cascade + user plus
-the AlertManager hand-off; C6 (metric) appends to the same registry; C7 wires
-the PatternLearner in. The
+the AlertManager hand-off; C6 added the metric detector (one BH-FDR
+significance pass per cycle); C7 wires the PatternLearner in. The
 engine, like the rest of the pipeline, is single-threaded by design: detect()
 runs synchronously inside the pipeline loop and the API reads the accumulators
 between ticks on the same event loop — no locking anywhere.
@@ -24,6 +24,7 @@ from src.aggregation import MetricAggregator
 from src.config import Settings
 from src.engine.base import DetectionContext, Detector
 from src.engine.cascade import CascadeDetector
+from src.engine.metric import MetricDetector
 from src.engine.session import SessionDetector
 from src.engine.temporal import TemporalDetector
 from src.engine.user import UserDetector
@@ -72,6 +73,7 @@ class CorrelationEngine:
             SessionDetector(settings),
             CascadeDetector(settings),
             UserDetector(settings),
+            MetricDetector(settings),
         ]
 
         # --- In-memory accumulators (the API reads these, never Redis) ---------
