@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from fastapi import FastAPI
 
 from src.aggregation import MetricAggregator
+from src.alerts import AlertManager
 from src.api import create_app
 from src.collector import LogCollector
 from src.config import Settings, get_settings
@@ -44,6 +45,9 @@ class Runtime:
     collector: LogCollector | None = None
     #: The correlation engine (detection runs every detection_interval_seconds).
     engine: CorrelationEngine | None = None
+    #: The alert manager the engine consults each detection cycle; kept on the
+    #: runtime so the C7 dashboard endpoint can read its recent() feed directly.
+    alerts: AlertManager | None = None
     #: The background pipeline task; None until the lifespan starts it (and always
     #: None under tests, which inject a pre-built Runtime and drive ticks manually).
     pipeline_task: asyncio.Task | None = None
@@ -64,7 +68,8 @@ class Runtime:
         generator = LogGenerator(settings)
         aggregator = MetricAggregator()
         collector = LogCollector(settings, generator, aggregator, store)
-        engine = CorrelationEngine(settings, aggregator, store)
+        alerts = AlertManager(settings)
+        engine = CorrelationEngine(settings, aggregator, store, alerts=alerts)
         return cls(
             settings=settings,
             started_at=time.monotonic(),
@@ -73,6 +78,7 @@ class Runtime:
             aggregator=aggregator,
             collector=collector,
             engine=engine,
+            alerts=alerts,
         )
 
 

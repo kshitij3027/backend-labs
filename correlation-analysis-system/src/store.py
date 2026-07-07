@@ -13,6 +13,8 @@ single source of truth and later commits extend it with pattern and alert keys):
     corr:correlations:recent          LIST — newest-first Correlation JSON, capped at 2000
     corr:correlations:by_type:{type}  LIST — newest-first per-type Correlation JSON, capped at 500
     corr:stats                        HASH — total, per-type ``type:{t}`` counts, strength_sum
+    corr:alerts:recent                LIST — newest-first Alert JSON, capped at 200
+    corr:alerts:channel               PUB/SUB — every fresh Alert JSON, fanned out live
 """
 
 from __future__ import annotations
@@ -22,16 +24,20 @@ import time
 
 import redis
 
-from src.models import Correlation, LogEvent
+from src.models import Alert, Correlation, LogEvent
 
 logger = logging.getLogger(__name__)
 
-# --- Key registry (C5+ adds pattern/alert keys here) ---------------------------
+# --- Key registry (C7 adds pattern keys here) ----------------------------------
 KEY_EVENTS_RECENT = "corr:events:recent"
 KEY_CORRELATIONS_RECENT = "corr:correlations:recent"
 #: Template — ``.format(type=...)`` with a CorrelationType value.
 KEY_CORRELATIONS_BY_TYPE = "corr:correlations:by_type:{type}"
 KEY_STATS = "corr:stats"
+KEY_ALERTS_RECENT = "corr:alerts:recent"
+#: Pub/sub channel every fresh alert is PUBLISHed to (live subscribers see
+#: alerts the moment they fire, without polling the list).
+CHANNEL_ALERTS = "corr:alerts:channel"
 
 #: Hard cap on the mirrored recent-events list (the LTRIM bound).
 EVENTS_RECENT_MAX = 1000
@@ -39,6 +45,8 @@ EVENTS_RECENT_MAX = 1000
 CORRELATIONS_RECENT_MAX = 2000
 #: Hard cap on each per-type correlation list.
 CORRELATIONS_BY_TYPE_MAX = 500
+#: Hard cap on the mirrored recent-alerts list (matches the AlertManager deque).
+ALERTS_RECENT_MAX = 200
 
 #: How long :attr:`RedisStore.available` trusts the last probe before pinging
 #: Redis again (avoids a ping per /health request).
@@ -158,6 +166,31 @@ class RedisStore:
             pipe.execute()
         except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
             self._mark_failure("incr_stats", exc)
+            return
+        self._mark_success()
+
+    def push_alerts(self, alerts: list[Alert]) -> None:
+        """Mirror fresh alerts into the capped list and PUBLISH each to the channel.
+
+        One pipelined round-trip per alert batch: a single LPUSH of the whole
+        batch (chronological order, newest at index 0) + LTRIM to the 200-entry
+        cap on ``corr:alerts:recent``, then one PUBLISH per alert on
+        ``corr:alerts:channel`` so live subscribers (tests, future dashboards)
+        receive each alert the moment it fires. Each alert is serialized
+        exactly once; same graceful degradation as every other write.
+        """
+        if not alerts:
+            return
+        payloads = [alert.model_dump_json() for alert in alerts]
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.lpush(KEY_ALERTS_RECENT, *payloads)
+            pipe.ltrim(KEY_ALERTS_RECENT, 0, ALERTS_RECENT_MAX - 1)
+            for payload in payloads:
+                pipe.publish(CHANNEL_ALERTS, payload)
+            pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("push_alerts", exc)
             return
         self._mark_success()
 

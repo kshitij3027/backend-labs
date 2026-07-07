@@ -3,8 +3,9 @@ cycle and owns all detection-side accumulators — the recent-correlations deque
 lifetime counters, the 10-minute timeline, the 5x5 source matrix — plus the
 Redis persistence hand-off.
 
-C4 registers the temporal + session detectors; C5 (cascade, user + alerts) and
-C6 (metric) append to the same registry; C7 wires the PatternLearner in. The
+C4 registered the temporal + session detectors; C5 added cascade + user plus
+the AlertManager hand-off; C6 (metric) appends to the same registry; C7 wires
+the PatternLearner in. The
 engine, like the rest of the pipeline, is single-threaded by design: detect()
 runs synchronously inside the pipeline loop and the API reads the accumulators
 between ticks on the same event loop — no locking anywhere.
@@ -22,8 +23,10 @@ import numpy as np
 from src.aggregation import MetricAggregator
 from src.config import Settings
 from src.engine.base import DetectionContext, Detector
+from src.engine.cascade import CascadeDetector
 from src.engine.session import SessionDetector
 from src.engine.temporal import TemporalDetector
+from src.engine.user import UserDetector
 from src.models import Correlation, CorrelationType, LogEvent, SourceType
 from src.store import RedisStore
 
@@ -57,14 +60,18 @@ class CorrelationEngine:
         self.aggregator = aggregator
         #: Optional Redis mirror; None (or a dead Redis) degrades to memory-only.
         self.store = store
-        #: PatternLearner (C7) / AlertManager (C5) — typed loosely until they land.
+        #: PatternLearner (C7) — typed loosely until it lands.
         self.patterns = patterns
+        #: AlertManager (duck-typed on purpose: :mod:`src.alerts` imports
+        #: :mod:`src.engine.base`, so naming the class here would import-cycle).
         self.alerts = alerts
         #: Detector registry, run in order each cycle. Each detector owns its own
         #: dedupe cache internally — no engine-level dedupe is needed.
         self.detectors: list[Detector] = [
             TemporalDetector(settings),
             SessionDetector(settings),
+            CascadeDetector(settings),
+            UserDetector(settings),
         ]
 
         # --- In-memory accumulators (the API reads these, never Redis) ---------
@@ -108,7 +115,6 @@ class CorrelationEngine:
             except Exception:  # noqa: BLE001 — a detector bug must not kill the loop
                 logger.exception("detector %r failed; skipping it this cycle", detector.name)
 
-        # C5 hook: self.alerts.evaluate(found) runs here once AlertManager lands.
         # C7 hook: self.patterns confidence-boost/anomaly assessment runs here.
 
         if found:
@@ -116,6 +122,13 @@ class CorrelationEngine:
             if self.store is not None:
                 self.store.push_correlations(found)
                 self.store.incr_stats(found)
+            # C5: the alert rules run over this cycle's fresh findings — the
+            # manager owns thresholds + cooldowns, the store fans fired alerts
+            # out (capped list + pub/sub channel).
+            if self.alerts is not None:
+                new_alerts = self.alerts.evaluate(found, now)
+                if new_alerts and self.store is not None:
+                    self.store.push_alerts(new_alerts)
         return found
 
     # --- Read side (API) ------------------------------------------------------------

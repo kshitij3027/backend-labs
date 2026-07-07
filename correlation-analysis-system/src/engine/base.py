@@ -2,8 +2,9 @@
 
 Defines the per-cycle :class:`DetectionContext` handed to every detector, the
 :class:`Detector` protocol the engine registers against, a TTL
-:class:`DedupeCache` that suppresses re-emission of the same finding, and the
-tiny scoring/id helpers every detector shares. Individual detector families
+:class:`DedupeCache` that suppresses re-emission of the same finding, the
+shared :data:`FRESHNESS_SECONDS` emission bound, and the tiny scoring/id
+helpers every detector shares. Individual detector families
 live in sibling modules (``temporal``, ``session`` — C5/C6 add ``cascade``,
 ``user`` and ``metric``); :class:`src.engine.CorrelationEngine` orchestrates
 them all.
@@ -22,6 +23,15 @@ from src.models import Correlation, LogEvent
 #: keys, capping per-call prune work. In practice the key space is tiny (one
 #: key per source pair / journey), so the sweep almost never triggers.
 _PRUNE_THRESHOLD = 1024
+
+#: Freshness bound on emissions: a detector only emits a relationship whose
+#: NEWEST underlying event is at most this many seconds old. Anchoring every
+#: emission to current activity keeps per-row detection latency (detected_at
+#: minus the newest event's timestamp) <= ~4 s + one detection tick —
+#: comfortably inside the pipeline's 5 s real-time contract — and means that
+#: once a dedupe TTL lapses, a finding is re-emitted only on genuinely fresh
+#: activity, never on stale events still lingering in the sliding window.
+FRESHNESS_SECONDS = 4.0
 
 
 @dataclass

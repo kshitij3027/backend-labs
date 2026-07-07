@@ -1,8 +1,9 @@
 """Unit tests for CorrelationEngine initialization (spec area: engine initialization).
 
-A freshly built engine must register exactly the C4 detectors, honor injected
-settings, and expose empty-but-well-shaped read models: the spec-verbatim
-zeroed stats payload, empty recent/timeline lists, and an all-zero 5x5 matrix.
+A freshly built engine must register exactly the C4+C5 detectors, honor
+injected settings, and expose empty-but-well-shaped read models: the
+spec-verbatim zeroed stats payload, empty recent/timeline lists, and an
+all-zero 5x5 matrix.
 """
 
 from src.aggregation import MetricAggregator
@@ -17,9 +18,14 @@ def make_engine(**overrides) -> CorrelationEngine:
     return CorrelationEngine(settings, MetricAggregator(), store=None)
 
 
-def test_registers_temporal_and_session_detectors():
+def test_registers_expected_detectors():
     engine = make_engine()
-    assert {det.name for det in engine.detectors} == {"temporal", "session_based"}
+    assert {det.name for det in engine.detectors} == {
+        "temporal",
+        "session_based",
+        "error_cascade",
+        "user_based",
+    }
 
 
 def test_empty_stats_payload_is_exact():
