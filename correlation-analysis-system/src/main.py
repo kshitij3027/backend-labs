@@ -1,10 +1,10 @@
 """Application entrypoint and runtime wiring for the Correlation Analysis System.
 
 Defines :class:`Runtime` — the single container for per-process state (settings,
-the generator -> collector -> aggregator pipeline stages, the Redis store, and
-the background pipeline task) — plus the FastAPI ``lifespan`` that builds it on
-startup and starts/stops the pipeline. The module-level ``app`` is what uvicorn
-serves (``python -m uvicorn src.main:app``).
+the generator -> collector -> aggregator -> engine pipeline stages, the Redis
+store, and the background pipeline task) — plus the FastAPI ``lifespan`` that
+builds it on startup and starts/stops the pipeline. The module-level ``app`` is
+what uvicorn serves (``python -m uvicorn src.main:app``).
 """
 
 from __future__ import annotations
@@ -22,7 +22,9 @@ from src.aggregation import MetricAggregator
 from src.api import create_app
 from src.collector import LogCollector
 from src.config import Settings, get_settings
+from src.engine import CorrelationEngine
 from src.generators import LogGenerator
+from src.models import LogEvent
 from src.store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,8 @@ class Runtime:
     generator: LogGenerator | None = None
     aggregator: MetricAggregator | None = None
     collector: LogCollector | None = None
+    #: The correlation engine (detection runs every detection_interval_seconds).
+    engine: CorrelationEngine | None = None
     #: The background pipeline task; None until the lifespan starts it (and always
     #: None under tests, which inject a pre-built Runtime and drive ticks manually).
     pipeline_task: asyncio.Task | None = None
@@ -60,6 +64,7 @@ class Runtime:
         generator = LogGenerator(settings)
         aggregator = MetricAggregator()
         collector = LogCollector(settings, generator, aggregator, store)
+        engine = CorrelationEngine(settings, aggregator, store)
         return cls(
             settings=settings,
             started_at=time.monotonic(),
@@ -67,11 +72,13 @@ class Runtime:
             generator=generator,
             aggregator=aggregator,
             collector=collector,
+            engine=engine,
         )
 
 
 async def _pipeline_loop(runtime: Runtime) -> None:
-    """The 1-second generate->parse->buffer->aggregate heartbeat (runs until cancelled).
+    """The 1-second generate->parse->buffer->aggregate heartbeat (runs until
+    cancelled), with a synchronous detection pass every detection interval.
 
     Each iteration is individually guarded: one bad tick logs and continues,
     because the pipeline must never die from a transient failure. Cancellation
@@ -80,22 +87,29 @@ async def _pipeline_loop(runtime: Runtime) -> None:
     """
     settings = runtime.settings
     collector = runtime.collector
+    engine = runtime.engine
     if collector is None:  # defensive: Runtime.build always wires one
         logger.error("pipeline started without a collector; nothing to run")
         return
 
     interval = settings.generation_interval_seconds
     last_detection = 0.0
+    # Events parsed since the last detection pass — handed to the engine as its
+    # new_events batch, then reset (so nothing is re-detected as "new").
+    pending_new: list[LogEvent] = []
     while True:
         t0 = time.perf_counter()
         try:
             now = time.time()
-            collector.tick(now)
+            pending_new.extend(collector.tick(now))
             if now - last_detection >= settings.detection_interval_seconds:
                 last_detection = now
-                # C4 hook: the CorrelationEngine's detect() runs HERE every
-                # detection_interval_seconds once the engine lands, followed by
-                # its single pipelined Redis flush.
+                batch, pending_new = pending_new, []
+                if engine is not None:
+                    cutoff = now - settings.window_seconds
+                    window_events = [ev for ev in collector.buffer if ev.timestamp >= cutoff]
+                    # Synchronous detection + its single pipelined Redis flush.
+                    engine.detect(batch, window_events, now)
         except Exception:  # noqa: BLE001 — a bad tick must not kill the pipeline
             logger.exception("pipeline tick failed; continuing")
         elapsed = time.perf_counter() - t0

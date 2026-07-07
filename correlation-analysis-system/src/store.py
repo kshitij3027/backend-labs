@@ -7,10 +7,12 @@ Failures log ONE warning per outage (and one info line on recovery), never one
 per call, so a long Redis outage cannot flood the logs at 1000 events/sec.
 
 Key schema (everything carries the ``corr:`` prefix; the registry below is the
-single source of truth and later commits extend it with correlation, pattern and
-alert keys):
+single source of truth and later commits extend it with pattern and alert keys):
 
-    corr:events:recent   LIST — newest-first LogEvent JSON, capped at 1000
+    corr:events:recent                LIST — newest-first LogEvent JSON, capped at 1000
+    corr:correlations:recent          LIST — newest-first Correlation JSON, capped at 2000
+    corr:correlations:by_type:{type}  LIST — newest-first per-type Correlation JSON, capped at 500
+    corr:stats                        HASH — total, per-type ``type:{t}`` counts, strength_sum
 """
 
 from __future__ import annotations
@@ -20,15 +22,23 @@ import time
 
 import redis
 
-from src.models import LogEvent
+from src.models import Correlation, LogEvent
 
 logger = logging.getLogger(__name__)
 
-# --- Key registry (C4+ adds correlation/pattern/alert keys here) --------------
+# --- Key registry (C5+ adds pattern/alert keys here) ---------------------------
 KEY_EVENTS_RECENT = "corr:events:recent"
+KEY_CORRELATIONS_RECENT = "corr:correlations:recent"
+#: Template — ``.format(type=...)`` with a CorrelationType value.
+KEY_CORRELATIONS_BY_TYPE = "corr:correlations:by_type:{type}"
+KEY_STATS = "corr:stats"
 
 #: Hard cap on the mirrored recent-events list (the LTRIM bound).
 EVENTS_RECENT_MAX = 1000
+#: Hard cap on the mirrored recent-correlations list (matches the engine deque).
+CORRELATIONS_RECENT_MAX = 2000
+#: Hard cap on each per-type correlation list.
+CORRELATIONS_BY_TYPE_MAX = 500
 
 #: How long :attr:`RedisStore.available` trusts the last probe before pinging
 #: Redis again (avoids a ping per /health request).
@@ -92,6 +102,62 @@ class RedisStore:
             pipe.execute()
         except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
             self._mark_failure("push_recent_logs", exc)
+            return
+        self._mark_success()
+
+    def push_correlations(self, corrs: list[Correlation]) -> None:
+        """Mirror newly detected correlations into the capped Redis lists.
+
+        One pipelined round-trip per detection cycle: LPUSH + LTRIM on the
+        global ``corr:correlations:recent`` list (cap 2000), plus one
+        LPUSH + LTRIM per correlation type present in the batch
+        (``corr:correlations:by_type:{type}``, cap 500 each). Each correlation
+        is serialized exactly once and pushed in chronological order, so the
+        newest lands at index 0 everywhere.
+        """
+        if not corrs:
+            return
+        payloads = [(corr.correlation_type.value, corr.model_dump_json()) for corr in corrs]
+        by_type: dict[str, list[str]] = {}
+        for type_value, payload in payloads:
+            by_type.setdefault(type_value, []).append(payload)
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.lpush(KEY_CORRELATIONS_RECENT, *(payload for _, payload in payloads))
+            pipe.ltrim(KEY_CORRELATIONS_RECENT, 0, CORRELATIONS_RECENT_MAX - 1)
+            for type_value, items in by_type.items():
+                key = KEY_CORRELATIONS_BY_TYPE.format(type=type_value)
+                pipe.lpush(key, *items)
+                pipe.ltrim(key, 0, CORRELATIONS_BY_TYPE_MAX - 1)
+            pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("push_correlations", exc)
+            return
+        self._mark_success()
+
+    def incr_stats(self, corrs: list[Correlation]) -> None:
+        """Advance the ``corr:stats`` hash counters for a batch of correlations.
+
+        Fields: ``total`` (HINCRBY), one ``type:{t}`` count per type present
+        (HINCRBY), and ``strength_sum`` (HINCRBYFLOAT) — enough for readers to
+        rebuild ``avg_strength`` without replaying the lists. One pipelined
+        round-trip, same graceful degradation as every other write.
+        """
+        if not corrs:
+            return
+        type_counts: dict[str, int] = {}
+        for corr in corrs:
+            type_value = corr.correlation_type.value
+            type_counts[type_value] = type_counts.get(type_value, 0) + 1
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.hincrby(KEY_STATS, "total", len(corrs))
+            for type_value, count in type_counts.items():
+                pipe.hincrby(KEY_STATS, f"type:{type_value}", count)
+            pipe.hincrbyfloat(KEY_STATS, "strength_sum", float(sum(c.strength for c in corrs)))
+            pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("incr_stats", exc)
             return
         self._mark_success()
 

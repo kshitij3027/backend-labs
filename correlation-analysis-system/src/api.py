@@ -1,9 +1,9 @@
 """FastAPI application factory and HTTP surface for the Correlation Analysis System.
 
-Endpoints so far: ``GET /health`` (C1) and ``GET /api/v1/logs/recent`` (C3). The
-health payload's ``status`` and ``service`` values are SPEC-VERBATIM contract
-values — the unit tests and the C8 E2E verifier assert them exactly, so they
-must never change.
+Endpoints so far: ``GET /health`` (C1), ``GET /api/v1/logs/recent`` (C3) and
+``GET /api/v1/correlations`` (C4). The health payload's ``status`` and
+``service`` values are SPEC-VERBATIM contract values — the unit tests and the
+C8 E2E verifier assert them exactly, so they must never change.
 
 ``/health`` always returns HTTP 200 while the process is alive: a degraded dependency
 is signalled inside the body (``components``), never via a non-2xx status, so the
@@ -31,6 +31,9 @@ API_TITLE = "Correlation Analysis System"
 
 #: /api/v1/logs/recent clamps its ``count`` query param into [1, this] silently.
 _RECENT_COUNT_MAX = 500
+
+#: /api/v1/correlations clamps its ``limit`` query param into [1, this] silently.
+_CORRELATIONS_LIMIT_MAX = 1000
 
 
 def _memory_mb() -> float | None:
@@ -111,5 +114,24 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             return {"events": []}
         clamped = max(1, min(count, _RECENT_COUNT_MAX))
         return {"events": [ev.model_dump() for ev in collector.recent(clamped)]}
+
+    @app.get("/api/v1/correlations")
+    async def correlations(
+        request: Request, limit: int = 50, min_strength: float = 0.0
+    ) -> dict[str, Any]:
+        """The newest detected correlations, newest first.
+
+        ``limit`` is clamped silently into [1, 1000] (same convention as
+        /api/v1/logs/recent: out-of-range is a tuning mistake, not a 422);
+        ``min_strength`` drops every correlation weaker than the given value.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        engine = None if rt is None else getattr(rt, "engine", None)
+        if engine is None:
+            # Defensive: no engine wired — an empty feed, never a 500.
+            return {"count": 0, "correlations": []}
+        clamped = max(1, min(limit, _CORRELATIONS_LIMIT_MAX))
+        found = engine.recent(limit=clamped, min_strength=min_strength)
+        return {"count": len(found), "correlations": [corr.model_dump() for corr in found]}
 
     return app
