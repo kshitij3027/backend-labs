@@ -1,10 +1,11 @@
 """Unit tests for the AlertManager (rules, cooldowns, bounded history).
 
 Rules run in order and the first match per correlation wins: an error_cascade
-at strength >= 0.6 pages as critical; any type at strength >= 0.8 AND
-confidence >= 0.6 warns; anything weaker stays silent. A per-(rule, type,
-source-pair) cooldown (60 s) keeps a persistent condition to one alert per
-minute instead of one per detection cycle.
+at strength >= 0.6 pages as critical; a PatternLearner-flagged anomaly
+(details["anomaly"], C7) warns regardless of absolute strength/confidence; any
+type at strength >= 0.8 AND confidence >= 0.6 warns; anything weaker stays
+silent. A per-(rule, type, source-pair) cooldown (60 s) keeps a persistent
+condition to one alert per minute instead of one per detection cycle.
 """
 
 import pytest
@@ -103,6 +104,38 @@ def test_strong_cascade_matches_cascade_rule_first():
     fired = make_manager().evaluate([corr], now=EPOCH)
     assert len(fired) == 1
     assert fired[0].severity == "critical"
+
+
+def test_anomaly_flag_fires_warning_even_when_weak():
+    # C7: the PatternLearner sets details["anomaly"] when a well-known pattern
+    # deviates >2 sigma from its learned baseline — the deviation itself alerts,
+    # even though 0.5/0.5 would fail both the cascade and the strong-rule gates.
+    manager = make_manager()
+    corr = fab_corr(strength=0.5, confidence=0.5, details={"anomaly": True})
+
+    fired = manager.evaluate([corr], now=EPOCH)
+
+    assert len(fired) == 1
+    alert = fired[0]
+    assert alert.severity == "warning"
+    assert alert.title == "Anomalous correlation pattern"
+    assert "session_based" in alert.message
+    assert "web" in alert.message and "database" in alert.message
+    assert "0.50" in alert.message  # strength cited against the learned baseline
+    assert alert.strength == 0.5
+    assert alert.confidence == 0.5
+
+
+def test_anomaly_rule_respects_cooldown():
+    manager = make_manager()  # alert_cooldown_seconds = 60
+    corr = fab_corr(strength=0.5, confidence=0.5, details={"anomaly": True})
+    assert len(manager.evaluate([corr], now=EPOCH)) == 1
+    # Same anomalous condition again within the cooldown: suppressed.
+    assert manager.evaluate([corr], now=EPOCH + 30.0) == []
+    assert len(manager.alerts) == 1
+    # 61 s after the first firing the cooldown has expired: fires again.
+    assert len(manager.evaluate([corr], now=EPOCH + 61.0)) == 1
+    assert len(manager.alerts) == 2
 
 
 def test_weak_correlation_stays_silent():

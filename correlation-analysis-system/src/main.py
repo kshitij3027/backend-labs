@@ -26,6 +26,7 @@ from src.config import Settings, get_settings
 from src.engine import CorrelationEngine
 from src.generators import LogGenerator
 from src.models import LogEvent
+from src.patterns import PatternLearner
 from src.store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,9 @@ class Runtime:
     collector: LogCollector | None = None
     #: The correlation engine (detection runs every detection_interval_seconds).
     engine: CorrelationEngine | None = None
+    #: The pattern learner the engine assesses/records against each detection
+    #: cycle; kept on the runtime so operators/tests can inspect its baselines.
+    patterns: PatternLearner | None = None
     #: The alert manager the engine consults each detection cycle; kept on the
     #: runtime so the C7 dashboard endpoint can read its recent() feed directly.
     alerts: AlertManager | None = None
@@ -69,7 +73,10 @@ class Runtime:
         aggregator = MetricAggregator()
         collector = LogCollector(settings, generator, aggregator, store)
         alerts = AlertManager(settings)
-        engine = CorrelationEngine(settings, aggregator, store, alerts=alerts)
+        patterns = PatternLearner(settings, store)
+        engine = CorrelationEngine(
+            settings, aggregator, store, patterns=patterns, alerts=alerts
+        )
         return cls(
             settings=settings,
             started_at=time.monotonic(),
@@ -78,6 +85,7 @@ class Runtime:
             aggregator=aggregator,
             collector=collector,
             engine=engine,
+            patterns=patterns,
             alerts=alerts,
         )
 

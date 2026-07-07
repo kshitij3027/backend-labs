@@ -22,13 +22,14 @@ import numpy as np
 
 from src.aggregation import MetricAggregator
 from src.config import Settings
-from src.engine.base import DetectionContext, Detector
+from src.engine.base import DetectionContext, Detector, clamp01
 from src.engine.cascade import CascadeDetector
 from src.engine.metric import MetricDetector
 from src.engine.session import SessionDetector
 from src.engine.temporal import TemporalDetector
 from src.engine.user import UserDetector
 from src.models import Correlation, CorrelationType, LogEvent, SourceType
+from src.patterns import PatternLearner
 from src.store import RedisStore
 
 __all__ = ["CorrelationEngine"]
@@ -54,14 +55,15 @@ class CorrelationEngine:
         settings: Settings,
         aggregator: MetricAggregator | None,
         store: RedisStore | None = None,
-        patterns: Any | None = None,
+        patterns: PatternLearner | None = None,
         alerts: Any | None = None,
     ) -> None:
         self.settings = settings
         self.aggregator = aggregator
         #: Optional Redis mirror; None (or a dead Redis) degrades to memory-only.
         self.store = store
-        #: PatternLearner (C7) — typed loosely until it lands.
+        #: PatternLearner (C7): each cycle's findings are assessed against it
+        #: BEFORE persistence (boost/anomaly/new flags), then recorded into it.
         self.patterns = patterns
         #: AlertManager (duck-typed on purpose: :mod:`src.alerts` imports
         #: :mod:`src.engine.base`, so naming the class here would import-cycle).
@@ -100,8 +102,12 @@ class CorrelationEngine:
         """Run every registered detector once and fold the results into state.
 
         Each detector runs inside its own guard: one buggy detector logs and is
-        skipped for the cycle, never killing the pipeline loop. Results are
-        accumulated in memory and mirrored to Redis (best-effort) in one go.
+        skipped for the cycle, never killing the pipeline loop. Findings are
+        then pattern-assessed (confidence boost, anomaly and new-pattern flags)
+        BEFORE they are recorded, persisted, or alerted on, so every downstream
+        consumer — Redis mirror, alert rules, API readers — sees the enriched
+        versions. Results are accumulated in memory and mirrored to Redis
+        (best-effort) in one go.
         """
         ctx = DetectionContext(
             now=now,
@@ -117,13 +123,29 @@ class CorrelationEngine:
             except Exception:  # noqa: BLE001 — a detector bug must not kill the loop
                 logger.exception("detector %r failed; skipping it this cycle", detector.name)
 
-        # C7 hook: self.patterns confidence-boost/anomaly assessment runs here.
-
         if found:
+            # C7: pattern learning. Assess each finding against the baseline
+            # BEFORE this observation (boost confidence by recurrence, flag >2σ
+            # anomalies and brand-new strong patterns), then record the whole
+            # batch — so a pattern's Nth detection is always judged against the
+            # previous N-1.
+            if self.patterns is not None:
+                for corr in found:
+                    assessment = self.patterns.assess(corr, now)
+                    corr.confidence = clamp01(corr.confidence + assessment.boost)
+                    # Count INCLUDING this observation: a re-detection carries >= 2.
+                    corr.details["pattern_count"] = assessment.count + 1
+                    if assessment.is_anomalous:
+                        corr.details["anomaly"] = True
+                    if assessment.is_new:
+                        corr.details["new_pattern"] = True
+                self.patterns.record(found, now)
+
             self._record(found)
             if self.store is not None:
                 self.store.push_correlations(found)
                 self.store.incr_stats(found)
+                self.store.incr_minute_stats(found, now)
             # C5: the alert rules run over this cycle's fresh findings — the
             # manager owns thresholds + cooldowns, the store fans fired alerts
             # out (capped list + pub/sub channel).

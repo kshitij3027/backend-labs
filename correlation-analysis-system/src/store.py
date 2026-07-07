@@ -7,12 +7,22 @@ Failures log ONE warning per outage (and one info line on recovery), never one
 per call, so a long Redis outage cannot flood the logs at 1000 events/sec.
 
 Key schema (everything carries the ``corr:`` prefix; the registry below is the
-single source of truth and later commits extend it with pattern and alert keys):
+single source of truth):
 
     corr:events:recent                LIST — newest-first LogEvent JSON, capped at 1000
     corr:correlations:recent          LIST — newest-first Correlation JSON, capped at 2000
     corr:correlations:by_type:{type}  LIST — newest-first per-type Correlation JSON, capped at 500
     corr:stats                        HASH — total, per-type ``type:{t}`` counts, strength_sum
+    corr:stats:minute:{minute}        HASH — per-minute total + ``type:{t}`` counts,
+                                      1 h TTL (durability belt-and-braces; the API
+                                      never reads it)
+    corr:pattern:{type}:{a}:{b}       HASH — count, strength_sum, strength_sqsum,
+                                      first_seen, last_seen. One PatternLearner
+                                      baseline per pattern; {a}/{b} are the sorted
+                                      normalized endpoints (source values, or
+                                      metric names for metric_based)
+    corr:pattern:index                ZSET — member = the full pattern hash key,
+                                      score = observation count (hot patterns first)
     corr:alerts:recent                LIST — newest-first Alert JSON, capped at 200
     corr:alerts:channel               PUB/SUB — every fresh Alert JSON, fanned out live
 """
@@ -28,12 +38,19 @@ from src.models import Alert, Correlation, LogEvent
 
 logger = logging.getLogger(__name__)
 
-# --- Key registry (C7 adds pattern keys here) ----------------------------------
+# --- Key registry ----------------------------------------------------------------
 KEY_EVENTS_RECENT = "corr:events:recent"
 KEY_CORRELATIONS_RECENT = "corr:correlations:recent"
 #: Template — ``.format(type=...)`` with a CorrelationType value.
 KEY_CORRELATIONS_BY_TYPE = "corr:correlations:by_type:{type}"
 KEY_STATS = "corr:stats"
+#: Template — ``.format(minute=int(now // 60))``: per-minute detection counters.
+KEY_STATS_MINUTE = "corr:stats:minute:{minute}"
+#: Template — ``.format(type=..., a=..., b=...)``: one baseline hash per learned
+#: pattern; {a}/{b} are the pattern's sorted normalized endpoints.
+KEY_PATTERN = "corr:pattern:{type}:{a}:{b}"
+#: ZSET index of every pattern hash key, scored by observation count.
+KEY_PATTERN_INDEX = "corr:pattern:index"
 KEY_ALERTS_RECENT = "corr:alerts:recent"
 #: Pub/sub channel every fresh alert is PUBLISHed to (live subscribers see
 #: alerts the moment they fire, without polling the list).
@@ -47,10 +64,31 @@ CORRELATIONS_RECENT_MAX = 2000
 CORRELATIONS_BY_TYPE_MAX = 500
 #: Hard cap on the mirrored recent-alerts list (matches the AlertManager deque).
 ALERTS_RECENT_MAX = 200
+#: TTL on the per-minute stats hashes — durability breadcrumbs, not API state.
+MINUTE_STATS_TTL_SECONDS = 3600
 
 #: How long :attr:`RedisStore.available` trusts the last probe before pinging
 #: Redis again (avoids a ping per /health request).
 _AVAILABILITY_TTL_SECONDS = 5.0
+
+#: SCAN page size when hydrating pattern baselines (one startup-time sweep).
+_PATTERN_SCAN_COUNT = 500
+
+
+def _parse_int(value: str | None, default: int = 0) -> int:
+    """Defensive int parse for hydrated hash fields (garbage -> ``default``)."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_float(value: str | None, default: float = 0.0) -> float:
+    """Defensive float parse for hydrated hash fields (garbage -> ``default``)."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 class RedisStore:
@@ -80,6 +118,16 @@ class RedisStore:
         """Last known availability, re-probed lazily at most every 5 seconds."""
         if time.monotonic() - self._last_ping >= _AVAILABILITY_TTL_SECONDS:
             self.ping()
+        return self._healthy
+
+    @property
+    def healthy(self) -> bool:
+        """Last observed health with ZERO I/O (no probe, unlike :attr:`available`).
+
+        Kept fresh by the pipeline's once-a-second writes; optimistically True
+        before the first operation. The dashboard endpoint reads this so its
+        request path never performs a Redis operation, not even a ping.
+        """
         return self._healthy
 
     def ping(self) -> bool:
@@ -193,6 +241,110 @@ class RedisStore:
             self._mark_failure("push_alerts", exc)
             return
         self._mark_success()
+
+    def incr_minute_stats(self, corrs: list[Correlation], now: float) -> None:
+        """Advance the per-minute durability counters (never read by the API).
+
+        HINCRBYs ``total`` plus one ``type:{t}`` count per type present onto
+        ``corr:stats:minute:{minute}`` (minute = ``int(now // 60)``) and
+        refreshes the 1-hour TTL — belt-and-braces history that survives
+        restarts without feeding any request path. One pipelined round-trip,
+        same graceful degradation as every other write.
+        """
+        if not corrs:
+            return
+        key = KEY_STATS_MINUTE.format(minute=int(now // 60))
+        type_counts: dict[str, int] = {}
+        for corr in corrs:
+            type_value = corr.correlation_type.value
+            type_counts[type_value] = type_counts.get(type_value, 0) + 1
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            pipe.hincrby(key, "total", len(corrs))
+            for type_value, count in type_counts.items():
+                pipe.hincrby(key, f"type:{type_value}", count)
+            pipe.expire(key, MINUTE_STATS_TTL_SECONDS)
+            pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("incr_minute_stats", exc)
+            return
+        self._mark_success()
+
+    # --- Pattern baselines (C7) -----------------------------------------------------
+    def record_patterns(
+        self, updates: list[tuple[tuple[str, str, str], float, float]]
+    ) -> None:
+        """Advance one baseline hash per update ((type, a, b), strength, now).
+
+        One pipelined round-trip per detection cycle; per update: HINCRBY
+        ``count``, HINCRBYFLOAT ``strength_sum`` / ``strength_sqsum``
+        (strength squared), HSETNX ``first_seen`` (only the first observation
+        wins), HSET ``last_seen``, and a ZINCRBY on ``corr:pattern:index``
+        keyed by the full pattern hash key — so the hottest patterns sort
+        first. Same graceful degradation as every other write.
+        """
+        if not updates:
+            return
+        try:
+            pipe = self._client.pipeline(transaction=False)
+            for (type_value, endpoint_a, endpoint_b), strength, now in updates:
+                key = KEY_PATTERN.format(type=type_value, a=endpoint_a, b=endpoint_b)
+                pipe.hincrby(key, "count", 1)
+                pipe.hincrbyfloat(key, "strength_sum", float(strength))
+                pipe.hincrbyfloat(key, "strength_sqsum", float(strength) * float(strength))
+                pipe.hsetnx(key, "first_seen", now)
+                pipe.hset(key, "last_seen", now)
+                pipe.zincrby(KEY_PATTERN_INDEX, 1, key)
+            pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("record_patterns", exc)
+            return
+        self._mark_success()
+
+    # --- Reads (startup hydration only — never on a request path) --------------------
+    def load_patterns(self) -> dict[tuple[str, str, str], dict[str, float]]:
+        """Hydrate every pattern baseline: {(type, a, b): fields} ({} on failure).
+
+        One SCAN sweep (MATCH ``corr:pattern:*``, COUNT 500) collects the hash
+        keys — skipping the index zset, which shares the prefix — then a single
+        pipelined HGETALL round-trip fetches them all. Field values are parsed
+        defensively: a malformed value falls back to 0 instead of poisoning the
+        learner, and a malformed key is skipped entirely.
+        """
+        try:
+            keys = [
+                key
+                for key in self._client.scan_iter(
+                    match="corr:pattern:*", count=_PATTERN_SCAN_COUNT
+                )
+                if key != KEY_PATTERN_INDEX
+            ]
+            if not keys:
+                self._mark_success()
+                return {}
+            pipe = self._client.pipeline(transaction=False)
+            for key in keys:
+                pipe.hgetall(key)
+            rows = pipe.execute()
+        except Exception as exc:  # noqa: BLE001 — degradation contract: never raise
+            self._mark_failure("load_patterns", exc)
+            return {}
+        self._mark_success()
+
+        out: dict[tuple[str, str, str], dict[str, float]] = {}
+        prefix_len = len("corr:pattern:")
+        for key, row in zip(keys, rows):
+            parts = key[prefix_len:].split(":")
+            if len(parts) != 3 or not isinstance(row, dict) or not row:
+                continue  # defensive: a foreign key shape under our prefix
+            out[(parts[0], parts[1], parts[2])] = {
+                "count": _parse_int(row.get("count")),
+                "strength_sum": _parse_float(row.get("strength_sum")),
+                "strength_sqsum": _parse_float(row.get("strength_sqsum")),
+                "first_seen": _parse_float(row.get("first_seen")),
+                "last_seen": _parse_float(row.get("last_seen")),
+            }
+        return out
 
     # --- Outage bookkeeping (one log line per burst, not per op) -------------------
     def _mark_failure(self, op: str, exc: Exception) -> None:

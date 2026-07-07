@@ -6,7 +6,11 @@ detected correlation — the FIRST matching rule wins per correlation:
     1. ``cascade_critical``  — an ``error_cascade`` at strength >=
        :data:`CASCADE_STRENGTH_THRESHOLD` pages as **critical** (a propagating
        failure is urgent regardless of statistical confidence).
-    2. ``strong_correlation`` — ANY type at strength >=
+    2. ``anomaly`` — a correlation the PatternLearner flagged as deviating >2σ
+       from its learned baseline (``details["anomaly"]``) raises a **warning**
+       even when its absolute strength/confidence are modest: the deviation
+       itself is the signal.
+    3. ``strong_correlation`` — ANY type at strength >=
        ``settings.alert_strength_threshold`` AND confidence >=
        ``settings.alert_confidence_threshold`` raises a **warning**.
 
@@ -41,6 +45,9 @@ class AlertManager:
         self.settings = settings
         #: Every fired alert, oldest -> newest, bounded like the Redis mirror.
         self.alerts: deque[Alert] = deque(maxlen=RECENT_MAX)
+        #: Lifetime count of every alert ever fired (the deque above is capped;
+        #: the dashboard reports this as ``stats.alerts_total``).
+        self.total = 0
         self._cooldowns = DedupeCache()
 
     def evaluate(self, corrs: list[Correlation], now: float) -> list[Alert]:
@@ -76,6 +83,7 @@ class AlertManager:
                 confidence=corr.confidence,
             )
             self.alerts.append(alert)
+            self.total += 1
             fired.append(alert)
         return fired
 
@@ -110,6 +118,19 @@ class AlertManager:
                 f"{corr.event_a.source.value}→{corr.event_b.source.value} cascade "
                 f"({services} services, span {span}s)",
             )
+        if corr.details.get("anomaly"):
+            # C7: the PatternLearner marked this pattern >2σ from its learned
+            # baseline — surface the deviation even when the absolute numbers
+            # are modest (rule 1 already covered propagating cascades).
+            return (
+                "anomaly",
+                "warning",
+                "Anomalous correlation pattern",
+                f"{corr.correlation_type.value} correlation between "
+                f"{corr.event_a.source.value} and {corr.event_b.source.value} "
+                f"at strength {corr.strength:.2f} deviates >2σ from its "
+                f"learned baseline",
+            )
         if (
             corr.strength >= self.settings.alert_strength_threshold
             and corr.confidence >= self.settings.alert_confidence_threshold
@@ -122,6 +143,4 @@ class AlertManager:
                 f"{corr.event_a.source.value} and {corr.event_b.source.value} "
                 f"(strength {corr.strength:.2f}, confidence {corr.confidence:.2f})",
             )
-        # C7 hook: the anomaly rule ("pattern deviates >2σ from its learned
-        # baseline" -> info/warning) slots in here once PatternLearner lands.
         return None
