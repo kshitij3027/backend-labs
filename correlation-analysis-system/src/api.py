@@ -1,8 +1,9 @@
 """FastAPI application factory and HTTP surface for the Correlation Analysis System.
 
-C1 exposes only ``GET /health``. The health payload's ``status`` and ``service``
-values are SPEC-VERBATIM contract values — the unit tests and the C8 E2E verifier
-assert them exactly, so they must never change.
+Endpoints so far: ``GET /health`` (C1) and ``GET /api/v1/logs/recent`` (C3). The
+health payload's ``status`` and ``service`` values are SPEC-VERBATIM contract
+values — the unit tests and the C8 E2E verifier assert them exactly, so they
+must never change.
 
 ``/health`` always returns HTTP 200 while the process is alive: a degraded dependency
 is signalled inside the body (``components``), never via a non-2xx status, so the
@@ -27,6 +28,9 @@ SERVICE_VERSION = "0.1.0"
 
 #: Human-readable API title (not part of the /health contract).
 API_TITLE = "Correlation Analysis System"
+
+#: /api/v1/logs/recent clamps its ``count`` query param into [1, this] silently.
+_RECENT_COUNT_MAX = 500
 
 
 def _memory_mb() -> float | None:
@@ -72,7 +76,8 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         # report healthy with degraded components rather than crashing the probe.
         rt = getattr(request.app.state, "runtime", None)
         uptime = 0.0 if rt is None else max(0.0, time.monotonic() - rt.started_at)
-        pipeline_running = False if rt is None else bool(rt.pipeline_running)
+        store = None if rt is None else getattr(rt, "store", None)
+        collector = None if rt is None else getattr(rt, "collector", None)
         return {
             "status": "healthy",  # SPEC-VERBATIM
             "service": SERVICE_NAME,  # SPEC-VERBATIM
@@ -80,11 +85,31 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             "uptime_seconds": uptime,
             "memory_mb": _memory_mb(),
             "components": {
-                # Null until the Redis store lands in C3 (a real store.ping() is
-                # wired then); null distinguishes "not wired" from a failed ping.
-                "redis": None,
-                "pipeline_running": pipeline_running,
+                # None = no store wired at all; bool = last known Redis
+                # availability (RedisStore re-probes lazily, at most every 5s).
+                "redis": None if store is None else bool(store.available),
+                "pipeline_running": False if rt is None else bool(rt.pipeline_running),
+                "events_processed": 0 if collector is None else collector.events_total,
+                "events_per_sec": (
+                    0.0 if collector is None else round(float(collector.events_per_sec), 1)
+                ),
+                "parse_errors": 0 if collector is None else collector.parse_errors,
             },
         }
+
+    @app.get("/api/v1/logs/recent")
+    async def recent_logs(request: Request, count: int = 50) -> dict[str, Any]:
+        """The newest parsed events, newest first.
+
+        ``count`` is clamped silently into [1, 500] — an out-of-range value is a
+        tuning mistake, not a client error, so it never yields a 422.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        collector = None if rt is None else getattr(rt, "collector", None)
+        if collector is None:
+            # Defensive: no pipeline wired — an empty feed, never a 500.
+            return {"events": []}
+        clamped = max(1, min(count, _RECENT_COUNT_MAX))
+        return {"events": [ev.model_dump() for ev in collector.recent(clamped)]}
 
     return app
