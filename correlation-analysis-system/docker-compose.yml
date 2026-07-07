@@ -5,9 +5,10 @@
 # as an asyncio task. It depends on `redis` (event mirror, pattern baselines, alert
 # pub/sub), which exposes a healthcheck so `backend` only starts once it is ready.
 #
-# The profile-gated `test` service runs the pytest suite and never starts on a bare
-# `docker compose up`. The frontend (C9) and e2e/loadtest (C8) services are added in
-# later commits. Run via `make up` / `make test`.
+# The profile-gated `test`, `e2e` (C8) and `loadtest` (C8) services run the pytest
+# suite, the black-box E2E verifier and the perf/load harness respectively; none of
+# them starts on a bare `docker compose up`. The frontend (C9) service is added in a
+# later commit. Run via `make up` / `make test` / `make e2e` / `make load`.
 
 services:
   # Redis — shared state (recent events/correlations, learned patterns, alerts).
@@ -72,3 +73,57 @@ services:
       redis:
         condition: service_healthy
     command: ["pytest", "-q"]
+
+  # Black-box E2E verifier (C8). Reuses the tester image (Dockerfile.test ships src/ +
+  # scripts/ + httpx) and runs scripts/verify_e2e.py against the LIVE backend over the
+  # compose network — HTTP only, 14 ordered checks covering the whole pipeline
+  # (throughput, all 5 correlation types, detection latency, session accuracy vs
+  # ground truth, target scenario correlations, alerts, dashboard shape, memory).
+  # Every gate below is host-overridable. Profile-gated so it never starts on a bare
+  # `docker compose up`. Run via `make e2e`; a failed check exits non-zero.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - E2E_BASE_URL=http://backend:8000
+      - MIN_EVENTS_PER_SEC=${MIN_EVENTS_PER_SEC:-100}
+      - E2E_MAX_P95_LATENCY=${E2E_MAX_P95_LATENCY:-5.0}
+      - E2E_MIN_SESSION_RECALL=${E2E_MIN_SESSION_RECALL:-0.95}
+      - E2E_MAX_P_ADJ=${E2E_MAX_P_ADJ:-0.05}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
+  # Load / performance harness (C8). Same tester image, running scripts/load_test.py
+  # against the LIVE backend over the compose network — four hard-gated phases:
+  # sustained ingest, sequential stats latency, 100-way concurrent mixed GETs
+  # (RPS + error rate), and server-reported memory. Every gate below is
+  # host-overridable (e.g. `MIN_EVENTS_PER_SEC=100000 make load` proves the gate
+  # bites). Profile-gated so it never starts on a bare `docker compose up`.
+  # Run via `make load`; a breached gate exits non-zero.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - BASE_URL=http://backend:8000
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-100}
+      - LOAD_REQUESTS=${LOAD_REQUESTS:-500}
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-50}
+      - STATS_SEQUENTIAL=${STATS_SEQUENTIAL:-50}
+      - STATS_AVG_MS_MAX=${STATS_AVG_MS_MAX:-50}
+      - STATS_MAX_MS=${STATS_MAX_MS:-100}
+      - LOAD_MAX_ERROR_RATE=${LOAD_MAX_ERROR_RATE:-0.0}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+      - MIN_EVENTS_PER_SEC=${MIN_EVENTS_PER_SEC:-100}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]

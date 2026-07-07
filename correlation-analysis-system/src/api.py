@@ -1,12 +1,14 @@
 """FastAPI application factory and HTTP surface for the Correlation Analysis System.
 
 Endpoints: ``GET /health`` (C1), ``GET /api/v1/logs/recent`` (C3),
-``GET /api/v1/correlations`` (C4), and the C7 completion of the v1 surface —
+``GET /api/v1/correlations`` (C4), the C7 completion of the v1 surface —
 ``GET /api/v1/correlations/stats``, ``GET /api/v1/correlations/types/{type}``
-and ``GET /api/v1/dashboard``. The health payload's ``status``/``service``
-values and the stats payload's exact 4-key shape are SPEC-VERBATIM contract
-values — the unit tests and the C8 E2E verifier assert them exactly, so they
-must never change (richer operational data belongs to /api/v1/dashboard only).
+and ``GET /api/v1/dashboard`` — plus ``GET /api/v1/debug/ground-truth`` (C8),
+a verification aid for the E2E harness only. The health payload's
+``status``/``service`` values and the stats payload's exact 4-key shape are
+SPEC-VERBATIM contract values — the unit tests and the C8 E2E verifier assert
+them exactly, so they must never change (richer operational data belongs to
+/api/v1/dashboard only).
 
 Every endpoint serves purely from in-memory accumulators — no handler performs
 a Redis operation, so the whole read surface keeps answering mid-outage.
@@ -50,6 +52,12 @@ _DASHBOARD_FEED_COUNT = 20
 _DASHBOARD_SCATTER_MAX = 200
 #: /api/v1/dashboard timeline depth (10 s buckets — the engine's full history).
 _DASHBOARD_TIMELINE_BUCKETS = 60
+
+#: /api/v1/debug/ground-truth clamps ``max_age`` (seconds) into this range and
+#: returns at most _GROUND_TRUTH_COUNT_MAX journeys.
+_GROUND_TRUTH_MAX_AGE_MIN = 1.0
+_GROUND_TRUTH_MAX_AGE_MAX = 600.0
+_GROUND_TRUTH_COUNT_MAX = 500
 
 def _empty_stats() -> dict[str, Any]:
     """The SPEC-VERBATIM zeroed stats shape (the no-engine degradation value)."""
@@ -282,6 +290,49 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
                 if alerts is None
                 else [alert.model_dump() for alert in alerts.recent(_DASHBOARD_FEED_COUNT)]
             ),
+        }
+
+    @app.get("/api/v1/debug/ground-truth")
+    async def ground_truth(request: Request, max_age: float = 120) -> dict[str, Any]:
+        """Verification aid for the E2E harness — the generator's journey ground truth.
+
+        Returns every ground-truth :class:`~src.models.JourneyRecord` whose
+        ``completed_at`` is set and lies within the last ``max_age`` seconds
+        (clamped silently into [1, 600] — the numeric-param convention used
+        everywhere else), newest first, capped at 500. The C8 E2E session-accuracy
+        check computes its recall against these journeys. This endpoint exists
+        only because the traffic is synthetic (the simulator KNOWS the true
+        journeys); it is not part of the product API surface.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        generator = None if rt is None else getattr(rt, "generator", None)
+        journeys = None if generator is None else getattr(generator, "journeys", None)
+        if journeys is None:
+            # Defensive: no generator wired (or a stub without ground truth) —
+            # an empty feed, never a 500.
+            return {"journeys": []}
+        clamped = max(_GROUND_TRUTH_MAX_AGE_MIN, min(float(max_age), _GROUND_TRUTH_MAX_AGE_MAX))
+        cutoff = time.time() - clamped
+        eligible = [
+            record
+            for record in journeys
+            if record.completed_at is not None and record.completed_at >= cutoff
+        ]
+        # Spawn order is only approximately completion order (hop times are
+        # jittered), so sort explicitly: newest completion first.
+        eligible.sort(key=lambda record: record.completed_at, reverse=True)
+        return {
+            "journeys": [
+                {
+                    "correlation_id": record.correlation_id,
+                    "user_id": record.user_id,
+                    "sources": list(record.sources),
+                    "started_at": record.started_at,
+                    "completed_at": record.completed_at,
+                    "abandoned": record.abandoned,
+                }
+                for record in eligible[:_GROUND_TRUTH_COUNT_MAX]
+            ]
         }
 
     return app

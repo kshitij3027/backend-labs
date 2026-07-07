@@ -44,8 +44,12 @@ class Settings(BaseSettings):
     generation_interval_seconds: float = 1.0
     #: Detection tick — run the correlation detectors every N seconds.
     detection_interval_seconds: float = 2.0
-    #: Target synthetic log volume produced by the generator.
-    events_per_second: int = 120
+    #: Target synthetic log volume produced by the generator. 135 rather than a
+    #: round 120: realized ingest measures ~0.9x this target (journeys emit ~6
+    #: lines in practice against the /7 spawn sizing), so 135 keeps the
+    #: sustained measured rate (~119 eps) comfortably above the E2E/load
+    #: throughput gate of 100 events/sec.
+    events_per_second: int = 135
     #: Max parsed events held in the in-memory buffer (collections.deque maxlen).
     event_buffer_size: int = 5000
     #: Master switch for the background pipeline task (the compose `test` service

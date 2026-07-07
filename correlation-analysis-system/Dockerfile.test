@@ -25,13 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code + the test suite and its config.
+# App code + the test suite and its config, plus the C8 E2E verifier and load-test
+# harness (the e2e/loadtest compose profiles run them from this same image).
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY pytest.ini ./
-
-# COPY scripts/ ./scripts/
-# ^ C8 hook: the E2E verifier + load-test harness land in scripts/ in C8 — uncomment
-#   this line then so the e2e/loadtest compose profiles can run them from this image.
+COPY scripts/ ./scripts/
 
 CMD ["pytest", "-q"]

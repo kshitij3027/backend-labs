@@ -28,7 +28,9 @@ def test_defaults(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     settings = Settings(_env_file=None)  # hermetic: ignore any ambient .env file too
     assert settings.window_seconds == 30
-    assert settings.events_per_second == 120
+    # 135, not a round 120: realized ingest is ~0.9x target, and 135 keeps the
+    # measured rate above the 100 eps E2E/load gate (see src/config.py).
+    assert settings.events_per_second == 135
     assert settings.pipeline_enabled is True
     assert settings.detection_interval_seconds == 2.0
     assert settings.redis_url == "redis://localhost:6379/0"
