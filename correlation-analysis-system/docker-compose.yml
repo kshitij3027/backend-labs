@@ -55,6 +55,29 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # React (Vite) dashboard (C9) — a static SPA built by frontend/Dockerfile and served
+  # by nginx, which reverse-proxies /api STRAIGHT THROUGH to `backend:8000` (no prefix
+  # strip — our routes already live under /api/v1). The SPA polls GET /api/v1/dashboard
+  # every 5s. Build context is the PROJECT ROOT (so the Dockerfile's COPY paths carry
+  # the `frontend/` prefix); it only starts once the backend is healthy.
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # nginx:alpine ships wget (busybox) — a 200 on / means the SPA is being served.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:80/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
   # code + requirements as the backend, plus the tests) and runs pytest. Profile-gated
   # so it never starts on a bare `docker compose up`. Run via `make test`.

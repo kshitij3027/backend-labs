@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs test test-unit test-int e2e load clean
+.PHONY: help build up down logs test test-unit test-int e2e load ui clean
 
 help:
 	@echo "Correlation Analysis System — make targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - black-box E2E verifier vs the live stack (14 checks)"
 	@echo "  load       - perf/load gates vs the live stack (ingest, latency, RPS, memory)"
+	@echo "  ui         - run redis + backend + React dashboard (detached), print the URLs"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -73,8 +74,13 @@ load:
 	docker compose down; \
 	exit $$status
 
-# Placeholder target (lands in C9):
-# ui:    - bring up redis + backend + frontend dashboard, print the URL (C9)
+# Bring up the full dashboard stack (redis + backend + frontend) detached, building
+# images as needed. Redis and backend come up first as healthy deps of the frontend;
+# the SPA then polls GET /api/v1/dashboard through nginx's /api proxy every 5s.
+ui:
+	docker compose up -d --build redis backend frontend
+	@echo "Dashboard: http://localhost:$${FRONTEND_PORT:-3000}"
+	@echo "API:       http://localhost:$${BACKEND_PORT:-8000}  (GET /health)"
 
 clean:
 	docker compose down -v --remove-orphans

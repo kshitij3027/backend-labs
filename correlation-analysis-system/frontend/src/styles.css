@@ -1,0 +1,576 @@
+/* Correlation Analysis System — dashboard theme (C9 shell).
+ *
+ * Dark, dense operations-console look. Colours, radii and spacing are driven by
+ * CSS custom properties; all assets are self-contained (system font stack, no
+ * external fonts/CDNs) so the page is CSP-safe behind nginx. C10 layers the
+ * charts / heatmap / alerts feed on top of this shell. */
+
+:root {
+  /* Surfaces */
+  --bg: #0f1419;
+  --bg-2: #0c1116;
+  --card: #1a2029;
+  --card-2: #1e2632;
+  --border: #2a3340;
+  --border-soft: #232b36;
+
+  /* Text */
+  --text: #e6edf3;
+  --text-dim: #9aa7b4;
+  --text-faint: #6b7785;
+
+  /* Status / accents */
+  --accent: #6ba3ff;
+  --ok: #4ecb8d;
+  --warn: #ffb454;
+  --bad: #ff6b6b;
+  --wait: #9aa7b4;
+
+  /* Per-correlation-type accents (backend CorrelationType values). Mirrored by the
+     .type--<value> classes below and reused for chips + (in C10) chart series. */
+  --type-temporal: #6ba3ff;
+  --type-session: #4ecb8d;
+  --type-user: #c58af9;
+  --type-cascade: #ff6b6b;
+  --type-metric: #ffb454;
+  --type-unknown: #7c8aa5;
+
+  /* Log-level accents */
+  --level-error: #ff6b6b;
+  --level-warn: #ffb454;
+  --level-info: #8b97a5;
+  --level-debug: #6b7785;
+
+  /* Alert-severity accents (used by the C10 alerts feed; defined here for C10). */
+  --sev-critical: #ff6b6b;
+  --sev-warning: #ffb454;
+  --sev-info: #6ba3ff;
+
+  /* Shape & motion */
+  --radius: 12px;
+  --radius-sm: 9px;
+  --shadow: 0 8px 26px rgba(3, 7, 12, 0.55);
+  --gap: 16px;
+  --maxw: 1280px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #15202b 0%, transparent 55%),
+    radial-gradient(1000px 520px at 100% 0%, #141b2a 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+/* ----------------------------------------------------------------- layout -- */
+
+.app {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 26px clamp(14px, 3vw, 36px) 60px;
+}
+
+.app__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  margin-bottom: 20px;
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.app__logo {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--accent), var(--type-user));
+  box-shadow: var(--shadow);
+  flex: 0 0 auto;
+}
+
+.app__title {
+  margin: 0;
+  font-size: 21px;
+  letter-spacing: -0.01em;
+}
+
+.app__subtitle {
+  margin: 2px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.app__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+/* --------------------------------------------------------- live indicator -- */
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.live__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--wait);
+  flex: 0 0 auto;
+}
+
+.live__dot--ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(78, 203, 141, 0.16);
+  animation: livepulse 2s ease-in-out infinite;
+}
+
+.live__dot--bad {
+  background: var(--bad);
+  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.16);
+}
+
+.live__dot--warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px rgba(255, 180, 84, 0.16);
+}
+
+.live__dot--wait {
+  background: var(--wait);
+}
+
+@keyframes livepulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px rgba(78, 203, 141, 0.16);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(78, 203, 141, 0.04);
+  }
+}
+
+/* -------------------------------------------------------------- error banner -- */
+
+.errorbanner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: var(--gap);
+  padding: 11px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 107, 107, 0.4);
+  background: rgba(255, 107, 107, 0.1);
+  color: var(--bad);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.errorbanner__icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* ------------------------------------------------------------- connecting -- */
+
+.connecting {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 40px 4px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2.5px solid rgba(107, 163, 255, 0.25);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ------------------------------------------------------------- stat cards -- */
+
+.statcards {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.statcards__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.statcard {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  box-shadow: var(--shadow);
+}
+
+.statcard__value {
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+}
+
+.statcard__value--ok {
+  color: var(--ok);
+}
+.statcard__value--bad {
+  color: var(--bad);
+}
+.statcard__value--warn {
+  color: var(--warn);
+}
+
+.statcard__label {
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.statcard__hint {
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+/* ------------------------------------------------------------- type chips -- */
+
+.typechips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.typechip {
+  --tcolor: var(--type-unknown);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  border-color: color-mix(in srgb, var(--tcolor) 40%, var(--border));
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.typechip__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--tcolor);
+  flex: 0 0 auto;
+}
+
+.typechip__label {
+  color: var(--tcolor);
+  font-weight: 600;
+}
+
+.typechip__count {
+  color: var(--text);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Per-type accent binding (backend CorrelationType enum values). */
+.type--temporal {
+  --tcolor: var(--type-temporal);
+}
+.type--session_based {
+  --tcolor: var(--type-session);
+}
+.type--user_based {
+  --tcolor: var(--type-user);
+}
+.type--error_cascade {
+  --tcolor: var(--type-cascade);
+}
+.type--metric_based {
+  --tcolor: var(--type-metric);
+}
+.type--unknown {
+  --tcolor: var(--type-unknown);
+}
+
+/* ----------------------------------------------------------- dashboard grid -- */
+
+/* Two equal columns on wide screens (analytics placeholders in C9; charts in C10),
+   collapsing to a single column when narrow. minmax(0,...) lets a column shrink so
+   an overflowing table/chart sizes to it instead of blowing out the row. */
+.dashgrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .dashgrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---------------------------------------------------------------- panels -- */
+
+.panel {
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+}
+
+.panel__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.panel__count {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.panel__soon {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: rgba(107, 163, 255, 0.08);
+}
+
+.panel--placeholder {
+  border-style: dashed;
+  border-color: var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+  min-height: 120px;
+}
+
+.placeholder__note {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------------- tables -- */
+
+/* Horizontal scroll is confined to this wrapper so the page body never scrolls
+   sideways on a narrow viewport. */
+.tablewrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.datatable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.datatable thead th {
+  position: sticky;
+  top: 0;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+  white-space: nowrap;
+}
+
+.datatable tbody td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  vertical-align: middle;
+}
+
+.datatable tbody tr:hover td {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.datatable__row--error td {
+  background: rgba(255, 107, 107, 0.06);
+}
+
+.datatable__row--error:hover td {
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.datatable__time,
+.datatable__num,
+.datatable__corr {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.datatable__corr {
+  color: var(--text-faint);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.datatable__msg {
+  max-width: 340px;
+  color: var(--text);
+}
+
+.datatable__empty {
+  text-align: center;
+  color: var(--text-faint);
+  font-style: italic;
+  padding: 22px 10px;
+}
+
+/* -------------------------------------------------------------- endpoints -- */
+
+.endpoint {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+
+.endpoint__source {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.endpoint__service {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ------------------------------------------------------------ strength bar -- */
+
+.strengthbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 96px;
+}
+
+.strengthbar__track {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+
+.strengthbar__fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--ok));
+}
+
+.strengthbar__val {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  min-width: 30px;
+  text-align: right;
+}
+
+/* --------------------------------------------------------------- levels -- */
+
+.level {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-dim);
+}
+
+.level--error {
+  color: var(--level-error);
+  border-color: color-mix(in srgb, var(--level-error) 45%, var(--border));
+  background: rgba(255, 107, 107, 0.1);
+}
+
+.level--warn {
+  color: var(--level-warn);
+  border-color: color-mix(in srgb, var(--level-warn) 45%, var(--border));
+  background: rgba(255, 180, 84, 0.1);
+}
+
+.level--info {
+  color: var(--level-info);
+}
+
+.level--debug,
+.level--other {
+  color: var(--level-debug);
+}
