@@ -94,3 +94,54 @@ export function levelClass(level) {
   if (l === "DEBUG") return "debug";
   return "other";
 }
+
+// The five e-commerce log sources (backend SourceType enum values), in the same
+// order the correlation matrix emits its rows/columns. Drives the stable source
+// filter chips + heatmap axes so the layout holds even on an empty payload.
+export const SOURCE_TYPES = ["web", "database", "api_service", "payment", "inventory"];
+
+// Short display labels for the dense heatmap axes / filter chips.
+export const SOURCE_LABELS = {
+  web: "Web",
+  database: "DB",
+  api_service: "API",
+  payment: "Pay",
+  inventory: "Inv",
+};
+
+/** Short display label for a source; unknown sources echo back verbatim. */
+export function sourceLabel(source) {
+  return SOURCE_LABELS[source] ?? String(source ?? "—");
+}
+
+/** The three log levels the generator emits, in ascending severity order. */
+export const LOG_LEVELS = ["INFO", "WARN", "ERROR"];
+
+/** Sort rank for a log level (higher = more severe) so Level sorts by severity. */
+export function levelRank(level) {
+  const l = String(level ?? "").toUpperCase();
+  if (l === "ERROR" || l === "CRITICAL" || l === "FATAL") return 3;
+  if (l === "WARN" || l === "WARNING") return 2;
+  if (l === "INFO") return 1;
+  return 0;
+}
+
+/**
+ * Resolve a CSS custom property from :root to its concrete value. Recharts renders
+ * SVG and sets fill/stroke as presentation attributes, which do NOT resolve
+ * `var(--x)` — so charts read their theme colours through this at mount instead.
+ * Falls back to `fallback` if the DOM/computed style isn't available.
+ */
+export function cssVar(name, fallback = "") {
+  if (typeof document === "undefined" || typeof getComputedStyle !== "function") {
+    return fallback;
+  }
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name);
+  return (v && v.trim()) || fallback;
+}
+
+/** Clamp a value into [0, 1]; 0 for non-finite input. Shared by the heatmap/charts. */
+export function clamp01(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? Math.max(0, Math.min(1, x)) : 0;
+}

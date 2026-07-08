@@ -1,20 +1,24 @@
 import { useDashboard } from "./hooks/useDashboard.js";
 import ErrorBanner from "./components/ErrorBanner.jsx";
 import StatsCards from "./components/StatsCards.jsx";
+import TimelineChart from "./components/TimelineChart.jsx";
+import ScatterPlot from "./components/ScatterPlot.jsx";
+import MatrixHeatmap from "./components/MatrixHeatmap.jsx";
+import AlertsFeed from "./components/AlertsFeed.jsx";
 import CorrelationsTable from "./components/CorrelationsTable.jsx";
 import LogsTable from "./components/LogsTable.jsx";
 
 // Poll cadence for the whole dashboard — one GET /api/v1/dashboard every 5s.
 const POLL_MS = 5000;
 
-// Top-level dashboard (C9 shell). A single polling loop (useDashboard) fetches the
-// fat GET /api/v1/dashboard payload through nginx's /api proxy and fans it out to
-// the stats grid + tables. C10 adds the visual analytics (timeline, scatter,
-// matrix heatmap, alerts feed) into the placeholder slots below — a pure src change
-// because this shell already lays out the grid and null-guards every field.
+// Top-level dashboard. A single polling loop (useDashboard) fetches the fat GET
+// /api/v1/dashboard payload through nginx's /api proxy and fans it out to the stats
+// grid, the visual analytics (timeline, scatter, matrix heatmap, alerts feed) and
+// the two data tables. Every slice is read defensively so first render and a
+// degraded payload never crash.
 //
 // Graceful degradation: the hook keeps the last good snapshot on a failed poll and
-// raises `error`/`stale`, so the ErrorBanner explains the outage while the tables
+// raises `error`/`stale`, so the ErrorBanner explains the outage while the panels
 // keep showing the last data instead of blanking out.
 export default function App() {
   const { data, error, lastUpdated, loading, stale } = useDashboard(POLL_MS);
@@ -22,6 +26,10 @@ export default function App() {
   // Defensive reads so first render (data === null) and a degraded payload never crash.
   const status = data?.status ?? {};
   const stats = data?.stats ?? {};
+  const timeline = data?.timeline ?? [];
+  const scatter = data?.scatter ?? [];
+  const matrix = data?.matrix ?? { sources: [], cells: [] };
+  const alerts = data?.alerts ?? [];
   const correlations = data?.recent_correlations ?? [];
   const logs = data?.recent_logs ?? [];
 
@@ -80,29 +88,17 @@ export default function App() {
         <main className="app__main">
           <StatsCards stats={stats} status={status} />
 
-          {/* Visual analytics row. C9 ships structural placeholders so the grid +
-              layout are already correct; C10 drops the real charts into these slots
-              as a pure src change. */}
-          <section className="dashgrid">
-            {/* C10: TimelineChart, ScatterPlot, MatrixHeatmap, AlertsFeed slot here */}
-            <div className="panel panel--placeholder">
-              <div className="panel__head">
-                <h2 className="panel__title">Timeline &amp; scatter</h2>
-                <span className="panel__soon">C10</span>
-              </div>
-              <p className="placeholder__note">
-                Throughput timeline and strength × confidence scatter arrive in C10.
-              </p>
-            </div>
-            <div className="panel panel--placeholder">
-              <div className="panel__head">
-                <h2 className="panel__title">Correlation matrix &amp; alerts</h2>
-                <span className="panel__soon">C10</span>
-              </div>
-              <p className="placeholder__note">
-                Source×source heatmap and the live alerts feed arrive in C10.
-              </p>
-            </div>
+          {/* Visual analytics. Two responsive rows of paired panels (each collapses
+              to a single column ≤900px), then the two full-width tables. Every slice
+              is null-guarded above so first render + a degraded payload never crash. */}
+          <section className="dashgrid-2">
+            <TimelineChart timeline={timeline} />
+            <ScatterPlot scatter={scatter} />
+          </section>
+
+          <section className="dashgrid-2">
+            <MatrixHeatmap matrix={matrix} />
+            <AlertsFeed alerts={alerts} />
           </section>
 
           <CorrelationsTable correlations={correlations} />
