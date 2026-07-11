@@ -46,13 +46,18 @@ class Runtime:
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
-        """Construct a fresh Runtime holding the settings and empty placeholders.
+        """Construct a fresh Runtime holding the settings and the RCA analyzer.
 
-        Nothing here touches the network or spawns a task: the analyzer and its
-        collaborators are attached by later commits, and the live-stream task is
-        started by the lifespan only when enabled.
+        The analyzer is built here (C2) so both the injected-runtime test path and
+        the production lifespan share one construction site. Nothing here touches the
+        network or spawns a task: the connection manager is attached in C6 and the
+        live-stream task is started by the lifespan only when enabled (C8). The
+        import is deferred to keep module import order simple and avoid any import
+        cycle through the analysis package.
         """
-        return cls(settings=settings)
+        from src.analysis import RCAAnalyzer
+
+        return cls(settings=settings, analyzer=RCAAnalyzer(settings))
 
 
 @asynccontextmanager
