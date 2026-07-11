@@ -50,14 +50,19 @@ class Runtime:
 
         The analyzer is built here (C2) so both the injected-runtime test path and
         the production lifespan share one construction site. Nothing here touches the
-        network or spawns a task: the connection manager is attached in C6 and the
-        live-stream task is started by the lifespan only when enabled (C8). The
-        import is deferred to keep module import order simple and avoid any import
-        cycle through the analysis package.
+        network or spawns a task: the connection manager is constructed here (C6 — an
+        empty in-memory registry, no I/O) and the live-stream task is started by the
+        lifespan only when enabled (C8). The imports are deferred to keep module
+        import order simple and avoid any import cycle through the analysis package.
         """
         from src.analysis import RCAAnalyzer
+        from src.ws import ConnectionManager
 
-        return cls(settings=settings, analyzer=RCAAnalyzer(settings))
+        return cls(
+            settings=settings,
+            analyzer=RCAAnalyzer(settings),
+            connection_manager=ConnectionManager(),
+        )
 
 
 @asynccontextmanager
