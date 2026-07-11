@@ -6,13 +6,15 @@ composes the per-stage collaborators (each a small module in this package).
 
 C2 wired the first stage — the :class:`~src.analysis.timeline.TimelineReconstructor`.
 C3 added the second — the :class:`~src.analysis.causal_graph.CausalGraphBuilder` —
-populating the report's serialized ``causal_graph``. C4 adds the third — the
+populating the report's serialized ``causal_graph``. C4 added the third — the
 :class:`~src.analysis.root_cause.RootCauseIdentifier` +
-:class:`~src.analysis.root_cause.ConfidenceScorer` — so ``analyze`` now also populates
-the report's ranked ``root_causes``. Impact and hypotheses remain at their empty
-defaults until later commits fill them in at the marked seams; those stages consume the
-in-memory ``graph`` object built here. Each stage is folded into ``analyze`` at its
-marked seam:
+:class:`~src.analysis.root_cause.ConfidenceScorer` — populating the report's ranked
+``root_causes``. C5 adds the fourth — the
+:class:`~src.analysis.impact.ImpactAnalyzer` — and completes report assembly:
+``analyze`` now also populates ``impact_analysis`` (blast radius, affected services,
+weighted reachability) off that same graph and ranked causes, so every report field
+except ``hypotheses`` (empty until C7) is filled. Each stage is folded into ``analyze``
+at its marked seam:
 
 * C3 — causal-graph builder (``networkx.DiGraph``),
 * C4 — root-cause identifier + confidence scorer,
@@ -29,10 +31,11 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from src.analysis.causal_graph import CausalGraphBuilder
+from src.analysis.impact import ImpactAnalyzer
 from src.analysis.root_cause import ConfidenceScorer, RootCauseIdentifier
 from src.analysis.timeline import TimelineReconstructor
 from src.config import Settings
-from src.models import ImpactAnalysis, IncidentReport, LogEvent
+from src.models import IncidentReport, LogEvent
 from src.service_map import ServiceDependencyMap
 
 logger = logging.getLogger(__name__)
@@ -55,7 +58,8 @@ class RCAAnalyzer:
         self.root_cause_identifier = RootCauseIdentifier(settings)
         #: Scores + descending-ranks those candidates into RootCause objects.
         self.confidence_scorer = ConfidenceScorer(settings)
-        # TODO(C5): self.impact = ImpactAnalyzer(settings)
+        #: Blast radius / affected services / weighted reachability off the graph.
+        self.impact_analyzer = ImpactAnalyzer(settings)
         # TODO(C7): self.anomaly = AnomalyAmplifier(settings)
         # TODO(C7): self.hypotheses = MultiHypothesisTracker(settings)
         # TODO(C8): self.clock = ClockSkewCorrector(settings)
@@ -66,13 +70,13 @@ class RCAAnalyzer:
     def analyze(self, events: list[LogEvent]) -> IncidentReport:
         """Analyze a batch of events into an :class:`IncidentReport`.
 
-        C4 scope: reconstruct the timeline (which back-fills each event's
-        ``event_id``), build the causal :class:`networkx.DiGraph`, then rank its
-        candidate root causes into ``report.root_causes``; the serialized graph is
-        attached as ``report.causal_graph``. Impact and hypotheses stay empty until
-        later commits. The report is appended to the bounded in-memory history and
-        returned; the live ``graph`` object is also available to the C5 impact stage at
-        the TODO seam below.
+        C5 scope: reconstruct the timeline (which back-fills each event's
+        ``event_id``), build the causal :class:`networkx.DiGraph`, rank its candidate
+        root causes into ``report.root_causes``, and compute the blast-radius /
+        weighted-reachability ``report.impact_analysis`` off that same graph and ranked
+        causes; the serialized graph is attached as ``report.causal_graph``. The report
+        is now fully assembled except ``hypotheses`` (empty until C7). It is appended to
+        the bounded in-memory history and returned.
         """
         # TODO(C8): clock-skew correction (reorder near-simultaneous / inverted events)
         # before timeline reconstruction.
@@ -94,7 +98,9 @@ class RCAAnalyzer:
         # out-degree centrality) off the causal graph; empty when there were no events.
         root_causes = self.confidence_scorer.rank(events, graph)
         # TODO(C7): hypotheses = self.hypotheses.track(graph, anomaly_seeds)
-        # TODO(C5): impact = self.impact.analyze(graph, root_causes)
+        # C5: blast-radius / affected-services / weighted-reachability impact, computed
+        # off the same graph + ranked causes (never recomputed differently downstream).
+        impact = self.impact_analyzer.analyze(events, graph, root_causes)
         # TODO(C9): root_causes = self.calibration.apply(root_causes)
         report = IncidentReport(
             incident_id="inc-" + uuid4().hex[:12],
@@ -102,7 +108,7 @@ class RCAAnalyzer:
             events=events,
             timeline=timeline,
             root_causes=root_causes,
-            impact_analysis=ImpactAnalysis(),
+            impact_analysis=impact,
             hypotheses=[],
             causal_graph=self.graph_builder.to_serializable(graph),
         )
