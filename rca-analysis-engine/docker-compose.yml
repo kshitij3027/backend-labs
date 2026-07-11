@@ -1,0 +1,86 @@
+# RCA Analysis Engine — service topology (Commit C1).
+#
+# `backend` is the runnable production service: a single uvicorn/FastAPI process on
+# :8000 serving the RCA API (REST +, from C6, the /ws WebSocket). ALL analysis state
+# is in-memory in this one process — there is NO redis, NO database and NO message
+# queue. The React dashboard `frontend` service is added in a later commit (C11).
+#
+# The profile-gated `test`, `e2e` (C10) and `loadtest` (C10) services run the pytest
+# suite, the black-box E2E verifier and the perf/load harness respectively (all built
+# from Dockerfile.test); none of them starts on a bare `docker compose up`. Run via
+# `make up` / `make test`.
+
+services:
+  # Live production API — built from the production Dockerfile and exposed on the
+  # host. No container_name (sibling convention: leaves compose free to name/scale it).
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /api/health is dependency-free, so the app is healthy as soon as uvicorn
+      # binds; 20s is a safe margin for image start-up.
+      start_period: 20s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same
+  # code + requirements as the backend, plus the tests) and runs pytest. Profile-gated
+  # so it never starts on a bare `docker compose up`. Run via `make test`.
+  # LIVE_STREAM_ENABLED=false keeps tests deterministic (never start the live loop).
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - LIVE_STREAM_ENABLED=false
+    command: ["pytest", "-q"]
+
+  # Black-box E2E verifier (C10). Reuses the tester image and runs
+  # scripts/verify_e2e.py against the LIVE backend over the compose network (HTTP/WS
+  # only). Every gate below is host-overridable. Profile-gated so it never starts on a
+  # bare `docker compose up`. Wired to a Makefile `e2e` target in C10.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - E2E_BASE_URL=http://backend:8000
+      - MIN_CAUSAL_ACCURACY=${MIN_CAUSAL_ACCURACY:-0.85}
+      - E2E_MAX_ANALYZE_LATENCY=${E2E_MAX_ANALYZE_LATENCY:-30.0}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
+  # Load / performance harness (C10). Same tester image, running scripts/load_test.py
+  # against the LIVE backend over the compose network. Every gate below is
+  # host-overridable (e.g. `MIN_EVENTS_PER_SEC=100000 make load` proves the gate
+  # bites). Profile-gated so it never starts on a bare `docker compose up`.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - BASE_URL=http://backend:8000
+      - LOAD_EVENTS=${LOAD_EVENTS:-1000}
+      - MIN_EVENTS_PER_SEC=${MIN_EVENTS_PER_SEC:-1000}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]

@@ -1,0 +1,10 @@
+{
+  "api-gateway": ["auth", "user", "payment"],
+  "auth": ["database", "redis"],
+  "user": ["database", "file-storage"],
+  "payment": ["database", "external-payment-api"],
+  "database": [],
+  "redis": [],
+  "file-storage": [],
+  "external-payment-api": []
+}
