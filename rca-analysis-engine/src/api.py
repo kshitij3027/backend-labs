@@ -6,8 +6,11 @@ into an :class:`~src.models.IncidentReport`) and ``GET /api/incidents[/{id}]`` (
 bounded, newest-first in-memory incident history and single-incident lookup). The
 factory also installs the permissive CORS middleware and the real-time ``/ws``
 WebSocket (C6) — the POST handler broadcasts each new report to every connected client
-via the :class:`~src.ws.ConnectionManager` — and a later commit adds
-``GET /api/calibration`` (C9). Handlers read shared state off
+via the :class:`~src.ws.ConnectionManager` — plus the C9 post-mortem / calibration
+surface: ``GET /api/incidents/{id}/report`` (export a markdown post-mortem with recovery
+points + event classifications), ``GET /api/calibration`` (calibrator stats: method,
+Brier, reliability bins), and ``POST /api/incidents/{id}/feedback`` (record a resolved
+incident's true root cause and refit the calibrator). Handlers read shared state off
 ``request.app.state.runtime`` (attached by the lifespan, or injected by tests) and
 degrade gracefully when it is absent — reads fall back to empty / 404 and writes to
 503, so a missing runtime never becomes a 500.
@@ -26,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from src.config import get_settings
 from src.models import IncidentReport, LogEvent
@@ -43,6 +47,16 @@ API_VERSION = "0.1.0"
 
 #: SPEC-VERBATIM /api/health body — never change these keys/values.
 _HEALTH_BODY: dict[str, Any] = {"status": "healthy", "analyzer_ready": True}
+
+
+class FeedbackRequest(BaseModel):
+    """Body of ``POST /api/incidents/{id}/feedback`` — the resolved ground-truth cause.
+
+    A malformed body (missing / wrong-typed field) is rejected as 422 by pydantic before
+    the handler runs, so the feedback endpoint never sees invalid input.
+    """
+
+    true_root_cause_event_id: str
 
 
 def _runtime(request: Request) -> Any | None:
@@ -200,6 +214,79 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         raise HTTPException(
             status_code=404, detail=f"incident {incident_id!r} not found"
         )
+
+    @app.get("/api/incidents/{incident_id}/report")
+    async def incident_report(incident_id: str, request: Request) -> dict[str, Any]:
+        """Export the C9 post-mortem for a stored incident, or 404 when unknown.
+
+        Looks the report up in history and returns
+        :meth:`~src.analysis.report.PostMortemReporter.build` as JSON —
+        ``{"incident_id", "markdown", "recovery_points", "classifications"}``. The graph is
+        rebuilt from the report's serialized ``causal_graph`` inside ``build`` (graph=None),
+        so the post-mortem is produced from the stored report alone.
+        """
+        analyzer = _runtime_analyzer(request)
+        if analyzer is not None:
+            reporter = getattr(analyzer, "reporter", None)
+            for report in analyzer.incident_history:
+                if report.incident_id == incident_id:
+                    if reporter is None:
+                        raise HTTPException(status_code=503, detail="reporter unavailable")
+                    built = reporter.build(report)
+                    return {
+                        "incident_id": incident_id,
+                        "markdown": built["markdown"],
+                        "recovery_points": built["recovery_points"],
+                        "classifications": built["classifications"],
+                    }
+        raise HTTPException(
+            status_code=404, detail=f"incident {incident_id!r} not found"
+        )
+
+    @app.get("/api/calibration")
+    async def calibration(request: Request) -> dict[str, Any]:
+        """Return the confidence calibrator's stats (method, Brier, reliability bins).
+
+        Reports the unfitted shape (``fitted: false``, ``n_samples: 0``, ``None`` Briers,
+        empty bins) until enough resolved incidents have been fed back via the feedback
+        endpoint. Degrades to a valid unfitted stats dict when no analyzer/calibrator is
+        wired, mirroring the rest of the module's graceful-degradation pattern.
+        """
+        analyzer = _runtime_analyzer(request)
+        calibrator = getattr(analyzer, "calibrator", None)
+        if calibrator is None:
+            method = get_settings().calibration_method
+            return {
+                "method": method,
+                "n_samples": 0,
+                "fitted": False,
+                "brier_raw": None,
+                "brier_calibrated": None,
+                "reliability_bins": [],
+            }
+        return calibrator.stats()
+
+    @app.post("/api/incidents/{incident_id}/feedback")
+    async def incident_feedback(
+        incident_id: str, body: FeedbackRequest, request: Request
+    ) -> dict[str, Any]:
+        """Record a resolved incident's ground-truth root cause; return updated calibration.
+
+        The body is ``{"true_root_cause_event_id": "..."}`` (a malformed body -> 422 from
+        pydantic). The analyzer records one calibration sample per ranked candidate of the
+        stored incident, refits, and returns the fresh
+        :meth:`~src.analysis.calibration.ConfidenceCalibrator.stats`. An unknown incident
+        -> 404; a missing analyzer -> 503.
+        """
+        analyzer = _runtime_analyzer(request)
+        if analyzer is None:
+            raise HTTPException(status_code=503, detail="analyzer unavailable")
+        try:
+            return analyzer.record_outcome(incident_id, body.true_root_cause_event_id)
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=404, detail=f"incident {incident_id!r} not found"
+            ) from exc
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:

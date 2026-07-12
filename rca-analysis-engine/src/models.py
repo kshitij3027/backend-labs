@@ -92,8 +92,14 @@ class RootCause(BaseModel):
     service: str
     level: LogLevel
     message: str
-    #: Confidence in [0, 1] that this event is the (a) root cause.
+    #: Confidence in [0, 1] that this event is the (a) root cause. From C9 this is the
+    #: *applied* value — the calibrated score when a calibrator is fitted, else identical
+    #: to ``raw_confidence`` (the calibrator is the identity until it has learned).
     confidence: float = 0.0
+    #: Pre-calibration confidence (C9). ``analyze`` copies the scorer's raw output here
+    #: before overwriting ``confidence`` with the calibrated value, so the original
+    #: ranking signal is always preserved. ``None`` on reports built before C9.
+    raw_confidence: float | None = None
     timestamp: str
 
 
@@ -149,3 +155,12 @@ class IncidentReport(BaseModel):
     #: and consumed by the C12 dashboard. Defaults empty so earlier/partial reports
     #: (assembled before the graph stage) still validate and serialize cleanly.
     causal_graph: dict = Field(default_factory=dict)
+    #: Post-mortem recovery points (C9): interior propagation-path nodes where an
+    #: intervention would truncate the largest downstream subtree, ranked descending —
+    #: ``[{"event_id","service","gated_subtree_size","rationale"}]``. Defaults empty so
+    #: earlier/partial reports still validate.
+    recovery_points: list = Field(default_factory=list)
+    #: Post-mortem event classification (C9): ``event_id -> EventClass`` value
+    #: (``primary_trigger`` / ``propagation_path`` / ``contributing_factor``). Every
+    #: event is classified exactly once. Defaults empty so earlier reports still validate.
+    event_classifications: dict = Field(default_factory=dict)

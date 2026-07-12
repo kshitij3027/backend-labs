@@ -34,10 +34,12 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from src.analysis.anomaly import AnomalyAmplifier
+from src.analysis.calibration import ConfidenceCalibrator
 from src.analysis.causal_graph import CausalGraphBuilder
 from src.analysis.clock import ClockSkewCorrector
 from src.analysis.hypotheses import MultiHypothesisTracker
 from src.analysis.impact import ImpactAnalyzer
+from src.analysis.report import PostMortemReporter
 from src.analysis.root_cause import ConfidenceScorer, RootCauseIdentifier
 from src.analysis.timeline import TimelineReconstructor
 from src.config import Settings
@@ -74,8 +76,12 @@ class RCAAnalyzer:
         #: into a causally consistent order BEFORE the timeline stage; shares the service
         #: map so its dependency happens-before edges match the causal graph's direction.
         self.clock_corrector = ClockSkewCorrector(settings, self.service_map)
-        # TODO(C9): self.calibration = ConfidenceCalibrator(settings)
-        # TODO(C9): self.reporter = PostMortemReporter(settings)
+        #: Confidence calibration (C9): learns raw-confidence -> empirical-root-cause
+        #: probability from resolved incidents (via record_outcome). Identity until fitted,
+        #: so analyze() is unaffected until enough outcomes have been fed back.
+        self.calibrator = ConfidenceCalibrator(settings)
+        #: Post-mortem generator (C9): recovery points, event classification, markdown.
+        self.reporter = PostMortemReporter(settings)
 
     def analyze(self, events: list[LogEvent]) -> IncidentReport:
         """Analyze a batch of events into an :class:`IncidentReport`.
@@ -84,11 +90,14 @@ class RCAAnalyzer:
         causally-consistent ordering, then reconstruct the timeline (which back-fills each
         event's ``event_id``), build the causal :class:`networkx.DiGraph`, score per-event
         base-rate ``anomaly_scores``,
-        rank candidate ``root_causes``, track the top-k concurrent ``hypotheses`` via
-        anomaly-seeded reversed-graph PageRank, and compute the blast-radius /
-        weighted-reachability ``impact_analysis`` off that same graph; the serialized
-        graph is attached as ``report.causal_graph``. The fully-assembled report is
-        appended to the bounded in-memory history and returned.
+        rank candidate ``root_causes`` (C9 then stashes each raw score on
+        ``raw_confidence`` and overwrites ``confidence`` with the calibrated probability —
+        identity until the calibrator learns, so the ranking is unchanged), track the top-k
+        concurrent ``hypotheses`` via anomaly-seeded reversed-graph PageRank, compute the
+        blast-radius / weighted-reachability ``impact_analysis`` off that same graph, and
+        derive the C9 post-mortem ``recovery_points`` + per-event ``event_classifications``;
+        the serialized graph is attached as ``report.causal_graph``. The fully-assembled
+        report is appended to the bounded in-memory history and returned.
         """
         # C8: clock-skew correction runs FIRST — before timeline reconstruction — so every
         # downstream stage keys off a single causally-consistent ordering. It returns a new
@@ -117,6 +126,15 @@ class RCAAnalyzer:
         # C4: rank candidate root causes (severity + temporal position + normalized
         # out-degree centrality) off the causal graph; empty when there were no events.
         root_causes = self.confidence_scorer.rank(events, graph)
+        # C9: apply confidence calibration as a *display* value while preserving the raw
+        # ranking. ``root_causes`` is already sorted descending by the scorer's raw
+        # confidence; we stash that on ``raw_confidence`` and overwrite ``confidence`` with
+        # the calibrated probability IN PLACE (no re-sort). The calibrator is the identity
+        # until enough outcomes are fed back — and isotonic/Platt are monotonic — so the
+        # #1 ground-truth cause never changes rank; only the number shown is recalibrated.
+        for rc in root_causes:
+            rc.raw_confidence = rc.confidence
+            rc.confidence = self.calibrator.transform(rc.raw_confidence)
         # C7: top-k concurrent root-cause hypotheses with independent confidences, ranked
         # by personalized PageRank / RWR on the reversed causal graph seeded by the
         # anomaly scores (mass flows from symptoms back toward the causal sources).
@@ -124,7 +142,11 @@ class RCAAnalyzer:
         # C5: blast-radius / affected-services / weighted-reachability impact, computed
         # off the same graph + ranked causes (never recomputed differently downstream).
         impact = self.impact_analyzer.analyze(events, graph, root_causes)
-        # TODO(C9): root_causes = self.calibration.apply(root_causes)
+        # C9: post-mortem artifacts off the same graph + ranked causes — recovery points
+        # (interior choke points that gate the largest downstream subtree) and a
+        # one-class-per-event causal-role classification.
+        recovery_points = self.reporter.recovery_points(graph, root_causes)
+        event_classifications = self.reporter.classify_events(events, graph, root_causes)
         report = IncidentReport(
             incident_id="inc-" + uuid4().hex[:12],
             timestamp=incident_timestamp,
@@ -135,10 +157,36 @@ class RCAAnalyzer:
             hypotheses=hypotheses,
             anomaly_scores=anomaly_scores,
             causal_graph=self.graph_builder.to_serializable(graph),
+            recovery_points=recovery_points,
+            event_classifications=event_classifications,
         )
 
         self._remember(report)
         return report
+
+    def record_outcome(self, incident_id: str, true_root_cause_event_id: str) -> dict:
+        """Learn from a resolved incident and return the updated calibration stats (C9).
+
+        Looks up ``incident_id`` in the bounded history, feeds each of that report's ranked
+        candidates to the calibrator as a ``(raw_confidence, was_root_cause)`` sample (the
+        candidate matching ``true_root_cause_event_id`` is the positive), refits the
+        calibrator (a no-op until it has ``calibration_min_samples`` samples across both
+        classes), and returns :meth:`ConfidenceCalibrator.stats`. Raises :class:`KeyError`
+        when no such incident is retained — the API layer maps that to a 404.
+        """
+        report = self._find(incident_id)
+        if report is None:
+            raise KeyError(incident_id)
+        self.calibrator.record_outcome(report.root_causes, true_root_cause_event_id)
+        self.calibrator.fit()
+        return self.calibrator.stats()
+
+    def _find(self, incident_id: str) -> IncidentReport | None:
+        """Return the retained report with ``incident_id``, or ``None`` if trimmed/unknown."""
+        for report in self.incident_history:
+            if report.incident_id == incident_id:
+                return report
+        return None
 
     def remember(self, report: IncidentReport) -> None:
         """Append an externally-produced report to the bounded history.

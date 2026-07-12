@@ -61,6 +61,10 @@ def test_defaults(monkeypatch):
     assert settings.live_stream_seed == 0
     assert settings.incremental_max_events == 500
 
+    # Confidence calibration (C9).
+    assert settings.calibration_min_samples == 10
+    assert settings.calibration_method == "isotonic"
+
 
 def test_constructor_override_wins_over_default():
     # A constructor kwarg beats the field default (env file disabled for hermeticity).

@@ -91,6 +91,16 @@ class Settings(BaseSettings):
     #: order — only a dependency / happens-before constraint may reorder within the band.
     clock_skew_epsilon: float = 2.0
 
+    # --- Confidence calibration (C9, feature area C) ---
+    #: Minimum recorded (raw_confidence, was_root_cause) samples before the calibrator
+    #: will fit a model. Below this — or when only one outcome class has been seen — it
+    #: stays unfitted and transform() is the identity, so a normal analyze() never breaks.
+    calibration_min_samples: int = 10
+    #: Calibration model fit against historical outcomes: "isotonic" (monotonic,
+    #: non-parametric) or "platt" (sigmoid / logistic regression). Any other value falls
+    #: back to isotonic.
+    calibration_method: str = "isotonic"
+
     # --- Incident history / live stream ---
     #: Max incidents retained in the bounded in-memory history.
     max_incident_history: int = 1000

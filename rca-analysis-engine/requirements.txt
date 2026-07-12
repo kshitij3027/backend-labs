@@ -16,6 +16,10 @@ networkx==3.3
 numpy==1.26.4
 scipy==1.13.0
 
+# Confidence calibration (C9): isotonic / Platt regression + Brier score + reliability
+# curve. Pinned to a build compatible with numpy 1.26 / scipy 1.13.
+scikit-learn==1.5.2
+
 # Tolerant timestamp parsing (ISO-8601 / offsets / clock-skew handling)
 python-dateutil==2.9.0.post0
 
