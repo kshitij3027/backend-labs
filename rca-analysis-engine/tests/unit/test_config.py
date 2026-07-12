@@ -55,6 +55,12 @@ def test_defaults(monkeypatch):
         settings.service_dependency_map_path == "src/config/service_dependency_map.json"
     )
 
+    # Clock-skew correction + incremental streaming (C8).
+    assert settings.clock_skew_epsilon == 2.0
+    assert settings.live_stream_interval == 5.0
+    assert settings.live_stream_seed == 0
+    assert settings.incremental_max_events == 500
+
 
 def test_constructor_override_wins_over_default():
     # A constructor kwarg beats the field default (env file disabled for hermeticity).

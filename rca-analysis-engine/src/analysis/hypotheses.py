@@ -78,7 +78,10 @@ class MultiHypothesisTracker:
         self.settings = settings
 
     def random_walk_with_restart(
-        self, graph: nx.DiGraph, anomaly_scores: dict[str, float]
+        self,
+        graph: nx.DiGraph,
+        anomaly_scores: dict[str, float],
+        initial: dict[str, float] | None = None,
     ) -> tuple[list[str], np.ndarray, int]:
         """Run anomaly-seeded RWR on the reversed causal graph.
 
@@ -86,6 +89,14 @@ class MultiHypothesisTracker:
         stationary distribution (sums to 1 for a non-empty graph), and ``iterations`` the
         number of power-iteration steps taken (``< pagerank_max_iter`` once converged). An
         empty graph yields ``([], empty, 0)``.
+
+        ``initial`` is an optional **warm start** — a ``node -> mass`` map (typically a
+        previous run's ``pi``) used as the iteration's starting vector instead of the
+        uniform/restart cold start. The fixed point is unchanged (so the ranking is
+        identical), but when the graph changed only slightly the walk begins near its new
+        stationary point and converges in fewer iterations. Missing nodes seed to 0 and the
+        vector is L1-normalized; an all-zero / absent ``initial`` falls back to a cold
+        start, so existing callers that omit it are completely unaffected.
         """
         nodes = list(graph.nodes())
         n = len(nodes)
@@ -131,7 +142,16 @@ class MultiHypothesisTracker:
         tol = self.settings.pagerank_tol
         max_iter = self.settings.pagerank_max_iter
 
-        pi = restart.copy()
+        # Warm start from ``initial`` (a prior pi) when supplied and non-degenerate; else
+        # cold-start from the restart vector (the original, unchanged behaviour).
+        if initial is not None:
+            seed = np.array(
+                [max(0.0, float(initial.get(node, 0.0))) for node in nodes], dtype=float
+            )
+            seed_mass = seed.sum()
+            pi = seed / seed_mass if seed_mass > 0.0 else restart.copy()
+        else:
+            pi = restart.copy()
         iterations = 0
         for step in range(1, max_iter + 1):
             iterations = step
@@ -150,6 +170,7 @@ class MultiHypothesisTracker:
         events: list[LogEvent],
         graph: nx.DiGraph,
         anomaly_scores: dict[str, float],
+        initial: dict[str, float] | None = None,
     ) -> list[Hypothesis]:
         """Return the surviving top-k root-cause hypotheses, sorted by confidence desc.
 
@@ -160,8 +181,32 @@ class MultiHypothesisTracker:
         PageRank mass and anomaly score, and each is labelled CONFIRMED / TENTATIVE or
         dropped when PRUNED. An empty graph yields an empty list; a single node yields one
         hypothesis.
+
+        ``initial`` is an optional warm-start ``node -> mass`` vector forwarded to the power
+        iteration (see :meth:`random_walk_with_restart`); it changes only how fast the walk
+        converges, not the resulting ranking. Defaults to ``None`` (cold start), so the C7
+        analyze call site is unchanged.
         """
-        nodes, pi, _iterations = self.random_walk_with_restart(graph, anomaly_scores)
+        nodes, pi, _iterations = self.random_walk_with_restart(
+            graph, anomaly_scores, initial=initial
+        )
+        return self.hypotheses_from_pi(nodes, pi, anomaly_scores)
+
+    def hypotheses_from_pi(
+        self,
+        nodes: list[str],
+        pi: np.ndarray,
+        anomaly_scores: dict[str, float],
+    ) -> list[Hypothesis]:
+        """Build the surviving top-k hypotheses from a precomputed PageRank vector.
+
+        Extracted so a caller that already ran the walk (e.g. the incremental analyzer,
+        which needs the iteration count and the raw ``pi`` for its warm start) can reuse the
+        exact independent-confidence + lifecycle logic without recomputing the walk. Given
+        the index order ``nodes`` and its stationary distribution ``pi``, returns the
+        surviving hypotheses sorted by confidence descending; an empty ``nodes`` yields
+        ``[]``.
+        """
         n = len(nodes)
         if n == 0:
             return []

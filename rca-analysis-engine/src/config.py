@@ -85,12 +85,27 @@ class Settings(BaseSettings):
     cors_origins: str = "*"
     log_level: str = "INFO"
 
+    # --- Clock-skew correction (C8, feature area E) ---
+    #: Tolerance band in seconds: two events whose |Δt| is below this are treated as
+    #: "concurrent" (near-simultaneous), so a sub-ε timestamp difference never forces an
+    #: order — only a dependency / happens-before constraint may reorder within the band.
+    clock_skew_epsilon: float = 2.0
+
     # --- Incident history / live stream ---
     #: Max incidents retained in the bounded in-memory history.
     max_incident_history: int = 1000
     #: Master switch for the background live-stream loop. Defaults OFF so tests/CI
     #: never spin up the loop; the real-time streaming path is turned on in C8.
     live_stream_enabled: bool = False
+    #: Seconds between synthetic incidents in the background live-stream loop (C8). The
+    #: loop is self-correcting: it sleeps ``max(0.1, interval - elapsed)`` each tick.
+    live_stream_interval: float = 5.0
+    #: Base RNG seed for the live-stream loop's generated incidents (C8); each tick uses
+    #: ``live_stream_seed + counter`` so successive incidents vary yet stay reproducible.
+    live_stream_seed: int = 0
+    #: Max events retained in the IncrementalAnalyzer's rolling window (C8). The window
+    #: is bounded by BOTH this count and ``temporal_window`` (time), whichever is tighter.
+    incremental_max_events: int = 500
 
     # --- Service dependency map ---
     #: Path to the externalized upstream -> downstream service map (Req §7). Relative

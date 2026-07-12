@@ -35,6 +35,7 @@ from uuid import uuid4
 
 from src.analysis.anomaly import AnomalyAmplifier
 from src.analysis.causal_graph import CausalGraphBuilder
+from src.analysis.clock import ClockSkewCorrector
 from src.analysis.hypotheses import MultiHypothesisTracker
 from src.analysis.impact import ImpactAnalyzer
 from src.analysis.root_cause import ConfidenceScorer, RootCauseIdentifier
@@ -69,24 +70,31 @@ class RCAAnalyzer:
         self.anomaly_amplifier = AnomalyAmplifier(settings)
         #: Top-k concurrent root-cause hypotheses via anomaly-seeded reversed-graph PPR.
         self.hypothesis_tracker = MultiHypothesisTracker(settings)
-        # TODO(C8): self.clock = ClockSkewCorrector(settings)
-        # TODO(C8): self.incremental = IncrementalAnalyzer(settings)
+        #: Clock-skew correction (C8): re-orders near-simultaneous / skew-inverted events
+        #: into a causally consistent order BEFORE the timeline stage; shares the service
+        #: map so its dependency happens-before edges match the causal graph's direction.
+        self.clock_corrector = ClockSkewCorrector(settings, self.service_map)
         # TODO(C9): self.calibration = ConfidenceCalibrator(settings)
         # TODO(C9): self.reporter = PostMortemReporter(settings)
 
     def analyze(self, events: list[LogEvent]) -> IncidentReport:
         """Analyze a batch of events into an :class:`IncidentReport`.
 
-        Reconstruct the timeline (which back-fills each event's ``event_id``), build the
-        causal :class:`networkx.DiGraph`, score per-event base-rate ``anomaly_scores``,
+        Apply clock-skew correction FIRST (C8) so the whole pipeline keys off one
+        causally-consistent ordering, then reconstruct the timeline (which back-fills each
+        event's ``event_id``), build the causal :class:`networkx.DiGraph`, score per-event
+        base-rate ``anomaly_scores``,
         rank candidate ``root_causes``, track the top-k concurrent ``hypotheses`` via
         anomaly-seeded reversed-graph PageRank, and compute the blast-radius /
         weighted-reachability ``impact_analysis`` off that same graph; the serialized
         graph is attached as ``report.causal_graph``. The fully-assembled report is
         appended to the bounded in-memory history and returned.
         """
-        # TODO(C8): clock-skew correction (reorder near-simultaneous / inverted events)
-        # before timeline reconstruction.
+        # C8: clock-skew correction runs FIRST — before timeline reconstruction — so every
+        # downstream stage keys off a single causally-consistent ordering. It returns a new
+        # list of new events (inputs untouched); sub-ε timestamp noise is neutralized and a
+        # dependency happens-before restores an upstream cause ahead of a skew-early effect.
+        events = self.clock_corrector.correct(events)
         timeline = self.timeline.reconstruct(events)
 
         # Incident start = earliest event's timestamp (timeline is chronological), or
@@ -131,6 +139,16 @@ class RCAAnalyzer:
 
         self._remember(report)
         return report
+
+    def remember(self, report: IncidentReport) -> None:
+        """Append an externally-produced report to the bounded history.
+
+        Public entry point for the C8 live-stream loop, whose incremental snapshots are
+        assembled outside :meth:`analyze` but must still land in the same bounded, newest-
+        last history the REST surface serves. Delegates to :meth:`_remember` so the trim
+        policy lives in exactly one place.
+        """
+        self._remember(report)
 
     def _remember(self, report: IncidentReport) -> None:
         """Append ``report`` to history, trimming the oldest past the bound."""
