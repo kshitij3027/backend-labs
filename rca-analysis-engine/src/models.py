@@ -141,6 +141,10 @@ class IncidentReport(BaseModel):
     impact_analysis: ImpactAnalysis = Field(default_factory=ImpactAnalysis)
     #: Concurrent alternative explanations (multi-hypothesis tracking, C7).
     hypotheses: list[Hypothesis] = Field(default_factory=list)
+    #: Per-event base-rate anomaly scores in [0, 1] (``event_id -> score``), produced by
+    #: the anomaly amplifier in C7 and used to seed the multi-hypothesis PageRank.
+    #: Defaults empty so earlier/partial reports still validate and serialize cleanly.
+    anomaly_scores: dict = Field(default_factory=dict)
     #: Serialized causal DiGraph — ``{"nodes": [...], "edges": [...]}`` — built in C3
     #: and consumed by the C12 dashboard. Defaults empty so earlier/partial reports
     #: (assembled before the graph stage) still validate and serialize cleanly.

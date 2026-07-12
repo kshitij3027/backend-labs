@@ -64,6 +64,20 @@ class Settings(BaseSettings):
     #: Weight on normalized out-degree centrality in the causal graph.
     centrality_score_weight: float = 0.2
 
+    # --- Multi-hypothesis tracking + anomaly amplification (C7) ---
+    #: Max concurrent root-cause hypotheses retained (top-k by personalized PageRank).
+    max_hypotheses: int = 5
+    #: Confidence at/above which a hypothesis is marked CONFIRMED.
+    hypothesis_confirm_threshold: float = 0.6
+    #: Confidence below which a hypothesis is PRUNED (dropped from the report).
+    hypothesis_prune_threshold: float = 0.1
+    #: Personalized-PageRank damping factor (restart probability = 1 - alpha).
+    pagerank_alpha: float = 0.85
+    #: Max power-iteration steps before giving up on convergence.
+    pagerank_max_iter: int = 100
+    #: L1 convergence tolerance for the power iteration.
+    pagerank_tol: float = 1e-6
+
     # --- Server / API ---
     #: uvicorn bind port (compose maps ${BACKEND_PORT} -> this).
     server_port: int = 8000
