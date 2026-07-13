@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs test test-unit test-int clean
+.PHONY: help build up down logs test test-unit test-int e2e load clean
 
 help:
 	@echo "RCA Analysis Engine — make targets:"
@@ -10,6 +10,8 @@ help:
 	@echo "  test       - full pytest suite in Docker (rebuilds the test image first)"
 	@echo "  test-unit  - unit tests only in Docker"
 	@echo "  test-int   - integration tests only in Docker"
+	@echo "  e2e        - black-box E2E verifier vs the live backend (11 checks)"
+	@echo "  load       - perf/load gates vs the live backend (throughput, latency, memory)"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -49,6 +51,26 @@ test-int:
 	docker compose build test
 	@status=0; \
 	docker compose --profile test run --rm test pytest tests/integration -q || status=$$?; \
+	docker compose down; \
+	exit $$status
+
+# Black-box E2E: boot the backend fresh (waiting on its healthcheck), run the 11-check
+# verifier in a throwaway container (rebuilt so a stale image can never mask a change),
+# tear the stack down; the verifier's exit status propagates so one failed check fails
+# `make e2e`.
+e2e:
+	docker compose up -d --build --wait backend
+	@status=0; \
+	docker compose --profile e2e run --rm --build e2e || status=$$?; \
+	docker compose down; \
+	exit $$status
+
+# Perf/load gates against the same live backend, same exit-code pattern. Gates are
+# host-overridable, e.g. `MIN_EVENTS_PER_SEC=100000 make load` must fail.
+load:
+	docker compose up -d --build --wait backend
+	@status=0; \
+	docker compose --profile loadtest run --rm --build loadtest || status=$$?; \
 	docker compose down; \
 	exit $$status
 

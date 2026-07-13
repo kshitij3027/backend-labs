@@ -44,6 +44,11 @@ class Runtime:
     #: settings.live_stream_enabled is true (always None under tests, which inject a
     #: pre-built Runtime and never enter the lifespan).
     live_task: asyncio.Task | None = None
+    #: Latest live-stream incident's injected ground truth (C10) —
+    #: ``{"incident_id", "root_cause_event_id", "root_cause_service"}`` — tagged each tick
+    #: by the live loop so ``GET /api/debug/ground-truth`` can surface it. ``None`` until
+    #: the loop runs (it is off by default), which the endpoint maps to ``{}``.
+    last_ground_truth: dict | None = None
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
@@ -102,6 +107,14 @@ async def _live_stream_loop(runtime: Runtime) -> None:
             report = incremental.snapshot()
             if analyzer is not None:
                 analyzer.remember(report)
+            # C10: tag this tick's injected ground truth so GET /api/debug/ground-truth can
+            # surface the known root cause of the most recent live incident. Harmless when
+            # nothing consumes it; the e2e verifier's primary ground truth is in-process.
+            runtime.last_ground_truth = {
+                "incident_id": report.incident_id,
+                "root_cause_event_id": scenario.root_cause_event_id,
+                "root_cause_service": scenario.root_cause_service,
+            }
             if manager is not None:
                 await manager.broadcast(
                     {"type": "incident_update", "data": report.model_dump(mode="json")}

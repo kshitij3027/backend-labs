@@ -49,6 +49,24 @@ API_VERSION = "0.1.0"
 _HEALTH_BODY: dict[str, Any] = {"status": "healthy", "analyzer_ready": True}
 
 
+def _read_rss_mb() -> float | None:
+    """Return this process's resident-set size in MB from ``/proc/self/status``.
+
+    Reads the ``VmRSS`` line (Linux reports it in kB) and converts to MB. Returns
+    ``None`` when ``/proc`` is unavailable or unparseable (e.g. a non-Linux host) so the
+    debug endpoint can degrade to ``{"memory_mb": null}`` rather than erroring — the
+    value is observability for the C10 load-test gate, never a contract.
+    """
+    try:
+        with open("/proc/self/status", encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("VmRSS:"):
+                    return round(float(line.split()[1]) / 1024.0, 1)
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 class FeedbackRequest(BaseModel):
     """Body of ``POST /api/incidents/{id}/feedback`` — the resolved ground-truth cause.
 
@@ -141,6 +159,33 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         returned each call so the module-level constant can never be mutated.
         """
         return dict(_HEALTH_BODY)
+
+    @app.get("/api/debug/memory")
+    async def debug_memory() -> dict[str, Any]:
+        """Report this backend process's resident-set size in MB (C10 load-test probe).
+
+        This endpoint exists only because ``/api/health`` is spec-frozen to exactly
+        ``{"status", "analyzer_ready"}`` and must NOT carry memory. The C10 load-test
+        harness polls this after driving load and gates the backend RSS against
+        ``MAX_BACKEND_MEM_MB``. Reads the current process's own ``VmRSS`` (never a
+        client's), and degrades to ``{"memory_mb": null}`` when ``/proc`` is unavailable.
+        """
+        return {"memory_mb": _read_rss_mb()}
+
+    @app.get("/api/debug/ground-truth")
+    async def debug_ground_truth(request: Request) -> dict[str, Any]:
+        """Return the most recent live-stream incident's known root cause, or ``{}``.
+
+        Convenience for the C10 verifier: when the background live loop is running
+        (``LIVE_STREAM_ENABLED``) it tags each generated incident's injected ground truth
+        on the runtime, and this returns the latest tag —
+        ``{"incident_id", "root_cause_event_id", "root_cause_service"}``. Empty ``{}`` when
+        the live loop is off (the default under the e2e/loadtest profiles) or nothing has
+        been tagged yet: the verifier's primary ground-truth source is importing
+        ``src.generators`` in-process, so this endpoint is a deliberate nice-to-have.
+        """
+        runtime = _runtime(request)
+        return getattr(runtime, "last_ground_truth", None) or {}
 
     @app.post("/api/analyze-incident")
     async def analyze_incident(

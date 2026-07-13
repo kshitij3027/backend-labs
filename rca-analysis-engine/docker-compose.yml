@@ -48,38 +48,48 @@ services:
     command: ["pytest", "-q"]
 
   # Black-box E2E verifier (C10). Reuses the tester image and runs
-  # scripts/verify_e2e.py against the LIVE backend over the compose network (HTTP/WS
-  # only). Every gate below is host-overridable. Profile-gated so it never starts on a
-  # bare `docker compose up`. Wired to a Makefile `e2e` target in C10.
+  # scripts/verify_e2e.py against the LIVE backend over the compose network (HTTP + WS).
+  # Reaches the backend by service name (TARGET_URL=http://backend:8000), never a host
+  # port. Every gate below is host-overridable via ${VAR:-default}. Profile-gated so it
+  # never starts on a bare `docker compose up`. Run via the Makefile `e2e` target.
   e2e:
     build:
       context: .
       dockerfile: Dockerfile.test
     profiles: [e2e]
     environment:
-      - E2E_BASE_URL=http://backend:8000
-      - MIN_CAUSAL_ACCURACY=${MIN_CAUSAL_ACCURACY:-0.85}
-      - E2E_MAX_ANALYZE_LATENCY=${E2E_MAX_ANALYZE_LATENCY:-30.0}
-      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+      - TARGET_URL=http://backend:8000
+      - MIN_ACCURACY=${MIN_ACCURACY:-0.85}
+      - ACCURACY_SAMPLES=${ACCURACY_SAMPLES:-20}
+      - MAX_ANALYSIS_SECONDS=${MAX_ANALYSIS_SECONDS:-30}
+      - E2E_LATENCY_EVENTS=${E2E_LATENCY_EVENTS:-300}
+      - E2E_WS_TIMEOUT=${E2E_WS_TIMEOUT:-10}
     depends_on:
       backend:
         condition: service_healthy
     command: ["python", "-m", "scripts.verify_e2e"]
 
   # Load / performance harness (C10). Same tester image, running scripts/load_test.py
-  # against the LIVE backend over the compose network. Every gate below is
-  # host-overridable (e.g. `MIN_EVENTS_PER_SEC=100000 make load` proves the gate
-  # bites). Profile-gated so it never starts on a bare `docker compose up`.
+  # against the LIVE backend over the compose network (TARGET_URL=http://backend:8000).
+  # Every gate below is host-overridable (e.g. `MIN_EVENTS_PER_SEC=100000 make load`
+  # proves the throughput gate bites; `MAX_BACKEND_MEM_MB=200 make load` checks the
+  # aspirational memory bar). The memory gate DEFAULTS to the spec's hard 500 MB ceiling —
+  # 200 MB is the aspirational target, always reported but not the default gate so a heavy
+  # scipy/sklearn RSS cannot false-fail. Profile-gated so it never starts on a bare
+  # `docker compose up`.
   loadtest:
     build:
       context: .
       dockerfile: Dockerfile.test
     profiles: [loadtest]
     environment:
-      - BASE_URL=http://backend:8000
+      - TARGET_URL=http://backend:8000
       - LOAD_EVENTS=${LOAD_EVENTS:-1000}
+      - LOAD_EVENTS_PER_INCIDENT=${LOAD_EVENTS_PER_INCIDENT:-20}
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-20}
       - MIN_EVENTS_PER_SEC=${MIN_EVENTS_PER_SEC:-1000}
-      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-200}
+      - MAX_P95_MS=${MAX_P95_MS:-2000}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-500}
     depends_on:
       backend:
         condition: service_healthy
