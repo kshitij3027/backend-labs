@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs test test-unit test-int e2e load clean
+.PHONY: help build up down logs test test-unit test-int e2e load ui clean
 
 help:
 	@echo "RCA Analysis Engine — make targets:"
@@ -12,6 +12,7 @@ help:
 	@echo "  test-int   - integration tests only in Docker"
 	@echo "  e2e        - black-box E2E verifier vs the live backend (11 checks)"
 	@echo "  load       - perf/load gates vs the live backend (throughput, latency, memory)"
+	@echo "  ui         - run backend + React dashboard (detached), print the URLs"
 	@echo "  clean      - down + remove volumes and orphans"
 
 build:
@@ -73,6 +74,14 @@ load:
 	docker compose --profile loadtest run --rm --build loadtest || status=$$?; \
 	docker compose down; \
 	exit $$status
+
+# Bring up the full dashboard stack (backend + frontend) detached, building images as
+# needed. The backend comes up first as a healthy dep of the frontend; the SPA then
+# loads the incident history over nginx's /api proxy and live-updates over /ws.
+ui:
+	docker compose up -d --build backend frontend
+	@echo "Dashboard: http://localhost:$${FRONTEND_PORT:-3000}"
+	@echo "API:       http://localhost:$${BACKEND_PORT:-8000}  (GET /api/health)"
 
 clean:
 	docker compose down -v --remove-orphans

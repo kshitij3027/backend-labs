@@ -1,0 +1,7 @@
+# Frontend build + dependency artifacts — never committed.
+node_modules/
+dist/
+
+# Vite / tooling caches
+.vite/
+*.local
