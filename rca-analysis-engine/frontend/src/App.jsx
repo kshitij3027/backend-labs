@@ -1,16 +1,26 @@
+import { useCallback, useEffect, useState } from "react";
 import { useIncidents } from "./hooks/useIncidents.js";
 import ErrorBanner from "./components/ErrorBanner.jsx";
 import IncidentsList from "./components/IncidentsList.jsx";
 import TimelinePanel from "./components/TimelinePanel.jsx";
 import RootCausesPanel from "./components/RootCausesPanel.jsx";
+import CausalGraphPanel from "./components/CausalGraphPanel.jsx";
+import ImpactPanel from "./components/ImpactPanel.jsx";
 import { shortId, formatDateTime } from "./util.js";
 
-// Top-level RCA dashboard shell (C11).
+// Top-level RCA dashboard shell.
 //
 // `useIncidents` loads the existing incident history over REST and then live-updates it
-// from the `/ws` WebSocket. The layout is a two-column split: a left incidents rail and
-// a right detail pane (timeline + ranked root causes) for the selected incident, plus a
-// reserved placeholder for the C12 interactive Plotly causal-graph / impact panels.
+// from the `/ws` WebSocket. The layout is a two-column split: a left incidents rail and a
+// right detail pane for the selected incident. The detail pane is a responsive grid — the
+// interactive Plotly causal-graph plot is the prominent element (full width), with the
+// ranked root causes, the impact / blast-radius panel, and the reconstructed timeline
+// arranged around it; it collapses to a single column at ≤900px.
+//
+// A single `focusNodeId` is shared across the causal graph and the root-causes panel:
+// clicking a graph node OR a root-cause row highlights that node's downstream blast
+// radius in the plot and marks the matching root cause active. Selecting a different
+// incident clears the focus.
 //
 // Graceful degradation: the WebSocket status drives a live indicator and, when the feed
 // drops or the initial fetch fails, an ErrorBanner — while the last-good incidents stay
@@ -22,6 +32,20 @@ export default function App() {
   // populated even before the user clicks (and if the selection scrolled off the cap).
   const selected =
     incidents.find((i) => i.incident_id === selectedId) ?? incidents[0] ?? null;
+
+  // Shared highlight, lifted here so the causal graph and the root-causes panel stay in
+  // sync. Toggling the same node id clears it.
+  const [focusNodeId, setFocusNodeId] = useState(null);
+  const onFocusNode = useCallback((id) => {
+    setFocusNodeId((cur) => (cur === id ? null : id));
+  }, []);
+
+  // Reset the highlight whenever the selected incident changes — a node id from one
+  // incident is meaningless in another.
+  const selectedIncidentId = selected?.incident_id ?? null;
+  useEffect(() => {
+    setFocusNodeId(null);
+  }, [selectedIncidentId]);
 
   // Live indicator: Connecting (first connect) → Live (socket open) → Offline (dropped).
   let liveTone = "wait";
@@ -86,27 +110,34 @@ export default function App() {
                 </div>
               </section>
 
-              <TimelinePanel incident={selected} />
-              <RootCausesPanel incident={selected} />
-
-              {/* Reserved for C12: the interactive Plotly causal-graph network plot and
-                  the richer impact / blast-radius panels. */}
-              <section className="panel panel--placeholder">
-                <div className="panel__head">
-                  <h2 className="panel__title">Causal Graph</h2>
-                  <span className="panel__soon">C12</span>
+              <div className="detailgrid">
+                <div className="detailgrid__cell detailgrid__cell--wide">
+                  <CausalGraphPanel
+                    incident={selected}
+                    focusNodeId={focusNodeId}
+                    onFocusNode={onFocusNode}
+                  />
                 </div>
-                <p className="placeholder__note">
-                  Interactive causal-graph network plot (severity-keyed nodes, weighted
-                  edges, click-to-highlight blast radius) arrives in C12.
-                </p>
-              </section>
+                <div className="detailgrid__cell">
+                  <RootCausesPanel
+                    incident={selected}
+                    focusNodeId={focusNodeId}
+                    onFocusNode={onFocusNode}
+                  />
+                </div>
+                <div className="detailgrid__cell">
+                  <ImpactPanel incident={selected} />
+                </div>
+                <div className="detailgrid__cell detailgrid__cell--wide">
+                  <TimelinePanel incident={selected} />
+                </div>
+              </div>
             </>
           ) : (
             <section className="panel panel--placeholder">
               <p className="placeholder__note">
-                Select an incident to see its timeline and ranked root causes. New
-                incidents stream in live as they are analyzed.
+                Select an incident to see its causal graph, timeline, ranked root causes,
+                and impact. New incidents stream in live as they are analyzed.
               </p>
             </section>
           )}

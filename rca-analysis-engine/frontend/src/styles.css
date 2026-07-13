@@ -660,3 +660,366 @@ body {
   --chip-color: var(--hyp-pruned);
   opacity: 0.7;
 }
+
+/* ============================================================ C12 additions == */
+
+/* ------------------------------------------------------ detail-pane grid -- */
+
+/* The selected incident's detail pane: a 2-column grid with the causal graph and the
+   timeline spanning both columns, and the root-causes / impact panels side-by-side.
+   Collapses to a single column at ≤900px (matching the outer layout breakpoint). */
+.detailgrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--gap);
+  align-items: start;
+}
+
+.detailgrid__cell {
+  min-width: 0;
+}
+
+.detailgrid__cell--wide {
+  grid-column: 1 / -1;
+}
+
+@media (max-width: 900px) {
+  .detailgrid {
+    grid-template-columns: 1fr;
+  }
+  .detailgrid__cell--wide {
+    grid-column: auto;
+  }
+}
+
+/* ------------------------------------------------------- causal graph -- */
+
+.graphpanel__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+  min-height: 28px;
+}
+
+.graphpanel__hint {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.graphpanel__blast {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.graphpanel__blast strong {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.graphpanel__blast-svc {
+  color: var(--text);
+  font-weight: 700;
+}
+
+/* Plotly draws into this box; a fixed height gives the responsive plot room to size to.
+   Width is fluid (responsive:true handles it). */
+.graphpanel__plot {
+  width: 100%;
+  height: 420px;
+  min-height: 320px;
+}
+
+@media (max-width: 640px) {
+  .graphpanel__plot {
+    height: 340px;
+  }
+}
+
+.graphpanel__note {
+  margin: 8px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  font-style: italic;
+}
+
+/* Small ghost button (graph "Reset" affordance). */
+.btn {
+  font: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease;
+}
+
+.btn:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.btn--ghost {
+  color: var(--text-dim);
+  flex: 0 0 auto;
+}
+
+/* Severity legend under the plot. */
+.graphlegend {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.graphlegend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  letter-spacing: 0.02em;
+}
+
+.graphlegend__swatch {
+  display: inline-block;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+.graphlegend__ring {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2.5px solid #ffd166;
+  background: transparent;
+  flex: 0 0 auto;
+}
+
+.graphlegend__item--root {
+  color: var(--text-faint);
+}
+
+/* -------------------------------------------------- root-cause enrichment -- */
+
+.rootcause--clickable {
+  cursor: pointer;
+  transition:
+    border-color 0.12s ease,
+    background 0.12s ease;
+}
+
+.rootcause--clickable:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.rootcause--clickable:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 1px;
+}
+
+.rootcause--active {
+  border-color: color-mix(in srgb, var(--accent) 60%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.rootcause__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin-bottom: 8px;
+}
+
+.rootcause__time {
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-faint);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+.rootcause__raw,
+.rootcause__anomaly {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.rootcause__anomaly {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--border));
+}
+
+/* --------------------------------------------------------------- impact -- */
+
+.impactstats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 520px) {
+  .impactstats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.impactstat {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.impactstat__value {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.impactstat__label {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+.impactblock {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.impactblock__label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: 9px;
+}
+
+.chip--service {
+  --chip-color: var(--accent);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  color: var(--text);
+}
+
+.recovery {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.recovery__item {
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.recovery__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+
+.recovery__service {
+  font-weight: 700;
+  color: var(--text);
+  font-size: 12.5px;
+}
+
+.recovery__gated {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: rgba(107, 163, 255, 0.08);
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.recovery__why {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-dim);
+}
+
+.classcounts {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.classcount {
+  --cc-color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  border-left: 3px solid var(--cc-color);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.classcount__value {
+  font-size: 17px;
+  font-weight: 800;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.classcount__label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+.classcount--primary {
+  --cc-color: var(--sev-critical);
+}
+.classcount--propagation {
+  --cc-color: var(--sev-warning);
+}
+.classcount--contributing {
+  --cc-color: var(--sev-other);
+}

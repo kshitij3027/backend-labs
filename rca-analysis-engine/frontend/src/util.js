@@ -28,6 +28,34 @@ export function levelRank(level) {
   return 0;
 }
 
+/**
+ * Concrete severity hex colour for a log level. Plotly renders markers to a canvas and
+ * won't resolve CSS custom properties, so the causal-graph panel needs literal colours;
+ * these mirror the `--sev-*` variables in styles.css exactly so a CRITICAL node matches
+ * a CRITICAL level pill / dot elsewhere on the dashboard.
+ */
+export function severityColor(level) {
+  const l = String(level ?? "").toUpperCase();
+  if (l === "CRITICAL" || l === "FATAL") return "#ff5c5c";
+  if (l === "ERROR") return "#ff8f4d";
+  if (l === "WARNING" || l === "WARN") return "#ffc44d";
+  if (l === "INFO") return "#6ba3ff";
+  return "#7c8aa5";
+}
+
+/**
+ * Marker diameter (px) keyed to severity for the Plotly causal-graph nodes: CRITICAL
+ * largest down to INFO smallest, so node size reinforces the colour encoding.
+ */
+export function severitySize(level) {
+  const l = String(level ?? "").toUpperCase();
+  if (l === "CRITICAL" || l === "FATAL") return 28;
+  if (l === "ERROR") return 22;
+  if (l === "WARNING" || l === "WARN") return 17;
+  if (l === "INFO") return 12;
+  return 12;
+}
+
 /** Clamp a value into [0, 1]; 0 for non-finite input. */
 export function clamp01(v) {
   const x = Number(v);
@@ -44,6 +72,21 @@ export function fmt(v, n = 2) {
   const x = Number(v);
   if (!Number.isFinite(x)) return "—";
   return x.toFixed(n);
+}
+
+/**
+ * Format a seconds offset from the incident start as `T+M:SS` — the same shape the
+ * backend timeline emits for `relative_time` (e.g. 125 -> "T+2:05"). Used by the
+ * causal-graph hover labels, which only carry absolute node timestamps. "—" for
+ * non-finite / negative input.
+ */
+export function formatOffset(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 0) return "—";
+  const total = Math.round(s);
+  const mins = Math.floor(total / 60);
+  const secs = String(total % 60).padStart(2, "0");
+  return `T+${mins}:${secs}`;
 }
 
 /**
