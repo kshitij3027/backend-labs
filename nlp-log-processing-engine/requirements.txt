@@ -1,0 +1,37 @@
+# nlp-log-processing-engine — Python dependencies (pinned FastAPI + NLP stack).
+#
+# Pins are EXACT for reproducible, offline builds. The spaCy English model is pinned as a
+# wheel URL (en_core_web_sm @ https://...) so `pip install -r` fetches it like any other
+# dependency — NO separate `python -m spacy download` step, and the image build stays
+# offline-reproducible. The full NLP stack is pinned now (only fastapi/uvicorn are used in
+# C1) so the pip layer caches once up front and later commits only rebuild the thin
+# `COPY src/` layer on top of it. numpy / scikit-learn / spacy all resolve to prebuilt
+# manylinux wheels on python:3.11-slim, so no C toolchain is needed. Guard: torch must
+# NEVER enter this file — the en_core_web_sm pipeline is CPU-only and pulling torch would
+# bloat the image by ~1 GB for no benefit.
+
+# --- Web / API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+websockets==13.0.1
+pydantic==2.9.2
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- NLP: entities / tokenization ---
+spacy==3.7.5
+en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# --- NLP: intent classification ---
+scikit-learn==1.5.2
+numpy==1.26.4
+joblib==1.4.2
+
+# --- NLP: sentiment / keywords ---
+vaderSentiment==3.3.2
+yake==0.4.8
+
+# --- Testing ---
+httpx==0.27.2
+pytest==8.3.3
+pytest-asyncio==0.24.0

@@ -1,0 +1,58 @@
+"""Application configuration for the NLP Log Processing Engine.
+
+Configuration precedence (lowest to highest):
+
+    field defaults  ->  .env file (optional)  ->  environment variables
+
+Defaults live on the :class:`Settings` model (pydantic-settings v2 ``BaseSettings``).
+This is the standard pydantic-settings source order (environment beats dotenv beats
+defaults), so no source customization is needed. Environment variable names are the
+upper-cased field names (pydantic-settings default, ``case_sensitive=False``), e.g.
+``log_level`` <- ``LOG_LEVEL``.
+
+C1 carries only the handful of settings the scaffold needs. The NLP tunables
+(intent-confidence floor, sentiment thresholds, stats window, trending top-k, ...) are
+added to this same model in later commits and read off :func:`get_settings` at their
+call sites, so operators can retune behaviour purely via environment / ``.env`` without
+touching code.
+
+Use :func:`get_settings` (LRU-cached) at call sites so the config is parsed once per
+process; tests that monkeypatch the environment clear the cache via
+``get_settings.cache_clear()``.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Flat application settings sourced from defaults, optional .env, then environment."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
+
+    # --- Server / logging ---
+    #: Root log level for the process (uvicorn / app loggers).
+    log_level: str = "INFO"
+    #: Informational: the uvicorn bind port inside the container (compose maps
+    #: ${BACKEND_PORT} -> 8000). Kept here so the value is discoverable in one place; the
+    #: container CMD hard-codes ``--port 8000``.
+    backend_port: int = 8000
+
+    # --- Live stream (placeholder) ---
+    #: Master switch for the background live-stream loop. Unused in C1 — declared now so
+    #: the compose ``test`` service's ``LIVE_STREAM_ENABLED=false`` has a home and the flag
+    #: is forward-compatible; the streaming path is wired in a later commit.
+    live_stream_enabled: bool = False
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Return the process-wide cached :class:`Settings` instance."""
+    return Settings()

@@ -1,0 +1,96 @@
+# NLP Log Processing Engine — service topology (Commit C1).
+#
+# `backend` is the runnable production service: a single uvicorn/FastAPI process on :8000
+# serving the NLP API (REST +, from a later commit, the /ws WebSocket). ALL state is
+# in-memory in this one process — there is NO redis, NO database and NO message queue. The
+# React dashboard `frontend` service (added in a later commit, C11) is an nginx-served SPA
+# that reverse-proxies /api and /ws to the backend; it starts only once the backend is
+# healthy.
+#
+# The profile-gated `test`, `e2e` (C10) and `loadtest` (C10) services run the pytest suite,
+# the black-box E2E verifier and the perf/load harness respectively (all built from
+# Dockerfile.test); none of them starts on a bare `docker compose up`. Run via `make up` /
+# `make test`.
+
+services:
+  # Live production API — built from the production Dockerfile and exposed on the host. No
+  # container_name (sibling convention: leaves compose free to name/scale it).
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /api/health is dependency-free, so the app is healthy as soon as uvicorn binds;
+      # 20s is a safe margin for image start-up.
+      start_period: 20s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code
+  # + requirements as the backend, plus the tests) and runs pytest. Profile-gated so it
+  # never starts on a bare `docker compose up`. Run via `make test`.
+  # LIVE_STREAM_ENABLED=false keeps tests deterministic (never start the live loop).
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - LIVE_STREAM_ENABLED=false
+    command: ["pytest", "-q"]
+
+  # Black-box E2E verifier (C10). Reuses the tester image and runs scripts/verify_e2e.py
+  # against the LIVE backend over the compose network (HTTP + WS). Reaches the backend by
+  # service name (TARGET_URL=http://backend:8000), never a host port. Every gate below is
+  # host-overridable via ${VAR:-default}. Profile-gated so it never starts on a bare
+  # `docker compose up`. NOTE: the verifier script itself lands in C10 — this service is
+  # declared now and only exercised then.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - TARGET_URL=http://backend:8000
+      - MIN_ACCURACY=${MIN_ACCURACY:-0.80}
+      - ACCURACY_SAMPLES=${ACCURACY_SAMPLES:-40}
+      - MAX_P95_MS=${MAX_P95_MS:-500}
+      - E2E_WS_TIMEOUT=${E2E_WS_TIMEOUT:-10}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
+  # Load / performance harness (C10). Same tester image, running scripts/load_test.py
+  # against the LIVE backend over the compose network (TARGET_URL=http://backend:8000).
+  # Every gate below is host-overridable (e.g. `MIN_MSGS_PER_SEC=100000 make load` proves
+  # the throughput gate bites; `MAX_BACKEND_MEM_MB=200 make load` checks a tighter memory
+  # bar). The memory gate DEFAULTS to the spec's 500 MB ceiling. Profile-gated so it never
+  # starts on a bare `docker compose up`. NOTE: the load-test script itself lands in C10 —
+  # this service is declared now and only exercised then.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - TARGET_URL=http://backend:8000
+      - LOAD_MESSAGES=${LOAD_MESSAGES:-2000}
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-20}
+      - MIN_MSGS_PER_SEC=${MIN_MSGS_PER_SEC:-100}
+      - MAX_P95_MS=${MAX_P95_MS:-500}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-500}
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]
