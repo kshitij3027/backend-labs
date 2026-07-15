@@ -34,4 +34,9 @@ COPY tests/ ./tests/
 COPY pytest.ini ./
 COPY scripts/ ./scripts/
 
+# Mirror production (C4): bake the intent artifact into the test image too, so a test can
+# load the baked src/nlp/artifacts/intent.joblib if desired and the image exercises the same
+# build-time train path prod does. Runs as root here — fine (the test image runs as root).
+RUN python -m scripts.train_intent
+
 CMD ["pytest", "-q"]

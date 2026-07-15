@@ -30,13 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install dependencies first (cached unless requirements.txt changes). The spaCy model
 # ships as a pinned wheel URL in requirements.txt, so there is NO separate `spacy download`
-# step. NOTE: no build-time model-train step yet — that arrives in a later commit (C4),
-# once the intent classifier exists.
+# step. The intent classifier (C4) IS trained at build time — see the train step below.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code only. Nothing else — later commits only rebuild from this layer down.
 COPY src/ ./src/
+
+# Build-time intent-model training (C4). scripts/train_intent.py trains the TF-IDF +
+# LogisticRegression pipeline on the deterministic synthetic corpus and writes
+# src/nlp/artifacts/intent.joblib INTO the image. The artifact is gitignored (`*.joblib`) —
+# it is built here, never committed, and reproduced deterministically on every build. This
+# runs as root, BEFORE the useradd/chown below, so the generated artifact is re-owned by
+# appuser in the chown that follows (the runtime user can read it).
+COPY scripts/ ./scripts/
+RUN python -m scripts.train_intent
 
 # Run as a non-root user (uid 1000).
 RUN useradd --uid 1000 --create-home appuser \
