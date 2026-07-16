@@ -4,11 +4,13 @@ Defines :class:`Runtime` — the single container for per-process state — and 
 ``lifespan`` that builds it on startup and tears it down on shutdown. The module-level
 ``app`` is what uvicorn serves (``python -m uvicorn src.main:app``).
 
-C1 wires only the settings. The NLP engine (which loads spaCy + the intent model + VADER
-+ YAKE once and exposes a ``.ready`` flag) is constructed in :meth:`Runtime.build` and
-loaded by the lifespan in a later commit. Injecting a pre-built Runtime via
-``create_app(runtime=...)`` (the test path) skips the lifespan entirely, so tests are
-hermetic.
+C1 wired only the settings. C7 adds the NLP engine: :meth:`Runtime.build_loaded` constructs
+an :class:`~src.nlp.NLPEngine` and ``load()``s it (spaCy + the intent model + VADER + YAKE,
+once), and the production ``lifespan`` uses it so the served app comes up with all models
+ready (``GET /api/health`` then reports ``analyzer_ready=true`` for real). :meth:`Runtime.build`
+still leaves ``engine`` ``None``, so injecting a pre-built Runtime via
+``create_app(runtime=Runtime.build(...))`` (the cheap unit-test path) skips the lifespan and
+loads no models — the HTTP surface stays hermetic.
 """
 
 from __future__ import annotations
@@ -17,11 +19,18 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from fastapi import FastAPI
 
 from src.api import create_app
 from src.config import Settings, get_settings
+
+if TYPE_CHECKING:
+    # Type-only: importing the engine at runtime would pull spaCy/sklearn/VADER/YAKE into
+    # every `import src.main` (e.g. the cheap unit-test path). The real import is deferred to
+    # build_loaded / the lifespan, which are the only places that actually load models.
+    from src.nlp import NLPEngine
 
 logger = logging.getLogger(__name__)
 
@@ -30,44 +39,64 @@ logger = logging.getLogger(__name__)
 class Runtime:
     """Per-process runtime state shared by the API handlers.
 
-    C1 holds only the settings. Later commits add an ``engine`` attribute (the loaded
-    ``NLPEngine``) here; ``GET /api/health`` already reads it defensively via
-    ``getattr(runtime, "engine", None)``, so that addition needs no restructuring.
+    Holds the settings and, once loaded, the :class:`~src.nlp.NLPEngine`. ``engine`` is
+    ``None`` for the cheap injected-runtime test path (:meth:`build`) and a fully-loaded
+    engine for the production app (:meth:`build_loaded`). ``GET /api/health`` and the analyze
+    routes read it defensively via ``getattr(runtime, "engine", None)``.
     """
 
     settings: Settings
+    engine: NLPEngine | None = None
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
-        """Construct a fresh Runtime.
+        """Construct a Runtime **without** loading any models (``engine=None``).
 
-        A single construction site shared by the injected-runtime test path and the
-        production lifespan. C1 does no I/O and spawns nothing; later commits build and
-        attach the NLP engine here so both paths share one wiring point.
+        The cheap path: does no I/O and builds no engine, so the injected-runtime unit tests
+        stay hermetic and ``GET /api/health`` degrades to ``analyzer_ready=true`` (no engine
+        wired). Production uses :meth:`build_loaded` instead.
         """
         return cls(settings=settings)
+
+    @classmethod
+    def build_loaded(cls, settings: Settings) -> Runtime:
+        """Construct a Runtime with a fully **loaded** :class:`~src.nlp.NLPEngine` attached.
+
+        The heavy path used by the production ``lifespan`` (and by the integration tests):
+        builds the engine and ``load()``s it once — spaCy, the intent pipeline (baked
+        artifact or freshly trained), VADER and YAKE — so ``engine.ready`` is ``True`` and the
+        analyze routes serve real results. The :class:`~src.nlp.NLPEngine` import is deferred
+        to here to keep ``import src.main`` free of the heavy NLP stack.
+        """
+        from src.nlp import NLPEngine
+
+        engine = NLPEngine().load()
+        return cls(settings=settings, engine=engine)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Build the Runtime on startup, attach it to ``app.state``, tear it down on exit.
+    """Build a **loaded** Runtime on startup, attach it to ``app.state``, tear it down on exit.
 
-    Tests never enter this path when they inject a pre-built Runtime via
-    ``create_app(runtime=...)``. C1 has nothing to start (no engine load, no background
-    loop) and nothing to release; the structured teardown below is the drop-in point for
-    later commits (engine handles, a live-stream task) and keeps their addition
-    restructure-free.
+    Production entry point: :meth:`Runtime.build_loaded` loads all NLP models before the app
+    starts serving (blocking — the health ``start_period`` gives it ample margin), so the live
+    app reports true readiness. Tests never enter this path: they inject a pre-built Runtime
+    via ``create_app(runtime=...)``, skipping the lifespan (and the model load) entirely.
     """
     settings = get_settings()
-    runtime = Runtime.build(settings)
+    runtime = Runtime.build_loaded(settings)
     app.state.runtime = runtime
-    logger.info("runtime initialised (log_level=%s)", settings.log_level)
+    logger.info(
+        "runtime initialised (log_level=%s, analyzer_ready=%s)",
+        settings.log_level,
+        getattr(runtime.engine, "ready", False),
+    )
 
     try:
         yield
     finally:
-        # Nothing to tear down yet — no engine handles to release and no live-stream loop
-        # wired in C1. Later commits cancel their background task here.
+        # The engine is pure in-memory state (loaded models) with no handles/sockets to
+        # release. Later commits cancel their background live-stream task here.
         pass
 
 

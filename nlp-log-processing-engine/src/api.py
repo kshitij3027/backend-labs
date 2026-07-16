@@ -27,9 +27,18 @@ change.
 from __future__ import annotations
 
 import logging
+import resource
+import sys
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+
+from src.models import (
+    AnalysisResponse,
+    AnalyzeRequest,
+    BatchAnalyzeRequest,
+    BatchAnalyzeResponse,
+)
 
 if TYPE_CHECKING:
     # Type-only import: src.main imports create_app from this module, so importing Runtime
@@ -41,6 +50,29 @@ logger = logging.getLogger(__name__)
 #: Human-readable API title / version (shown in the OpenAPI docs; not a contract).
 API_TITLE = "NLP Log Processing Engine"
 API_VERSION = "0.1.0"
+
+
+def _process_rss_mb() -> float:
+    """Return this process's resident-set size in MB. Never raises — falls back to 0.0.
+
+    Primary source is ``/proc/self/status`` ``VmRSS`` (kB) — accurate and current on Linux
+    (the container). When ``/proc`` is unavailable (macOS dev boxes) it falls back to
+    :func:`resource.getrusage` ``ru_maxrss``, whose unit differs by platform: **bytes** on
+    macOS, **kB** on Linux. Any failure degrades to ``0.0`` rather than propagating.
+    """
+    try:
+        with open("/proc/self/status", encoding="ascii") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return round(float(line.split()[1]) / 1024.0, 2)
+    except OSError:
+        pass
+    try:
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        divisor = 1024.0 * 1024.0 if sys.platform == "darwin" else 1024.0
+        return round(maxrss / divisor, 2)
+    except (ValueError, OSError):
+        return 0.0
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
@@ -77,5 +109,51 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         engine = getattr(rt, "engine", None)
         analyzer_ready = bool(engine.ready) if engine is not None else True
         return {"status": "healthy", "analyzer_ready": analyzer_ready}
+
+    def _ready_engine(request: Request) -> Any:
+        """Return the loaded NLP engine or raise 503 — the shared guard for the analyze routes.
+
+        Reads the engine defensively off the runtime (a missing runtime/engine degrades to
+        ``None`` rather than raising), and turns "no engine wired" or "engine not yet loaded"
+        into a clean ``503 analyzer not ready`` — never a 500.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        engine = getattr(rt, "engine", None)
+        if engine is None or not engine.ready:
+            raise HTTPException(status_code=503, detail="analyzer not ready")
+        return engine
+
+    # NOTE: sync `def` handlers on purpose. FastAPI runs sync routes in a threadpool, so the
+    # (CPU-bound, GIL-releasing) spaCy/sklearn work never blocks the event loop.
+    @app.post("/api/analyze", response_model=AnalysisResponse)
+    def analyze(req: AnalyzeRequest, request: Request) -> dict[str, Any]:
+        """Analyze one log line into entities, intent, sentiment and keywords.
+
+        Returns the :class:`~src.models.AnalysisResponse` schema. Requires a loaded engine —
+        otherwise ``503 analyzer not ready`` (see :func:`_ready_engine`).
+        """
+        engine = _ready_engine(request)
+        return engine.analyze(req.message)
+
+    @app.post("/api/analyze/batch", response_model=BatchAnalyzeResponse)
+    def analyze_batch(req: BatchAnalyzeRequest, request: Request) -> dict[str, Any]:
+        """Analyze many log lines in one request (order preserved).
+
+        Returns the :class:`~src.models.BatchAnalyzeResponse` envelope (``results`` +
+        ``count``). An empty ``messages`` list yields ``{"results": [], "count": 0}``. Requires
+        a loaded engine — otherwise ``503 analyzer not ready``.
+        """
+        engine = _ready_engine(request)
+        results = engine.analyze_batch(req.messages)
+        return {"results": results, "count": len(results)}
+
+    @app.get("/api/debug/memory")
+    def debug_memory() -> dict[str, Any]:
+        """Report the process resident-set size in MB (feeds the load-test memory gate).
+
+        Dependency-free and always HTTP 200: :func:`_process_rss_mb` never raises (it degrades
+        to ``0.0`` if the RSS cannot be read).
+        """
+        return {"memory_mb": _process_rss_mb()}
 
     return app
