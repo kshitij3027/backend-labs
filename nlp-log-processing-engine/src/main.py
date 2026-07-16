@@ -25,6 +25,7 @@ from fastapi import FastAPI
 
 from src.api import create_app
 from src.config import Settings, get_settings
+from src.stats import StatsAggregator
 
 if TYPE_CHECKING:
     # Type-only: importing the engine at runtime would pull spaCy/sklearn/VADER/YAKE into
@@ -43,10 +44,17 @@ class Runtime:
     ``None`` for the cheap injected-runtime test path (:meth:`build`) and a fully-loaded
     engine for the production app (:meth:`build_loaded`). ``GET /api/health`` and the analyze
     routes read it defensively via ``getattr(runtime, "engine", None)``.
+
+    ``stats`` is the process-local :class:`~src.stats.StatsAggregator` powering ``GET
+    /api/stats``. It is cheap in-memory state (no models, no I/O), so **both** build paths
+    create one — even the not-loaded unit-test runtime has working, if empty, stats. The
+    analyze routes fold each result into it and ``/api/stats`` reads its snapshot, both via a
+    defensive ``getattr(runtime, "stats", None)``.
     """
 
     settings: Settings
     engine: NLPEngine | None = None
+    stats: StatsAggregator | None = None
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
@@ -54,9 +62,10 @@ class Runtime:
 
         The cheap path: does no I/O and builds no engine, so the injected-runtime unit tests
         stay hermetic and ``GET /api/health`` degrades to ``analyzer_ready=true`` (no engine
-        wired). Production uses :meth:`build_loaded` instead.
+        wired). A :class:`~src.stats.StatsAggregator` is still attached — it is pure in-memory
+        state, so ``/api/stats`` works (empty) even on this cheap path.
         """
-        return cls(settings=settings)
+        return cls(settings=settings, stats=cls._build_stats(settings))
 
     @classmethod
     def build_loaded(cls, settings: Settings) -> Runtime:
@@ -71,7 +80,19 @@ class Runtime:
         from src.nlp import NLPEngine
 
         engine = NLPEngine().load()
-        return cls(settings=settings, engine=engine)
+        return cls(settings=settings, engine=engine, stats=cls._build_stats(settings))
+
+    @staticmethod
+    def _build_stats(settings: Settings) -> StatsAggregator:
+        """Construct the rolling :class:`~src.stats.StatsAggregator` from settings.
+
+        Shared by both build paths so the window / trending-top-k tunables are read from
+        :class:`~src.config.Settings` in exactly one place.
+        """
+        return StatsAggregator(
+            window=settings.stats_window,
+            trending_top_k=settings.trending_top_k,
+        )
 
 
 @asynccontextmanager

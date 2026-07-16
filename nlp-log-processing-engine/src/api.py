@@ -75,6 +75,25 @@ def _process_rss_mb() -> float:
         return 0.0
 
 
+def _empty_stats_snapshot() -> dict[str, Any]:
+    """A well-formed, zeroed ``/api/stats`` body for when no aggregator is wired.
+
+    Mirrors the shape of :meth:`src.stats.StatsAggregator.snapshot` so the endpoint can
+    degrade to an empty-but-valid payload (never a 500) if a runtime somehow carries no stats
+    aggregator. Kept as a literal here — rather than importing ``StatsAggregator`` — so this
+    module stays free of the (transitively heavy) NLP import chain.
+    """
+    return {
+        "total_analyzed": 0,
+        "intent_distribution": {},
+        "sentiment_distribution": {},
+        "entity_type_distribution": {},
+        "trending_keywords": [],
+        "recent": [],
+        "throughput_per_sec": 0.0,
+    }
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     """Build and return the FastAPI application.
 
@@ -123,6 +142,20 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail="analyzer not ready")
         return engine
 
+    def _record_stats(request: Request, results: list[dict[str, Any]]) -> None:
+        """Fold analyze ``results`` into the runtime's rolling stats — a no-op if none is wired.
+
+        Reads the aggregator defensively (``getattr(runtime, "stats", None)``) so a missing or
+        half-wired runtime simply skips recording rather than raising; :meth:`StatsAggregator.update`
+        is itself robust to any individual malformed result.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        stats = getattr(rt, "stats", None)
+        if stats is None:
+            return
+        for result in results:
+            stats.update(result)
+
     # NOTE: sync `def` handlers on purpose. FastAPI runs sync routes in a threadpool, so the
     # (CPU-bound, GIL-releasing) spaCy/sklearn work never blocks the event loop.
     @app.post("/api/analyze", response_model=AnalysisResponse)
@@ -130,10 +163,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         """Analyze one log line into entities, intent, sentiment and keywords.
 
         Returns the :class:`~src.models.AnalysisResponse` schema. Requires a loaded engine —
-        otherwise ``503 analyzer not ready`` (see :func:`_ready_engine`).
+        otherwise ``503 analyzer not ready`` (see :func:`_ready_engine`). The successful result
+        is also folded into the runtime's rolling stats (feeding ``GET /api/stats``).
         """
         engine = _ready_engine(request)
-        return engine.analyze(req.message)
+        result = engine.analyze(req.message)
+        _record_stats(request, [result])
+        return result
 
     @app.post("/api/analyze/batch", response_model=BatchAnalyzeResponse)
     def analyze_batch(req: BatchAnalyzeRequest, request: Request) -> dict[str, Any]:
@@ -141,11 +177,28 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
         Returns the :class:`~src.models.BatchAnalyzeResponse` envelope (``results`` +
         ``count``). An empty ``messages`` list yields ``{"results": [], "count": 0}``. Requires
-        a loaded engine — otherwise ``503 analyzer not ready``.
+        a loaded engine — otherwise ``503 analyzer not ready``. Every result is folded into the
+        runtime's rolling stats (feeding ``GET /api/stats``).
         """
         engine = _ready_engine(request)
         results = engine.analyze_batch(req.messages)
+        _record_stats(request, results)
         return {"results": results, "count": len(results)}
+
+    @app.get("/api/stats")
+    def stats(request: Request) -> dict[str, Any]:
+        """Return the rolling aggregate stats snapshot powering the dashboard.
+
+        Reads the :class:`~src.stats.StatsAggregator` defensively off the runtime and returns
+        its :meth:`~src.stats.StatsAggregator.snapshot`. If no aggregator is wired (a degraded
+        or half-built runtime), returns a well-formed **empty** snapshot rather than a 500, so
+        the dashboard always gets the documented shape. Never requires a loaded engine.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        aggregator = getattr(rt, "stats", None)
+        if aggregator is None:
+            return _empty_stats_snapshot()
+        return aggregator.snapshot()
 
     @app.get("/api/debug/memory")
     def debug_memory() -> dict[str, Any]:

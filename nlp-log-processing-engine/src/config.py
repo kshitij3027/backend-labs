@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     #: is forward-compatible; the streaming path is wired in a later commit.
     live_stream_enabled: bool = False
 
+    # --- Stats / dashboard (C8) ---
+    #: Rolling-window size for the in-memory ``StatsAggregator`` — bounds both the newest-first
+    #: ``recent`` buffer and the timestamp window backing ``throughput_per_sec`` on ``/api/stats``.
+    stats_window: int = 500
+    #: Number of trending keywords ``GET /api/stats`` returns (``StatsAggregator`` top-k).
+    trending_top_k: int = 10
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
