@@ -26,6 +26,7 @@ from fastapi import FastAPI
 from src.api import create_app
 from src.config import Settings, get_settings
 from src.stats import StatsAggregator
+from src.ws import ConnectionManager
 
 if TYPE_CHECKING:
     # Type-only: importing the engine at runtime would pull spaCy/sklearn/VADER/YAKE into
@@ -50,11 +51,18 @@ class Runtime:
     create one — even the not-loaded unit-test runtime has working, if empty, stats. The
     analyze routes fold each result into it and ``/api/stats`` reads its snapshot, both via a
     defensive ``getattr(runtime, "stats", None)``.
+
+    ``connections`` is the process-local :class:`~src.ws.ConnectionManager` backing the ``/ws``
+    live feed (C9). Like ``stats`` it is cheap, dependency-light in-memory state, so **both**
+    build paths create one; the ``/ws`` route registers clients on it and the analyze routes
+    broadcast each result + a fresh stats snapshot to it, all via a defensive
+    ``getattr(runtime, "connections", None)``.
     """
 
     settings: Settings
     engine: NLPEngine | None = None
     stats: StatsAggregator | None = None
+    connections: ConnectionManager | None = None
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
@@ -62,10 +70,15 @@ class Runtime:
 
         The cheap path: does no I/O and builds no engine, so the injected-runtime unit tests
         stay hermetic and ``GET /api/health`` degrades to ``analyzer_ready=true`` (no engine
-        wired). A :class:`~src.stats.StatsAggregator` is still attached — it is pure in-memory
-        state, so ``/api/stats`` works (empty) even on this cheap path.
+        wired). A :class:`~src.stats.StatsAggregator` and a :class:`~src.ws.ConnectionManager`
+        are still attached — both are pure in-memory state, so ``/api/stats`` works (empty) and
+        the ``/ws`` route accepts clients even on this cheap path.
         """
-        return cls(settings=settings, stats=cls._build_stats(settings))
+        return cls(
+            settings=settings,
+            stats=cls._build_stats(settings),
+            connections=ConnectionManager(),
+        )
 
     @classmethod
     def build_loaded(cls, settings: Settings) -> Runtime:
@@ -80,7 +93,12 @@ class Runtime:
         from src.nlp import NLPEngine
 
         engine = NLPEngine().load()
-        return cls(settings=settings, engine=engine, stats=cls._build_stats(settings))
+        return cls(
+            settings=settings,
+            engine=engine,
+            stats=cls._build_stats(settings),
+            connections=ConnectionManager(),
+        )
 
     @staticmethod
     def _build_stats(settings: Settings) -> StatsAggregator:

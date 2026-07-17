@@ -24,8 +24,10 @@ process; tests that monkeypatch the environment clear the cache via
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Annotated
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -57,6 +59,33 @@ class Settings(BaseSettings):
     stats_window: int = 500
     #: Number of trending keywords ``GET /api/stats`` returns (``StatsAggregator`` top-k).
     trending_top_k: int = 10
+
+    # --- CORS / WebSocket live feed (C9) ---
+    #: Origins the CORS middleware allows. Fully permissive (``["*"]``) by default — in
+    #: production nginx proxies the dashboard same-origin, so this only relaxes direct
+    #: cross-origin access in dev. ``"*"`` anywhere in the list means allow-any, and credentials
+    #: are then disabled (the CORS spec forbids pairing the wildcard origin with credentials —
+    #: see :func:`src.api.create_app`). ``NoDecode`` + the validator below let operators set
+    #: ``CORS_ORIGINS`` as a plain comma-separated string rather than JSON.
+    cors_origins: Annotated[list[str], NoDecode] = ["*"]
+    #: Master switch for the ``/ws`` live feed. The route and the analyze-broadcast are always
+    #: wired; this is declared for forward-compat / operability so the flag has a home and ops
+    #: get a documented knob.
+    ws_enabled: bool = True
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _split_cors_origins(cls, value: object) -> object:
+        """Accept ``CORS_ORIGINS`` as a comma-separated string, not only a JSON / Python list.
+
+        With ``NoDecode`` the environment value reaches this validator as a raw string (pydantic
+        -settings skips its usual JSON decode for the field), so we split on commas and trim each
+        origin — ``CORS_ORIGINS=http://a, http://b`` and ``CORS_ORIGINS=*`` both just work. A real
+        list (the Python default, or one supplied from code) is passed straight through untouched.
+        """
+        if isinstance(value, str):
+            return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
 
 
 @lru_cache(maxsize=1)

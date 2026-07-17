@@ -11,10 +11,17 @@
   hermetically.
 
 All routes are declared **inline** in this factory (no ``APIRouter``) so each closes over
-the app it belongs to; later commits add ``/api/analyze`` and friends right here. Handlers
-read shared state defensively off ``request.app.state.runtime`` using
-``getattr(..., default)`` and degrade gracefully rather than raising: a missing or
+the app it belongs to. Handlers read shared state defensively off ``request.app.state.runtime``
+using ``getattr(..., default)`` and degrade gracefully rather than raising: a missing or
 half-wired runtime yields a safe fallback, never a 500.
+
+C9 adds the real-time surface: the permissive :class:`CORSMiddleware` (so the dashboard can
+reach the API cross-origin) and the ``/ws`` WebSocket backed by the runtime's
+:class:`~src.ws.ConnectionManager`. ``POST /api/analyze`` and ``/api/analyze/batch`` are async
+handlers that offload the CPU-bound analysis to the threadpool via ``run_in_threadpool`` (the
+event loop stays free) and then **best-effort broadcast** each result — plus a fresh stats
+snapshot — to every connected client. The broadcast is fully guarded: a WebSocket failure can
+never turn a successful analysis into a failed HTTP response.
 
 ``/api/health`` is a FROZEN contract — exactly ``{"status": "healthy",
 "analyzer_ready": <bool>}`` (the two keys, nothing more). It is dependency-free and always
@@ -31,8 +38,11 @@ import resource
 import sys
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 
+from src.config import get_settings
 from src.models import (
     AnalysisResponse,
     AnalyzeRequest,
@@ -113,6 +123,21 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
         app = FastAPI(title=API_TITLE, version=API_VERSION, lifespan=lifespan)
 
+    # CORS (C9): installed once so every route — the REST surface and the /ws handshake alike —
+    # is reachable cross-origin from the dashboard. Prefer the injected runtime's settings (tests
+    # build the Runtime from specific Settings); fall back to the process-wide cached settings on
+    # the production/lifespan path. Credentials are disabled whenever "*" is allowed, because the
+    # CORS spec forbids pairing the wildcard origin with credentialed requests.
+    settings = runtime.settings if runtime is not None else get_settings()
+    allow_origins = list(settings.cors_origins)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials="*" not in allow_origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.get("/api/health")
     async def health(request: Request) -> dict[str, Any]:
         """Liveness probe — dependency-free, always HTTP 200 while the process is alive.
@@ -156,33 +181,64 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         for result in results:
             stats.update(result)
 
-    # NOTE: sync `def` handlers on purpose. FastAPI runs sync routes in a threadpool, so the
-    # (CPU-bound, GIL-releasing) spaCy/sklearn work never blocks the event loop.
+    async def _broadcast(request: Request, results: list[dict[str, Any]]) -> None:
+        """Best-effort push of each analysis result + a fresh stats snapshot to ``/ws`` clients.
+
+        Emits one ``{"type": "analysis", "data": <result>}`` frame per result, then a single
+        ``{"type": "stats", "data": <snapshot>}`` trailer so the dashboard's aggregate panels
+        refresh in lockstep with the feed. Reads the manager (and stats) defensively off the
+        runtime, so a missing or half-wired runtime simply skips the push. The whole body is
+        wrapped so a broadcast failure can NEVER fail the HTTP response — the analysis is already
+        computed and recorded by the time we get here — and :meth:`ConnectionManager.broadcast`
+        additionally prunes any individual dead socket internally.
+        """
+        rt = getattr(request.app.state, "runtime", None)
+        manager = getattr(rt, "connections", None)
+        if manager is None:
+            return
+        try:
+            for result in results:
+                await manager.broadcast({"type": "analysis", "data": result})
+            stats = getattr(rt, "stats", None)
+            if stats is not None:
+                await manager.broadcast({"type": "stats", "data": stats.snapshot()})
+        except Exception:  # noqa: BLE001 - broadcasting is best-effort, never fatal
+            logger.exception("failed to broadcast analysis frames to /ws clients")
+
+    # NOTE: async `def` handlers (C9). The post-analysis /ws broadcast must run on the event
+    # loop, so these are async — but the CPU-bound (GIL-releasing) spaCy/sklearn analysis is
+    # pushed to the threadpool via run_in_threadpool so it still never blocks the loop. The fast
+    # stats fold and the best-effort broadcast then run inline on the loop after it returns.
     @app.post("/api/analyze", response_model=AnalysisResponse)
-    def analyze(req: AnalyzeRequest, request: Request) -> dict[str, Any]:
+    async def analyze(req: AnalyzeRequest, request: Request) -> dict[str, Any]:
         """Analyze one log line into entities, intent, sentiment and keywords.
 
         Returns the :class:`~src.models.AnalysisResponse` schema. Requires a loaded engine —
         otherwise ``503 analyzer not ready`` (see :func:`_ready_engine`). The successful result
-        is also folded into the runtime's rolling stats (feeding ``GET /api/stats``).
+        is folded into the runtime's rolling stats (feeding ``GET /api/stats``) and then
+        best-effort broadcast to every ``/ws`` client (an ``analysis`` frame followed by a
+        ``stats`` frame). The broadcast can never fail the request.
         """
         engine = _ready_engine(request)
-        result = engine.analyze(req.message)
+        result = await run_in_threadpool(engine.analyze, req.message)
         _record_stats(request, [result])
+        await _broadcast(request, [result])
         return result
 
     @app.post("/api/analyze/batch", response_model=BatchAnalyzeResponse)
-    def analyze_batch(req: BatchAnalyzeRequest, request: Request) -> dict[str, Any]:
+    async def analyze_batch(req: BatchAnalyzeRequest, request: Request) -> dict[str, Any]:
         """Analyze many log lines in one request (order preserved).
 
         Returns the :class:`~src.models.BatchAnalyzeResponse` envelope (``results`` +
         ``count``). An empty ``messages`` list yields ``{"results": [], "count": 0}``. Requires
         a loaded engine — otherwise ``503 analyzer not ready``. Every result is folded into the
-        runtime's rolling stats (feeding ``GET /api/stats``).
+        runtime's rolling stats (feeding ``GET /api/stats``) and then best-effort broadcast to
+        every ``/ws`` client (one ``analysis`` frame per result, then a single ``stats`` frame).
         """
         engine = _ready_engine(request)
-        results = engine.analyze_batch(req.messages)
+        results = await run_in_threadpool(engine.analyze_batch, req.messages)
         _record_stats(request, results)
+        await _broadcast(request, results)
         return {"results": results, "count": len(results)}
 
     @app.get("/api/stats")
@@ -208,5 +264,39 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         to ``0.0`` if the RSS cannot be read).
         """
         return {"memory_mb": _process_rss_mb()}
+
+    @app.websocket("/ws")
+    async def ws_endpoint(websocket: WebSocket) -> None:
+        """Real-time live feed (C9): register the client, then serve keepalives.
+
+        The connection is registered with the runtime's
+        :class:`~src.ws.ConnectionManager` — the same manager ``POST /api/analyze`` broadcasts
+        each result + stats snapshot to, so a connected dashboard updates without polling.
+        Inbound traffic is used only for a lightweight ``"ping"`` -> ``"pong"`` keepalive; any
+        other text is ignored (the client is a listener). The socket is ALWAYS removed from the
+        manager on exit — via ``finally`` — whether the client disconnects cleanly
+        (:class:`WebSocketDisconnect`) or the receive loop fails for any other reason, so the
+        live set never leaks a dead connection. When no runtime/manager is wired (not expected in
+        production or under the test fixtures) the handshake is closed immediately rather than
+        500-ing.
+        """
+        rt = getattr(websocket.app.state, "runtime", None)
+        manager = getattr(rt, "connections", None)
+        if manager is None:
+            await websocket.close()
+            return
+        await manager.connect(websocket)
+        try:
+            while True:
+                text = await websocket.receive_text()
+                if text == "ping":
+                    await websocket.send_text("pong")
+                # Any other inbound message is ignored for now (the client is a listener).
+        except WebSocketDisconnect:
+            pass
+        except Exception:  # noqa: BLE001 - never let a receive-loop error escape unhandled
+            logger.debug("websocket receive loop errored; disconnecting", exc_info=True)
+        finally:
+            manager.disconnect(websocket)
 
     return app
