@@ -3,12 +3,11 @@
 # Pins are EXACT for reproducible, offline builds. The spaCy English model is pinned as a
 # wheel URL (en_core_web_sm @ https://...) so `pip install -r` fetches it like any other
 # dependency — NO separate `python -m spacy download` step, and the image build stays
-# offline-reproducible. The full NLP stack is pinned now (only fastapi/uvicorn are used in
-# C1) so the pip layer caches once up front and later commits only rebuild the thin
-# `COPY src/` layer on top of it. numpy / scikit-learn / spacy all resolve to prebuilt
-# manylinux wheels on python:3.11-slim, so no C toolchain is needed. Guard: torch must
-# NEVER enter this file — the en_core_web_sm pipeline is CPU-only and pulling torch would
-# bloat the image by ~1 GB for no benefit.
+# offline-reproducible. This layer is installed before `COPY src/`, so it caches once up
+# front and app-code changes only rebuild the thin `COPY src/` layer on top of it. numpy /
+# scikit-learn / spacy all resolve to prebuilt manylinux wheels on python:3.11-slim, so no C
+# toolchain is needed. Guard: torch must NEVER enter this file — the en_core_web_sm pipeline
+# is CPU-only and pulling torch would bloat the image by ~1 GB for no benefit.
 
 # --- Web / API ---
 fastapi==0.115.0
