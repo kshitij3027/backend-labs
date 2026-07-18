@@ -43,6 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from src.config import get_settings
+from src.generators import sample_messages
 from src.models import (
     AnalysisResponse,
     AnalyzeRequest,
@@ -60,6 +61,12 @@ logger = logging.getLogger(__name__)
 #: Human-readable API title / version (shown in the OpenAPI docs; not a contract).
 API_TITLE = "NLP Log Processing Engine"
 API_VERSION = "0.1.0"
+
+#: ``GET /api/debug/ground-truth`` bounds: the requested ``n`` is clamped to this many samples
+#: (a small inspection aid, never a bulk export) and drawn with this fixed seed so the labeled
+#: payload is byte-stable across calls.
+_GROUND_TRUTH_MAX = 200
+_GROUND_TRUTH_SEED = 0
 
 
 def _process_rss_mb() -> float:
@@ -264,6 +271,28 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         to ``0.0`` if the RSS cannot be read).
         """
         return {"memory_mb": _process_rss_mb()}
+
+    @app.get("/api/debug/ground-truth")
+    def debug_ground_truth(n: int = 10) -> list[dict[str, Any]]:
+        """Return up to :data:`_GROUND_TRUTH_MAX` labeled generator samples for inspection.
+
+        Each item is ``{message, intent, entities: [[text, label], ...], sentiment}`` drawn from
+        the deterministic corpus generator (fixed seed), so a human — or a pure-HTTP verifier that
+        does not ship ``src/`` — can eyeball the ground truth the analyzer is scored against.
+        Dependency-free and never raises: ``n`` is clamped to ``[0, _GROUND_TRUTH_MAX]`` (FastAPI
+        coerces the query param to ``int``), and :func:`~src.generators.sample_messages` is itself
+        empty-safe.
+        """
+        capped = max(0, min(int(n), _GROUND_TRUTH_MAX))
+        return [
+            {
+                "message": sample.message,
+                "intent": sample.intent,
+                "entities": [[text, label] for text, label in sample.entities],
+                "sentiment": sample.sentiment,
+            }
+            for sample in sample_messages(capped, seed=_GROUND_TRUTH_SEED)
+        ]
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
