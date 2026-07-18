@@ -1,9 +1,15 @@
 import { useEffect, useState } from "react";
 import { useWebSocket } from "./hooks/useWebSocket.js";
+import { useStats } from "./hooks/useStats.js";
 import { getHealth, getStats } from "./api.js";
 import AnalyzeBox from "./components/AnalyzeBox.jsx";
 import ResultCard from "./components/ResultCard.jsx";
 import LiveFeed from "./components/LiveFeed.jsx";
+import StatsCards from "./components/StatsCards.jsx";
+import IntentChart from "./components/IntentChart.jsx";
+import SentimentChart from "./components/SentimentChart.jsx";
+import EntityTypeChart from "./components/EntityTypeChart.jsx";
+import TrendingKeywords from "./components/TrendingKeywords.jsx";
 
 // Top-level NLP dashboard shell (C11).
 //
@@ -20,6 +26,11 @@ import LiveFeed from "./components/LiveFeed.jsx";
 // the newest LiveFeed row.
 export default function App() {
   const { status, lastStats, feed } = useWebSocket();
+
+  // Freshest stats for the C12 charts row: REST bootstrap + ~5s fallback poll, updated live
+  // from each WS `stats` frame (freshest source wins), with a `stale` flag when the poll is
+  // failing. Independent of the header's one-shot `stats` below.
+  const { stats: chartStats, stale: chartStale } = useStats(lastStats);
 
   // The most recent manual analysis (from the AnalyzeBox), shown in the ResultCard.
   const [manualResult, setManualResult] = useState(null);
@@ -113,18 +124,32 @@ export default function App() {
           )}
         </div>
 
-        {/* ================= C12 CHARTS ROW (placeholder) =================
-            C12 mounts the recharts visualisations here — intent & sentiment
-            distributions, trending keywords and a throughput sparkline — all fed by
-            `stats` (the /api/stats bootstrap + live `stats` WS frames already wired
-            above). `recharts` is already a dependency in package.json; nothing in the
-            C11 shell imports it yet. Keep this region as the single insertion point. */}
-        <section className="panel panel--placeholder charts-placeholder">
-          <span className="panel__soon">CHARTS · C12</span>
-          <p className="placeholder__note">
-            Intent &amp; sentiment distributions, trending keywords and throughput charts
-            land here in C12, driven by the same live stats feed.
-          </p>
+        {/* ===================== C12 CHARTS ROW =====================
+            KPI tiles across the top, then a responsive 2-up grid of the intent, sentiment,
+            entity-type and trending-keyword charts (Recharts). All are fed by
+            `useStats(lastStats)` — REST bootstrap + ~5s poll, refreshed live on every WS
+            `stats` frame — so they populate from zero-data empty-states as lines are
+            analysed. The grid uses auto-fit/minmax to stack to a single column on narrow
+            and mobile widths with no media query. */}
+        <section
+          className="charts"
+          aria-label="Live statistics"
+          style={{ display: "flex", flexDirection: "column", gap: "var(--gap)" }}
+        >
+          <StatsCards stats={chartStats} status={status} stale={chartStale} />
+          <div
+            className="charts__grid"
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 26rem), 1fr))",
+              gap: "var(--gap)",
+            }}
+          >
+            <IntentChart stats={chartStats} />
+            <SentimentChart stats={chartStats} />
+            <EntityTypeChart stats={chartStats} />
+            <TrendingKeywords stats={chartStats} />
+          </div>
         </section>
 
         <LiveFeed feed={feed} status={status} />
