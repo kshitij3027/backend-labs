@@ -1,0 +1,791 @@
+/* NLP Log Processing Engine — dashboard theme (C11 shell).
+ *
+ * Dark, dense operations-console look. Colours, radii and spacing are driven by CSS custom
+ * properties; all assets are self-contained (system font stack, no external fonts/CDNs) so
+ * the page is CSP-safe behind nginx and works offline. C12 layers the recharts stats row on
+ * top of this shell (see the placeholder in App.jsx).
+ *
+ * Colour system:
+ *   * Four SENTIMENT/severity tokens — positive (green) < neutral (grey) < negative
+ *     (orange) < critical (red) — used by the sentiment badge and the feed severity dots.
+ *   * Eight ENTITY-label tokens (SERVICE/HOST/IP/USER_ID/ERROR_CODE/PATH/URL/PORT) plus a
+ *     "general" fallback for spaCy's own entities — used by the inline highlights + chips.
+ *   * Nine INTENT tokens (the 8 intents + the "other" reject bucket) — used by intent badges.
+ */
+
+:root {
+  /* Surfaces */
+  --bg: #0f1419;
+  --card: #1a2029;
+  --card-2: #1e2632;
+  --border: #2a3340;
+  --border-soft: #232b36;
+
+  /* Text */
+  --text: #e6edf3;
+  --text-dim: #9aa7b4;
+  --text-faint: #6b7785;
+
+  /* Generic accents / status */
+  --accent: #6ba3ff;
+  --accent-2: #c58af9;
+  --ok: #4ecb8d;
+  --bad: #ff6b6b;
+  --wait: #9aa7b4;
+
+  /* Sentiment / severity (positive < neutral < negative < critical). */
+  --sent-positive: #4ecb8d;
+  --sent-neutral: #9aa7b4;
+  --sent-negative: #ff9f43;
+  --sent-critical: #ff5c5c;
+
+  /* Entity-label categories. */
+  --ent-service: #6ba3ff;
+  --ent-host: #4ecdc4;
+  --ent-ip: #c58af9;
+  --ent-user_id: #ff8fb1;
+  --ent-error_code: #ff6b6b;
+  --ent-path: #ffb454;
+  --ent-url: #8fe388;
+  --ent-port: #ff9f68;
+  --ent-general: #9aa7b4;
+
+  /* Intent categories (8 intents + "other"). */
+  --intent-authentication: #8f9bff;
+  --intent-deployment: #4ecb8d;
+  --intent-error_report: #ff6b6b;
+  --intent-health_check: #4ecdc4;
+  --intent-resource_warning: #ffb454;
+  --intent-network: #6ba3ff;
+  --intent-database: #c58af9;
+  --intent-config_change: #56ccf2;
+  --intent-other: #9aa7b4;
+
+  /* Shape & motion */
+  --radius: 12px;
+  --radius-sm: 9px;
+  --shadow: 0 8px 26px rgba(3, 7, 12, 0.55);
+  --gap: 16px;
+  --maxw: 1240px;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 10% -10%, #15202b 0%, transparent 55%),
+    radial-gradient(1000px 520px at 100% 0%, #141b2a 0%, transparent 50%),
+    var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  min-height: 100vh;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  color: var(--text-dim);
+}
+
+/* ----------------------------------------------------------------- layout -- */
+
+.app {
+  max-width: var(--maxw);
+  margin: 0 auto;
+  padding: 26px clamp(14px, 3vw, 36px) 60px;
+}
+
+.app__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap);
+  margin-bottom: 20px;
+}
+
+.app__brand {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.app__logo {
+  width: 38px;
+  height: 38px;
+  border-radius: 11px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-2));
+  box-shadow: var(--shadow);
+  flex: 0 0 auto;
+}
+
+.app__title {
+  margin: 0;
+  font-size: 21px;
+  letter-spacing: -0.01em;
+}
+
+.app__subtitle {
+  margin: 2px 0 0;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+.headmeta {
+  display: inline-flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+
+.headstat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.headstat__value {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.headstat__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+.app__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+/* Top row: analyze box + result, side by side; collapses to one column ≤900px.
+   minmax(0, ...) lets a column shrink so long content wraps instead of blowing out. */
+.app__top {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: var(--gap);
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .app__top {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* --------------------------------------------------------- live indicator -- */
+
+.live {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.live__dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--wait);
+  flex: 0 0 auto;
+}
+
+.live__dot--ok {
+  background: var(--ok);
+  box-shadow: 0 0 0 3px rgba(78, 203, 141, 0.16);
+  animation: livepulse 2s ease-in-out infinite;
+}
+
+.live__dot--bad {
+  background: var(--bad);
+  box-shadow: 0 0 0 3px rgba(255, 107, 107, 0.16);
+}
+
+.live__dot--wait {
+  background: var(--wait);
+}
+
+@keyframes livepulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 3px rgba(78, 203, 141, 0.16);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(78, 203, 141, 0.04);
+  }
+}
+
+/* ---------------------------------------------------------------- panels -- */
+
+.panel {
+  background: linear-gradient(180deg, var(--card), var(--card-2));
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px 18px;
+  min-width: 0;
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.panel__title {
+  margin: 0;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.panel__count {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.panel__soon {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: rgba(107, 163, 255, 0.08);
+}
+
+.panel--placeholder {
+  border-style: dashed;
+  border-color: var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.placeholder__note {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.placeholder__note strong {
+  color: var(--text-dim);
+  font-weight: 700;
+}
+
+.muted {
+  margin: 0;
+  color: var(--text-faint);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.charts-placeholder {
+  align-items: flex-start;
+}
+
+/* ------------------------------------------------------------- badges -- */
+
+.badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  --badge-color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  border: 1px solid color-mix(in srgb, var(--badge-color) 42%, var(--border));
+  background: color-mix(in srgb, var(--badge-color) 14%, transparent);
+  color: var(--badge-color);
+  text-transform: capitalize;
+}
+
+.badge--sm {
+  padding: 2px 8px;
+  font-size: 10.5px;
+  gap: 5px;
+}
+
+.badge__meta {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  font-weight: 800;
+  padding-left: 6px;
+  border-left: 1px solid color-mix(in srgb, var(--badge-color) 35%, transparent);
+}
+
+/* Intent badge palette. */
+.intent--authentication {
+  --badge-color: var(--intent-authentication);
+}
+.intent--deployment {
+  --badge-color: var(--intent-deployment);
+}
+.intent--error_report {
+  --badge-color: var(--intent-error_report);
+}
+.intent--health_check {
+  --badge-color: var(--intent-health_check);
+}
+.intent--resource_warning {
+  --badge-color: var(--intent-resource_warning);
+}
+.intent--network {
+  --badge-color: var(--intent-network);
+}
+.intent--database {
+  --badge-color: var(--intent-database);
+}
+.intent--config_change {
+  --badge-color: var(--intent-config_change);
+}
+.intent--other {
+  --badge-color: var(--intent-other);
+}
+
+/* Sentiment badge palette. */
+.sentiment--positive {
+  --badge-color: var(--sent-positive);
+}
+.sentiment--neutral {
+  --badge-color: var(--sent-neutral);
+}
+.sentiment--negative {
+  --badge-color: var(--sent-negative);
+}
+.sentiment--critical {
+  --badge-color: var(--sent-critical);
+}
+
+/* ------------------------------------------------------- severity dots -- */
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--sent-neutral);
+  flex: 0 0 auto;
+}
+
+.dot--positive {
+  background: var(--sent-positive);
+}
+.dot--neutral {
+  background: var(--sent-neutral);
+}
+.dot--negative {
+  background: var(--sent-negative);
+}
+.dot--critical {
+  background: var(--sent-critical);
+  box-shadow: 0 0 0 3px rgba(255, 92, 92, 0.14);
+}
+
+/* ------------------------------------------------------------ analyze box -- */
+
+.analyzebox__hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.analyzebox__input {
+  width: 100%;
+  resize: vertical;
+  min-height: 84px;
+  padding: 12px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+  outline: none;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+.analyzebox__input::placeholder {
+  color: var(--text-faint);
+}
+
+.analyzebox__input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px rgba(107, 163, 255, 0.12);
+}
+
+.analyzebox__examples {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+
+.analyzebox__examples-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+}
+
+.chipbtn {
+  font: inherit;
+  cursor: pointer;
+  max-width: 230px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-family: var(--mono);
+  transition: border-color 0.12s ease, color 0.12s ease, background 0.12s ease;
+}
+
+.chipbtn:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.analyzebox__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.btn {
+  font: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  padding: 8px 18px;
+  font-size: 13px;
+  font-weight: 700;
+  transition: border-color 0.12s ease, background 0.12s ease, opacity 0.12s ease;
+}
+
+.btn:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 60%, transparent);
+  outline-offset: 1px;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 26%, transparent),
+    color-mix(in srgb, var(--accent) 16%, transparent)
+  );
+  color: #eaf1ff;
+}
+
+.btn--primary:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--border));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--accent) 34%, transparent),
+    color-mix(in srgb, var(--accent) 20%, transparent)
+  );
+}
+
+.analyzebox__error {
+  color: var(--bad);
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* ------------------------------------------------------------- result card -- */
+
+.resultcard__message {
+  margin: 0 0 16px;
+  padding: 12px 13px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(0, 0, 0, 0.22);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 2;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+/* Inline entity highlight inside the message. */
+.ent {
+  --ent-color: var(--ent-general);
+  border-radius: 5px;
+  padding: 1px 4px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--ent-color) 20%, transparent);
+  box-shadow: inset 0 -2px 0 color-mix(in srgb, var(--ent-color) 55%, transparent);
+}
+
+.ent__tag {
+  margin-left: 4px;
+  font-family: system-ui, sans-serif;
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ent-color);
+  vertical-align: 1.5px;
+}
+
+.resultcard__section {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.resultcard__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin-bottom: 10px;
+}
+
+.resultcard__count {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Entity chip list. */
+.entchips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.entchip {
+  --ent-color: var(--ent-general);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ent-color) 40%, var(--border));
+  background: color-mix(in srgb, var(--ent-color) 10%, transparent);
+  font-size: 12px;
+}
+
+.entchip__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ent-color);
+  flex: 0 0 auto;
+}
+
+.entchip__text {
+  font-family: var(--mono);
+  color: var(--text);
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.entchip__label {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ent-color);
+}
+
+/* Keyword chips. */
+.chips {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.kw {
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.02);
+  font-size: 12px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+}
+
+/* Entity-category tokens shared by the inline marks, the chips and the feed mini-chips. */
+.ent--service {
+  --ent-color: var(--ent-service);
+}
+.ent--host {
+  --ent-color: var(--ent-host);
+}
+.ent--ip {
+  --ent-color: var(--ent-ip);
+}
+.ent--user_id {
+  --ent-color: var(--ent-user_id);
+}
+.ent--error_code {
+  --ent-color: var(--ent-error_code);
+}
+.ent--path {
+  --ent-color: var(--ent-path);
+}
+.ent--url {
+  --ent-color: var(--ent-url);
+}
+.ent--port {
+  --ent-color: var(--ent-port);
+}
+.ent--general {
+  --ent-color: var(--ent-general);
+}
+
+/* --------------------------------------------------------------- live feed -- */
+
+.feed {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  max-height: 62vh;
+  overflow-y: auto;
+}
+
+.feedrow {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-soft);
+  background: rgba(255, 255, 255, 0.015);
+}
+
+.feedrow__top {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.feedrow__msg {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.feedrow__time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.feedrow__bottom {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.minichip {
+  --ent-color: var(--ent-general);
+  display: inline-flex;
+  align-items: center;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--ent-color) 40%, var(--border));
+  background: color-mix(in srgb, var(--ent-color) 10%, transparent);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 10.5px;
+}
+
+.feedrow__more {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}

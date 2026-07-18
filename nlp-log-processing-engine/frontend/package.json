@@ -1,0 +1,21 @@
+{
+  "name": "nlp-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Live dashboard for the NLP Log Processing Engine — React + Vite, served by nginx. recharts is a dependency now for the C12 charts row; the C11 shell does not import it yet.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.3",
+    "vite": "^5.4.10"
+  }
+}

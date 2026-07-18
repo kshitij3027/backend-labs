@@ -36,6 +36,30 @@ services:
       start_period: 20s
     restart: unless-stopped
 
+  # React (Vite) dashboard SPA (C11). An nginx-served static build that reverse-proxies /api
+  # (REST) and /ws (WebSocket) to the `backend` service (see frontend/nginx.conf), so the
+  # browser only ever talks to nginx on :80 — no CORS, no hardcoded backend host. Built from
+  # the PROJECT ROOT context (`context: .`) so the multi-stage frontend/Dockerfile can COPY
+  # the `frontend/` tree. It starts only once the backend is healthy, and is itself
+  # health-gated on a 200 from `/` (the served SPA). Host port is ${FRONTEND_PORT:-3000}.
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # nginx:alpine ships wget (busybox) — a 200 on / means the SPA is being served.
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code
   # + requirements as the backend, plus the tests) and runs pytest. Profile-gated so it
   # never starts on a bare `docker compose up`. Run via `make test`.
