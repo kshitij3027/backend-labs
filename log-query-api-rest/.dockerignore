@@ -1,0 +1,43 @@
+# Keep junk and bulky artifacts out of the build context / image. The production Dockerfile
+# copies only src/ (+ requirements.txt) and Dockerfile.test additionally copies tests/ +
+# scripts/ + pytest.ini, so most of this is belt-and-braces. tests/ and scripts/ are
+# deliberately NOT ignored — the tester image needs them in its build context.
+
+# VCS / planning docs
+.git
+.gitignore
+*.md
+README.md
+plan.md
+
+# Python caches / build artifacts
+__pycache__
+*.py[cod]
+*.pyc
+*$py.class
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+build
+dist
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Secrets / env — a real .env must never be baked into an image layer. Compose reads it at
+# run time via `env_file`, which is the correct seam.
+.env
+
+# Local data (seeded store snapshots, exports, scratch results)
+data/
+
+# OS / logs
+.DS_Store
+*.log

@@ -1,0 +1,144 @@
+# Log Query API (REST) — service topology (Commit C1).
+#
+# `api` is the ONE runnable production service: a single uvicorn/FastAPI process on :8000
+# serving the unversioned /health probe, the /api/v1 data routes (paginated retrieval,
+# structured search, SSE tail, stats, append), the OpenAPI docs, and — from C13 — the static
+# dashboard. All state (the append-only log ring, the rate limiter's token buckets, the SSE
+# subscriber set) lives in that single process: there is NO database, NO Redis, NO queue and
+# therefore no second service and no volumes.
+#
+# The profile-gated `test`, `e2e` (C12) and `loadtest` (C12) services run the pytest suite,
+# the black-box E2E verifier and the perf/load harness respectively — all three built from
+# the SAME Dockerfile.test image. None of them starts on a bare `docker compose up`. The
+# harnesses reach the API by SERVICE NAME over the compose network (http://api:8000), never
+# via a published host port, so they are immune to an API_PORT collision on the host.
+#
+# Every one of the README's 16 settings is passed to `api` as ${VAR:-default}, so the whole
+# config surface is host-overridable and this file never has to change again as later commits
+# start reading those keys.
+
+services:
+  # Live production API — built from the production Dockerfile and the only service exposed
+  # on the host. No container_name (sibling convention: leaves compose free to name/scale it).
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # An operator-supplied .env is optional: `required: false` keeps a clean clone runnable.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Dev-only signing key — NOT a secret, and deliberately not one of the placeholder
+      # values Settings rejects, so `make up` / `make test` work on a clean clone with no
+      # .env at all. Override it via .env or the shell (`JWT_SECRET=$(openssl rand -hex 32)`)
+      # for anything that is not a laptop.
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-key-not-a-secret-0123456789abcdef}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - ACCESS_TOKEN_TTL_MIN=${ACCESS_TOKEN_TTL_MIN:-30}
+      - STORE_CAPACITY=${STORE_CAPACITY:-100000}
+      - SEED_ENTRIES=${SEED_ENTRIES:-10000}
+      - DEFAULT_PAGE_SIZE=${DEFAULT_PAGE_SIZE:-50}
+      - MAX_PAGE_SIZE=${MAX_PAGE_SIZE:-500}
+      - SSE_HEARTBEAT_SEC=${SSE_HEARTBEAT_SEC:-15}
+      - SSE_QUEUE_SIZE=${SSE_QUEUE_SIZE:-1000}
+      - MAX_STREAMS_PER_PRINCIPAL=${MAX_STREAMS_PER_PRINCIPAL:-3}
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+      - "TIER_LIMITS=${TIER_LIMITS:-free:10:20,pro:100:200,enterprise:1000:2000}"
+      - STATS_BUCKET_SEC=${STATS_BUCKET_SEC:-60}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    # The container always binds :8000; only the host side is tunable, because sibling
+    # projects in this repo routinely hold :8000.
+    ports:
+      - "${API_PORT:-8010}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free and needs no token, so the app is healthy as soon as
+      # uvicorn binds; 20s covers the startup corpus seed without flapping the container.
+      start_period: 20s
+    # Trade-off, accepted deliberately: a FATAL config error (e.g. a placeholder JWT_SECRET,
+    # which Settings rejects at import) restart-loops here rather than stopping once — compose
+    # cannot distinguish "crashed transiently" from "will never start". The refusal contract
+    # still holds (the container never serves a request with a bad key, and `docker compose up`
+    # surfaces `exited with code 1` on every cycle), and auto-recovery from transient crashes is
+    # worth more day to day than a clean exit on a misconfiguration you see immediately anyway.
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code and
+  # requirements as `api`, plus tests/ and scripts/) and runs pytest. Profile-gated so it never
+  # starts on a bare `docker compose up`. Run via `make test`.
+  #
+  # SEED_ENTRIES=0 and STORE_CAPACITY=1000 pin the suite to a small, deterministic store —
+  # tests that need a corpus build one explicitly rather than inheriting 10k random entries.
+  # RATE_LIMIT_ENABLED=true is explicit, not incidental: the limiter's behaviour is under test.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - JWT_SECRET=${JWT_SECRET:-test-only-insecure-signing-key-0123456789}
+      - SEED_ENTRIES=0
+      - STORE_CAPACITY=1000
+      - RATE_LIMIT_ENABLED=true
+    # No -q: verbosity is centralized in pytest.ini (`addopts = -q --tb=short`). A second -q
+    # here would stack to -qq and suppress the "N passed in Xs" summary line.
+    command: ["pytest"]
+
+  # Black-box E2E verifier (C12). Reuses the tester image and runs scripts/verify_e2e.py
+  # against the LIVE api over the compose network (HTTP + SSE), reaching it by service name
+  # (TARGET_URL=http://api:8000), never a host port. Waits on the api healthcheck first, so
+  # it can never race a still-seeding store. Every gate below is host-overridable via
+  # ${VAR:-default} so a deliberately impossible bar proves the gate actually bites.
+  # NOTE: the verifier script itself lands in C12 — this service is declared now and only
+  # exercised then.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - TARGET_URL=http://api:8000
+      - E2E_READY_TIMEOUT=${E2E_READY_TIMEOUT:-90}
+      - E2E_PAGE_LIMIT=${E2E_PAGE_LIMIT:-100}
+      - E2E_SSE_TIMEOUT=${E2E_SSE_TIMEOUT:-15}
+      - E2E_RATE_LIMIT_PROBE=${E2E_RATE_LIMIT_PROBE:-60}
+      - E2E_LATENCY_SAMPLES=${E2E_LATENCY_SAMPLES:-50}
+      - MAX_P95_MS=${MAX_P95_MS:-250}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-400}
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
+  # Load / performance harness (C12). Same tester image, running scripts/load_test.py against
+  # the same live api over the compose network. It authenticates as an admin/enterprise
+  # principal so the per-tier rate limit never masks the measurement. Gates are host-
+  # overridable (e.g. `LOAD_MIN_RPS=1000000 make load` MUST fail, which is how we prove the
+  # gates are real rather than decorative). Profile-gated so it never starts on a bare
+  # `docker compose up`. NOTE: the load-test script itself lands in C12 — this service is
+  # declared now and only exercised then.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - TARGET_URL=http://api:8000
+      - LOAD_REQUESTS=${LOAD_REQUESTS:-2000}
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-50}
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-200}
+      - LOAD_MAX_ERROR_RATE=${LOAD_MAX_ERROR_RATE:-0.0}
+      - LOAD_SSE_CLIENTS=${LOAD_SSE_CLIENTS:-8}
+      - LOAD_SSE_SECONDS=${LOAD_SSE_SECONDS:-10}
+      - LOAD_MIN_SSE_EVENTS=${LOAD_MIN_SSE_EVENTS:-5}
+      - MAX_P95_MS=${MAX_P95_MS:-250}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-400}
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]

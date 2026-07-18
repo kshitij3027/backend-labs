@@ -1,0 +1,36 @@
+# log-query-api-rest — Python dependencies (pinned FastAPI stack).
+#
+# Pins are EXACT so image builds are reproducible and offline-friendly. This layer is
+# installed before the app source is copied, so it caches once and code changes only
+# rebuild the thin source layer on top of it. Everything here resolves to a prebuilt
+# manylinux wheel on python:3.11-slim — no C toolchain required.
+#
+# Deliberately NOT here: any database driver, Redis client, or ORM. The log store is
+# an in-process, in-memory append-only structure with secondary indexes, and the rate
+# limiter's token buckets live in the same process. Introducing a backing store is a
+# separate decision, not an accident of this file.
+
+# --- Web / API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- Server-Sent Events (GET /api/v1/logs/stream) ---
+sse-starlette==2.1.3
+
+# --- Auth: JWT issuing/verification + password hashing ---
+PyJWT==2.9.0
+bcrypt==4.2.1
+python-multipart==0.0.12   # OAuth2 password-form body parsing for the token endpoint
+
+# --- Serialization / runtime helpers ---
+orjson==3.10.7
+psutil==6.0.0              # backend RSS probe used by the load/E2E memory gates
+
+# --- Testing ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
+httpx==0.27.2
+httpx-sse==0.4.0           # consuming the SSE stream from tests / the E2E verifier
