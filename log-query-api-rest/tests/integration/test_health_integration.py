@@ -14,7 +14,13 @@ whole project — is red for reasons that have nothing to do with the code. Keep
 non-trivial integration test here from C1 keeps that gate meaningful instead of merely green.
 """
 
-from src.main import API_TITLE, API_VERSION
+from datetime import UTC, datetime, timedelta
+
+from fastapi.testclient import TestClient
+
+from src.config import Settings
+from src.main import API_TITLE, API_VERSION, Runtime, create_app
+from src.models import LogEntry
 
 
 def test_health_through_full_stack(seeded_client):
@@ -107,3 +113,46 @@ def test_request_id_is_unique_across_requests(seeded_client):
 
     assert first and second
     assert first != second
+
+
+def test_health_reports_non_zero_store_entries(settings: Settings):
+    """``store_entries`` must be the real resident count, not a defensively-zeroed placeholder.
+
+    Every other assertion about this field is ``== 0`` or ``>= 0``, which is satisfied whether
+    the probe works or silently fails — and it *did* silently fail: ``_store_entries`` calls
+    ``len(store)`` behind ``except (TypeError, ValueError): return 0``, so a store without
+    ``__len__`` reported 0 forever while holding thousands of entries. Nothing caught it because
+    the store is empty at C4 and 0 was right by accident.
+
+    So this test puts a **known non-zero** count into the ring and demands the route echo it
+    exactly. It is written against ``runtime.store`` rather than the seeder, so it keeps holding
+    when C5 wires ``build_seeded`` to ``generate_entries`` and the number stops being one this
+    test chose.
+    """
+    runtime = Runtime.build_seeded(settings)
+    assert runtime.store is not None
+    baseline = len(runtime.store)
+
+    base_ts = datetime(2026, 7, 27, 10, 0, 0, tzinfo=UTC)
+    runtime.store.append_many(
+        LogEntry(
+            id=f"health-{i:04d}",
+            ts=base_ts + timedelta(seconds=i),
+            level="ERROR",
+            service="auth-svc",
+            host="node-3",
+            message="invalid token",
+        )
+        for i in range(37)
+    )
+    expected = baseline + 37
+    assert expected <= runtime.store.capacity(), (
+        "the appended entries must fit without eviction, or `expected` is not the resident count"
+    )
+
+    client = TestClient(create_app(runtime=runtime))
+    body = client.get("/health").json()
+
+    assert body["store_entries"] == expected != 0
+    assert body["store_entries"] == runtime.store.size()
+    assert body["status"] == "healthy"

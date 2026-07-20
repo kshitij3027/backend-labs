@@ -34,6 +34,7 @@ from starlette.responses import Response
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
+from src.store import LogStore
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +80,20 @@ EXPOSE_HEADERS = [
 class Runtime:
     """Per-process runtime state shared by every handler.
 
-    ``store`` (C4's ``LogStore``) and ``limiter`` (C8's ``RateLimiter``) are typed loosely here
-    because their classes do not exist yet; each commit narrows the annotation as it lands.
-    They stay ``None`` on the C1 scaffold, and every read site uses ``getattr(runtime, ...,
-    default)`` so a ``None`` collaborator degrades gracefully instead of raising.
+    ``store`` is C4's :class:`~src.store.LogStore` and is built by **both** constructors, so no
+    handler ever has to cope with a store-less runtime in practice. It stays ``Optional``
+    anyway, and read sites still use ``getattr(runtime, "store", None)``, because the whole
+    point of the defensive-read convention is that a half-wired runtime degrades to a documented
+    fallback rather than a 500 — a guarantee that would evaporate the moment one field made it
+    unconditional. ``limiter`` (C8's ``RateLimiter``) is still typed loosely because its class
+    does not exist yet; each commit narrows the annotation as it lands.
 
     ``started_monotonic`` is captured from :func:`time.monotonic`, not the wall clock, so
     reported uptime cannot go backwards when NTP steps the system clock.
     """
 
     settings: Settings
-    store: object | None = None
+    store: LogStore | None = None
     limiter: object | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
 
@@ -105,20 +109,26 @@ class Runtime:
         The unit-test path. Injected via ``create_app(runtime=Runtime.build(settings))``, it
         skips the lifespan entirely so the HTTP surface is exercised hermetically and a test
         never pays for 10,000 generated entries it does not use.
+
+        The store is real but **empty**: constructing a :class:`~src.store.LogStore` allocates an
+        empty ``deque`` and three empty dicts regardless of ``store_capacity``, so this stays as
+        cheap as it was before C4 while removing the ``store is None`` branch from every test.
+        A test that wants a corpus appends one explicitly.
         """
-        return cls(settings=settings)
+        return cls(settings=settings, store=LogStore(capacity=settings.store_capacity))
 
     @classmethod
     def build_seeded(cls, settings: Settings) -> Runtime:
         """Construct the production Runtime, with the store seeded to ``settings.seed_entries``.
 
-        Identical to :meth:`build` today because there is nothing to seed yet; kept as a
-        separate, already-wired entry point so the production and test paths are distinguishable
-        from C1 rather than being retrofitted later.
+        Kept as a separate, already-wired entry point so the production and test paths are
+        distinguishable from C1 rather than being retrofitted later.
         """
-        # C4 seeds the corpus here: build the LogStore(capacity=settings.store_capacity) and
-        # fill it with generate_entries(settings.seed_entries) before returning.
-        return cls(settings=settings)
+        # C5 seeds the corpus here: fill the store with generate_entries(settings.seed_entries)
+        # via `store.append_many(...)`. Deliberately not wired in C4 — `src/generators.py` lands
+        # in the sibling commit, and importing a module that may not exist yet would make the
+        # process fail to start rather than merely start empty.
+        return cls(settings=settings, store=LogStore(capacity=settings.store_capacity))
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
