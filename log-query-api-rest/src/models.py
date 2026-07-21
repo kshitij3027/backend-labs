@@ -2,11 +2,11 @@
 
 This module is the **single source of truth** for everything that crosses the HTTP boundary:
 the log entry itself, the write body, the pagination envelope, the shared query-filter bundle,
-and the error envelope. Every route in ``src/api/v1.py`` declares one of these as its
-``response_model`` or body type, which means the shapes here are literally what the generated
-OpenAPI 3.1 document advertises at ``/docs`` and ``/redoc``. Change a field here and the
-published contract changes with it — that is the point of concentrating them in one file rather
-than letting each handler invent its own dict.
+the error envelope, and the two auth response shapes. Every route in ``src/api/v1.py`` declares
+one of these as its ``response_model`` or body type, which means the shapes here are literally
+what the generated OpenAPI 3.1 document advertises at ``/docs`` and ``/redoc``. Change a field
+here and the published contract changes with it — that is the point of concentrating them in one
+file rather than letting each handler invent its own dict.
 
 Three contracts in here are load-bearing enough to be worth stating up front:
 
@@ -44,6 +44,7 @@ from pydantic import (
     model_validator,
 )
 
+from src.auth import Principal, Role, Tier
 from src.config import Settings
 
 # ---------------------------------------------------------------------------------------------
@@ -494,6 +495,125 @@ class ErrorBody(BaseModel):
         default=None,
         description="The X-Request-ID of the failing request, for log correlation.",
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Auth response shapes
+#
+# ``Role`` and ``Tier`` are imported from ``src.auth`` rather than redeclared here, so the enum a
+# token is *signed* with and the enum a response is *validated* against are the same object. Two
+# parallel declarations would be a contract that only holds by coincidence. The import direction
+# is safe and checked: ``src.auth`` depends on nothing but the standard library, jwt, bcrypt,
+# pydantic and ``src.config`` — in particular it does NOT import this module or ``src.store`` —
+# so ``models -> auth -> config`` is a chain, not a cycle.
+# ---------------------------------------------------------------------------------------------
+
+
+class TokenResponse(BaseModel):
+    """Body of a successful ``POST /api/v1/auth/token``.
+
+    ``access_token`` / ``token_type`` / ``expires_in`` are the RFC 6749 §5.1 access-token
+    response, spelled exactly as the standard does — ``token_type`` is the literal lowercase
+    ``"bearer"``, and ``expires_in`` is a **relative** lifetime in seconds. Keeping the standard
+    field names means a generic OAuth2 client, the Swagger UI's *Authorize* button, and every
+    HTTP library's bearer helper all work against this endpoint with no adapter.
+
+    ``expires_at`` / ``role`` / ``tier`` are this API's additions on top. They are strictly
+    redundant — all three are already claims inside the signed token — but a client that would
+    otherwise have to base64-decode a JWT just to render "you are an analyst until 14:32" is a
+    client that will do it wrong. An absolute RFC-3339 instant is also what the C12 verifier
+    asserts against, since a relative ``expires_in`` cannot be compared to anything without first
+    knowing when the response was received.
+    """
+
+    access_token: str = Field(
+        description="The signed HS256 JWT. Send it as `Authorization: Bearer <token>`.",
+    )
+    token_type: str = Field(
+        default="bearer",
+        description=(
+            "Always the literal `bearer`, lowercase, per RFC 6750. It is a constant rather than "
+            "an omission because RFC 6749 §5.1 marks it REQUIRED."
+        ),
+        examples=["bearer"],
+    )
+    expires_in: int = Field(
+        description="Token lifetime in seconds (ACCESS_TOKEN_TTL_MIN * 60).",
+        examples=[1800],
+    )
+    expires_at: datetime = Field(
+        description=(
+            "Absolute expiry as RFC-3339 UTC with a 'Z' suffix — the same instant the token's "
+            "`exp` claim carries, so the two can never disagree."
+        ),
+        examples=["2026-07-27T11:01:04.000Z"],
+    )
+    role: Role = Field(
+        description="The granted role: viewer | analyst | writer | admin. Also the `role` claim."
+    )
+    tier: Tier = Field(
+        description="The rate-limit tier: free | pro | enterprise. Also the `tier` claim."
+    )
+
+    @field_serializer("expires_at")
+    def _serialise_expires_at(self, value: datetime) -> str:
+        """Emit the same RFC-3339 ``Z`` form every other timestamp in this API uses.
+
+        Reuses :func:`_rfc3339_z` rather than restating the format: one definition of "how this
+        API writes a timestamp" means a client writes one parser. See that function for why
+        ``+00:00`` and microseconds are not acceptable here.
+        """
+        return _rfc3339_z(value)
+
+
+class PrincipalResponse(BaseModel):
+    """Body of ``GET /api/v1/auth/me`` — the decoded principal, echoed back.
+
+    The fastest way to prove a token works: one authenticated round trip that touches no store,
+    no filter and no pagination, so a `200` here isolates the auth chain from everything else. It
+    is also what a dashboard calls on load to decide which controls to render, which is why the
+    role and tier are here rather than left inside the token for the client to dig out.
+
+    Field names deliberately match :class:`~src.auth.Principal` one-for-one, so
+    :meth:`from_principal` is a straight projection with nowhere for a mapping mistake to hide.
+    """
+
+    subject: str = Field(
+        description="The authenticated username (the token's `sub` claim).",
+        examples=["analyst"],
+    )
+    role: Role = Field(description="Access role: viewer | analyst | writer | admin.")
+    tier: Tier = Field(description="Rate-limit tier: free | pro | enterprise.")
+    issued_at: datetime = Field(
+        description="When the token was signed (`iat`), RFC-3339 UTC with a 'Z' suffix.",
+        examples=["2026-07-27T10:31:04.000Z"],
+    )
+    expires_at: datetime = Field(
+        description="When the token stops being accepted (`exp`), same format.",
+        examples=["2026-07-27T11:01:04.000Z"],
+    )
+
+    @field_serializer("issued_at", "expires_at")
+    def _serialise_instants(self, value: datetime) -> str:
+        """Both instants in the API's one timestamp format. See :func:`_rfc3339_z`."""
+        return _rfc3339_z(value)
+
+    @classmethod
+    def from_principal(cls, principal: Principal) -> PrincipalResponse:
+        """Project a :class:`~src.auth.Principal` onto its wire shape.
+
+        The projection lives here, beside the model, rather than being spelled out in the
+        handler: ``GET /auth/me`` is not the only thing that will ever want to render a
+        principal, and two hand-written projections are two chances to map ``subject`` to the
+        wrong field.
+        """
+        return cls(
+            subject=principal.subject,
+            role=principal.role,
+            tier=principal.tier,
+            issued_at=principal.issued_at,
+            expires_at=principal.expires_at,
+        )
 
 
 def clamp_limit(requested: int | None, settings: Settings) -> tuple[int, bool]:

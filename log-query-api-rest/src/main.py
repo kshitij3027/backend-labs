@@ -33,7 +33,9 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from src.api.health import router as health_router
+from src.api.v1 import router as v1_router
 from src.config import Settings, get_settings
+from src.generators import generate_entries
 from src.store import LogStore
 
 logger = logging.getLogger(__name__)
@@ -123,12 +125,23 @@ class Runtime:
 
         Kept as a separate, already-wired entry point so the production and test paths are
         distinguishable from C1 rather than being retrofitted later.
+
+        The corpus comes from :func:`~src.generators.generate_entries`, which returns entries
+        **oldest first** — so the store's monotonic ``seq`` order agrees with time order, which is
+        the assumption every newest-first scan and every cursor anchor in ``src/store.py`` rests
+        on. Seeding newest-first would leave the store internally consistent and sorted backwards.
         """
-        # C5 seeds the corpus here: fill the store with generate_entries(settings.seed_entries)
-        # via `store.append_many(...)`. Deliberately not wired in C4 — `src/generators.py` lands
-        # in the sibling commit, and importing a module that may not exist yet would make the
-        # process fail to start rather than merely start empty.
-        return cls(settings=settings, store=LogStore(capacity=settings.store_capacity))
+        store = LogStore(capacity=settings.store_capacity)
+        # `seed_entries=0` is a normal configuration rather than an edge case — the compose
+        # `test` service pins it so the suite starts from an empty, fully deterministic store —
+        # so the guard skips a pointless generate-and-append round trip rather than defending
+        # against something invalid.
+        if settings.seed_entries > 0:
+            # `append_many` takes the store's lock ONCE for the whole batch. Seeding 10,000
+            # entries through `append` would be 10,000 uncontended lock round-trips inside the
+            # container healthcheck's start_period, for no benefit.
+            store.append_many(generate_entries(settings.seed_entries))
+        return cls(settings=settings, store=store)
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -181,12 +194,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     runtime = Runtime.build_seeded(settings)
     app.state.runtime = runtime
+    # `seed_entries` is what was REQUESTED; `store_entries` is what actually landed. The two
+    # differ whenever SEED_ENTRIES exceeds STORE_CAPACITY (the ring evicts while it is being
+    # filled), and the resident count is the number every later question — page.total, /health,
+    # /stats — is actually answered from, so it is the one worth having in the startup line.
+    seeded = len(runtime.store) if runtime.store is not None else 0
     logger.info(
         "runtime initialised (log_level=%s, store_capacity=%d, seed_entries=%d, "
-        "rate_limit_enabled=%s, tiers=%s)",
+        "store_entries=%d, rate_limit_enabled=%s, tiers=%s)",
         settings.log_level,
         settings.store_capacity,
         settings.seed_entries,
+        seeded,
         settings.rate_limit_enabled,
         ",".join(sorted(settings.tier_limits)),
     )
@@ -246,8 +265,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         expose_headers=EXPOSE_HEADERS,
     )
 
-    # Unversioned liveness. The /api/v1 router joins it from C5 onwards.
+    # Unversioned liveness, then the versioned data surface. They are two routers rather than
+    # one so `/health` cannot drift under `/api/v1` — see `src/api/health.py`. A future v2 adds
+    # a THIRD `include_router` line here beside v1; it never edits v1's shapes.
     app.include_router(health_router)
+    app.include_router(v1_router)
 
     return app
 
