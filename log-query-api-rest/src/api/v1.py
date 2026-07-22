@@ -20,7 +20,7 @@ crashed by half-wired process state is not a read path worth having.
 
 ``X-Page-Limit-Clamped`` and ``X-Cursor-Truncated`` are attached through the handler's injected
 ``response: Response``, which is the right tool **here specifically**: both are success-path-only
-facts, and every failure mode in this file raises before either could be set. C8's rate-limit
+facts, and every failure mode in this file raises before either could be set. The rate-limit
 headers are the opposite kind of thing — they matter most on ``401``/``403``/``429``, and headers
 set on an injected ``Response`` do **not** survive the exception path — so those are attached by
 ``RequestContextMiddleware`` instead. The distinction is deliberate, not an inconsistency.
@@ -37,8 +37,10 @@ produces it.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -53,14 +55,21 @@ from fastapi import (
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import ValidationError
 
-from src.auth import Principal, authenticate, create_access_token
+from src.auth import authenticate, create_access_token
 from src.config import Settings
-from src.deps import WWW_AUTHENTICATE, current_principal, settings_from_request
+from src.deps import (
+    WWW_AUTHENTICATE,
+    RoleDocumentedRoute,
+    ViewerGuard,
+    WriterGuard,
+    settings_from_request,
+)
 from src.models import (
     CLAMPED_HEADER,
     CURSOR_TRUNCATED_HEADER,
     MAX_Q_LEN,
     ErrorBody,
+    LogCreate,
     LogEntry,
     LogLevel,
     LogPage,
@@ -73,11 +82,19 @@ from src.models import (
 )
 from src.store import Filter, InvalidCursor, LogStore, decode_cursor, encode_cursor
 
+logger = logging.getLogger(__name__)
+
 #: The prefix is spelled here and documented as ``src.main.API_V1_PREFIX`` there. It is
 #: deliberately **not** imported from ``src.main``: that module imports this one, so the import
 #: would be a cycle. ``tests/integration/test_logs_api.py`` asserts the two strings are equal, so
 #: the duplication is pinned rather than merely hoped for.
-router = APIRouter(prefix="/api/v1")
+#:
+#: ``route_class`` is what turns each route's role gate into published documentation:
+#: :class:`~src.deps.RoleDocumentedRoute` reads the requirement back off the dependency tree it is
+#: about to enforce and writes it into the operation's ``description`` and ``x-required-role``.
+#: FastAPI preserves the class through ``include_router`` (it re-creates each route with
+#: ``route_class_override=type(route)``), so declaring it once here covers the whole v1 surface.
+router = APIRouter(prefix="/api/v1", route_class=RoleDocumentedRoute)
 
 #: How much of a client-supplied id is echoed back in a ``404`` message. Bounded so a caller
 #: cannot use the error body as an arbitrary-length reflector; long enough that a real id (a
@@ -94,6 +111,46 @@ _ECHO_ID_CHARS = 64
 #: mapping the user list cannot. ``tests/integration/test_auth_api.py`` asserts the two responses
 #: are byte-identical.
 INVALID_CREDENTIALS_DETAIL = "incorrect username or password"
+
+#: The ``401`` entry every **gated** route publishes. One dict, referenced from each route's
+#: ``responses``, so the published description of "your token was not usable" cannot drift from
+#: route to route the way four hand-typed copies of it would.
+#:
+#: Safe to share by reference: FastAPI copies each response entry before rewriting it into the
+#: OpenAPI document, and ``include_router`` merges the mapping rather than mutating its values.
+UNAUTHENTICATED_RESPONSE = {
+    "model": ErrorBody,
+    "description": "Missing, malformed, expired or tampered token.",
+}
+
+#: The ``403`` entry, declared only on routes where a real principal can actually fail the gate.
+#:
+#: The ``viewer`` routes deliberately do **not** declare one: ``viewer`` is the floor of the
+#: ladder, so every token this service issues satisfies it and a ``403`` there is unreachable by
+#: construction. Advertising an impossible status code would be a documentation bug, not caution
+#: — clients write handling for it, and it never arrives.
+FORBIDDEN_RESPONSE = {
+    "model": ErrorBody,
+    "description": (
+        "Authenticated, but the principal's role is below this route's minimum. Never returned "
+        "for a missing or unusable token — that is a 401."
+    ),
+}
+
+#: The ``429`` entry, declared on every **metered** route — which is every gated route, since
+#: :func:`~src.deps.guarded` is one gate carrying both the ladder and the bucket.
+#:
+#: Published rather than left implicit because a rate limit a client cannot discover from the
+#: contract is a rate limit it will discover by tripping. The `X-RateLimit-*` triple rides on
+#: *every* response for the same reason; this row is the machine-readable half of that promise.
+RATE_LIMITED_RESPONSE = {
+    "model": ErrorBody,
+    "description": (
+        "The principal's per-tier token bucket is empty. Carries `Retry-After` (delay-seconds, "
+        "never below 1) alongside the `X-RateLimit-*` triple. Retryable, and the response says "
+        "exactly when."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -304,8 +361,8 @@ async def issue_token(
 
     .. rubric:: This route is deliberately UNMETERED — do not add a rate-limit dependency
 
-    C8 must **not** attach `rate_limit` here, and C12's p95 gate must exclude this path. Two
-    reasons, and the first is structural:
+    It carries no `*Guard`, and C12's p95 gate must exclude this path. Two reasons, and the
+    first is structural:
 
     * The limiter is keyed on `principal.subject`, and at this point in the request there **is**
       no principal — that is the entire purpose of the route. Keying a bucket on the *claimed*
@@ -359,25 +416,28 @@ async def issue_token(
     tags=["auth"],
     summary="Echo the authenticated principal",
     responses={
-        status.HTTP_401_UNAUTHORIZED: {
-            "model": ErrorBody,
-            "description": "Missing, malformed, expired or tampered token.",
-        }
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
     },
 )
-async def read_me(
-    principal: Annotated[Principal, Depends(current_principal)],
-) -> PrincipalResponse:
+async def read_me(principal: ViewerGuard) -> PrincipalResponse:
     """Return the decoded principal — the fastest way to prove a token works.
 
     It touches no store, no filter and no pagination, so a `200` here isolates the auth chain
     from every other moving part: if this succeeds and a data route does not, the token is not
     the problem. A `401` carries `WWW-Authenticate: Bearer`, as RFC 9110 §11.6.1 requires.
 
-    The declared `Depends(current_principal)` is also what puts the `bearerAuth` security
-    requirement on this operation in the generated OpenAPI document — the README's claim that
-    the auth contract is published rather than tribal knowledge is pinned by
-    `test_openapi_documents_auth_routes`.
+    The declared dependency is also what puts the `bearerAuth` security requirement on this
+    operation in the generated OpenAPI document — the README's claim that the auth contract is
+    published rather than tribal knowledge is pinned by `test_openapi_documents_auth_routes`.
+
+    `ViewerGuard` rather than a bare `current_principal`: the README's table gives this route
+    the `viewer` role like every other read, and the floor of the ladder admits every token this
+    service issues, so the ladder half of the gate changes no behaviour. What it changes is the
+    *source* — every route in v1 now carries an explicit, greppable, published minimum, and
+    "gated at the lowest level" stops being indistinguishable from "nobody gated this". The
+    metering half is not free, though: this route spends a token like any other, which is
+    correct, because a client polling `/auth/me` in a loop is load exactly like any other load.
     """
     return PrincipalResponse.from_principal(principal)
 
@@ -399,6 +459,43 @@ async def read_me(
 #  Add new literal `/logs/...` routes above it, never below.
 # =============================================================================================
 
+# =============================================================================================
+#  THE RBAC + METERING CONTRACT — the README's role table, as applied in this file
+# ---------------------------------------------------------------------------------------------
+#  Every gated route spells ONE dependency, `<Role>Guard`, and it carries BOTH cross-cutting
+#  gates: the role ladder (403) and the per-tier token bucket (429), in that order. They are one
+#  dependency rather than two because the order is not negotiable — `src.deps.guarded` nests the
+#  limiter *inside* the role check so a 403 can never drain a bucket, and two separately-declared
+#  dependencies would leave that ordering to FastAPI's resolution order rather than to the graph.
+#  Do not "simplify" a route back to `RequireX` + a sibling rate-limit dependency.
+#
+#  Landed in C7 (ladder) and C8 (metering):
+#      GET  /auth/me            -> viewer     (ViewerGuard)
+#      GET  /logs               -> viewer     (ViewerGuard)
+#      GET  /logs/{entry_id}    -> viewer     (ViewerGuard)
+#      POST /logs               -> writer     (WriterGuard)
+#      POST /auth/token         -> PUBLIC and UNMETERED. It is what mints a principal, so there
+#                                  is nothing to key a bucket on; gating it would be a
+#                                  chicken-and-egg deadlock, and `test_openapi_documents_auth_
+#                                  routes` asserts the operation publishes no security block.
+#                                  See its docstring for why bcrypt is the right brake here.
+#
+#  Still to be gated, by the commit that adds the route:
+#      POST /logs/search        -> analyst    (C9  — AnalystGuard)
+#      GET  /logs/stream        -> analyst    (C10 — the `?access_token=` escape hatch means its
+#                                  principal does NOT come from the header, so it composes
+#                                  `RequireAnalyst` with its own principal source; see the C10
+#                                  note in `src/deps.py`. SSE also has its own concurrency cap,
+#                                  which is a different resource from the request bucket.)
+#      GET  /stats              -> viewer     (C11 — ViewerGuard)
+#      GET  /debug/memory       -> admin      (C11 — AdminGuard)
+#
+#  `tests/integration/test_rbac_api.py::test_role_matrix_across_every_guarded_route` is the
+#  single test that pins the ladder half. It is data-driven: adding a route above means adding
+#  one row to `GUARDED_ROUTES` there, and the 4x1 role sweep comes for free.
+#  `tests/integration/test_ratelimit_api.py` pins the metering half.
+# =============================================================================================
+
 
 @router.get(
     "/logs",
@@ -410,12 +507,15 @@ async def read_me(
             "model": ErrorBody,
             "description": "Incoherent query: a bad/foreign cursor, cursor+offset together, "
             "or `since` after `until`.",
-        }
+        },
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
     },
 )
 async def list_logs(
     request: Request,
     response: Response,
+    principal: ViewerGuard,
     level: Annotated[
         list[LogLevel] | None,
         Query(description="Match any of these levels. Repeatable: `?level=ERROR&level=FATAL`."),
@@ -501,6 +601,11 @@ async def list_logs(
 
     Supplying both is a `400`: a cursor already encodes a position, so there is no reading of the
     pair that isn't a guess. `limit` is always clamped, never rejected.
+
+    `principal` is declared but not read: the parameter exists so the `viewer` gate runs, and
+    binding it as a value (rather than as a parameterless `dependencies=[...]` entry) is what
+    keeps the requirement visible in the signature — and available to any future filtering by
+    caller identity without re-plumbing the route.
     """
     # LogQuery owns the coherence rules (cursor XOR offset; since <= until) AND the normalisation
     # of `since`/`until` to UTC. Validating through it rather than re-checking here means the two
@@ -538,6 +643,94 @@ async def list_logs(
     )
 
 
+@router.post(
+    "/logs",
+    response_model=LogEntry,
+    status_code=status.HTTP_201_CREATED,
+    tags=["logs"],
+    summary="Append one log entry (writer role)",
+    responses={
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_403_FORBIDDEN: FORBIDDEN_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorBody,
+            "description": "The runtime has no store, so the entry could not be durably "
+            "accepted. Retryable.",
+        },
+    },
+)
+async def append_log(
+    request: Request,
+    response: Response,
+    body: LogCreate,
+    principal: WriterGuard,
+) -> LogEntry:
+    """Append one entry to the store. **The write path the rest of the system is measured by.**
+
+    Everything downstream reads what this route writes: the entry becomes immediately visible to
+    `GET /logs` and `GET /logs/{id}`, it is what C10's SSE subscribers receive as a live frame,
+    and it is what moves C11's `/stats` counters. That makes this the route the liveness tests
+    hang off — C10's "the stream delivers an entry appended *after* connect" and C12's E2E marker
+    round-trip are both, underneath, a `POST` here followed by an assertion somewhere else. A
+    read-only API can look healthy while being completely inert; this is what proves it is not.
+
+    `201` rather than `200`, with `Location: /api/v1/logs/{id}`, because a resource was created
+    and the client needs its address — including in the common case where the *server* minted the
+    id. The body is the created entry as well, so a client never has to follow the header just to
+    learn what it wrote.
+
+    .. rubric:: `ts` and `id` are optional, and a duplicate `id` is accepted
+
+    Both default server-side (now-UTC, fresh uuid4 hex) via `LogCreate.to_entry`, which is the
+    single definition of that rule — the route does not restate it. Both are honoured when
+    supplied, because a shipper replaying its own buffer must be able to preserve the original
+    event time and its own idempotency key.
+
+    A **duplicate `id` is accepted, not rejected**, and this is a deliberate contract. The store
+    is an append-only ring: a second entry with an existing id is appended as its own record with
+    its own `seq`, and the id map is repointed at the newer one — so `GET /logs/{id}` returns the
+    latest, while both records remain resident, both are scanned, and both are counted. Rejecting
+    the duplicate instead would mean maintaining a second index of "ids ever seen", which is an
+    unbounded structure sitting behind a bounded store — the exact memory leak the ring exists to
+    prevent (see `LogStore._append_locked`, which prunes `_by_id` on eviction for the same
+    reason). Deduplication is a client-side concern; at-least-once is the right posture for logs.
+    """
+    store, _ = _runtime_parts(request)
+    if store is None:
+        # The one handler in this file that must NOT degrade to a cheerful empty answer.
+        #
+        # Every read route here returns an honest empty page when the runtime is half-wired,
+        # because "there is nothing to read" is a true statement about a store that does not
+        # exist. There is no equivalent true statement for a write: returning `201` would claim
+        # the entry was accepted when it went nowhere, and a log shipper that trusts a `201` to
+        # mean "safe to drop from my buffer" would silently lose data. `503` is the honest
+        # degradation — a distinct, retryable, non-`500` answer that names the condition — and it
+        # is the same reasoning `issue_token` uses for refusing to sign a token without a key.
+        #
+        # The subject is logged because this is the one path where an operator needs to know
+        # *whose* write was refused — a shipper that retries forever against a store-less process
+        # is the failure this line makes findable. It is a failure-path log only: a line per
+        # successful append would be an ingest-rate-proportional firehose.
+        logger.error(
+            "append rejected for %r: the runtime exposes no store", principal.subject
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="log store is unavailable; the entry was not accepted",
+        )
+
+    entry = body.to_entry()
+    store.append(entry)
+
+    # Percent-encoded because `id` is client-suppliable free text (1..128 chars, no pattern), and
+    # a raw `/` or space in a `Location` value produces a header that points at a different
+    # resource or at nothing at all. `safe=""` leaves the uuid4 hex the server mints untouched,
+    # so the header a normal client sees is exactly `/api/v1/logs/<id>`.
+    response.headers["Location"] = f"{router.prefix}/logs/{quote(entry.id, safe='')}"
+    return entry
+
+
 # --- `/logs/{entry_id}` is the wildcard. Keep it LAST. See the block above. -------------------
 
 
@@ -547,10 +740,12 @@ async def list_logs(
     tags=["logs"],
     summary="Fetch one log entry by id",
     responses={
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
         status.HTTP_404_NOT_FOUND: {
             "model": ErrorBody,
             "description": "No entry with that id is resident in the ring.",
-        }
+        },
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
     },
 )
 async def get_log_entry(
@@ -559,6 +754,7 @@ async def get_log_entry(
         str,
         Path(description="The entry's `id`, exactly as it appears in a list response."),
     ],
+    principal: ViewerGuard,
 ) -> LogEntry:
     """Return a single entry, or `404` if it is unknown **or has been evicted**.
 
@@ -566,6 +762,12 @@ async def get_log_entry(
     from the outside and both answer `404`. Inventing a `410 Gone` for the second case would
     require retaining a tombstone per evicted id — an unbounded structure behind a bounded store,
     which is the exact memory leak the ring exists to prevent.
+
+    Note the ordering of the two failure modes: an unauthenticated caller gets a `401` and an
+    under-privileged one a `403` **before** the id is ever looked up, so this route cannot be used
+    as an unauthenticated existence oracle for entry ids.
+
+    `principal` is declared but not read — see `list_logs` for why the gate is bound as a value.
     """
     store, _ = _runtime_parts(request)
     entry = None if store is None else store.get(entry_id)

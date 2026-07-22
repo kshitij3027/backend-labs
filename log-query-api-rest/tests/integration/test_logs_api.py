@@ -1,8 +1,13 @@
 """Integration tests for the C5 ``/api/v1`` read surface: list, paginate, filter, fetch.
 
-These drive the **whole** ASGI stack — middleware, router, dependency-free handlers, response
-models and FastAPI's generated OpenAPI document — against a store holding a known, deterministic
-corpus (see ``tests/integration/conftest.py``).
+These drive the **whole** ASGI stack — middleware, router, handlers, response models and
+FastAPI's generated OpenAPI document — against a store holding a known, deterministic corpus (see
+``tests/integration/conftest.py``).
+
+C7 gated these routes at the ``viewer`` role, so ``seeded_client`` now carries a default bearer
+token; nothing else in this file changed, because the read contract did not. What a *missing* or
+*insufficient* credential does to these routes is ``tests/integration/test_rbac_api.py``'s
+subject, not this file's.
 
 .. rubric:: Why almost nothing here is a hardcoded number
 

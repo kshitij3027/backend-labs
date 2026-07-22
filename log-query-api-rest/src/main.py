@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from uuid import uuid4
@@ -35,7 +35,9 @@ from starlette.responses import Response
 from src.api.health import router as health_router
 from src.api.v1 import router as v1_router
 from src.config import Settings, get_settings
+from src.deps import rate_limit_headers
 from src.generators import generate_entries
+from src.ratelimit import RateLimiter
 from src.store import LogStore
 
 logger = logging.getLogger(__name__)
@@ -78,17 +80,43 @@ EXPOSE_HEADERS = [
 ]
 
 
+#: A clock. Named so the two constructors below can advertise the seam without repeating the
+#: signature; :func:`time.monotonic` is what production uses.
+TimeFunc = Callable[[], float]
+
+
+def _build_limiter(settings: Settings, clock: TimeFunc | None = None) -> RateLimiter:
+    """Size a :class:`~src.ratelimit.RateLimiter` from configuration.
+
+    One construction site for both :meth:`Runtime.build` and :meth:`Runtime.build_seeded`, so the
+    test path and the production path cannot be limited differently — which is precisely the class
+    of bug that makes a limiter look correct in CI and behave differently in the container.
+
+    ``clock`` is a **test seam**, and it exists because the alternative is a flaky suite. The
+    limiter is defined in terms of elapsed time, so an integration test that fires 21 requests at
+    a burst-20 bucket is racing its own runtime: at the free tier's 10 tokens/s, the ~50 ms those
+    requests take is worth half a token, and whether the 21st is refused depends on how loaded the
+    machine is. Freezing the clock makes the assertion exact. Production passes ``None`` and gets
+    :func:`time.monotonic` — see :class:`~src.ratelimit.TokenBucket` for why never the wall clock.
+    """
+    if clock is None:
+        return RateLimiter(settings.tier_limits, enabled=settings.rate_limit_enabled)
+    return RateLimiter(
+        settings.tier_limits, enabled=settings.rate_limit_enabled, time_func=clock
+    )
+
+
 @dataclass
 class Runtime:
     """Per-process runtime state shared by every handler.
 
-    ``store`` is C4's :class:`~src.store.LogStore` and is built by **both** constructors, so no
-    handler ever has to cope with a store-less runtime in practice. It stays ``Optional``
-    anyway, and read sites still use ``getattr(runtime, "store", None)``, because the whole
-    point of the defensive-read convention is that a half-wired runtime degrades to a documented
-    fallback rather than a 500 — a guarantee that would evaporate the moment one field made it
-    unconditional. ``limiter`` (C8's ``RateLimiter``) is still typed loosely because its class
-    does not exist yet; each commit narrows the annotation as it lands.
+    ``store`` is C4's :class:`~src.store.LogStore` and ``limiter`` is C8's
+    :class:`~src.ratelimit.RateLimiter`; both are built by **both** constructors, so no handler
+    ever has to cope with a runtime missing either one in practice. They stay ``Optional``
+    anyway, and read sites still use ``getattr(runtime, "store", None)`` /
+    :func:`~src.deps.limiter_from_request`, because the whole point of the defensive-read
+    convention is that a half-wired runtime degrades to a documented fallback rather than a 500 —
+    a guarantee that would evaporate the moment one field made it unconditional.
 
     ``started_monotonic`` is captured from :func:`time.monotonic`, not the wall clock, so
     reported uptime cannot go backwards when NTP steps the system clock.
@@ -96,7 +124,7 @@ class Runtime:
 
     settings: Settings
     store: LogStore | None = None
-    limiter: object | None = None
+    limiter: RateLimiter | None = None
     started_monotonic: float = field(default_factory=time.monotonic)
 
     @property
@@ -105,7 +133,7 @@ class Runtime:
         return max(0.0, time.monotonic() - self.started_monotonic)
 
     @classmethod
-    def build(cls, settings: Settings) -> Runtime:
+    def build(cls, settings: Settings, *, limiter_clock: TimeFunc | None = None) -> Runtime:
         """Construct a Runtime cheaply — **no corpus seeding, no I/O**.
 
         The unit-test path. Injected via ``create_app(runtime=Runtime.build(settings))``, it
@@ -116,11 +144,20 @@ class Runtime:
         empty ``deque`` and three empty dicts regardless of ``store_capacity``, so this stays as
         cheap as it was before C4 while removing the ``store is None`` branch from every test.
         A test that wants a corpus appends one explicitly.
+
+        Args:
+            limiter_clock: See :func:`_build_limiter`. Test seam only.
         """
-        return cls(settings=settings, store=LogStore(capacity=settings.store_capacity))
+        return cls(
+            settings=settings,
+            store=LogStore(capacity=settings.store_capacity),
+            limiter=_build_limiter(settings, limiter_clock),
+        )
 
     @classmethod
-    def build_seeded(cls, settings: Settings) -> Runtime:
+    def build_seeded(
+        cls, settings: Settings, *, limiter_clock: TimeFunc | None = None
+    ) -> Runtime:
         """Construct the production Runtime, with the store seeded to ``settings.seed_entries``.
 
         Kept as a separate, already-wired entry point so the production and test paths are
@@ -130,6 +167,9 @@ class Runtime:
         **oldest first** — so the store's monotonic ``seq`` order agrees with time order, which is
         the assumption every newest-first scan and every cursor anchor in ``src/store.py`` rests
         on. Seeding newest-first would leave the store internally consistent and sorted backwards.
+
+        Args:
+            limiter_clock: See :func:`_build_limiter`. Test seam only.
         """
         store = LogStore(capacity=settings.store_capacity)
         # `seed_entries=0` is a normal configuration rather than an edge case — the compose
@@ -141,16 +181,28 @@ class Runtime:
             # entries through `append` would be 10,000 uncontended lock round-trips inside the
             # container healthcheck's start_period, for no benefit.
             store.append_many(generate_entries(settings.seed_entries))
-        return cls(settings=settings, store=store)
+        return cls(
+            settings=settings,
+            store=store,
+            limiter=_build_limiter(settings, limiter_clock),
+        )
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
-    """Mint or echo ``X-Request-ID`` on every request, and stamp it on every response.
+    """Stamp ``X-Request-ID`` and the ``X-RateLimit-*`` triple on **every** response.
 
-    Correlation ids are only useful if they survive the whole request — including the error
-    paths — so this is middleware rather than a dependency: it wraps 200s, 401s, 403s, 429s and
-    unhandled 500s alike. An id supplied by the client is echoed (so a caller can correlate
-    across services); otherwise a fresh hex uuid4 is minted.
+    Both are middleware concerns for the same reason: they are only useful if they survive the
+    whole request, error paths included. This wraps 200s, 401s, 403s, 429s and unhandled 500s
+    alike, because it sees the response that actually leaves the app rather than the one a
+    handler intended to return.
+
+    The alternative — a dependency writing to its injected ``response: Response`` — silently
+    drops everything the moment a dependency raises, and the raising paths (``401``, ``403``,
+    ``429``) are exactly the ones where a client most needs to be told what its ceiling is. A
+    ``429`` that does not say when to come back is barely better than a connection reset.
+
+    An id supplied by the client is echoed (so a caller can correlate across services);
+    otherwise a fresh hex uuid4 is minted.
     """
 
     async def dispatch(
@@ -162,14 +214,18 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
 
-        # --- C8 HOOK -------------------------------------------------------------------
-        # C8's `rate_limit` dependency stashes its Decision on `request.state` and attaches
-        # X-RateLimit-Limit / -Remaining / -Reset HERE, not via a `response: Response`
-        # parameter. Reason: headers set on a dependency's injected Response do not survive
-        # the exception path — and the exception path (429, 403, 401) is exactly the one
-        # where a client most needs to be told the ceiling. Middleware sees whatever response
-        # actually leaves the app, so this is the only placement that covers all of them.
-        # -------------------------------------------------------------------------------
+        # `request.state` is backed by the ASGI `scope`, and `call_next` hands the SAME scope
+        # object to the app underneath — so the Decision the `rate_limit` gate stashed several
+        # layers in is readable right here, on the way back out.
+        #
+        # `rate_limit_headers` returns an EMPTY mapping when this request had no principal
+        # (a 401, /health, /docs, the token endpoint), and nothing is emitted in that case. That
+        # is deliberate: with no principal there is no bucket, so any value would be invented,
+        # and a header claiming a ceiling that was never evaluated is worse than a missing one —
+        # a client can handle absence but cannot detect fiction. See `src.deps` for the full
+        # three-case rule, including why a 403 reports a peeked (non-consuming) allowance.
+        for header, value in rate_limit_headers(request).items():
+            response.headers[header] = value
 
         return response
 
