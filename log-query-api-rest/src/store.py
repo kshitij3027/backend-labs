@@ -65,11 +65,13 @@ it would prevent.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
 import heapq
 import json
+import logging
 import operator
 import re
 import threading
@@ -150,6 +152,15 @@ _B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 #: :meth:`LogStore._index_append` and :meth:`LogStore._prune_indexes` cannot disagree about the
 #: set of indexes that exists.
 INDEXED_DIMENSIONS: tuple[str, ...] = ("level", "service", "host")
+
+#: Fallback per-subscriber queue depth, used only when a caller does not pass one. The real
+#: value is ``SSE_QUEUE_SIZE`` from :class:`~src.config.Settings`, threaded in by the route — the
+#: store deliberately does not import ``Settings`` (it is the correctness core and has no
+#: configuration of its own), so the default exists purely so unit tests and ad-hoc callers can
+#: subscribe without inventing a number.
+DEFAULT_SUBSCRIBER_QUEUE_SIZE = 1000
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1072,6 +1083,97 @@ def decode_cursor(
 
 
 # ---------------------------------------------------------------------------------------------
+# SSE fan-out
+#
+# The tail half of the read surface. `GET /logs` walks the history under a filter; a subscriber
+# holds the *same* filter against the future, and `append` is the single place the two meet.
+#
+# Three rules govern everything below, and every one of them exists because the alternative is a
+# way for a client to hurt the server:
+#
+#   1. **A subscriber is a bounded queue, never an unbounded one.** `asyncio.Queue(maxsize=N)` —
+#      so a reader that stops reading costs at most N record *references* (the records
+#      themselves are already resident in the ring and shared by reference; a queued entry adds
+#      a pointer, not a copy).
+#   2. **Overflow drops the subscriber; it never blocks the writer and never grows the buffer.**
+#      `append` publishes with `put_nowait` and treats `QueueFull` as "this consumer is gone".
+#      Blocking would let one stalled reader stall ingest for everybody; growing would hand a
+#      stalled reader the process's memory.
+#   3. **Fan-out can never break ingest.** Every per-subscriber step runs inside a `try`, and any
+#      failure removes *that* subscriber. `POST /logs` returns 201 even if every subscriber in
+#      the process is broken, because the entry did land in the ring — which is what 201 claims.
+# ---------------------------------------------------------------------------------------------
+
+
+class StreamLimitExceeded(RuntimeError):
+    """A principal already holds :data:`max_streams` concurrent subscriptions.
+
+    Raised by :meth:`LogStore.subscribe` and mapped by ``GET /logs/stream`` to a ``429`` whose
+    detail is deliberately *unlike* the rate limiter's — one long-lived connection and one
+    thousand quick requests are different resources, and an operator reading a log line (or a
+    test reading a body) must be able to tell which ceiling was hit.
+    """
+
+    def __init__(self, subject: str, limit: int) -> None:
+        self.subject = subject
+        self.limit = limit
+        super().__init__(
+            f"principal {subject!r} already holds {limit} concurrent stream(s)"
+        )
+
+
+class Subscription:
+    """One live SSE subscriber: a bounded queue, the filter it is watching, and its lifecycle.
+
+    Not a ``dataclass``: :attr:`released` and :attr:`dropped` mutate, the object is used as a
+    dict key (so it needs identity hashing, which a non-frozen dataclass would keep but an
+    ``eq=True`` one would break), and ``__slots__`` keeps it cheap enough that the per-principal
+    cap is the only thing bounding how many exist.
+
+    Attributes:
+        subject: The owning principal's ``sub`` claim. The key the per-principal stream counter
+            is kept under, captured here so :meth:`LogStore.unsubscribe` can decrement without
+            being told who to decrement — a caller that had to pass the subject again would be a
+            caller that could pass the wrong one.
+        queue: Bounded ``asyncio.Queue``. Holds :class:`StoredEntry` records, plus at most one
+            ``None`` **terminal sentinel** meaning "this subscription is over, stop reading".
+        flt: The compiled filter. Evaluated once per subscriber per append, in the writer's
+            thread — which is why a filter that raises must cost only this subscriber.
+        released: Set exactly once, by :meth:`LogStore.unsubscribe`. **This flag is the whole
+            idempotency mechanism**: the route has six exit paths that all unsubscribe, and the
+            per-principal counter must decrement exactly once no matter how many of them run.
+        dropped: True when the subscription ended because the consumer could not keep up, as
+            opposed to disconnecting or being closed at shutdown. The route turns it into a
+            terminal ``event: dropped`` frame, so a client learns it was cut off rather than
+            silently believing it saw everything.
+    """
+
+    __slots__ = ("dropped", "flt", "queue", "released", "subject")
+
+    def __init__(
+        self,
+        *,
+        subject: str,
+        flt: Filter | CompiledFilter,
+        queue_size: int = DEFAULT_SUBSCRIBER_QUEUE_SIZE,
+    ) -> None:
+        self.subject = subject
+        self.flt = flt
+        #: `maxsize` is the hard memory bound. It is passed positionally-by-keyword here rather
+        #: than defaulted to 0 (unbounded) anywhere, because an unbounded queue is precisely the
+        #: bug this class exists to make unwritable.
+        self.queue: asyncio.Queue[StoredEntry | None] = asyncio.Queue(maxsize=queue_size)
+        self.released = False
+        self.dropped = False
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return (
+            f"Subscription(subject={self.subject!r}, queued={self.queue.qsize()}, "
+            f"released={self.released}, dropped={self.dropped})"
+        )
+
+
+# ---------------------------------------------------------------------------------------------
 # The store
 # ---------------------------------------------------------------------------------------------
 
@@ -1096,6 +1198,9 @@ class LogStore:
         "_indexes",
         "_lock",
         "_next_seq",
+        "_stream_counts",
+        "_sub_lock",
+        "_subscribers",
         "_time_func",
     )
 
@@ -1143,6 +1248,28 @@ class LogStore:
         self._time_func = time_func
         self._append_times: deque[float] = deque(maxlen=INGEST_SAMPLE_CAP)
         self._lock = threading.Lock()
+
+        # -- SSE fan-out state ---------------------------------------------------------------
+        #
+        #: Live subscribers, as an **ordered set** (a dict with ignored values). Order makes
+        #: fan-out deterministic, which is what lets a multi-subscriber test assert on more than
+        #: "somebody got it"; dict membership makes removal O(1) rather than a list scan, which
+        #: matters because removal happens on every disconnect.
+        self._subscribers: dict[Subscription, None] = {}
+        #: subject -> live subscription count. Keys are deleted at zero rather than left at 0,
+        #: so a process that churns through a million principals does not accumulate a million
+        #: dict entries — the same bounded-bookkeeping argument the rate limiter's `sweep` makes.
+        self._stream_counts: dict[str, int] = {}
+        #: A **second** lock, guarding only the two structures above.
+        #:
+        #: It is separate from `_lock` on purpose and the reason is a deadlock, not tidiness.
+        #: Publication happens inside `_append_locked`, i.e. with `_lock` already held; the drop
+        #: path there calls `unsubscribe`, which must take a lock of its own. If that were
+        #: `_lock` — a plain, non-reentrant `threading.Lock` — a single slow consumer would
+        #: deadlock the writer permanently. Lock ordering is therefore fixed and one-directional:
+        #: `_lock` may be held while taking `_sub_lock`, never the reverse. No method below takes
+        #: `_lock`, so the reverse edge does not exist and no cycle can form.
+        self._sub_lock = threading.Lock()
 
     # -- writes ---------------------------------------------------------------------------
 
@@ -1202,6 +1329,19 @@ class LogStore:
         self._by_id[entry.id] = record
         self._index_append(record)
         self._append_times.append(self._time_func())
+
+        # Publication is the LAST thing an append does, and it is deliberately inside the
+        # critical section rather than after it. Two reasons:
+        #
+        #   * The record must be resident before any subscriber can see it. A frame carrying
+        #     seq N whose record is not yet in the ring would make `Last-Event-ID: N` resume from
+        #     an anchor the store does not have.
+        #   * `append_many` funnels through here too, so a stream that is open during a bulk
+        #     append sees the batch instead of silently missing it.
+        #
+        # Being inside the section is only safe because `_publish` takes `_sub_lock` and never
+        # `_lock` (see `__init__`), and because it cannot raise — see its own docstring.
+        self._publish(record)
         return record
 
     def _index_append(self, record: StoredEntry) -> None:
@@ -1356,6 +1496,271 @@ class LogStore:
             return 0.0
         span = now - oldest
         return count / span if span > 0 else 0.0
+
+    # -- SSE fan-out ----------------------------------------------------------------------
+
+    def subscribe(
+        self,
+        flt: Filter | CompiledFilter,
+        *,
+        subject: str,
+        queue_size: int = DEFAULT_SUBSCRIBER_QUEUE_SIZE,
+        max_streams: int | None = None,
+    ) -> Subscription:
+        """Register a live subscriber and return its handle.
+
+        Args:
+            flt: The filter the subscriber watches. The *same* vocabulary the paginated route
+                uses, so "the tail of this search" and "the history of this search" are the same
+                predicate applied to two ends of the ring rather than two implementations that
+                have to be kept in agreement.
+            subject: The owning principal, for the concurrent-stream cap.
+            queue_size: Per-subscriber buffer depth. The route passes ``SSE_QUEUE_SIZE``.
+            max_streams: Cap on this principal's concurrent subscriptions, or ``None`` for no
+                cap. ``None`` is the unit-test default rather than the production one — the
+                route always passes a number.
+
+        Raises:
+            StreamLimitExceeded: The principal is already at ``max_streams``. The check and the
+                registration happen under one acquisition of ``_sub_lock``, so two connections
+                arriving together cannot both read "one slot left" and both take it.
+            ValueError: ``queue_size`` is not positive. A zero-maxsize ``asyncio.Queue`` is
+                *unbounded*, which would silently turn the one guarantee this whole subsystem
+                makes into its opposite — so it fails loudly at subscribe time instead.
+        """
+        if queue_size < 1:
+            raise ValueError(
+                f"queue_size must be >= 1 (0 means UNBOUNDED to asyncio.Queue), got {queue_size}"
+            )
+
+        sub = Subscription(subject=subject, flt=flt, queue_size=queue_size)
+        with self._sub_lock:
+            held = self._stream_counts.get(subject, 0)
+            if max_streams is not None and held >= max_streams:
+                raise StreamLimitExceeded(subject, max_streams)
+            self._stream_counts[subject] = held + 1
+            self._subscribers[sub] = None
+        return sub
+
+    def unsubscribe(self, sub: Subscription) -> bool:
+        """Release a subscription. **Idempotent** — returns True only for the call that released.
+
+        Idempotence is not a nicety here, it is the correctness property this method exists for.
+        ``GET /logs/stream`` has six ways to end — the generator's ``finally``, the response's
+        ``BackgroundTask``, the handler's ``except``, the slow-consumer drop below, lifespan
+        shutdown, and an ordinary return once ``max_events`` is reached — and several of them
+        routinely run for the *same* connection (a client that disconnects mid-frame trips both
+        the ``finally`` and the background task). Each one calls this method. If the
+        per-principal counter decremented per call rather than per subscription, a principal's
+        slot count would drift downward until the cap stopped meaning anything, or upward until
+        they could never connect again; the first is a security hole and the second is a support
+        ticket.
+
+        The guard is :attr:`Subscription.released`, read and written under ``_sub_lock`` so two
+        exit paths racing on different threads still produce exactly one release.
+
+        Returns:
+            True if this call released the subscription, False if it was already released.
+        """
+        with self._sub_lock:
+            if sub.released:
+                return False
+            sub.released = True
+            self._subscribers.pop(sub, None)
+            remaining = self._stream_counts.get(sub.subject, 1) - 1
+            if remaining > 0:
+                self._stream_counts[sub.subject] = remaining
+            else:
+                # Deleted rather than left at zero — see `_stream_counts` in `__init__`.
+                self._stream_counts.pop(sub.subject, None)
+        return True
+
+    def subscriber_count(self) -> int:
+        """How many subscriptions are live process-wide. C11's ``/debug/memory`` reports it."""
+        with self._sub_lock:
+            return len(self._subscribers)
+
+    def stream_count(self, subject: str) -> int:
+        """How many subscriptions ``subject`` currently holds. The cap is measured against this."""
+        with self._sub_lock:
+            return self._stream_counts.get(subject, 0)
+
+    def close_all_subscribers(self) -> int:
+        """Terminate every live subscription and return how many were closed. Shutdown path.
+
+        Called from the lifespan teardown. Without it a shutdown leaves every generator parked
+        on ``await queue.get()`` on a queue nothing will ever write to again, and the process
+        waits on them instead of exiting.
+
+        Unlike the drop path this does **not** drain first: whatever a client has already been
+        sent is legitimately theirs, and the sentinel is appended behind it so the generator
+        finishes delivering before it returns. Only if the queue is completely full does one
+        record make way for the sentinel — a terminal frame that arrives is worth more than the
+        last record of a stream that is ending anyway.
+        """
+        with self._sub_lock:
+            current = list(self._subscribers)
+        for sub in current:
+            self._terminate(sub, drain_first=False)
+        return len(current)
+
+    def replay_since(
+        self,
+        after_seq: int,
+        flt: Filter | CompiledFilter,
+        *,
+        max_items: int,
+    ) -> tuple[list[StoredEntry], bool]:
+        """Matching records with ``seq > after_seq``, oldest first — the ``Last-Event-ID`` resume.
+
+        Args:
+            after_seq: The last seq the client acknowledges having seen. ``-1`` means "nothing
+                yet", which is why this is ``after_seq`` and not ``from_seq``: an SSE ``id`` is
+                an entry the client *received*, so the resume starts strictly past it.
+            flt: The reconnecting client's filter. Applied here as well as to the live tail, so
+                a resume cannot deliver rows the same query would not have delivered live.
+            max_items: Hard bound on the returned list, mirroring ``SSE_QUEUE_SIZE``. A client
+                that was away for an hour must not be able to make the server materialise the
+                whole ring into one response.
+
+        Returns:
+            ``(items, truncated)``. ``truncated`` is True when the resume is **provably
+            incomplete** — either more than ``max_items`` records matched, or the requested
+            anchor has already been evicted so the records immediately after it no longer exist.
+            When it is True the newest ``max_items`` are returned rather than the oldest: the
+            replay is about to be spliced onto the live tail, and keeping the newest end means
+            the join is seamless and the gap is at the far, already-flagged end. Returning fewer
+            rows *silently* is the one behaviour that must never happen — hence the flag rather
+            than a shorter list.
+        """
+        if max_items < 1:
+            return [], True
+
+        oldest = self.oldest_seq()
+        # `after_seq + 1` is the first seq the client is owed. If the ring's head has already
+        # moved past it, whatever sat in between is gone — the client's gap is real and no
+        # amount of scanning will find it.
+        truncated = oldest is not None and after_seq + 1 < oldest
+
+        kept: deque[StoredEntry] = deque(maxlen=max_items)
+        matched = 0
+        # ASC because a replay is delivered oldest-first: the client is rebuilding a timeline,
+        # and `_walk` with an anchor already yields strictly beyond it, which is exactly the
+        # "strictly past the last id" semantics above.
+        for record in self._walk(flt, SortOrder.ASC, after_seq if after_seq >= 0 else None):
+            matched += 1
+            kept.append(record)
+        if matched > max_items:
+            truncated = True
+        return list(kept), truncated
+
+    def _publish(self, record: StoredEntry) -> None:
+        """Fan one record out to every matching subscriber. **Never raises.** Caller holds ``_lock``.
+
+        This method is the reason ``POST /logs`` can promise ``201`` unconditionally. It runs on
+        the writer's thread, inside the store's critical section, and everything it touches is
+        supplied by clients: the predicate came from a query string, the queue's fullness is set
+        by how fast a reader reads. Any of it can misbehave, and none of it may turn a
+        successful append into a failed request — so each subscriber is handled inside its own
+        ``try`` and any failure removes *that* subscriber and nothing else.
+
+        .. rubric:: The event-loop constraint, stated plainly
+
+        ``asyncio.Queue`` is **not thread-safe**. ``put_nowait`` wakes a parked getter by
+        resolving a future, and resolving a future from outside its loop's thread is undefined
+        behaviour. This is safe here because the service is single-loop by construction: the
+        only caller that publishes to a live subscriber is ``POST /logs``, an ``async def``
+        handler running on uvicorn's loop, and the other append path (``append_many`` during
+        seeding) runs before the loop exists and therefore before any subscriber can exist. The
+        honest statement of the invariant is *appends that can reach a subscriber happen on the
+        loop thread*. If this service ever grows a background ingest thread, this is the line
+        that has to change — to ``loop.call_soon_threadsafe(queue.put_nowait, record)`` with the
+        loop captured at subscribe time — and nothing else does.
+        """
+        subscribers = self._subscribers
+        # Unlocked truthiness check. The common case by far — nobody is streaming — and taking a
+        # lock per append to discover that is a cost every ingest pays for a feature nobody is
+        # using. A subscriber that registers concurrently with this line simply starts one record
+        # later, which is indistinguishable from having connected a microsecond later.
+        if not subscribers:
+            return
+
+        with self._sub_lock:
+            current = list(subscribers)
+
+        failed: list[Subscription] = []
+        for sub in current:
+            if sub.released:
+                continue
+            try:
+                if not sub.flt.matches(record):
+                    continue
+                sub.queue.put_nowait(record)
+            except asyncio.QueueFull:
+                # The whole back-pressure policy, in one branch: the consumer is `queue_size`
+                # records behind and still not reading. Buffering more would let it grow the
+                # process's memory without bound; blocking would let it stall ingest for every
+                # other client. So it loses its subscription and is told so.
+                failed.append(sub)
+            except Exception:  # noqa: BLE001 - a broken subscriber must not break ingest
+                # Reached when a filter raises. Not expected — `compile_filter` and
+                # `Filter.from_query` both produce total predicates — but "not expected" is not
+                # "impossible", and the failure mode if this were unhandled is that one bad
+                # subscriber makes every subsequent `POST /logs` a 500.
+                logger.exception(
+                    "dropping subscriber for %r: filter raised during fan-out", sub.subject
+                )
+                failed.append(sub)
+
+        for sub in failed:
+            self._terminate(sub, drain_first=True)
+
+    def _terminate(self, sub: Subscription, *, drain_first: bool) -> None:
+        """End one subscription: (optionally drain), enqueue the terminal sentinel, unregister.
+
+        ``drain_first`` distinguishes the two reasons a subscription ends without the client
+        going away. A **drop** drains, because the queue being full is the entire problem and a
+        sentinel that cannot be enqueued is a generator that never learns it was dropped — the
+        exact "stalled reader parked forever" outcome the drop exists to prevent. A **shutdown**
+        does not, because those records were legitimately delivered-in-flight.
+
+        Ordering matters: the sentinel goes in *before* :meth:`unsubscribe`, so the generator can
+        never observe "released, but nothing left in the queue" and be left waiting.
+        """
+        sub.dropped = sub.dropped or drain_first
+        queue = sub.queue
+        if drain_first:
+            self._drain(queue)
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            # Shutdown against a completely full queue. Make room for the sentinel by discarding
+            # the oldest queued record — a terminal frame that arrives beats the last record of
+            # a stream that is ending regardless.
+            self._drain(queue, limit=1)
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:  # pragma: no cover - the queue cannot still be full
+                pass
+        except Exception:  # noqa: BLE001 - termination is best-effort by construction
+            logger.exception("failed to enqueue terminal sentinel for %r", sub.subject)
+        self.unsubscribe(sub)
+
+    @staticmethod
+    def _drain(queue: asyncio.Queue[StoredEntry | None], *, limit: int | None = None) -> int:
+        """Discard up to ``limit`` (default: all) queued items. Returns how many were discarded.
+
+        ``get_nowait`` rather than rebuilding the queue, so the object identity a parked getter
+        is waiting on is preserved.
+        """
+        discarded = 0
+        while limit is None or discarded < limit:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            discarded += 1
+        return discarded
 
     # -- scanning -------------------------------------------------------------------------
 

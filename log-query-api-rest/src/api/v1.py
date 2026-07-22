@@ -37,9 +37,11 @@ produces it.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import AsyncIterator
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import quote
 
 from fastapi import (
@@ -52,10 +54,20 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import HTTPAuthorizationCredentials, OAuth2PasswordRequestForm
 from pydantic import ValidationError
+from sse_starlette.sse import EventSourceResponse
+from starlette.background import BackgroundTask
 
-from src.auth import authenticate, create_access_token
+from src.auth import (
+    AuthError,
+    Principal,
+    Role,
+    authenticate,
+    create_access_token,
+    decode_token,
+    role_satisfies,
+)
 from src.config import Settings
 from src.deps import (
     WWW_AUTHENTICATE,
@@ -63,8 +75,20 @@ from src.deps import (
     RoleDocumentedRoute,
     ViewerGuard,
     WriterGuard,
+    bearer_scheme,
+    rate_limit,
+    role_denied_detail,
     settings_from_request,
 )
+
+#: Imported private-with-intent, and the one import in this file that needs a defence.
+#: :class:`~src.deps.RoleDocumentedRoute` recovers a route's minimum role by looking for this
+#: attribute on the callables in its dependency tree. ``GET /logs/stream`` cannot compose one of
+#: the four ``*Guard`` aliases — its principal does not come from the ``Authorization`` header —
+#: so it builds its own guard, and stamping the same attribute is what keeps it inside the
+#: published ``x-required-role`` ladder instead of appearing ungated in the OpenAPI document.
+#: Importing the constant rather than re-spelling the string is what stops the two drifting.
+from src.deps import _MINIMUM_ROLE_ATTR  # noqa: PLC2701
 from src.models import (
     CLAMPED_HEADER,
     CURSOR_TRUNCATED_HEADER,
@@ -87,6 +111,9 @@ from src.store import (
     Filter,
     InvalidCursor,
     LogStore,
+    StoredEntry,
+    StreamLimitExceeded,
+    Subscription,
     compile_filter,
     decode_cursor,
     encode_cursor,
@@ -465,7 +492,11 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #      * C9's  POST /logs/search   LANDED, and is declared above `/logs/{entry_id}`. It is the
 #                                  proof the rule works: declared below, every search request
 #                                  would have come back as a 404 for the entry id "search".
-#      * C10's GET  /logs/stream   MUST be declared ABOVE `/logs/{entry_id}`.
+#      * C10's GET  /logs/stream   LANDED, and is declared above `/logs/{entry_id}`. Declared
+#                                  below it, a stream request would come back as a 404 for the
+#                                  entry id "stream" — which is why
+#                                  `test_stream_returns_event_stream_not_404` asserts on the
+#                                  response's content type rather than merely on its status.
 #
 #  `/logs/{entry_id}` is deliberately the LAST `/logs*` route in this file and must stay last.
 #  Add new literal `/logs/...` routes above it, never below.
@@ -496,12 +527,16 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #                                  routes` asserts the operation publishes no security block.
 #                                  See its docstring for why bcrypt is the right brake here.
 #
+#      GET  /logs/stream        -> analyst    (C10 — `StreamGuard`, NOT `AnalystGuard`. The
+#                                  `?access_token=` escape hatch means its principal does not
+#                                  come from the header, so it re-spells the 401/403/429 ladder
+#                                  over its own principal source; see `stream_principal`. It is
+#                                  the one route in the file that does, and the one route that
+#                                  may. SSE additionally has a concurrent-connection cap, which
+#                                  is a different resource from the request bucket and therefore
+#                                  a 429 with a different `detail`.)
+#
 #  Still to be gated, by the commit that adds the route:
-#      GET  /logs/stream        -> analyst    (C10 — the `?access_token=` escape hatch means its
-#                                  principal does NOT come from the header, so it composes
-#                                  `RequireAnalyst` with its own principal source; see the C10
-#                                  note in `src/deps.py`. SSE also has its own concurrency cap,
-#                                  which is a different resource from the request bucket.)
 #      GET  /stats              -> viewer     (C11 — ViewerGuard)
 #      GET  /debug/memory       -> admin      (C11 — AdminGuard)
 #
@@ -839,6 +874,493 @@ async def search_logs(
         # the route stating that, rather than plumbing a parameter the schema does not publish.
         offset=None,
         response=response,
+    )
+
+
+# =============================================================================================
+#  THE SSE TAIL — `GET /logs/stream`
+#
+#  Declared HERE, above `/logs/{entry_id}`, because it must be. See the route-ordering block.
+#
+#  Everything from here to `get_log_entry` is one feature. It is the most subtle code in the
+#  project, so the hazards are written down beside the code that avoids them rather than in a
+#  commit message nobody will read again:
+#
+#    * DO NOT `await request.is_disconnected()` inside the generator. sse-starlette 2.x runs its
+#      own disconnect listener on the same ASGI `receive` channel; two consumers race for one
+#      `http.disconnect` message, and the one that loses never learns the client went away. The
+#      stream then lives until the process does, holding a subscription slot forever. Disconnect
+#      handling is the library's job here, and the cleanup hangs off `finally` + a BackgroundTask.
+#    * The response's status code is fixed the moment the first byte is written, so every answer
+#      that is NOT 200 — 401, 403, 429 (either kind), 503 — has to be decided in the handler,
+#      before the `EventSourceResponse` is constructed. Nothing below the `return` can fail
+#      loudly any more; it can only stop.
+#    * Subscription happens BEFORE replay, so an entry appended between the two is delivered
+#      twice rather than not at all. At-least-once with a dedupe key (`id` = seq) is the right
+#      trade for logs; the other order silently loses the entry, which is the one outcome a log
+#      pipeline may not have.
+# =============================================================================================
+
+#: The SSE header a reconnecting `EventSource` sends automatically. Lower-case because Starlette's
+#: `Headers` mapping is case-insensitive; spelled once so the header and query spellings of the
+#: same idea cannot drift.
+LAST_EVENT_ID_HEADER = "last-event-id"
+
+#: The `429` detail for the concurrent-stream cap. Deliberately worded so it cannot be confused
+#: with `src.deps.rate_limit_detail`'s: both are 429s, they meter *different resources* (one
+#: long-lived connection is not one request), and an operator reading a log — or a test reading a
+#: body — must be able to tell which ceiling was hit without counting requests.
+MAX_STREAMS_DETAIL = "too many concurrent SSE streams"
+
+#: Frame names. `ready` and `dropped` are protocol, not decoration — see the route docstring.
+STREAM_EVENT_READY = "ready"
+STREAM_EVENT_LOG = "log"
+STREAM_EVENT_DROPPED = "dropped"
+
+#: Headers every stream response carries, beyond what sse-starlette sets for itself.
+#:
+#: `X-Accel-Buffering: no` is the load-bearing one: nginx (and several other reverse proxies)
+#: buffer an upstream response by default, which converts a live tail into a batch that arrives
+#: whenever the buffer happens to fill — the feature still "works" and is completely useless.
+#: `Referrer-Policy: no-referrer` exists because of `?access_token=`: without it, any URL this
+#: page later navigates to would receive the full stream URL — token included — in the `Referer`
+#: header. The escape hatch already costs us the token appearing in one access log; it does not
+#: also have to leak onward to third parties.
+STREAM_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+async def stream_principal(
+    request: Request,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+    ] = None,
+    access_token: Annotated[
+        str | None,
+        Query(
+            description=(
+                "**Stream-only** fallback for the `Authorization` header, because the browser's "
+                "native `EventSource` API cannot set request headers. The header always wins "
+                "when both are present. Accepted on this route and no other."
+            ),
+        ),
+    ] = None,
+) -> Principal:
+    """Resolve the caller for the SSE route: `Authorization` header first, `?access_token=` second.
+
+    .. rubric:: Why this exists, and why it is not in ``src.deps.current_principal``
+
+    ``EventSource`` — the only way a browser consumes SSE without shipping a polyfill — takes a
+    URL and nothing else. No headers. A dashboard that authenticates every other call with a
+    bearer token therefore has exactly one way to authenticate its stream, and this is it.
+
+    The cost is real and worth stating: a query string is written down by every hop it passes
+    through — the proxy's access log, the browser's history, any APM tool in between — so this
+    parameter puts a live credential somewhere a header never goes. That is why it is scoped as
+    narrowly as it can be:
+
+    * It is **this dependency**, not :func:`~src.deps.current_principal`. Widening the header
+      rule would have extended the query-param path to every route in the API, including
+      ``POST /logs/search`` whose entire rationale is keeping search terms *out* of access logs.
+      ``test_access_token_query_param_rejected_on_search_route`` pins that boundary.
+    * The response sets ``Referrer-Policy: no-referrer`` so the URL is not leaked onward.
+    * Tokens are short-lived (``ACCESS_TOKEN_TTL_MIN``), so a leaked one is a bounded loss.
+
+    .. rubric:: Precedence, and why a bad header is not retried against the query
+
+    A present ``Authorization`` header wins outright — including when it is *invalid*, which then
+    fails as a ``401``. Falling back would mean a client with a stale header and a fresh query
+    token silently succeeds under an identity it did not intend to present, and it would let an
+    attacker who can append to a URL override a credential the browser attached itself. "The
+    strongest credential channel decides" is the only rule that is not situational.
+
+    Every failure is the same ``401`` with a ``WWW-Authenticate: Bearer`` challenge, matching
+    :func:`~src.deps.current_principal` exactly — a caller must not be able to tell from the
+    response *which* channel it was read from.
+    """
+    raw = credentials.credentials if credentials is not None else None
+    source = "header"
+    if not raw:
+        raw, source = access_token, "query"
+
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing bearer token",
+            headers=dict(WWW_AUTHENTICATE),
+        )
+
+    try:
+        principal = decode_token(raw, settings=settings_from_request(request))
+    except AuthError as exc:
+        logger.info("rejected stream token from %s: %s", source, exc.reason)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=exc.reason,
+            headers=dict(WWW_AUTHENTICATE),
+        ) from exc
+
+    # Same stash `current_principal` performs, and for the same two readers: the rate limiter
+    # below and `RequestContextMiddleware` on the way back out.
+    request.state.principal = principal
+    return principal
+
+
+async def _stream_guard(
+    request: Request, principal: Principal = Depends(stream_principal)
+) -> Principal:
+    """`401` → `403` → `429`, in that order, over the stream's own principal source.
+
+    The same contract :func:`src.deps.guarded` implements, re-expressed for one route because the
+    one thing it cannot parameterise is where the principal comes from — ``require_role`` nests
+    ``current_principal`` by construction. The ordering guarantee survives the re-spelling for
+    the same structural reason it holds there: the role check runs to completion before
+    :func:`~src.deps.rate_limit` is called, so a ``403`` cannot drain the caller's bucket.
+
+    Note that the concurrent-stream cap is deliberately **not** enforced here. It is not an
+    authorization question, it needs the store, and it must be released on paths this dependency
+    never sees — so it lives with the subscription, in the handler.
+    """
+    if not role_satisfies(principal.role, Role.ANALYST):
+        logger.info(
+            "denied %r (role=%s) on the SSE stream", principal.subject, principal.role.value
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=role_denied_detail(principal.role, Role.ANALYST),
+        )
+    rate_limit(request, principal)
+    return principal
+
+
+# Stamped so `RoleDocumentedRoute` publishes `x-required-role: analyst` for the stream exactly as
+# it does for every route that spells one of the four `*Guard` aliases. Renamed for the same
+# reason `src.deps` renames its closures: a dependency-resolution error should name a gate.
+setattr(_stream_guard, _MINIMUM_ROLE_ATTR, Role.ANALYST)
+_stream_guard.__name__ = "stream_guard_analyst"
+_stream_guard.__qualname__ = _stream_guard.__name__
+
+#: What the stream route spells. Mirrors `AnalystGuard` in shape and in effect; differs only in
+#: where the token may be read from.
+StreamGuard = Annotated[Principal, Depends(_stream_guard)]
+
+
+def _parse_last_event_id(raw: str | None) -> int | None:
+    """Read a `Last-Event-ID` value as a seq, or ``None`` if it is not one.
+
+    **Garbage is ignored, never rejected.** This value is echoed back by the client from an ``id``
+    the server minted, and it travels through proxies, browser reconnect logic and third-party
+    SSE libraries — several of which have historically sent an empty string, a quoted value, or
+    the literal ``"null"``. A ``400`` there would break a reconnect for a client that did nothing
+    wrong and cannot fix it; ignoring it degrades to "resume from now", which is precisely what a
+    client with no usable checkpoint should get. Negative values are ignored on the same grounds:
+    seqs start at 0, so a negative id did not come from this server.
+    """
+    if raw is None:
+        return None
+    try:
+        seq = int(raw.strip())
+    except (TypeError, ValueError):
+        return None
+    return seq if seq >= 0 else None
+
+
+def _log_frame(record: StoredEntry) -> dict[str, Any]:
+    """Render one stored record as an SSE `log` frame.
+
+    ``data`` is **the same `LogEntry` JSON `GET /logs` returns** — one schema, two delivery
+    modes — so a client can hand a streamed frame to whatever already parses a paginated page.
+    ``id`` is the entry's ``seq``, which makes the SSE reconnect protocol work for free: the
+    browser echoes the last id it saw as ``Last-Event-ID``, and a seq is exactly the anchor
+    :meth:`~src.store.LogStore.replay_since` needs.
+    """
+    return {
+        "event": STREAM_EVENT_LOG,
+        "id": str(record.seq),
+        "data": record.entry.model_dump_json(),
+    }
+
+
+async def _stream_frames(
+    store: LogStore,
+    sub: Subscription,
+    *,
+    ready: dict[str, Any],
+    replay: list[StoredEntry],
+    max_events: int,
+) -> AsyncIterator[dict[str, Any]]:
+    """Yield the `ready` frame, then the replay, then the live tail until something ends it.
+
+    The ``finally`` is one of the six exit paths that unsubscribe (see
+    :meth:`~src.store.LogStore.unsubscribe`); it covers the normal return, ``max_events``
+    exhaustion, and the cancellation that a client disconnect produces.
+    """
+    try:
+        yield {"event": STREAM_EVENT_READY, "data": json.dumps(ready)}
+
+        sent = 0
+        for record in replay:
+            yield _log_frame(record)
+            sent += 1
+            # `max_events == 0` means unlimited, so the count is only consulted when it is set.
+            if max_events and sent >= max_events:
+                return
+
+        while True:
+            # Parked here for as long as nothing matches — which is the *normal* state of a
+            # filtered tail, and the reason heartbeats are sse-starlette's `ping` task rather
+            # than something this loop does. A hand-rolled keepalive would have to race this
+            # await against a timeout on every iteration; the library's ping runs on its own
+            # task and fires a comment frame while this coroutine is parked.
+            record = await sub.queue.get()
+            if record is None:
+                # The terminal sentinel. `dropped` distinguishes "you could not keep up" from
+                # "the server is shutting down", and a client that was cut off deserves to be
+                # told rather than left believing it saw everything.
+                if sub.dropped:
+                    yield {
+                        "event": STREAM_EVENT_DROPPED,
+                        "data": json.dumps(
+                            {
+                                "reason": "slow_consumer",
+                                "detail": (
+                                    "the client fell more than SSE_QUEUE_SIZE entries behind; "
+                                    "reconnect with Last-Event-ID to resume"
+                                ),
+                            }
+                        ),
+                    }
+                return
+            yield _log_frame(record)
+            sent += 1
+            if max_events and sent >= max_events:
+                return
+    finally:
+        store.unsubscribe(sub)
+
+
+@router.get(
+    "/logs/stream",
+    tags=["logs"],
+    summary="Stream matching log entries live over SSE (analyst role)",
+    response_class=EventSourceResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "description": (
+                "An open `text/event-stream`. One `ready` frame, then zero or more `log` frames "
+                "(`id` = the entry's seq, `data` = the same `LogEntry` JSON `GET /logs` "
+                "returns), interleaved with comment-only heartbeats."
+            ),
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        },
+        status.HTTP_400_BAD_REQUEST: {
+            "model": ErrorBody,
+            "description": "Incoherent filter: `since` after `until`.",
+        },
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_403_FORBIDDEN: FORBIDDEN_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: {
+            "model": ErrorBody,
+            "description": (
+                "Either the per-tier request bucket is empty, or this principal already holds "
+                "`MAX_STREAMS_PER_PRINCIPAL` concurrent streams. The two carry **different** "
+                "`detail` strings — they meter different resources."
+            ),
+        },
+        status.HTTP_503_SERVICE_UNAVAILABLE: {
+            "model": ErrorBody,
+            "description": "The runtime exposes no store, so nothing could ever be delivered.",
+        },
+    },
+)
+async def stream_logs(
+    request: Request,
+    principal: StreamGuard,
+    level: Annotated[
+        list[LogLevel] | None,
+        Query(description="Match any of these levels. Repeatable: `?level=ERROR&level=FATAL`."),
+    ] = None,
+    service: Annotated[
+        list[str] | None, Query(description="Match any of these service names. Repeatable.")
+    ] = None,
+    host: Annotated[
+        list[str] | None, Query(description="Match any of these host names. Repeatable.")
+    ] = None,
+    since: Annotated[
+        datetime | None,
+        Query(description="Inclusive lower bound on `ts` (RFC-3339). Applies to the replay."),
+    ] = None,
+    until: Annotated[
+        datetime | None,
+        Query(description="Inclusive upper bound on `ts` (RFC-3339). Applies to the replay."),
+    ] = None,
+    q: Annotated[
+        str | None,
+        Query(
+            max_length=MAX_Q_LEN,
+            description="Case-insensitive substring match over `message`.",
+        ),
+    ] = None,
+    last_event_id: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Resume anchor — the `id` of the last frame received. Equivalent to the "
+                "`Last-Event-ID` header, which wins when both are present. Exists because the "
+                "browser's `EventSource` cannot set that header on a *first* connection, which "
+                "is exactly what a page reload produces. Unparseable values are ignored."
+            ),
+        ),
+    ] = None,
+    max_events: Annotated[
+        int,
+        Query(
+            ge=0,
+            description=(
+                "Close the stream after this many `log` frames. `0` (the default) means never — "
+                "so a `curl` demo or a test can terminate deterministically without a timeout."
+            ),
+        ),
+    ] = 0,
+) -> EventSourceResponse:
+    """Follow matching entries live, over Server-Sent Events.
+
+    The same filter vocabulary as `GET /logs`, applied to the tail instead of the history — and
+    the same `LogEntry` JSON in every frame, so one parser serves both. SSE rather than a
+    WebSocket because this traffic is one-directional: a WebSocket would buy a channel back to
+    the server that nothing here uses, in exchange for an upgrade handshake that ordinary proxies
+    and `curl -N` handle less well than a long-lived `GET`.
+
+    .. rubric:: The frames
+
+    * **`ready`** — sent immediately, before any log frame, carrying
+      `{resumed_from, replayed, truncated, next_seq}`. It is a testability feature as much as a
+      protocol one: without it, "the stream delivers entries appended *after* I connected" can
+      only be tested by sleeping and hoping. With it, a client blocks until `ready`, then writes,
+      and the assertion is deterministic. `next_seq` is the seq the next append will take, so a
+      client knows precisely where its live window starts.
+    * **`log`** — `id` is the entry's seq, `data` is the entry.
+    * **`dropped`** — terminal. You fell too far behind and were disconnected; see below.
+    * Comment-only heartbeats every `SSE_HEARTBEAT_SEC`, so an idle connection is not reaped by
+      an intermediary that cannot tell "quiet" from "dead".
+
+    .. rubric:: A slow consumer is dropped, never buffered
+
+    Each subscriber owns a bounded queue (`SSE_QUEUE_SIZE`). An append that cannot enqueue does
+    not wait and does not grow the buffer — it drains that subscriber, sends it a `dropped`
+    frame and disconnects it. The alternatives are both worse than a dropped client: blocking
+    would let one stalled reader stall ingest for everyone, and buffering would hand a reader
+    that never reads the server's memory. Per-subscriber memory is therefore hard-bounded, and
+    the client's recovery is one reconnect with `Last-Event-ID`.
+
+    Worth knowing when reasoning about *when* the drop fires: `SSE_QUEUE_SIZE` bounds this
+    application-level queue only. Underneath it sit the kernel's socket send buffer and the
+    client's receive buffer, which absorb a further backlog the queue never sees, so a slow
+    reader on a fat network buffer can stay connected considerably longer than the queue depth
+    alone suggests. (Measured: a `curl --limit-rate 1` client against the default 1000-slot queue
+    was never dropped, because the socket buffers swallowed the whole backlog; at
+    `SSE_QUEUE_SIZE=50` the drop fired as designed.) The memory bound is unaffected either way —
+    it is just not the same thing as a latency bound.
+
+    .. rubric:: Resume is at-least-once, on purpose
+
+    A reconnect with `Last-Event-ID` (header **or** `?last_event_id=`) replays matching entries
+    strictly after that seq, bounded by `SSE_QUEUE_SIZE` and flagged `truncated` in the `ready`
+    frame when the bound or an eviction cut it short. The subscription is registered *before* the
+    replay is read, so an entry appended in between is delivered **twice** rather than dropped.
+    Deduplication on `id` is a line of client code; a lost log line is not recoverable at all.
+
+    .. rubric:: Authentication
+
+    Uniquely on this route, the token may arrive as `?access_token=` instead of a header, because
+    the browser's `EventSource` cannot send headers. The header wins when both are present. See
+    `stream_principal` for the full trade-off — and note that the parameter is deliberately not
+    accepted anywhere else, least of all on `POST /logs/search`.
+    """
+    store, _ = _runtime_parts(request)
+    settings = settings_from_request(request)
+
+    if store is None:
+        # The second handler (with `append_log`) that must not degrade to a cheerful empty
+        # answer. A read route with no store returns an empty page, which is true — there is
+        # nothing to read. A *stream* with no store would sit open forever delivering nothing,
+        # which a client cannot distinguish from "no matching logs yet". Staying silent while
+        # looking healthy is the failure mode this whole project's tests exist to catch, so the
+        # honest answer is a retryable 503 that names the condition.
+        logger.error("stream refused for %r: the runtime exposes no store", principal.subject)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="log store is unavailable; no stream could be established",
+        )
+
+    # Same model, same coherence rules, same 400 as `GET /logs` — the tail must not accept a
+    # filter the history would reject, or "stats for this search" and "stream for this search"
+    # would stop meaning the same thing.
+    try:
+        query = LogQuery(
+            level=level, service=service, host=host, since=since, until=until, q=q
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=_query_error_detail(exc)
+        ) from exc
+
+    flt = Filter.from_query(query)
+
+    try:
+        sub = store.subscribe(
+            flt,
+            subject=principal.subject,
+            queue_size=settings.sse_queue_size,
+            max_streams=settings.max_streams_per_principal,
+        )
+    except StreamLimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"{MAX_STREAMS_DETAIL}: {principal.subject!r} already holds {exc.limit}; "
+                "close one before opening another"
+            ),
+        ) from exc
+
+    # From here on the subscription exists, so EVERY path out of this function must release it.
+    # This `except` is the handler-level one of the six: it covers anything that goes wrong
+    # between subscribing and handing the generator to the response, at which point ownership
+    # passes to the generator's `finally` and the response's BackgroundTask.
+    try:
+        resumed_from = _parse_last_event_id(
+            request.headers.get(LAST_EVENT_ID_HEADER) or last_event_id
+        )
+        if resumed_from is None:
+            replay: list[StoredEntry] = []
+            truncated = False
+        else:
+            replay, truncated = store.replay_since(
+                resumed_from, flt, max_items=settings.sse_queue_size
+            )
+        ready = {
+            "resumed_from": resumed_from,
+            "replayed": len(replay),
+            "truncated": truncated,
+            "next_seq": store.next_seq(),
+        }
+    except Exception:
+        store.unsubscribe(sub)
+        raise
+
+    return EventSourceResponse(
+        _stream_frames(store, sub, ready=ready, replay=replay, max_events=max_events),
+        # The library's own keepalive. It runs on a separate task inside the response, so a
+        # comment frame fires on schedule even while the generator is parked on `queue.get()`.
+        ping=settings.sse_heartbeat_sec,
+        headers=STREAM_HEADERS,
+        # Exit path: runs after the response's task group unwinds, including on the disconnect
+        # path where the generator is cancelled rather than closed and its `finally` may not have
+        # run yet. Idempotent, so the overlap with that `finally` costs nothing.
+        background=BackgroundTask(store.unsubscribe, sub),
     )
 
 

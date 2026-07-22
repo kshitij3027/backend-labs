@@ -141,6 +141,40 @@ class Runtime:
         """Seconds since this Runtime was constructed (never negative)."""
         return max(0.0, time.monotonic() - self.started_monotonic)
 
+    # -- SSE stream accounting (C10) ---------------------------------------------------------
+    #
+    # The per-principal stream counter is *read* here and *owned* by the store. That split is
+    # deliberate and it is the one thing about this feature worth arguing over, so: a counter
+    # kept on the Runtime could only ever be decremented by the route, but the route is not the
+    # only thing that ends a subscription — the store itself ends one when a consumer falls
+    # behind (`LogStore._publish`) and again at shutdown (`close_all_subscribers`). A counter
+    # the store cannot reach would therefore leak a slot on exactly the paths a user can trigger
+    # on purpose, until a principal that holds nothing is told it holds three. Keeping the
+    # counter beside the registry it counts makes "unregister" and "decrement" one operation
+    # under one lock, which is what makes the exactly-once guarantee structural rather than
+    # careful. These accessors exist so callers (the stream route's 429, C11's
+    # `/debug/memory`, the lifespan below) ask the Runtime and never reach past it.
+
+    @property
+    def active_streams(self) -> int:
+        """Live SSE subscriptions process-wide, or 0 when there is no store to ask."""
+        store = self.store
+        return 0 if store is None else store.subscriber_count()
+
+    def stream_count(self, subject: str) -> int:
+        """Live SSE subscriptions held by one principal. What the concurrency cap is measured on."""
+        store = self.store
+        return 0 if store is None else store.stream_count(subject)
+
+    def close_streams(self) -> int:
+        """Terminate every live subscription and return how many were closed. Shutdown only.
+
+        A thin, defensive forward to :meth:`~src.store.LogStore.close_all_subscribers` so the
+        lifespan's teardown does not have to know whether a half-wired runtime has a store.
+        """
+        store = self.store
+        return 0 if store is None else store.close_all_subscribers()
+
     @classmethod
     def build(cls, settings: Settings, *, limiter_clock: TimeFunc | None = None) -> Runtime:
         """Construct a Runtime cheaply — **no corpus seeding, no I/O**.
@@ -395,9 +429,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # C10 closes SSE subscribers here: drain and unregister every live subscriber so a
-        # shutdown cannot leave generators parked forever on `await queue.get()`.
-        pass
+        # Close SSE subscribers: enqueue each one's terminal sentinel and unregister it, so a
+        # shutdown cannot leave generators parked forever on `await queue.get()` — a queue whose
+        # only writer is `LogStore.append`, and appends have stopped. uvicorn waits for in-flight
+        # tasks before exiting, so a subscriber that is never woken is not a leak that gets
+        # cleaned up at exit; it is the reason there is no exit.
+        #
+        # Best-effort by construction: teardown runs on the way out, and a failure here must not
+        # replace whatever actually caused the shutdown with a traceback from the cleanup.
+        try:
+            closed = runtime.close_streams()
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            logger.exception("failed to close SSE subscribers during shutdown")
+        else:
+            if closed:
+                logger.info("closed %d live SSE subscriber(s) on shutdown", closed)
 
 
 def create_app(runtime: Runtime | None = None) -> FastAPI:
