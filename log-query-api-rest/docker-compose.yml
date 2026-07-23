@@ -94,8 +94,6 @@ services:
   # (TARGET_URL=http://api:8000), never a host port. Waits on the api healthcheck first, so
   # it can never race a still-seeding store. Every gate below is host-overridable via
   # ${VAR:-default} so a deliberately impossible bar proves the gate actually bites.
-  # NOTE: the verifier script itself lands in C12 — this service is declared now and only
-  # exercised then.
   e2e:
     build:
       context: .
@@ -108,8 +106,13 @@ services:
       - E2E_SSE_TIMEOUT=${E2E_SSE_TIMEOUT:-15}
       - E2E_RATE_LIMIT_PROBE=${E2E_RATE_LIMIT_PROBE:-60}
       - E2E_LATENCY_SAMPLES=${E2E_LATENCY_SAMPLES:-50}
+      # The SEQUENTIAL read ceiling — one request in flight, so it bounds service time. The
+      # load harness deliberately uses a different var (`LOAD_MAX_P95_MS`) because a p95 taken
+      # at concurrency 50 is a different quantity and cannot share this number.
       - MAX_P95_MS=${MAX_P95_MS:-250}
       - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-400}
+      # Mirrors the api service's own SSE cap so check 10 can probe exactly one past it.
+      - MAX_STREAMS_PER_PRINCIPAL=${MAX_STREAMS_PER_PRINCIPAL:-3}
     depends_on:
       api:
         condition: service_healthy
@@ -120,8 +123,17 @@ services:
   # principal so the per-tier rate limit never masks the measurement. Gates are host-
   # overridable (e.g. `LOAD_MIN_RPS=1000000 make load` MUST fail, which is how we prove the
   # gates are real rather than decorative). Profile-gated so it never starts on a bare
-  # `docker compose up`. NOTE: the load-test script itself lands in C12 — this service is
-  # declared now and only exercised then.
+  # `docker compose up`.
+  #
+  # NOTE the latency gate here is `LOAD_MAX_P95_MS`, NOT the `MAX_P95_MS` the e2e service uses.
+  # They are different measurements and must not share a ceiling. `MAX_P95_MS` bounds the E2E's
+  # SEQUENTIAL reads — one request in flight, so it measures service time. This harness runs at
+  # LOAD_CONCURRENCY (50) in front of a SINGLE uvicorn process, where Little's Law alone puts
+  # mean latency at concurrency/throughput (~50/370 = ~135 ms) before the service has done
+  # anything wrong; the p95 tail sits ~2.8x that. Reusing the sequential ceiling here would fail
+  # a healthy server on arithmetic. `MAX_P95_MS` is deliberately NOT declared on this service:
+  # scripts/load_test.py does not read it, and an env var a script never reads is a false
+  # contract in the one file that is supposed to BE the contract.
   loadtest:
     build:
       context: .
@@ -129,6 +141,7 @@ services:
     profiles: [loadtest]
     environment:
       - TARGET_URL=http://api:8000
+      - LOAD_READY_TIMEOUT=${LOAD_READY_TIMEOUT:-90}
       - LOAD_REQUESTS=${LOAD_REQUESTS:-2000}
       - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-50}
       - LOAD_MIN_RPS=${LOAD_MIN_RPS:-200}
@@ -136,8 +149,11 @@ services:
       - LOAD_SSE_CLIENTS=${LOAD_SSE_CLIENTS:-8}
       - LOAD_SSE_SECONDS=${LOAD_SSE_SECONDS:-10}
       - LOAD_MIN_SSE_EVENTS=${LOAD_MIN_SSE_EVENTS:-5}
-      - MAX_P95_MS=${MAX_P95_MS:-250}
+      - LOAD_MAX_P95_MS=${LOAD_MAX_P95_MS:-800}
       - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-400}
+      # Mirrors the api service's own SSE cap so the fan-out phase can spread its clients
+      # under it. Read by the harness, set by the same host override that sets the api's.
+      - MAX_STREAMS_PER_PRINCIPAL=${MAX_STREAMS_PER_PRINCIPAL:-3}
     depends_on:
       api:
         condition: service_healthy
