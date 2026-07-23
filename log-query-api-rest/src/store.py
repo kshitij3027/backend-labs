@@ -70,16 +70,34 @@ import binascii
 import hashlib
 import heapq
 import json
+import operator
 import re
 import threading
 import time
 from bisect import bisect_left, bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from itertools import islice
+from types import MappingProxyType
+from typing import Any
 
-from src.models import LogEntry, LogQuery, SortOrder
+from src.models import (
+    LEVEL_ORDER,
+    MAX_FILTER_DEPTH,
+    ORDER_OPS,
+    FilterAll,
+    FilterAny,
+    FilterField,
+    FilterLeaf,
+    FilterNode,
+    FilterNot,
+    FilterOp,
+    LogEntry,
+    LogQuery,
+    SortOrder,
+    coerce_filter_value,
+)
 
 # ---------------------------------------------------------------------------------------------
 # Tunables that are implementation detail, not configuration
@@ -219,15 +237,16 @@ class Filter:
     Scalars are ANDed across fields, values are ORed within a field — the only thing a flat query
     string can honestly express. Anything more expressive is C9's business.
 
-    .. rubric:: Extension point for C9
+    .. rubric:: The extension seam — used by C9, and still the only one
 
     Three members are all that :meth:`LogStore.scan`, :meth:`LogStore.count` and
     :meth:`LogStore.iter_matching` ever call on a filter: :meth:`matches`, :meth:`index_hint`
     and :attr:`is_empty` (plus :meth:`fingerprint`, which only the cursor codec needs). C9's
-    ``compile_filter(node) -> CompiledFilter`` therefore has to produce *any* object exposing
-    those four members — a subclass here, or a separate class entirely — and the store's three
-    signatures do not change. Do not add filtering logic to the store: it belongs behind
-    ``matches``, or the "one evaluator, three entry points" guarantee stops holding.
+    :func:`compile_filter` produces a :class:`CompiledFilter` exposing exactly those four members
+    and nothing else, so ``POST /logs/search`` reaches the store through the identical door
+    ``GET /logs`` uses and **none of the three signatures changed**. Do not add filtering logic
+    to the store: it belongs behind ``matches``, or the "one evaluator, three entry points"
+    guarantee stops holding.
 
     Attributes:
         levels: Allowed ``level`` values, as plain strings (``"ERROR"``), not enum members.
@@ -369,6 +388,580 @@ class Filter:
             until_epoch=None if query.until is None else query.until.timestamp(),
             q_lower=query.q.lower() if query.q else None,
         )
+
+
+# =============================================================================================
+#  The compiled boolean filter — the predicate behind ``POST /logs/search`` (C9)
+# ---------------------------------------------------------------------------------------------
+#  :class:`Filter` above is everything a query string can express. This is the other shape: the
+#  nested boolean tree from :class:`~src.models.SearchRequest`, **compiled once** into a single
+#  closure and then handed to exactly the same :meth:`LogStore.scan` / :meth:`LogStore.count` /
+#  :meth:`LogStore.iter_matching`. The store never learns which of the two it is holding, and
+#  that is the guarantee: one scanner, one pager, so the list route and the search route cannot
+#  drift into describing different sets — or different envelopes — for the same predicate.
+#
+#  "Compiled once" is a performance contract, not a turn of phrase. A request may sweep the whole
+#  100k-entry ring (twice, in fact: once for ``page.total`` and once for the page), so walking
+#  pydantic models per record — attribute lookups through ``BaseModel.__getattr__``, an
+#  ``isinstance`` ladder per node, re-coercing ``value`` per comparison — would put the tree's
+#  entire parse cost inside the hot loop. Everything that can be resolved from the tree alone is
+#  resolved here, before the first record is touched: the operand, the accessor, the comparison
+#  function, and the shape of the boolean combination.
+# =============================================================================================
+
+
+#: One record's verdict. Every node of a filter tree compiles into one of these, and the tree
+#: collapses into exactly one before any record is read.
+Predicate = Callable[[StoredEntry], bool]
+
+#: The six identity/order comparisons, resolved from the wire operator **once** at compile time.
+#: By the time one of these runs, both operands are already plain comparable values — a float
+#: epoch, a :data:`~src.models.LEVEL_ORDER` ordinal, or a string — so the comparison is arithmetic
+#: rather than enum juggling. ``in``/``nin``/``contains`` are not here: membership and substring
+#: search invert the operand order (``needle in haystack``), so they are spelled out in
+#: :func:`_compile_leaf` instead of being forced into this table.
+_COMPARISONS: Mapping[FilterOp, Callable[[Any, Any], bool]] = MappingProxyType(
+    {
+        FilterOp.EQ: operator.eq,
+        FilterOp.NE: operator.ne,
+        FilterOp.GT: operator.gt,
+        FilterOp.GTE: operator.ge,
+        FilterOp.LT: operator.lt,
+        FilterOp.LTE: operator.le,
+    }
+)
+
+#: Leaf field -> the secondary index that can bound it. Exactly the three dimensions in
+#: :data:`INDEXED_DIMENSIONS`; ``message`` and ``ts`` have no index and never appear here.
+#: ``ts`` deliberately gets none even though the ring is time-ordered — the linear pass already
+#: walks it in seq (= time) order, so a "time index" would be a second spelling of the deque.
+_HINTABLE_FIELDS: Mapping[FilterField, str] = MappingProxyType(
+    {
+        FilterField.LEVEL: "level",
+        FilterField.SERVICE: "service",
+        FilterField.HOST: "host",
+    }
+)
+
+#: The only two operators an index hint may be derived from. Both name a **finite set of values**
+#: the record must have, which is exactly what a value-keyed index can enumerate. Everything else
+#: — ``ne``/``nin`` (a complement), ``contains`` (a substring), the order comparisons (a range over
+#: an unindexed dimension) — would need the index to enumerate what a record is *not*, and the
+#: index does not hold that.
+_HINTABLE_OPS: frozenset[FilterOp] = frozenset({FilterOp.EQ, FilterOp.IN})
+
+
+# -- field accessors: entry attribute -> the value the compiled comparison sees ----------------
+#
+# Module-level functions rather than lambdas so a profile or a traceback names them, and so each
+# one is created once for the process instead of once per compiled leaf.
+
+
+def _read_ts(rec: StoredEntry) -> float:
+    """``ts`` as a POSIX epoch — the precomputed one, never re-derived from the datetime."""
+    return rec.ts_epoch
+
+
+def _read_level_ordinal(rec: StoredEntry) -> int:
+    """``level`` as a severity ordinal, for ``gt``/``gte``/``lt``/``lte``.
+
+    This is the whole reason :data:`~src.models.LEVEL_ORDER` exists: ``level >= "WARN"`` must mean
+    *at least as severe as WARN* (WARN, ERROR, FATAL), not the lexicographic reading, under which
+    ``"WARN" > "ERROR" > "DEBUG"`` — almost exactly backwards.
+    """
+    return LEVEL_ORDER[rec.entry.level]
+
+
+def _read_level(rec: StoredEntry) -> str:
+    """``level`` as its wire string, for the identity operators."""
+    return rec.entry.level.value
+
+
+def _read_service(rec: StoredEntry) -> str:
+    return rec.entry.service
+
+
+def _read_host(rec: StoredEntry) -> str:
+    return rec.entry.host
+
+
+def _read_message(rec: StoredEntry) -> str:
+    return rec.entry.message
+
+
+def _read_message_lower(rec: StoredEntry) -> str:
+    """``message`` lower-cased — read from the store's precomputed cache, not recomputed.
+
+    ``contains`` is case-insensitive, and :class:`StoredEntry` already carries
+    ``message_lower`` for exactly this. Lower-casing here instead would allocate a fresh string
+    per record per request, which at 100k records is the scan.
+    """
+    return rec.message_lower
+
+
+def _read_service_lower(rec: StoredEntry) -> str:
+    """``service`` lower-cased, computed per record — there is no cache for it, deliberately.
+
+    ``service`` and ``host`` are short, low-cardinality identifiers and ``contains`` over them is
+    a rare query; caching a lower-cased copy of each would cost two extra strings on every one of
+    the 100k resident records to speed up a filter almost nobody writes. ``message`` is the
+    opposite trade — long, always searched — which is why it, and only it, is precomputed.
+    """
+    return rec.entry.service.lower()
+
+
+def _read_host_lower(rec: StoredEntry) -> str:
+    """``host`` lower-cased per record. Same trade as :func:`_read_service_lower`."""
+    return rec.entry.host.lower()
+
+
+def _accessor(field: FilterField, op: FilterOp) -> Callable[[StoredEntry], Any]:
+    """Pick the reader whose output matches the operand :func:`coerce_filter_value` produced.
+
+    The two must be chosen by the **same** ``(field, op)`` pair or the comparison is nonsense: the
+    coercion turns ``{"field": "level", "op": "gte", "value": "WARN"}`` into the ordinal ``2``, so
+    the reader has to yield an ordinal too; it turns a ``contains`` needle into lower case, so the
+    reader has to yield the lower-cased attribute. Every asymmetry here mirrors one there.
+    """
+    if field is FilterField.TS:
+        return _read_ts
+    if field is FilterField.LEVEL:
+        return _read_level_ordinal if op in ORDER_OPS else _read_level
+    if field is FilterField.MESSAGE:
+        return _read_message_lower if op is FilterOp.CONTAINS else _read_message
+    if field is FilterField.SERVICE:
+        return _read_service_lower if op is FilterOp.CONTAINS else _read_service
+    return _read_host_lower if op is FilterOp.CONTAINS else _read_host
+
+
+def _compile_leaf(leaf: FilterLeaf) -> Predicate:
+    """Compile one leaf predicate into a closure over its already-resolved operand.
+
+    :func:`~src.models.coerce_filter_value` is called here — the *second* of its two calls, the
+    first having happened inside :class:`~src.models.FilterLeaf`'s validator so a bad value is a
+    ``422`` at the edge. Calling the same function again (rather than caching its result on the
+    model) is what guarantees the value that validated and the operand that evaluates are produced
+    by one definition: a compiler that re-derived the operand its own way is how a filter ends up
+    passing validation and then meaning something else.
+    """
+    operand = coerce_filter_value(leaf.field, leaf.op, leaf.value)
+    read = _accessor(leaf.field, leaf.op)
+    op = leaf.op
+
+    if op is FilterOp.IN:
+        # `operand` is a frozenset, so this is a hash lookup rather than a list scan — which is
+        # why `coerce_filter_value` returns one for the list operators.
+        def match_in(rec: StoredEntry) -> bool:
+            return read(rec) in operand
+
+        return match_in
+
+    if op is FilterOp.NIN:
+
+        def match_nin(rec: StoredEntry) -> bool:
+            return read(rec) not in operand
+
+        return match_nin
+
+    if op is FilterOp.CONTAINS:
+        # Note the reversed operands: `needle in haystack`. This is the one operator whose
+        # arguments do not read left-to-right like the wire form does, which is exactly why it is
+        # written out here instead of being squeezed into `_COMPARISONS`.
+        def match_contains(rec: StoredEntry) -> bool:
+            return operand in read(rec)
+
+        return match_contains
+
+    compare = _COMPARISONS[op]
+
+    def match_compare(rec: StoredEntry) -> bool:
+        return compare(read(rec), operand)
+
+    return match_compare
+
+
+# -- boolean combinators ----------------------------------------------------------------------
+#
+# Each takes an already-compiled tuple of children and returns one closure. Children are kept in
+# the order the client wrote them: the operators are pure, so evaluation order cannot change the
+# answer, and reordering them by a guessed cost would be a query planner making decisions on
+# statistics this store does not collect. Short-circuiting still applies within the given order.
+
+
+def _conjunction(children: tuple[Predicate, ...]) -> Predicate:
+    """AND over two or more children, short-circuiting on the first refusal."""
+
+    def match(rec: StoredEntry) -> bool:
+        for child in children:
+            if not child(rec):
+                return False
+        return True
+
+    return match
+
+
+def _disjunction(children: tuple[Predicate, ...]) -> Predicate:
+    """OR over two or more children, short-circuiting on the first acceptance."""
+
+    def match(rec: StoredEntry) -> bool:
+        for child in children:
+            if child(rec):
+                return True
+        return False
+
+    return match
+
+
+def _negation(child: Predicate) -> Predicate:
+    """NOT of one child."""
+
+    def match(rec: StoredEntry) -> bool:
+        return not child(rec)
+
+    return match
+
+
+def _match_everything(rec: StoredEntry) -> bool:  # noqa: ARG001 - signature is the contract
+    """The constant-true predicate: an omitted filter, or one that folded to vacuous truth."""
+    return True
+
+
+def _match_nothing(rec: StoredEntry) -> bool:  # noqa: ARG001 - signature is the contract
+    """The constant-false predicate, e.g. ``{"any": []}`` or a self-contradictory conjunction."""
+    return False
+
+
+def _compile_node(node: FilterNode, depth: int) -> Predicate | bool:
+    """Compile one node, returning a closure — or the **constant** ``True``/``False``.
+
+    Folding constants out is not an optimisation for its own sake; it is how the two empty
+    collections get their documented meanings without either of them becoming a special case at
+    evaluation time. ``{"all": []}`` is vacuously true and ``{"any": []}`` is vacuously false (see
+    :class:`~src.models.FilterAll` and :class:`~src.models.FilterAny`), and once those are
+    constants they propagate correctly through every enclosing node for free — ``{"not": {"any":
+    []}}`` becomes the constant ``True``, ``{"all": [A, {"any": []}]}`` becomes the constant
+    ``False``, and a tree that reduces to "match everything" can be recognised as such by
+    :attr:`CompiledFilter.is_empty`.
+
+    Every test against a folded child is an **identity** check (``is True`` / ``is False``), never
+    a truthiness test. A compiled child is a function, and every function is truthy — ``if child:``
+    would silently treat the constant-false node as a live predicate.
+
+    Args:
+        node: The node to compile.
+        depth: 1-based nesting depth of this node.
+
+    Raises:
+        ValueError: When the tree is nested deeper than :data:`~src.models.MAX_FILTER_DEPTH`.
+            :func:`~src.models.check_filter_shape` already enforces this on the HTTP path, before
+            pydantic recurses; the check is repeated here because a tree constructed **in Python**
+            (a test, C10's stream filter, a future internal caller) never passes through that
+            validator, and the depth bound exists to stop a ``RecursionError`` — which is an
+            availability bug, not a validation nicety. The check runs *before* recursing, so this
+            function can never itself exhaust the stack proving that the input would have.
+    """
+    if depth > MAX_FILTER_DEPTH:
+        raise ValueError(
+            f"filter tree is nested deeper than {MAX_FILTER_DEPTH} levels; flatten it or "
+            "split the query"
+        )
+
+    if isinstance(node, FilterLeaf):
+        return _compile_leaf(node)
+
+    if isinstance(node, FilterAll):
+        compiled = [_compile_node(child, depth + 1) for child in node.all]
+        if any(child is False for child in compiled):
+            return False  # one impossible conjunct makes the whole conjunction impossible
+        live = tuple(child for child in compiled if child is not True)
+        if not live:
+            return True  # empty (or all-vacuous) conjunction: vacuously true
+        if len(live) == 1:
+            return live[0]  # no combinator frame for a one-child AND
+        return _conjunction(live)  # type: ignore[arg-type]  - bools filtered out above
+
+    if isinstance(node, FilterAny):
+        compiled = [_compile_node(child, depth + 1) for child in node.any]
+        if any(child is True for child in compiled):
+            return True  # one certain disjunct satisfies the whole disjunction
+        live = tuple(child for child in compiled if child is not False)
+        if not live:
+            return False  # empty (or all-impossible) disjunction: vacuously false
+        if len(live) == 1:
+            return live[0]
+        return _disjunction(live)  # type: ignore[arg-type]  - bools filtered out above
+
+    if isinstance(node, FilterNot):
+        child = _compile_node(node.not_, depth + 1)
+        if child is True:
+            return False
+        if child is False:
+            return True
+        return _negation(child)
+
+    # Unreachable through the union, which admits exactly the four shapes above. Loud rather than
+    # silent: a node type added to `FilterNode` without a branch here must fail immediately, not
+    # quietly stop filtering.
+    raise TypeError(f"not a filter node: {type(node).__name__}")
+
+
+def _hint_constraints(node: FilterNode | None) -> dict[str, frozenset[str]]:
+    """Collect the ``dimension -> allowed values`` facts an index hint may **soundly** rest on.
+
+    .. rubric:: This is the most dangerous function in the file — the soundness argument
+
+    A hint is a *candidate* seq list. :meth:`LogStore._walk_hinted` runs the predicate over every
+    candidate, so a hint that is too **wide** only costs time. A hint that is too **narrow** drops
+    matching records from the answer, and the client cannot tell: the page looks well-formed and
+    is simply missing rows. Every rule below exists to make "too narrow" unreachable, and the
+    invariant they enforce is:
+
+        the returned candidate set must be a **superset** of the true match set.
+
+    So a fact is only harvested when *every* record that matches the whole tree necessarily has
+    one of the collected values:
+
+    * **A leaf at the root.** The tree is that one predicate, so ``level eq ERROR`` means every
+      match is in the ``ERROR`` index list. Sound.
+    * **A leaf directly inside a root ``all``.** A conjunction requires every child, so every
+      match satisfies that leaf too. Sound.
+    * **Nothing under an ``any``.** A disjunct is an *alternative*: a record matching a different
+      branch is still a match, and it need not carry the value this branch names. Harvesting from
+      it would silently drop every row the other branches contributed.
+    * **Nothing under a ``not``.** A negated leaf is a statement about the records to **exclude**,
+      so its index list is close to the exact complement of what the caller wants — the most
+      precisely wrong candidate set available.
+    * **Only ``eq`` and ``in``** (:data:`_HINTABLE_OPS`), and only on an indexed field
+      (:data:`_HINTABLE_FIELDS`). Everything else names a complement, a substring or a range,
+      none of which a value-keyed index can enumerate.
+
+    A conjunction nested *inside* the root conjunction (``{"all": [{"all": [leaf]}]}``) would in
+    fact be sound to mine as well. It is deliberately **not** mined: every additional rule here is
+    another chance to be subtly wrong in the one direction that returns a silently short answer,
+    and the fallback — no hint, one linear pass — is always correct and never worse than the scan
+    the store would run anyway. When in doubt, do not hint.
+
+    Returns:
+        ``{}`` when nothing can be harvested, which the caller turns into "no hint, scan
+        linearly". Otherwise a dimension -> value-set map; **two constraints on the same
+        dimension intersect**, because inside an ``all`` a record must satisfy both. An empty
+        intersection is retained rather than dropped: it means no record can match, and an empty
+        candidate list is the correct — and cheapest — expression of that.
+    """
+    if node is None:
+        return {}
+
+    if isinstance(node, FilterLeaf):
+        children: tuple[FilterNode, ...] = (node,)
+    elif isinstance(node, FilterAll):
+        children = tuple(node.all)
+    else:
+        # `any` or `not` at the root. Neither can contribute anything sound; see above.
+        return {}
+
+    constraints: dict[str, frozenset[str]] = {}
+    for child in children:
+        if not isinstance(child, FilterLeaf):
+            continue
+        dimension = _HINTABLE_FIELDS.get(child.field)
+        if dimension is None or child.op not in _HINTABLE_OPS:
+            continue
+        operand = coerce_filter_value(child.field, child.op, child.value)
+        values: frozenset[str] = (
+            frozenset(operand) if child.op is FilterOp.IN else frozenset({operand})
+        )
+        existing = constraints.get(dimension)
+        constraints[dimension] = values if existing is None else existing & values
+    return constraints
+
+
+def _canonical(node: FilterNode | None) -> Any:
+    """Render a tree as a plain JSON-able structure that depends only on its **meaning**.
+
+    Feeds :meth:`CompiledFilter.fingerprint`, so what is normalised here is exactly what two
+    filters may differ in while still sharing a cursor:
+
+    * ``None`` renders as ``{"all": []}`` — an omitted filter and an empty conjunction both mean
+      "match everything", so a cursor minted by one is legitimately usable by the other.
+    * Leaf values render **post-coercion**: ``"2026-07-27T10:00:00Z"`` and its epoch spelling
+      become the same float, ``{"op": "gte", "value": "WARN"}`` becomes the ordinal, and a
+      ``contains`` needle is already lower-cased. Two spellings of one predicate are one
+      predicate.
+    * ``in``/``nin`` value sets are **sorted**, so ``["ERROR","FATAL"]`` and ``["FATAL","ERROR"]``
+      — and any duplicate within either — agree. Sorting is safe because a leaf's list is
+      homogeneous by construction: every element went through the same ``(field, op)`` coercion.
+    * ``all``/``any`` children are **sorted by their own canonical rendering**, because AND and OR
+      are commutative: reordering the boxes a UI ticked is not a different search.
+
+    Deliberately *not* normalised: duplicate children, double negation, and the associativity of
+    nested ``all``/``any``. Each would be a further true simplification, and each is another rule
+    that must stay correct forever to avoid two genuinely different filters colliding on one
+    fingerprint. The cost of not doing them is only a cursor that has to be re-minted.
+    """
+    if node is None:
+        return {"all": []}
+    if isinstance(node, FilterLeaf):
+        operand = coerce_filter_value(node.field, node.op, node.value)
+        value = sorted(operand) if isinstance(operand, frozenset) else operand
+        return {"f": node.field.value, "o": node.op.value, "v": value}
+    if isinstance(node, FilterAll):
+        return {"all": sorted((_canonical(child) for child in node.all), key=_canonical_key)}
+    if isinstance(node, FilterAny):
+        return {"any": sorted((_canonical(child) for child in node.any), key=_canonical_key)}
+    if isinstance(node, FilterNot):
+        return {"not": _canonical(node.not_)}
+    raise TypeError(f"not a filter node: {type(node).__name__}")  # pragma: no cover
+
+
+def _canonical_key(rendered: Any) -> str:
+    """Sort key for canonical child nodes: their own deterministic JSON text.
+
+    Dicts are not orderable, so the children cannot be sorted directly. Serialising each one is
+    both a total order and exactly the order that "identical meaning sorts identically" requires.
+    """
+    return json.dumps(rendered, separators=(",", ":"), sort_keys=True, allow_nan=False)
+
+
+class CompiledFilter:
+    """A boolean filter tree, compiled — the store's *other* filter, and its only other one.
+
+    Exposes precisely the four members :class:`LogStore` calls on a filter — :attr:`matches`,
+    :meth:`fingerprint`, :meth:`index_hint` and :attr:`is_empty` — and nothing else, so
+    ``POST /logs/search`` reaches :meth:`LogStore.scan` through the identical door ``GET /logs``
+    uses and not one of the store's three signatures changed to admit it. See :class:`Filter`'s
+    "extension seam" note.
+
+    Built only by :func:`compile_filter`; the constructor takes the already-resolved parts.
+    """
+
+    __slots__ = ("_constraints", "_fingerprint", "_matches_everything", "matches")
+
+    #: The compiled predicate, bound as an **attribute rather than a forwarding method**.
+    #:
+    #: :meth:`LogStore._walk_linear` hoists ``matches = flt.matches`` out of its loop and calls it
+    #: once per record. A method that forwarded to ``self._predicate`` would add a Python frame to
+    #: every one of those calls — on the order of 6 ms across a 100k-record pass, roughly half the
+    #: cost of the pass itself — to say nothing new. Binding the closure directly removes the
+    #: layer while leaving every call site spelled exactly as it is for :class:`Filter`.
+    matches: Predicate
+
+    def __init__(
+        self,
+        *,
+        predicate: Predicate,
+        fingerprint: str,
+        constraints: Mapping[str, frozenset[str]],
+        matches_everything: bool,
+    ) -> None:
+        self.matches = predicate
+        self._fingerprint = fingerprint
+        self._constraints = dict(constraints)
+        self._matches_everything = matches_everything
+
+    @property
+    def is_empty(self) -> bool:
+        """True only when **every** record matches — ``None``, ``{"all": []}``, or equivalent.
+
+        :meth:`LogStore.count` reads this to answer ``page.total`` with :meth:`LogStore.size`
+        instead of walking the corpus, so it means "unconstrained" and never merely "trivial".
+        ``{"any": []}`` matches *nothing* and is emphatically not empty in this sense — reporting
+        it as such would put the whole corpus's size on a page with zero items.
+        """
+        return self._matches_everything
+
+    def fingerprint(self) -> str:
+        """The stable identity of this search, as embedded in every cursor it mints.
+
+        Precomputed at compile time (the tree is at most
+        :data:`~src.models.MAX_FILTER_NODES` nodes, so it costs nothing) and returned verbatim.
+        Same construction as :meth:`Filter.fingerprint` — ``blake2b`` over a canonical JSON
+        rendering, 8-byte digest, 16 hex characters — so a search cursor and a list cursor are
+        indistinguishable in form, which is what keeps the cursor genuinely opaque rather than a
+        label telling a client which route minted it.
+
+        The rendering is namespaced (``{"tree": …}``) so it cannot collide with the flat filter's,
+        and it carries the sort order, because the walk's identity is the filter *and* its
+        direction. See :func:`_canonical` for exactly which differences are normalised away.
+        """
+        return self._fingerprint
+
+    def index_hint(self, store: LogStore) -> list[list[int]] | None:
+        """The cheapest sound candidate set, or ``None`` to scan linearly.
+
+        Structurally identical to :meth:`Filter.index_hint` — the most selective constrained
+        dimension wins, measured by total seqs contributed — over the constraints
+        :func:`_hint_constraints` proved safe to harvest. ``None`` means "no indexed dimension is
+        soundly constrained"; ``[]`` means "constrained, and the store holds nothing with any of
+        those values", which is a real zero-match answer and why the caller must tell the two
+        apart.
+
+        Everything about **why** a given constraint is or is not present lives in
+        :func:`_hint_constraints`. This method only chooses between the ones already collected.
+        """
+        if not self._constraints:
+            return None
+
+        best: list[list[int]] | None = None
+        best_size = -1
+        for dimension, values in self._constraints.items():
+            index = store.index_for(dimension)
+            lists = [index[value] for value in values if value in index]
+            size = sum(len(seqs) for seqs in lists)
+            if best is None or size < best_size:
+                best, best_size = lists, size
+        return best
+
+
+def compile_filter(node: FilterNode | None, order: SortOrder) -> CompiledFilter:
+    """Compile a :class:`~src.models.SearchRequest` filter tree into a store-ready predicate.
+
+    The single translation from C9's wire vocabulary into the store's, exactly as
+    :meth:`Filter.from_query` is the single translation from C5's. Everything expensive happens
+    here, once per request: the operands are coerced, the accessors and comparisons are resolved,
+    the constants are folded, the fingerprint is computed and the sound index constraints are
+    harvested. What comes back is a closure and three cached facts.
+
+    Args:
+        node: The tree, or ``None`` for "match everything" (:attr:`CompiledFilter.is_empty` is
+            then true, and ``page.total`` costs O(1) instead of a full sweep).
+        order: The walk's sort direction. It is folded into the fingerprint rather than merely
+            passed alongside it, because a cursor is a position in a *walk* and a walk is a filter
+            plus a direction — that is the only reason this function needs to know the order at
+            all; it does not affect the predicate. (:func:`decode_cursor` checks the order
+            separately and first, so a reversed-direction replay still gets the specific "other
+            sort order" message rather than a generic mismatch.)
+
+    Raises:
+        ValueError: If the tree is nested deeper than :data:`~src.models.MAX_FILTER_DEPTH`.
+        TypeError: If ``node`` is not a filter node.
+    """
+    compiled = True if node is None else _compile_node(node, 1)
+
+    # The two constants become real callables here so `matches` is uniformly callable, and
+    # `is_empty` records which of them (if either) this is. Only the always-true case is "empty":
+    # it is the one the store may answer with `size()` instead of a walk.
+    if compiled is True:
+        predicate: Predicate = _match_everything
+    elif compiled is False:
+        predicate = _match_nothing
+    else:
+        predicate = compiled
+
+    canonical = json.dumps(
+        {"tree": _canonical(node), "order": order.value},
+        separators=(",", ":"),
+        sort_keys=True,
+        allow_nan=False,
+    )
+    return CompiledFilter(
+        predicate=predicate,
+        # Same digest size and rendering as `Filter.fingerprint` — see that method for why a
+        # builtin `hash()` cannot be used here (it is salted per process, so a cursor would stop
+        # validating against its own filter after a restart).
+        fingerprint=hashlib.blake2b(canonical.encode("utf-8"), digest_size=8).hexdigest(),
+        constraints=_hint_constraints(node),
+        matches_everything=compiled is True,
+    )
 
 
 # ---------------------------------------------------------------------------------------------

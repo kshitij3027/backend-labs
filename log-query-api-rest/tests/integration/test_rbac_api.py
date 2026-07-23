@@ -39,6 +39,7 @@ from src.models import MAX_ATTR_VALUE_LEN, MAX_ATTRS_KEYS, LogEntry
 TOKEN_URL = f"{API_V1_PREFIX}/auth/token"
 ME_URL = f"{API_V1_PREFIX}/auth/me"
 LOGS_URL = f"{API_V1_PREFIX}/logs"
+SEARCH_URL = f"{API_V1_PREFIX}/logs/search"
 
 #: The single-fetch route as it appears in ``/openapi.json``. ``.format(entry_id=…)`` turns it
 #: into a concrete path, so the RBAC matrix and the OpenAPI assertions can share one spelling.
@@ -479,14 +480,17 @@ class GuardedRoute:
 #:
 #: This tuple is the single place the table is written down, and both tests below iterate it: the
 #: live matrix sweeps all four demo roles across every row, and the OpenAPI test asserts every row
-#: is discoverable in the published document. C9/C10/C11 extend the coverage by appending a row —
-#: ``POST /logs/search`` (analyst), ``GET /logs/stream`` (analyst), ``GET /stats`` (viewer),
-#: ``GET /debug/memory`` (admin) — and get the whole sweep for free.
+#: is discoverable in the published document. C9 has since added its row and got the whole sweep
+#: for free; C10/C11 extend it the same way — ``GET /logs/stream`` (analyst), ``GET /stats``
+#: (viewer), ``GET /debug/memory`` (admin).
 GUARDED_ROUTES: tuple[GuardedRoute, ...] = (
     GuardedRoute("GET", ME_URL, Role.VIEWER, 200),
     GuardedRoute("GET", LOGS_URL, Role.VIEWER, 200),
     GuardedRoute("GET", ENTRY_PATH_TEMPLATE, Role.VIEWER, 200),
     GuardedRoute("POST", LOGS_URL, Role.WRITER, 201, body=append_body()),
+    # C9. The empty body is a complete, valid `SearchRequest`: every field defaults, so `{}` means
+    # "everything, newest first" — which makes this row a role assertion and nothing else.
+    GuardedRoute("POST", SEARCH_URL, Role.ANALYST, 200, body={}),
 )
 
 

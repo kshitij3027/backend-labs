@@ -493,3 +493,37 @@ def test_openapi_documents_v1_routes(seeded_client):
     # The prefix is spelled in two places (src/main.API_V1_PREFIX documents it; src/api/v1.py
     # applies it) because importing one from the other would be a cycle. Pin them together.
     assert v1_router.prefix == API_V1_PREFIX == "/api/v1"
+
+
+def test_append_rejects_a_hostile_body_without_a_500(seeded_client):
+    """The write route shares the hardened validation renderer, so it shares the guarantee.
+
+    ``POST /logs/search`` is where a deeply nested body is *expected* — it takes a filter tree —
+    but the failure was never search-specific: FastAPI's default handler json-encodes the
+    rejected input recursively for **every** body route, so any of them could be made to raise a
+    ``RecursionError`` inside its own error handler and answer ``500``. One handler registered in
+    :func:`src.main.create_app` covers all of them; this is that claim, exercised on the route
+    nobody would think to point a nested body at.
+
+    A ``400`` is as acceptable as a ``422`` here: on some CPython versions the stdlib decoder
+    refuses a document this deep before any model sees it. ``500`` is the only wrong answer. See
+    ``tests/integration/test_search_api.py::test_extremely_deep_body_is_422_not_500``.
+    """
+    depth = 5_000
+    # Concatenated rather than built with json.dumps, whose C encoder would recurse once per
+    # level and blow the *test's* stack before the request was ever sent.
+    payload = (
+        '{"level":"INFO","service":"s","host":"h","message":"m","attrs":'
+        + '{"a":' * depth
+        + '"x"'
+        + "}" * depth
+        + "}"
+    ).encode()
+
+    response = seeded_client.post(
+        LOGS, content=payload, headers={"content-type": "application/json"}
+    )
+
+    assert response.status_code != 500, response.text[:300]
+    assert response.status_code in (400, 422), response.status_code
+    assert len(response.content) < 4096, len(response.content)

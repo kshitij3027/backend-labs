@@ -59,6 +59,7 @@ from src.auth import authenticate, create_access_token
 from src.config import Settings
 from src.deps import (
     WWW_AUTHENTICATE,
+    AnalystGuard,
     RoleDocumentedRoute,
     ViewerGuard,
     WriterGuard,
@@ -76,11 +77,20 @@ from src.models import (
     LogQuery,
     PageInfo,
     PrincipalResponse,
+    SearchRequest,
     SortOrder,
     TokenResponse,
     clamp_limit,
 )
-from src.store import Filter, InvalidCursor, LogStore, decode_cursor, encode_cursor
+from src.store import (
+    CompiledFilter,
+    Filter,
+    InvalidCursor,
+    LogStore,
+    compile_filter,
+    decode_cursor,
+    encode_cursor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +208,7 @@ def _query_error_detail(exc: ValidationError) -> str:
 def _paginate(
     store: LogStore | None,
     settings: Settings | None,
-    flt: Filter,
+    flt: Filter | CompiledFilter,
     order: SortOrder,
     *,
     limit: int | None,
@@ -452,7 +462,9 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #  and comes back as a 404 that looks like a routing bug and is actually an ordering bug. It is
 #  a genuinely confusing hour of debugging, and it is entirely avoidable:
 #
-#      * C9's  POST /logs/search   MUST be declared ABOVE `/logs/{entry_id}`.
+#      * C9's  POST /logs/search   LANDED, and is declared above `/logs/{entry_id}`. It is the
+#                                  proof the rule works: declared below, every search request
+#                                  would have come back as a 404 for the entry id "search".
 #      * C10's GET  /logs/stream   MUST be declared ABOVE `/logs/{entry_id}`.
 #
 #  `/logs/{entry_id}` is deliberately the LAST `/logs*` route in this file and must stay last.
@@ -469,11 +481,15 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #  dependencies would leave that ordering to FastAPI's resolution order rather than to the graph.
 #  Do not "simplify" a route back to `RequireX` + a sibling rate-limit dependency.
 #
-#  Landed in C7 (ladder) and C8 (metering):
+#  Landed in C7 (ladder), C8 (metering) and C9 (search):
 #      GET  /auth/me            -> viewer     (ViewerGuard)
 #      GET  /logs               -> viewer     (ViewerGuard)
 #      GET  /logs/{entry_id}    -> viewer     (ViewerGuard)
 #      POST /logs               -> writer     (WriterGuard)
+#      POST /logs/search        -> analyst    (AnalystGuard — the first route on the ladder that a
+#                                  `viewer` token cannot reach at all. Search is strictly more
+#                                  expressive than the list route, not merely a different spelling
+#                                  of it, which is what earns it its own rung.)
 #      POST /auth/token         -> PUBLIC and UNMETERED. It is what mints a principal, so there
 #                                  is nothing to key a bucket on; gating it would be a
 #                                  chicken-and-egg deadlock, and `test_openapi_documents_auth_
@@ -481,7 +497,6 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #                                  See its docstring for why bcrypt is the right brake here.
 #
 #  Still to be gated, by the commit that adds the route:
-#      POST /logs/search        -> analyst    (C9  — AnalystGuard)
 #      GET  /logs/stream        -> analyst    (C10 — the `?access_token=` escape hatch means its
 #                                  principal does NOT come from the header, so it composes
 #                                  `RequireAnalyst` with its own principal source; see the C10
@@ -729,6 +744,102 @@ async def append_log(
     # so the header a normal client sees is exactly `/api/v1/logs/<id>`.
     response.headers["Location"] = f"{router.prefix}/logs/{quote(entry.id, safe='')}"
     return entry
+
+
+@router.post(
+    "/logs/search",
+    response_model=LogPage,
+    tags=["logs"],
+    summary="Search log entries with a structured boolean filter (analyst role)",
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "model": ErrorBody,
+            "description": "The `cursor` is malformed, or belongs to a different filter or sort "
+            "order.",
+        },
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_403_FORBIDDEN: FORBIDDEN_RESPONSE,
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            "model": ErrorBody,
+            "description": (
+                "The filter tree is not valid: an unknown `field` or `op`, an operator that does "
+                "not suit its field, a value of the wrong shape, or a tree past the depth/node/"
+                "value caps. Rejected before a single record is read."
+            ),
+        },
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
+    },
+)
+async def search_logs(
+    request: Request,
+    response: Response,
+    body: SearchRequest,
+    principal: AnalystGuard,
+) -> LogPage:
+    """Walk the corpus under a nested boolean filter — `all` / `any` / `not` over leaf predicates.
+
+    The expressive half of the read surface. `GET /logs` ANDs its fields and ORs within a field,
+    which is the most a flat query string can honestly say; this route takes the structure itself
+    in the body, so *(level is ERROR or FATAL) and not (service is search-svc)* is one request
+    rather than a client-side intersection of three.
+
+    .. rubric:: Why a `POST` for a read
+
+    Two reasons, and neither is that the request is a write — it is not, and it is idempotent and
+    free of side effects:
+
+    * **A nested filter does not fit in a URL.** Encoding a tree into a query parameter means
+      inventing a serialisation format that no schema describes, no generated client can build,
+      and every proxy is free to truncate. In a body it is just JSON, and pydantic validates it
+      against a published schema for free.
+    * **A body keeps search terms out of access logs.** Query strings are written down by every
+      hop they pass through — nginx, the load balancer, the browser's history, any APM tool in
+      between — and "which user id was somebody searching the logs for" is exactly the sort of
+      thing that should not sit in an access log forever. (It is also why C10's `?access_token=`
+      escape hatch is deliberately not extended to this route.)
+
+    .. rubric:: There is no `offset`
+
+    `GET /logs` offers one, with the documented caveat that it drifts under concurrent appends.
+    Search does not, and that is a narrowing rather than an omission: offset paging exists for
+    "jump to page 7" over a stable table, while a nested filter over a live append-only ring is a
+    **stream** the caller walks to the end. The cursor is the only pagination that survives
+    concurrent writes, so offering both would mean publishing an option whose one distinguishing
+    property is that it can silently skip rows.
+
+    Everything else is deliberately identical to the list route, because it is *literally* the
+    same code: the compiled tree goes through the same `_paginate` helper, so the envelope, the
+    clamping, the `X-Page-Limit-Clamped` / `X-Cursor-Truncated` headers and the cursor are the
+    same objects with the same meanings. A cursor is still bound to the filter that minted it —
+    replaying a search cursor against a different tree is a `400`, never a plausible-looking
+    wrong page.
+    """
+    store, settings = _runtime_parts(request)
+
+    try:
+        flt = compile_filter(body.filter, body.sort.order)
+    except ValueError as exc:  # pragma: no cover - unreachable through the HTTP path
+        # Defence in depth, not a live branch. `SearchRequest` runs `check_filter_shape` as a
+        # `mode="before"` validator, so an over-deep tree is already a 422 with a message naming
+        # the cap, and anything that validates therefore compiles. The compiler re-checks the
+        # depth anyway (a Python-constructed tree skips that validator), and if it ever refuses
+        # something a client sent, a 400 explaining why beats a 500 that explains nothing.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
+
+    return _paginate(
+        store,
+        settings,
+        flt,
+        body.sort.order,
+        limit=body.limit,
+        cursor=body.cursor,
+        # Not a placeholder: `SearchRequest` has no `offset` field at all. Passing None here is
+        # the route stating that, rather than plumbing a parameter the schema does not publish.
+        offset=None,
+        response=response,
+    )
 
 
 # --- `/logs/{entry_id}` is the wildcard. Keep it LAST. See the block above. -------------------

@@ -33,12 +33,15 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from types import MappingProxyType
+from typing import Any
 from uuid import uuid4
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
+    ValidationError,
     field_serializer,
     field_validator,
     model_validator,
@@ -84,6 +87,26 @@ MAX_ATTR_VALUE_LEN = 512
 MAX_SERVICE_LEN = 128
 MAX_HOST_LEN = 128
 MAX_MESSAGE_LEN = 8192
+
+#: Bounds on a ``POST /logs/search`` filter tree (C9). This is the one place in the API where a
+#: client controls the *structure* of a request rather than only its values, so all three caps are
+#: about making a hostile body cheap to **reject** instead of expensive to evaluate.
+#:
+#: All three are needed, because each bounds a different dimension:
+#:
+#: * :data:`MAX_FILTER_DEPTH` bounds nesting, so parsing and compiling cannot be driven into a
+#:   ``RecursionError`` (which would surface as a ``500`` — an availability bug handed to any
+#:   caller who can post a body).
+#: * :data:`MAX_FILTER_NODES` bounds *width*, which depth alone does not: a single
+#:   ``{"all": [ …fifty thousand leaves… ]}`` is two levels deep and still a denial of service.
+#: * :data:`MAX_FILTER_VALUES` bounds the one leaf shape that carries a collection (``in``/``nin``).
+#:
+#: String values reuse :data:`MAX_Q_LEN` rather than inventing a fourth number — a leaf's
+#: ``contains`` needle is exactly the same kind of thing as the ``q`` query parameter, and it is
+#: scanned by exactly the same substring search.
+MAX_FILTER_DEPTH = 8
+MAX_FILTER_NODES = 100
+MAX_FILTER_VALUES = 64
 
 
 class LogLevel(StrEnum):
@@ -474,6 +497,566 @@ class LogQuery(BaseModel):
         if self.since is not None and self.until is not None and self.since > self.until:
             raise ValueError("since must not be after until")
         return self
+
+
+# =============================================================================================
+#  The structured filter tree — the body vocabulary of ``POST /api/v1/logs/search`` (C9)
+# ---------------------------------------------------------------------------------------------
+#  :class:`LogQuery` above is everything a flat query string can honestly say: fields ANDed,
+#  values ORed within a field. There is no way to spell *(level is ERROR or FATAL) and not
+#  (service is search-svc)* in a query string without inventing a mini-language inside a
+#  parameter value — which is how every "just add a `filter=` param" API ends up with a hand-
+#  rolled parser and no schema. So the expressive form moves into a JSON body, where the
+#  structure is the structure and pydantic validates it for free.
+#
+#  Four node shapes, distinguished by their keys, and every one of them ``extra="forbid"``:
+#
+#      {"all": [ … ]}                          conjunction
+#      {"any": [ … ]}                          disjunction
+#      {"not": { … }}                          negation
+#      {"field": …, "op": …, "value": …}       leaf predicate
+#
+#  ``extra="forbid"`` is load-bearing rather than merely tidy: it is what makes the union
+#  unambiguous. Each shape's required key is absent from the other three, so for any given object
+#  exactly one member of the union can possibly validate — no discriminator callable needed, and
+#  the generated OpenAPI stays a plain recursive ``anyOf`` of four ``$ref``s that any code
+#  generator can consume.
+# =============================================================================================
+
+
+class FilterField(StrEnum):
+    """The five entry attributes a leaf predicate may address. Nothing else is addressable.
+
+    Deliberately **not** open to ``attrs.*``. The attrs bag is an arbitrary string->string map,
+    so an addressable path into it would be an unbounded key space with no index behind it and no
+    schema to publish; every query over it would be a full linear scan with a per-record dict
+    lookup. Keeping the vocabulary closed is also what lets an unknown ``field`` be a ``422`` with
+    the valid set named in the message, rather than a filter that silently matches nothing —
+    which, to someone debugging an incident, is indistinguishable from "there are no such logs".
+    """
+
+    LEVEL = "level"
+    SERVICE = "service"
+    HOST = "host"
+    MESSAGE = "message"
+    TS = "ts"
+
+
+class FilterOp(StrEnum):
+    """The nine comparison operators. Which ones are legal depends on the field — see
+    :data:`FIELD_OPS`."""
+
+    EQ = "eq"
+    NE = "ne"
+    IN = "in"
+    NIN = "nin"
+    CONTAINS = "contains"
+    GT = "gt"
+    GTE = "gte"
+    LT = "lt"
+    LTE = "lte"
+
+
+#: The operators whose ``value`` is a **list**. Everything else takes a scalar, and the mismatch
+#: is rejected at validation rather than at evaluation — see :func:`coerce_filter_value`.
+LIST_OPS: frozenset[FilterOp] = frozenset({FilterOp.IN, FilterOp.NIN})
+
+#: The operators that compare by **order** rather than by identity. Only meaningful on a field
+#: that has an order: ``ts`` (an instant) and ``level`` (via :data:`LEVEL_ORDER`).
+ORDER_OPS: frozenset[FilterOp] = frozenset(
+    {FilterOp.GT, FilterOp.GTE, FilterOp.LT, FilterOp.LTE}
+)
+
+#: **The field x operator matrix.** Not every operator is meaningful on every field, and an
+#: operator that is merely *tolerated* on a field it does not suit is worse than one that is
+#: refused: it returns rows, so nobody notices it answered the wrong question.
+#:
+#: The three rules that generate this table:
+#:
+#: * **Ordering (`gt`/`gte`/`lt`/`lte`) needs an ordered field.** ``ts`` is an instant, and
+#:   ``level`` has :data:`LEVEL_ORDER` — which is the entire reason that ordinal map exists, so
+#:   ``{"field": "level", "op": "gte", "value": "WARN"}`` means *at least as severe as WARN*
+#:   rather than a lexicographic accident (alphabetically, "WARN" > "ERROR" > "DEBUG", which is
+#:   almost exactly backwards). Service/host/message have no order worth exposing: sorting host
+#:   names lexicographically answers no question anybody asks.
+#: * **`contains` needs free text.** ``service``/``host``/``message`` are text a human wrote, so a
+#:   substring search over them is meaningful. ``level`` is a closed five-member enum where
+#:   ``contains "ERROR"`` is just a slower, subtly wrong ``eq`` — and ``contains "R"`` would match
+#:   ERROR and WARN, which nobody means. ``ts`` is an instant, not a string.
+#: * **`eq`/`ne`/`in`/`nin` are identity**, and work anywhere a value can be compared for
+#:   equality — except ``in``/``nin`` on ``ts``, where an explicit *set of exact instants* is a
+#:   query nobody writes and an invitation to sub-millisecond confusion. Range operators are what
+#:   time is for.
+FIELD_OPS: Mapping[FilterField, frozenset[FilterOp]] = MappingProxyType(
+    {
+        FilterField.LEVEL: frozenset(
+            {FilterOp.EQ, FilterOp.NE, FilterOp.IN, FilterOp.NIN, *ORDER_OPS}
+        ),
+        FilterField.SERVICE: frozenset(
+            {FilterOp.EQ, FilterOp.NE, FilterOp.IN, FilterOp.NIN, FilterOp.CONTAINS}
+        ),
+        FilterField.HOST: frozenset(
+            {FilterOp.EQ, FilterOp.NE, FilterOp.IN, FilterOp.NIN, FilterOp.CONTAINS}
+        ),
+        FilterField.MESSAGE: frozenset(
+            {FilterOp.EQ, FilterOp.NE, FilterOp.IN, FilterOp.NIN, FilterOp.CONTAINS}
+        ),
+        FilterField.TS: frozenset({FilterOp.EQ, FilterOp.NE, *ORDER_OPS}),
+    }
+)
+
+#: What a leaf's ``value`` may be on the wire, before the per-field rules run. Broad on purpose:
+#: accepting ``{"field": "level", "op": "eq", "value": 3}`` as far as the *type* system and then
+#: refusing it with "3 is not a log level; expected one of [...]" is a far more useful ``422``
+#: than pydantic's generic "input should be a valid string".
+FilterScalar = str | bool | int | float
+
+#: Parses a leaf's ``ts`` value using **pydantic's own** datetime rules — the same ones behind
+#: ``LogQuery.since``/``until``. Sharing the parser is what guarantees that ``?since=…`` and
+#: ``{"field": "ts", "op": "gte", …}`` accept exactly the same spellings (RFC-3339 with any
+#: offset, ``Z``, or a POSIX epoch number); two hand-rolled parsers would eventually disagree
+#: about one of them, and the disagreement would look like a filtering bug.
+_TS_ADAPTER: TypeAdapter[datetime] = TypeAdapter(datetime)
+
+
+def _as_level(value: Any) -> LogLevel:
+    """Coerce a leaf value to a :class:`LogLevel`, naming the valid set on failure."""
+    try:
+        return LogLevel(value)
+    except ValueError as exc:
+        valid = [level.value for level in LogLevel]
+        raise ValueError(f"{value!r} is not a log level; expected one of {valid}") from exc
+
+
+def _as_text(field: FilterField, value: Any) -> str:
+    """Coerce a leaf value to a bounded string, or explain why it is not one.
+
+    ``bool`` fails the ``isinstance(value, str)`` test, which is what we want: ``True`` is not a
+    service name, and silently stringifying it would produce a filter matching nothing.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"field {field.value!r} compares against text, but the value is a "
+            f"{type(value).__name__}"
+        )
+    if len(value) > MAX_Q_LEN:
+        raise ValueError(
+            f"filter values are limited to {MAX_Q_LEN} characters, got {len(value)}"
+        )
+    return value
+
+
+def _as_epoch(value: Any) -> float:
+    """Coerce a leaf value to a POSIX timestamp in UTC.
+
+    Returns a float rather than a ``datetime`` because that is what the compiled predicate
+    compares against: :class:`~src.store.StoredEntry` precomputes ``ts_epoch`` for exactly this,
+    so a range test is two float compares instead of re-deriving a timestamp per record.
+    """
+    if isinstance(value, bool):
+        # `isinstance(True, int)` is True in Python, and pydantic reads an int as an epoch — so
+        # without this, `{"field": "ts", "op": "gt", "value": true}` would quietly become
+        # 1970-01-01T00:00:01Z and match the entire corpus.
+        raise ValueError("field 'ts' compares against a timestamp; a boolean is not one")
+    try:
+        parsed = _TS_ADAPTER.validate_python(value)
+    except ValidationError as exc:
+        raise ValueError(
+            f"field 'ts' expects an RFC-3339 timestamp or a POSIX epoch, got {value!r}"
+        ) from exc
+    return _to_utc(parsed).timestamp()
+
+
+def _coerce_scalar(field: FilterField, op: FilterOp, value: Any) -> str | int | float:
+    """Turn one wire scalar into the operand the compiled predicate will compare against."""
+    if field is FilterField.TS:
+        return _as_epoch(value)
+
+    if field is FilterField.LEVEL:
+        level = _as_level(value)
+        # Ordering compares ordinals; identity compares the wire string. Resolving which one here
+        # — at compile time, once — is what keeps `LEVEL_ORDER[...]` off the per-record path.
+        return LEVEL_ORDER[level] if op in ORDER_OPS else level.value
+
+    text = _as_text(field, value)
+    if op is FilterOp.CONTAINS:
+        if not text:
+            raise ValueError(
+                "'contains' needs a non-empty needle: '' is a substring of every string, so an "
+                "empty one is not a filter at all"
+            )
+        # Lower-cased **once, here**, so the per-record test is a plain substring search against
+        # the store's precomputed `message_lower`. Same rule as `Filter.from_query`'s `q`.
+        return text.lower()
+    return text
+
+
+def coerce_filter_value(field: FilterField, op: FilterOp, value: Any) -> Any:
+    """Validate a leaf's ``value`` against its ``(field, op)`` pair and return the **operand**.
+
+    One function, two callers, and that is the point: :class:`FilterLeaf` calls it during
+    validation so a bad value is a ``422`` at the edge, and :func:`~src.store.compile_filter`
+    calls it again to obtain the comparison operand. A second implementation of "what does this
+    value mean" living inside the compiler is how a filter that validates cleanly ends up
+    evaluating differently — so there is only one.
+
+    Returns:
+        ``frozenset[str | int | float]`` for ``in``/``nin`` (membership is a hash lookup, not a
+        list scan), a ``float`` epoch for ``ts``, an ``int`` ordinal for ordered ``level``
+        comparisons, a lower-cased ``str`` for ``contains``, and the exact ``str`` otherwise.
+
+    Raises:
+        ValueError: On any type or bound violation. Pydantic renders it as the ``422`` detail.
+    """
+    if op in LIST_OPS:
+        if not isinstance(value, list):
+            raise ValueError(
+                f"operator {op.value!r} requires a list value, got a {type(value).__name__}"
+            )
+        if not value:
+            # An empty `in` matches nothing. Accepting it would answer "no matching logs" to a
+            # request that was almost certainly a client bug — the same reasoning that makes
+            # `since > until` a 400 on `GET /logs` rather than a cheerful empty page.
+            raise ValueError(
+                f"operator {op.value!r} needs at least one value; an empty list matches nothing, "
+                "which is indistinguishable from 'no such logs'"
+            )
+        if len(value) > MAX_FILTER_VALUES:
+            raise ValueError(
+                f"operator {op.value!r} accepts at most {MAX_FILTER_VALUES} values, "
+                f"got {len(value)}"
+            )
+        return frozenset(_coerce_scalar(field, op, item) for item in value)
+
+    if isinstance(value, list):
+        raise ValueError(
+            f"operator {op.value!r} requires a single value, not a list — did you mean 'in'?"
+        )
+    return _coerce_scalar(field, op, value)
+
+
+class FilterLeaf(BaseModel):
+    """One predicate: ``{"field": "level", "op": "in", "value": ["ERROR", "FATAL"]}``.
+
+    The leaves are where all the real validation happens. An unknown ``field`` or ``op`` is
+    rejected by the enums; an operator that does not suit its field is rejected by
+    :data:`FIELD_OPS`; and a value of the wrong shape (a list where a scalar belongs, a
+    non-level where a level belongs, an unparseable timestamp) is rejected by
+    :func:`coerce_filter_value`. All four are ``422``s **at parse time**, before a single record
+    is touched — a filter that only fails on the thousandth row is a filter that has already
+    burned the request.
+
+    ``contains`` is a **case-insensitive substring** test, matching the ``q`` query parameter
+    exactly. The store precomputes ``message_lower`` for precisely this, so a ``contains`` over
+    ``message`` costs a substring search and no allocation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: FilterField = Field(
+        description="Entry attribute to test: level | service | host | message | ts.",
+        examples=["level"],
+    )
+    op: FilterOp = Field(
+        description=(
+            "Comparison to apply. Valid operators depend on the field: ordering "
+            "(gt/gte/lt/lte) only on `ts` and `level` (by severity, not alphabetically); "
+            "`contains` (case-insensitive substring) only on `service`/`host`/`message`; "
+            "`in`/`nin` take a list, everything else takes a scalar."
+        ),
+        examples=["in"],
+    )
+    value: FilterScalar | list[FilterScalar] = Field(
+        description=(
+            "The operand. A list for `in`/`nin` (1..64 entries), a scalar otherwise. Strings are "
+            f"capped at {MAX_Q_LEN} characters. `ts` accepts RFC-3339 or a POSIX epoch."
+        ),
+        examples=[["ERROR", "FATAL"]],
+    )
+
+    @model_validator(mode="after")
+    def _check_operator_and_value(self) -> FilterLeaf:
+        """Enforce the field x operator matrix and the value's shape. See :data:`FIELD_OPS`."""
+        allowed = FIELD_OPS[self.field]
+        if self.op not in allowed:
+            raise ValueError(
+                f"operator {self.op.value!r} is not valid on field {self.field.value!r}; "
+                f"valid operators there are {sorted(item.value for item in allowed)}"
+            )
+        # Result discarded: this call is here to *reject*, and the compiler calls the same
+        # function again for the operand. Caching it on the model would mean carrying a
+        # non-serialisable frozenset on a wire type for no gain — the tree is at most 100 nodes.
+        coerce_filter_value(self.field, self.op, self.value)
+        return self
+
+
+class FilterAll(BaseModel):
+    """Conjunction: ``{"all": [ … ]}`` — every child must match.
+
+    .. rubric:: ``{"all": []}`` matches **everything**, and that surprises people
+
+    An empty conjunction is *vacuously true*: "every one of these zero conditions holds" is a
+    true statement about any record, and ``True`` is the identity of AND (``x and True == x``, so
+    the empty product must be ``True`` for nesting to compose). It is the mathematically standard
+    reading, it is the only one under which ``{"all": [A, {"all": []}]}`` still means ``A``, and
+    it is what makes an empty filter and an omitted filter agree.
+
+    The alternative — treating it as "match nothing" — would make the natural client behaviour
+    (start with an empty ``all`` and push conditions into it as the user ticks boxes) return zero
+    rows until the first box is ticked, which reads as a broken search. See :class:`FilterAny`
+    for the mirror-image rule, which is the one that genuinely catches people out.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    all: list[FilterNode] = Field(
+        description=(
+            "Child nodes that must ALL match. An empty list matches every entry (vacuous truth "
+            "— the identity of AND)."
+        )
+    )
+
+
+class FilterAny(BaseModel):
+    """Disjunction: ``{"any": [ … ]}`` — at least one child must match.
+
+    .. rubric:: ``{"any": []}`` matches **nothing**
+
+    The mirror of :class:`FilterAll`'s rule and the one that actually catches people out: an
+    empty disjunction is vacuously *false*, because ``False`` is the identity of OR
+    (``x or False == x``). "At least one of these zero conditions holds" is false for every
+    record.
+
+    So the two empty collections are opposites, which is exactly right and exactly why it is
+    documented here rather than left for someone to discover: ``{"all": []}`` matches everything
+    and ``{"any": []}`` matches nothing. ``tests/unit/test_filters.py`` pins both directly.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    any: list[FilterNode] = Field(
+        description=(
+            "Child nodes of which at least ONE must match. An empty list matches no entry "
+            "(the identity of OR)."
+        )
+    )
+
+
+class FilterNot(BaseModel):
+    """Negation: ``{"not": { … }}`` — the child must **not** match.
+
+    The field is spelled ``not_`` in Python and ``not`` on the wire, because ``not`` is a
+    reserved word. ``populate_by_name=True`` accepts either, so a Python caller constructing a
+    tree directly is not forced to remember the alias.
+
+    Negation is also the node that makes index hints dangerous: everything under a ``not`` is a
+    statement about records that must be **excluded**, so deriving a candidate set from it would
+    return precisely the wrong rows. :func:`~src.store.compile_filter` therefore refuses to
+    descend into it when gathering hints — see that function's soundness note.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    not_: FilterNode = Field(
+        alias="not", description="The node to negate. Matches when the child does not."
+    )
+
+
+#: One node of the filter tree: a boolean combinator or a leaf predicate, recursively.
+#:
+#: A plain union rather than a discriminated one. Because every member forbids extra keys and no
+#: member's required key appears in another, at most one alternative can validate any given
+#: object — the union is already unambiguous, and the resulting OpenAPI is a recursive ``anyOf``
+#: of four ``$ref``s, which every schema consumer understands. A callable ``Discriminator`` would
+#: buy tidier error paths at the cost of a less portable published document.
+FilterNode = FilterAll | FilterAny | FilterNot | FilterLeaf
+
+# The three combinators reference ``FilterNode`` before it exists (they are what it is made of),
+# so pydantic leaves them incomplete at class-creation time and these calls finish the job now
+# that the name resolves. Without them the models raise on first use rather than at import —
+# and, worse, ``/openapi.json`` would 500 instead of publishing the schema.
+FilterAll.model_rebuild()
+FilterAny.model_rebuild()
+FilterNot.model_rebuild()
+
+
+#: The keys that mark a node as a combinator. A node carrying none of them is leaf-shaped.
+_BRANCH_KEYS: tuple[str, ...] = ("all", "any", "not")
+
+
+def check_filter_shape(value: Any) -> Any:
+    """Reject an over-deep, over-wide or ambiguously-shaped tree **before** pydantic parses it.
+
+    This runs as a ``mode="before"`` validator on :attr:`SearchRequest.filter`, which means it
+    sees the **raw decoded JSON** — and that timing is the entire point. Pydantic validates a
+    recursive model bottom-up, so by the time any ``mode="after"`` check could measure the depth,
+    the whole tree has already been constructed; a body nested ten thousand levels deep would
+    have exhausted the interpreter stack on the way in and surfaced as a ``500``. Measuring first,
+    on the raw structure, turns that into a ``422`` that costs one iterative pass.
+
+    The walk is **iterative** (an explicit stack) for the same reason. A recursive depth-checker
+    that blows its own stack while proving the input is too deep has not checked anything.
+
+    Three things are enforced here, and only these three — everything about a node's *contents*
+    stays with :class:`FilterLeaf`, so no rule is written down twice:
+
+    * depth <= :data:`MAX_FILTER_DEPTH`,
+    * total node count <= :data:`MAX_FILTER_NODES`,
+    * each node carries **at most one** of ``all`` / ``any`` / ``not``. A node mixing two of them
+      has no meaning, and letting it through would produce four parallel union errors instead of
+      one sentence naming the mistake.
+
+    A non-``dict`` input (``None``, a list, a string, or a already-constructed model instance
+    built in Python rather than parsed from JSON) is passed straight through for the union
+    validator to complain about in its own vocabulary. The depth bound is therefore enforced a
+    second time inside :func:`~src.store.compile_filter`, which is the one path a
+    Python-constructed tree cannot skip.
+    """
+    if not isinstance(value, dict):
+        return value
+
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    nodes = 0
+    while stack:
+        node, depth = stack.pop()
+        nodes += 1
+        if depth > MAX_FILTER_DEPTH:
+            raise ValueError(
+                f"filter tree is nested deeper than {MAX_FILTER_DEPTH} levels; flatten it or "
+                "split the query"
+            )
+        if nodes > MAX_FILTER_NODES:
+            raise ValueError(
+                f"filter tree carries more than {MAX_FILTER_NODES} nodes; depth alone does not "
+                "bound a wide tree, so the total is capped too"
+            )
+        if not isinstance(node, dict):
+            continue
+
+        present = [key for key in _BRANCH_KEYS if key in node]
+        if len(present) > 1:
+            raise ValueError(
+                f"a filter node carries {present} together; each node is exactly one of "
+                "'all', 'any', 'not', or a leaf {'field', 'op', 'value'}"
+            )
+        if not present:
+            continue  # leaf-shaped: FilterLeaf owns everything about it
+
+        branch = node[present[0]]
+        if present[0] == "not":
+            stack.append((branch, depth + 1))
+        elif isinstance(branch, list):
+            stack.extend((child, depth + 1) for child in branch)
+        # A non-list 'all'/'any' is left for the union validator to report as a type error.
+    return value
+
+
+class SortField(StrEnum):
+    """The sortable dimension. There is exactly one, and that is a statement about the store.
+
+    The ring's ``seq`` spine **is** time order (appends only ever add a larger seq, and the corpus
+    is generated oldest-first), so a walk ordered by ``ts`` costs nothing beyond the scan itself.
+    Every other ordering — by service, by level, by message — would require materialising and
+    sorting the whole match set per request, which at 100k entries is the one thing a paginated
+    read API exists to avoid. Offering it and then serving it slowly would be worse than not
+    offering it.
+
+    It is still spelled as a field rather than hardcoded, so the wire shape is honest about what
+    is being ordered and a future secondary ordering is an added enum member — additive, not a
+    breaking change to the request schema.
+    """
+
+    TS = "ts"
+
+
+class SortSpec(BaseModel):
+    """``{"field": "ts", "order": "desc"}`` — the sort half of a search request.
+
+    Both halves default, so ``sort`` can be omitted entirely and still mean the same thing
+    ``GET /logs`` means with no parameters: newest first.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    field: SortField = Field(
+        default=SortField.TS, description="Dimension to sort by. Only `ts` is supported."
+    )
+    order: SortOrder = Field(
+        default=SortOrder.DESC, description="Scan direction; newest-first by default."
+    )
+
+
+class SearchRequest(BaseModel):
+    """Body of ``POST /api/v1/logs/search`` — a filter tree, a sort, a page size and a cursor.
+
+    .. rubric:: Why a POST for a read
+
+    Two reasons, both in the README. A nested boolean filter does not fit in a URL — encoding one
+    into a query parameter means inventing a serialisation format that no schema describes and no
+    generated client can build. And a ``POST`` body keeps search terms out of proxy access logs,
+    reverse-proxy dashboards and browser history: a query string is written down by every hop it
+    passes through, and "which user id was somebody searching the logs for" is exactly the sort of
+    thing that should not be sitting in an nginx log forever. (It is also why the C10 SSE route's
+    ``?access_token=`` escape hatch is deliberately **not** extended to this route.)
+
+    .. rubric:: There is no ``offset``
+
+    ``GET /logs`` offers one, with the documented caveat that it drifts under concurrent appends.
+    Search does not, and that is a deliberate narrowing rather than an omission. Offset paging
+    exists for "jump to page 7" UIs over a stable table; a nested filter over a live append-only
+    ring is a **stream** — the caller walks it to the end, and the cursor is the only pagination
+    that survives concurrent writes while doing so. Offering both here would mean publishing an
+    option whose only distinguishing property is that it can silently skip rows.
+
+    ``limit`` is clamped exactly as it is on ``GET /logs`` (never a ``422``), and the cursor is
+    the identical opaque ``b64:`` token — bound to this filter's fingerprint, so replaying a
+    cursor from a different search is a ``400`` rather than a plausible-looking wrong page.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    filter: FilterNode | None = Field(
+        default=None,
+        description=(
+            "The boolean filter tree. Omit it (or send null) to match every entry. Nodes are "
+            "`{\"all\": [...]}`, `{\"any\": [...]}`, `{\"not\": {...}}`, or a leaf "
+            "`{\"field\": ..., \"op\": ..., \"value\": ...}`. Nesting is capped at "
+            f"{MAX_FILTER_DEPTH} levels and {MAX_FILTER_NODES} nodes."
+        ),
+        examples=[
+            {
+                "all": [
+                    {"field": "level", "op": "in", "value": ["ERROR", "FATAL"]},
+                    {"not": {"field": "service", "op": "eq", "value": "search-svc"}},
+                ]
+            }
+        ],
+    )
+    sort: SortSpec = Field(
+        default_factory=SortSpec, description="Sort dimension and direction."
+    )
+    # No `ge`/`le`, for the same reason `LogQuery.limit` has none: clamping is `clamp_limit`'s
+    # job and it never raises. An over-large page request is a 200 plus a header, never a 422.
+    limit: int | None = Field(
+        default=None,
+        description=(
+            "Requested page size. Clamped into [1, MAX_PAGE_SIZE] rather than rejected; the "
+            "response carries X-Page-Limit-Clamped when the requested value was adjusted."
+        ),
+    )
+    cursor: str | None = Field(
+        default=None,
+        description=(
+            "Opaque `next_cursor` from a previous search page. Bound to this filter and sort "
+            "order; replaying it against a different search is a 400, never a wrong page."
+        ),
+    )
+
+    @field_validator("filter", mode="before")
+    @classmethod
+    def _bound_filter_shape(cls, value: Any) -> Any:
+        """Bound the tree's size before pydantic recurses into it. See :func:`check_filter_shape`."""
+        return check_filter_shape(value)
 
 
 class ErrorBody(BaseModel):

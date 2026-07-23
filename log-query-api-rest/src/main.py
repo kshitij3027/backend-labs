@@ -10,6 +10,13 @@ Three things live here, and they are the three seams the rest of the project han
 * :func:`create_app` — the construction site. Passing a pre-built ``runtime`` skips the
   lifespan entirely, which is the hermetic test seam: no env, no corpus seeding, no I/O.
 
+.. rubric:: Rejected bodies
+
+:func:`validation_exception_handler` renders every ``RequestValidationError`` the body routes
+raise. It is registered inside :func:`create_app`, so both construction paths above carry it, and
+it reports ``loc``/``msg`` while never encoding the rejected input — see its docstring for why
+that is a stack-safety fix rather than a formatting preference.
+
 The module-level ``app`` is what uvicorn serves (``python -m uvicorn src.main:app``). Note that
 building it calls :func:`~src.config.get_settings`, so an invalid or placeholder ``JWT_SECRET``
 fails the process at import time — loudly, before the port is bound, which is exactly the
@@ -23,9 +30,11 @@ import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -230,6 +239,123 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         return response
 
 
+#: The ``detail`` every rejected body carries. A fixed string rather than a rendering of the
+#: failure, because :class:`~src.models.ErrorBody` types ``detail`` as ``str`` and the per-field
+#: specifics belong in ``errors`` below. FastAPI's default handler puts a *list* under ``detail``,
+#: which every route in ``src/api/v1.py`` already contradicts by publishing ``ErrorBody`` as its
+#: ``422`` model — so this constant also closes a gap between the document and the wire.
+VALIDATION_ERROR_DETAIL = "request body failed validation; see `errors` for the offending fields"
+
+#: The machine-readable half, for a client that would rather branch on a code than parse prose.
+VALIDATION_ERROR_CODE = "validation_error"
+
+#: How many individual field errors a single ``422`` will report. A body can fail validation in
+#: as many places as it has fields, and a hostile one can have a great many; twenty is far more
+#: than a human debugging a request needs and bounds the response regardless.
+MAX_REPORTED_VALIDATION_ERRORS = 20
+
+#: Per-error ``msg`` (and ``loc`` component) ceiling. Pydantic messages quote the offending value
+#: in some cases, so this is the second place a pathological body could inflate the response.
+MAX_VALIDATION_MESSAGE_CHARS = 300
+
+
+def _validation_error_payload(
+    request: Request, exc: RequestValidationError
+) -> dict[str, Any]:
+    """Render a :class:`~fastapi.exceptions.RequestValidationError` as an ``ErrorBody`` payload.
+
+    Only three scalars survive from each entry in ``exc.errors()`` — ``type``, ``loc`` and
+    ``msg``. ``input`` and ``ctx`` are dropped entirely, and that is the whole point of this
+    function rather than an incidental tidy-up:
+
+    * **It removes the recursion instead of moving it.** ``input`` is the *rejected value*, so for
+      a filter tree nested five hundred levels deep it is a five-hundred-level structure — and
+      FastAPI's default handler runs :func:`~fastapi.encoders.jsonable_encoder` over it, which
+      recurses once per level. That is a ``RecursionError`` raised *inside the error handler*,
+      which the server can only report as a ``500``: the documented ``MAX_FILTER_DEPTH`` guard
+      correctly refuses the body and the client is told the server broke. Raising
+      ``sys.setrecursionlimit`` would buy a deeper cliff at the cost of trading a caught exception
+      for a hard interpreter crash on stack exhaustion — the cliff moves, it does not disappear.
+      Never encoding the input at all is the only version with no cliff in it.
+    * **It is a privacy win.** ``POST /logs/search`` takes its filter in the body partly so that
+      sensitive search terms stay out of proxy access logs and browser history, which query
+      strings do not. Echoing the rejected body back inside an error payload would hand those
+      same terms to every error-tracking sink the client pipes ``422``s into, and undo the reason
+      the route is a ``POST``.
+
+    ``loc`` is kept in full (bounded only by length) because it is what makes an ordinary mistake
+    diagnosable: without it a client is told *that* its body is wrong and never *where*.
+    """
+    errors: list[dict[str, Any]] = []
+    for raw in list(exc.errors())[:MAX_REPORTED_VALIDATION_ERRORS]:
+        errors.append(
+            {
+                "type": str(raw.get("type", VALIDATION_ERROR_CODE)),
+                # Pydantic hands back a tuple of str|int; ints are array indexes and stay ints so
+                # `body.filter.all.0` is still walkable programmatically. Anything exotic is
+                # stringified rather than trusted to serialise.
+                "loc": [
+                    part
+                    if isinstance(part, int)
+                    else str(part)[:MAX_VALIDATION_MESSAGE_CHARS]
+                    for part in (raw.get("loc") or ())
+                ],
+                "msg": str(raw.get("msg", ""))[:MAX_VALIDATION_MESSAGE_CHARS],
+            }
+        )
+
+    return {
+        "detail": VALIDATION_ERROR_DETAIL,
+        "code": VALIDATION_ERROR_CODE,
+        # Read exactly the way every other consumer of the correlation id reads it, and defaulted
+        # rather than indexed: an exception handler runs on paths where the middleware may not
+        # have (a malformed ASGI scope, a handler swapped in by a test), and an `AttributeError`
+        # raised *here* would turn this 422 straight back into the 500 it exists to prevent.
+        "request_id": getattr(request.state, "request_id", None),
+        "errors": errors,
+    }
+
+
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> Response:
+    """Return ``422`` for a body FastAPI refused, without ever encoding the body itself.
+
+    Registered in :func:`create_app` (not on the module-level ``app``) so the injected-runtime
+    test path and the lifespan production path get identical behaviour — a hardening that only
+    applied to one of them would be worse than none, because the suite would prove the wrong one.
+
+    The whole payload construction is wrapped: an exception handler that can itself raise is just
+    a slower ``500``, so if anything at all goes wrong — an unexpected ``errors()`` shape, an
+    encoder refusing a value — the fallback is a minimal, statically-built body that cannot fail
+    to serialise. The status code is the contract; the diagnostics are best-effort.
+
+    Worth knowing when reading the tests: a body can be deep enough that this handler never runs.
+    The stdlib JSON decoder recurses once per container, so past a few hundred levels on CPython
+    3.11 ``json.loads`` itself refuses the document and FastAPI answers ``400`` ("there was an
+    error parsing the body") before any model is consulted. Where that ceiling sits moves between
+    interpreter versions — 3.12 and 3.14 parse thousands of levels, which is exactly the range
+    where the default handler used to answer ``500``. Both ``400`` and ``422`` are the server
+    refusing the *client's* body; only ``500`` was the server admitting it broke.
+    """
+    try:
+        return ORJSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content=_validation_error_payload(request, exc),
+        )
+    except Exception:  # pragma: no cover - defensive; nothing above is expected to raise
+        logger.warning("could not render validation error detail", exc_info=True)
+        return ORJSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            content={
+                "detail": VALIDATION_ERROR_DETAIL,
+                "code": VALIDATION_ERROR_CODE,
+                "request_id": None,
+                "errors": [],
+            },
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Build a **seeded** Runtime on startup, attach it to ``app.state``, tear it down on exit.
@@ -319,6 +445,15 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=EXPOSE_HEADERS,
+    )
+
+    # Every route that takes a body — `POST /logs`, `POST /logs/search`, the token form —
+    # rejects a bad one through the same exception, so the handler is registered once here
+    # rather than per-route. Registering it inside `create_app` is what makes it unconditional:
+    # both the lifespan path and the injected-runtime test path are built through this function.
+    app.add_exception_handler(
+        RequestValidationError,
+        validation_exception_handler,  # type: ignore[arg-type]
     )
 
     # Unversioned liveness, then the versioned data surface. They are two routers rather than
