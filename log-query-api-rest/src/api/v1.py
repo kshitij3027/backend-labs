@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Annotated, Any
@@ -59,6 +60,17 @@ from pydantic import ValidationError
 from sse_starlette.sse import EventSourceResponse
 from starlette.background import BackgroundTask
 
+#: Optional at import time, on purpose. ``psutil`` is pinned in ``requirements.txt`` and is
+#: present in every image this project builds, but it is a *compiled* dependency and the only
+#: thing in this module that could fail to import on an unusual platform. A hard import would
+#: mean one missing wheel takes down the entire v1 router — every route, not just the debug
+#: probe — which is a spectacular blast radius for a diagnostic. Absent, ``/debug/memory``
+#: reports ``0.0`` and says so in the field description; everything else is unaffected.
+try:  # pragma: no cover - exercised by its absence, which CI never has
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None  # type: ignore[assignment]
+
 from src.auth import (
     AuthError,
     Principal,
@@ -71,11 +83,13 @@ from src.auth import (
 from src.config import Settings
 from src.deps import (
     WWW_AUTHENTICATE,
+    AdminGuard,
     AnalystGuard,
     RoleDocumentedRoute,
     ViewerGuard,
     WriterGuard,
     bearer_scheme,
+    limiter_from_request,
     rate_limit,
     role_denied_detail,
     settings_from_request,
@@ -99,13 +113,16 @@ from src.models import (
     LogLevel,
     LogPage,
     LogQuery,
+    MemorySnapshot,
     PageInfo,
     PrincipalResponse,
     SearchRequest,
     SortOrder,
+    StatsSnapshot,
     TokenResponse,
     clamp_limit,
 )
+from src.stats import MAX_STATS_BUCKETS, compute_stats, empty_snapshot
 from src.store import (
     CompiledFilter,
     Filter,
@@ -536,9 +553,18 @@ async def read_me(principal: ViewerGuard) -> PrincipalResponse:
 #                                  is a different resource from the request bucket and therefore
 #                                  a 429 with a different `detail`.)
 #
-#  Still to be gated, by the commit that adds the route:
-#      GET  /stats              -> viewer     (C11 — ViewerGuard)
-#      GET  /debug/memory       -> admin      (C11 — AdminGuard)
+#  Landed in C11 (stats + the operational probe):
+#      GET  /stats              -> viewer     (ViewerGuard. Reading aggregates over the corpus is
+#                                  reading the corpus — the same rung as the list route, because
+#                                  a role that may see every entry may certainly see their sum.)
+#      GET  /debug/memory       -> admin      (AdminGuard — the top of the ladder, and the only
+#                                  route in the file that reports on the *process* rather than
+#                                  on the logs. RSS, ring occupancy and the limiter's bucket
+#                                  table are operational facts about the deployment; a `writer`
+#                                  that may append has no business reading them, which is what
+#                                  `test_debug_memory_requires_admin_403_for_writer` pins.)
+#
+#  Nothing in this file is ungated apart from `POST /auth/token`.
 #
 #  `tests/integration/test_rbac_api.py::test_role_matrix_across_every_guarded_route` is the
 #  single test that pins the ladder half. It is data-driven: adding a route above means adding
@@ -1410,3 +1436,219 @@ async def get_log_entry(
             detail=f"no log entry with id {entry_id[:_ECHO_ID_CHARS]!r}",
         )
     return entry
+
+
+# =============================================================================================
+#  --- stats & diagnostics (C11) ---
+# ---------------------------------------------------------------------------------------------
+#  Declared BELOW the `/logs*` block and that is safe: neither path starts with `/logs`, so
+#  neither participates in the `/logs/{entry_id}` wildcard-ordering hazard documented above, and
+#  neither may be moved into that block. Same reasoning as the `/auth/*` pair at the top of the
+#  file — routes that share no prefix with the wildcard are ordering-independent.
+#
+#  What these two have in common is that they are the endpoints something *else* reads: C12's E2E
+#  verifier gates on `/stats` agreeing with `/logs`, its load harness gates on `/debug/memory`
+#  staying under `MAX_BACKEND_MEM_MB`, and C13's dashboard polls `/stats` every five seconds.
+#  They are instrumentation, so they are held to the instrument's standard: cheap enough to poll,
+#  and never the thing that fails.
+# =============================================================================================
+
+
+@router.get(
+    "/stats",
+    response_model=StatsSnapshot,
+    tags=["stats"],
+    summary="Aggregate statistics over the filtered corpus (viewer role)",
+    responses={
+        status.HTTP_400_BAD_REQUEST: {
+            "model": ErrorBody,
+            "description": "Incoherent query: `since` after `until`.",
+        },
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_403_FORBIDDEN: FORBIDDEN_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
+    },
+)
+async def read_stats(
+    request: Request,
+    principal: ViewerGuard,
+    level: Annotated[
+        list[LogLevel] | None,
+        Query(description="Match any of these levels. Repeatable: `?level=ERROR&level=FATAL`."),
+    ] = None,
+    service: Annotated[
+        list[str] | None,
+        Query(description="Match any of these service names. Repeatable."),
+    ] = None,
+    host: Annotated[
+        list[str] | None,
+        Query(description="Match any of these host names. Repeatable."),
+    ] = None,
+    since: Annotated[
+        datetime | None,
+        Query(
+            description="Inclusive lower bound on `ts` (RFC-3339). Naive input is read as UTC.",
+        ),
+    ] = None,
+    until: Annotated[
+        datetime | None,
+        Query(
+            description="Inclusive upper bound on `ts` (RFC-3339). Naive input is read as UTC.",
+        ),
+    ] = None,
+    q: Annotated[
+        str | None,
+        Query(
+            max_length=MAX_Q_LEN,
+            description="Case-insensitive substring match over `message`. Same ceiling, and the "
+            "same meaning, as on `GET /logs`.",
+        ),
+    ] = None,
+    bucket_sec: Annotated[
+        int | None,
+        Query(
+            ge=1,
+            le=86_400,
+            description=(
+                "Histogram resolution in seconds. Defaults to `STATS_BUCKET_SEC`. A request that "
+                f"would exceed {MAX_STATS_BUCKETS} points is **folded** to a coarser width and "
+                "the effective value is reported in `window.bucket_sec` — the series is never "
+                "truncated, so the window always covers the whole match set."
+            ),
+        ),
+    ] = None,
+) -> StatsSnapshot:
+    """Aggregate the entries matching the filter: counts, a histogram, top errors, ingest rate.
+
+    **Takes exactly the filter vocabulary `GET /logs` takes**, through the same `LogQuery` model
+    and the same `Filter.from_query`, and aggregates over the same `store.iter_matching`. That
+    shared path is the whole point of this route's design rather than an implementation detail:
+
+        `stats.total` == `GET /logs` `page.total`, for the same filter, **by construction**.
+
+    Not by two handlers being careful — by there being one filter compiler, one iterator and one
+    definition of "matches". A dashboard can therefore put a number and a table side by side
+    without ever having to explain why they disagree by three.
+
+    Computed on demand, one pass, no incremental counters. Incremental aggregates are inherently
+    unfiltered and would need a second code path the moment `?service=…` appears — see
+    `src/stats.py`'s module docstring for the full argument.
+
+    `ingest` is the deliberate exception: it describes **the store**, not the query. "How fast
+    are logs arriving" is a property of the process, and an entry evicted an hour ago cannot be
+    tested against a filter, so filtering it would report a smaller number that answers nothing.
+
+    Three things this route will not do, in ascending order of temptation:
+
+    * It does not `500` on an over-narrow filter. Nothing matched is a normal answer: zeros,
+      empty maps, empty arrays, `null` bounds, and a `200`.
+    * It does not truncate the histogram to fit a ceiling. It folds to a coarser bucket and says
+      so, because a series that silently stops early is a chart that lies about its own window.
+    * It does not paginate. The response is bounded by construction — at most
+      `MAX_STATS_BUCKETS` points, at most `top_n` messages, and one key per observed level and
+      service — so there is nothing here that grows with the corpus.
+    """
+    # Same model, same coherence rules, same 400 as `GET /logs` and `GET /logs/stream`. The
+    # pagination fields are absent because there is nothing to paginate, but `since <= until` is
+    # checked here exactly as it is there — a bound pair the list route rejects must not be
+    # quietly accepted by the route that summarises the same set.
+    try:
+        query = LogQuery(
+            level=level, service=service, host=host, since=since, until=until, q=q
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=_query_error_detail(exc)
+        ) from exc
+
+    store, settings = _runtime_parts(request)
+    width = bucket_sec if bucket_sec is not None else _stats_bucket_sec(settings, request)
+
+    # `now` is passed in rather than read inside `compute_stats`, so the aggregation has no
+    # clock of its own: a test can pin `window.generated_at` exactly instead of asserting a
+    # tolerance around whatever the wall clock happened to say mid-pass.
+    now = time.time()
+    if store is None:
+        return empty_snapshot(bucket_sec=width, now=now)
+
+    return compute_stats(store, Filter.from_query(query), bucket_sec=width, now=now)
+
+
+@router.get(
+    "/debug/memory",
+    response_model=MemorySnapshot,
+    tags=["debug"],
+    summary="Process memory and runtime occupancy (admin role)",
+    responses={
+        status.HTTP_401_UNAUTHORIZED: UNAUTHENTICATED_RESPONSE,
+        status.HTTP_403_FORBIDDEN: FORBIDDEN_RESPONSE,
+        status.HTTP_429_TOO_MANY_REQUESTS: RATE_LIMITED_RESPONSE,
+    },
+)
+async def read_memory(request: Request, principal: AdminGuard) -> MemorySnapshot:
+    """Report this process's resident memory and what is currently occupying it. **Admin only.**
+
+    This is the probe C12's E2E verifier and load harness both gate on, and the reason it is a
+    route rather than a log line is that **RSS has to be reported by the server**. A harness can
+    measure its own memory, or its container's, or infer something from response sizes; none of
+    those is the number that matters, and all of them are easy to mistake for it. The process
+    that owns the ring is the only thing that can honestly say how much memory the ring costs.
+
+    Everything a harness wants arrives in **one call**, deliberately: RSS, ring occupancy, the
+    eviction count, live SSE subscriptions, and the limiter's bucket table. Four requests would
+    sample four different instants and call the result a snapshot — and under the load these
+    numbers are collected during, those instants are not interchangeable.
+
+    Why `admin` and not `analyst`: every other route in this file reports on the *logs*. This one
+    reports on the *deployment* — how much memory the box is using, how many connections are
+    open, how many principals the limiter is tracking. That is operational intelligence about the
+    service itself, and the role ladder's top rung is exactly where the README puts
+    "debug/operational routes".
+
+    `memory_mb` degrades to `0.0` rather than raising: a diagnostic that can itself fail is a
+    diagnostic that stops being reachable at exactly the moment it is needed. A `0.0` is
+    visibly wrong to a human and fails any sane memory gate, which is the right shape of failure
+    for this route — loud in the data, never in the status code.
+    """
+    store, _ = _runtime_parts(request)
+    limiter = limiter_from_request(request)
+
+    return MemorySnapshot(
+        memory_mb=_process_rss_mb(),
+        entries=0 if store is None else store.size(),
+        capacity=0 if store is None else store.capacity(),
+        evicted=0 if store is None else store.evicted(),
+        subscribers=0 if store is None else store.subscriber_count(),
+        rate_buckets=0 if limiter is None else limiter.bucket_count(),
+    )
+
+
+def _stats_bucket_sec(settings: Settings | None, request: Request) -> int:
+    """The configured histogram width, with the same defensive read every other setting gets.
+
+    ``_runtime_parts`` yields ``None`` for a half-wired runtime, and a stats request against one
+    still has to answer *something*. :func:`~src.deps.settings_from_request` already owns that
+    fallback (it logs and returns ``get_settings()``), so this defers to it rather than inventing
+    a second default that could drift from ``STATS_BUCKET_SEC``.
+    """
+    resolved = settings if settings is not None else settings_from_request(request)
+    return max(1, int(resolved.stats_bucket_sec))
+
+
+def _process_rss_mb() -> float:
+    """This process's resident set size in MiB, or ``0.0`` if the platform will not say.
+
+    Wrapped in a bare ``except`` on purpose, which is a thing this codebase otherwise avoids.
+    ``psutil`` reads ``/proc`` (or the Mach/Windows equivalent) and can fail for reasons that
+    have nothing to do with this service: a container with ``/proc`` masked, a hardened kernel, a
+    platform psutil supports imperfectly. None of those is a reason for the operational probe to
+    return a ``500`` — the caller is asking "how is the process doing", and "I could not measure
+    it" is a legitimate answer to give at ``200`` with a visibly wrong number in the field.
+    """
+    if psutil is None:  # pragma: no cover - psutil is pinned and always present in CI
+        return 0.0
+    try:
+        return psutil.Process().memory_info().rss / 1024**2
+    except Exception:  # noqa: BLE001 - see the docstring; a probe must not be the thing that 500s
+        logger.warning("psutil could not read this process's RSS", exc_info=True)
+        return 0.0

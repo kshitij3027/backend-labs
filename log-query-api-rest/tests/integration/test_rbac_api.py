@@ -40,6 +40,9 @@ TOKEN_URL = f"{API_V1_PREFIX}/auth/token"
 ME_URL = f"{API_V1_PREFIX}/auth/me"
 LOGS_URL = f"{API_V1_PREFIX}/logs"
 SEARCH_URL = f"{API_V1_PREFIX}/logs/search"
+STREAM_URL = f"{API_V1_PREFIX}/logs/stream"
+STATS_URL = f"{API_V1_PREFIX}/stats"
+MEMORY_URL = f"{API_V1_PREFIX}/debug/memory"
 
 #: The single-fetch route as it appears in ``/openapi.json``. ``.format(entry_id=…)`` turns it
 #: into a concrete path, so the RBAC matrix and the OpenAPI assertions can share one spelling.
@@ -480,9 +483,34 @@ class GuardedRoute:
 #:
 #: This tuple is the single place the table is written down, and both tests below iterate it: the
 #: live matrix sweeps all four demo roles across every row, and the OpenAPI test asserts every row
-#: is discoverable in the published document. C9 has since added its row and got the whole sweep
-#: for free; C10/C11 extend it the same way — ``GET /logs/stream`` (analyst), ``GET /stats``
-#: (viewer), ``GET /debug/memory`` (admin).
+#: is discoverable in the published document. C9 added its row and got the whole sweep for free;
+#: C11 has now added ``GET /stats`` (viewer) and ``GET /debug/memory`` (admin) the same way.
+#:
+#: .. rubric:: One route is deliberately excluded: ``GET /logs/stream``
+#:
+#: It is gated (``analyst``, via ``StreamGuard``) and it belongs in spirit, but it **cannot be
+#: driven by this table**, and the reason is structural rather than a matter of effort:
+#:
+#: * Both tests here drive ``TestClient``, which buffers the entire response body before
+#:   returning. ``tests/integration/test_stream_api.py``'s module docstring explains at length
+#:   why that deadlocks on an open-ended SSE response — it is why that suite starts its own
+#:   in-process uvicorn server on an ephemeral port.
+#: * ``?max_events=1`` does not rescue it. The generator emits its ``ready`` frame, finds nothing
+#:   to replay, and then parks on ``await sub.queue.get()`` forever, because nothing in this
+#:   sweep appends. Every *permitted*-role cell would hang rather than fail, and this project
+#:   pins no pytest timeout — so the failure mode is a CI job killed by the runner with no
+#:   failing test to point at, which is strictly worse than a missing row.
+#: * Forcing termination through ``?last_event_id=…`` so a replayed frame satisfies ``max_events``
+#:   would work, but it would turn a role assertion into a replay assertion that silently depends
+#:   on the fixture corpus still being resident in the ring.
+#:
+#: Neither half of the coverage is actually lost. The live gate is asserted by
+#: ``test_stream_api.py::test_stream_requires_analyst_403_for_viewer`` against a real socket, and
+#: the published requirement is asserted by
+#: :func:`test_openapi_documents_the_excluded_stream_route` below — which exists precisely so this
+#: exclusion is a recorded decision with a test attached, not an oversight the next reader has to
+#: rediscover. A route added here that *can* be driven by ``TestClient`` still belongs in the
+#: tuple: adding a row is two lines and buys the whole 4x1 sweep.
 GUARDED_ROUTES: tuple[GuardedRoute, ...] = (
     GuardedRoute("GET", ME_URL, Role.VIEWER, 200),
     GuardedRoute("GET", LOGS_URL, Role.VIEWER, 200),
@@ -491,6 +519,10 @@ GUARDED_ROUTES: tuple[GuardedRoute, ...] = (
     # C9. The empty body is a complete, valid `SearchRequest`: every field defaults, so `{}` means
     # "everything, newest first" — which makes this row a role assertion and nothing else.
     GuardedRoute("POST", SEARCH_URL, Role.ANALYST, 200, body={}),
+    # C11. Both take no body and no required parameter, so each row is a pure role assertion:
+    # `/stats` defaults to the whole corpus, and the memory probe takes nothing at all.
+    GuardedRoute("GET", STATS_URL, Role.VIEWER, 200),
+    GuardedRoute("GET", MEMORY_URL, Role.ADMIN, 200),
 )
 
 
@@ -509,8 +541,10 @@ def test_role_matrix_across_every_guarded_route(seeded_client, corpus, username,
     buy and which no amount of prose can guarantee on its own.
 
     The expectation is computed from :func:`~src.auth.role_satisfies` rather than typed out, so
-    the ladder's inclusiveness is asserted the same way in sixteen places without sixteen chances
-    to mistype it.
+    the ladder's inclusiveness is asserted the same way in every cell without one chance per cell
+    to mistype it. (Deliberately not a literal count: the matrix is ``len(GUARDED_ROUTES) x 4``
+    and grows with every gated route, so a number written here would go stale on the next commit
+    — as it did once already.)
     """
     held = DEV_ACCOUNTS[username][1]
 
@@ -578,6 +612,30 @@ def test_openapi_marks_the_append_route_as_a_writer_creation(client):
     assert "403" in operation["responses"]
     assert operation[REQUIRED_ROLE_EXTENSION] == Role.WRITER.value
     assert operation["tags"] == ["logs"]
+
+
+def test_openapi_documents_the_excluded_stream_route(client):
+    """The one gated route :data:`GUARDED_ROUTES` cannot sweep still publishes its requirement.
+
+    ``GET /logs/stream`` is excluded from the table for the structural reason set out above its
+    definition — ``TestClient`` cannot drive an open-ended SSE response. That exclusion costs the
+    live 4x1 sweep, which ``test_stream_api.py`` covers against a real socket; it must not also
+    cost the *documentation* assertion, which needs nothing but a ``GET /openapi.json`` and is
+    therefore perfectly expressible here.
+
+    This matters more for this route than for any other in the file. ``/logs/stream`` is the only
+    one that cannot compose one of the four ``*Guard`` aliases — its principal comes from
+    ``?access_token=`` as well as the header, so it builds its own guard and stamps
+    ``_MINIMUM_ROLE_ATTR`` by hand. A hand-stamped attribute is exactly the kind that can be
+    dropped in a refactor without anything visibly breaking: enforcement would carry on working
+    while the route quietly vanished from the published ladder and started looking ungated to a
+    policy linter. This is the assertion that would fail.
+    """
+    operation = client.get("/openapi.json").json()["paths"][STREAM_URL]["get"]
+
+    assert operation[REQUIRED_ROLE_EXTENSION] == Role.ANALYST.value
+    assert role_requirement_note(Role.ANALYST) in operation["description"]
+    assert "403" in operation["responses"]
 
 
 def test_openapi_leaves_the_public_token_route_ungated(client):

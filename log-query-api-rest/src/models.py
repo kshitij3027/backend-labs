@@ -1199,6 +1199,203 @@ class PrincipalResponse(BaseModel):
         )
 
 
+# =============================================================================================
+#  The stats and diagnostics surface (C11) — `GET /stats` and `GET /debug/memory`
+# ---------------------------------------------------------------------------------------------
+#  These are wire shapes only. The computation lives in `src/stats.py`, which imports from here
+#  and is imported by `src/api/v1.py` — one direction, no cycle, and the models stay readable as
+#  a description of the response rather than as a by-product of how it is calculated.
+#
+#  Every timestamp below goes through `_rfc3339_z`, the same serializer `LogEntry.ts` uses. A
+#  second formatter would be two definitions of "the API's timestamp format", and the one thing
+#  worse than an awkward format is two of them.
+# =============================================================================================
+
+
+class BucketPoint(BaseModel):
+    """One point of the ``/stats`` histogram: a bucket's start instant and how many landed in it.
+
+    ``bucket_start`` is the **inclusive left edge**, floor-aligned to a multiple of the effective
+    ``bucket_sec`` — not to the first matching entry. Alignment to the data would mean two
+    windows over the same corpus produced bars that do not line up, so "this hour vs the hour
+    before" would compare differently-phased buckets. The right edge is implicit
+    (``bucket_start + window.bucket_sec``) rather than carried, because a redundant field is a
+    field that can disagree with the one it is derived from.
+    """
+
+    bucket_start: datetime = Field(
+        description="Inclusive start of the bucket, RFC-3339 UTC with a 'Z' suffix.",
+        examples=["2026-07-27T10:31:00.000Z"],
+    )
+    count: int = Field(
+        description="Matching entries whose `ts` falls in this bucket. Zero-filled: a bucket "
+        "with no entries is present with `0`, never omitted."
+    )
+
+    @field_serializer("bucket_start")
+    def _serialise_bucket_start(self, value: datetime) -> str:
+        """The API's one timestamp format. See :func:`_rfc3339_z`."""
+        return _rfc3339_z(value)
+
+
+class TopMessage(BaseModel):
+    """One row of the ``top_errors`` ranking: a message and how often it recurred.
+
+    The raw message text, not a normalised or templated form. Clustering "connection refused to
+    10.0.0.4" with "connection refused to 10.0.0.7" is a genuinely useful feature and a genuinely
+    hard one; guessing at it here would produce a ranking that is *sometimes* right, which is
+    worse than one that is always literal and can be reasoned about.
+    """
+
+    message: str = Field(
+        description="The message text, verbatim.",
+        examples=["connection refused"],
+    )
+    count: int = Field(description="How many ERROR/FATAL entries in the match set carry it.")
+
+
+class IngestStats(BaseModel):
+    """Store-level throughput and occupancy. **The one filter-independent part of a snapshot.**
+
+    Every other facet of :class:`StatsSnapshot` describes the *match set*; this one describes the
+    *store*. There is no coherent way to filter it — an entry evicted an hour ago cannot be
+    tested against ``?service=auth-svc``, because it is gone — so filtering it would mean
+    reporting a smaller number that is not the answer to any question. See ``src/stats.py``'s
+    module docstring, and ``test_ingest_is_filter_independent`` which pins it.
+    """
+
+    entries_total: int = Field(
+        description="Every entry ever appended to this process, including evicted ones. "
+        "Monotone; never resets while the process lives."
+    )
+    resident: int = Field(description="Entries currently held in the ring.")
+    capacity: int = Field(description="The ring's fixed capacity.")
+    evicted: int = Field(
+        description="Entries dropped to make room. `entries_total - resident`."
+    )
+    per_sec: float = Field(
+        description="Appends per second over a bounded recent window. `0.0` until at least two "
+        "appends exist — one sample gives no interval to divide by."
+    )
+
+
+class StatsWindow(BaseModel):
+    """The bounds of the match set, and the resolution the histogram was actually computed at.
+
+    ``bucket_sec`` is the **effective** width, which is not necessarily the requested one: a
+    request that would have produced more than ``src.stats.MAX_STATS_BUCKETS`` points is folded
+    to a coarser width, and both values are reported so a client can label its own axis
+    correctly instead of assuming it got what it asked for. Silently serving a different
+    resolution under the requested name is the failure this pair exists to prevent.
+
+    ``earliest``/``latest`` are ``null`` on an empty match set — not the epoch, and not ``now``.
+    A filter that matches nothing has no window, and inventing one would make an empty result
+    plot as a spike at 1970.
+    """
+
+    earliest: datetime | None = Field(
+        default=None,
+        description="Oldest `ts` in the match set; null when nothing matched.",
+        examples=["2026-07-27T10:00:00.000Z"],
+    )
+    latest: datetime | None = Field(
+        default=None,
+        description="Newest `ts` in the match set; null when nothing matched.",
+        examples=["2026-07-27T10:31:04.512Z"],
+    )
+    bucket_sec: int = Field(
+        description="**Effective** histogram bucket width in seconds — what the `buckets` array "
+        "actually uses, after any folding."
+    )
+    requested_bucket_sec: int = Field(
+        description="Width the caller asked for (or the configured default). Differs from "
+        "`bucket_sec` exactly when the series was folded to stay under the point ceiling."
+    )
+    generated_at: datetime = Field(
+        description="When this snapshot was computed, RFC-3339 UTC with a 'Z' suffix.",
+        examples=["2026-07-27T10:31:05.000Z"],
+    )
+
+    @field_serializer("earliest", "latest", "generated_at")
+    def _serialise_instants(self, value: datetime | None) -> str | None:
+        """Same format as every other timestamp in this API; ``null`` stays ``null``."""
+        return None if value is None else _rfc3339_z(value)
+
+
+class StatsSnapshot(BaseModel):
+    """The body of ``GET /api/v1/stats`` — aggregates over exactly the filtered set.
+
+    ``total`` is the same number ``GET /logs`` reports as ``page.total`` for the same filter, and
+    that is not a coincidence to be maintained by discipline: both walk
+    :meth:`~src.store.LogStore.iter_matching` with the same filter object, so the equality holds
+    by construction. ``tests/integration/test_stats_api.py::
+    test_stats_total_equals_list_page_total_for_same_filter`` asserts it over real HTTP, and
+    C12's E2E verifier asserts it again against a running container.
+
+    ``by_level`` and ``by_service`` contain **observed keys only** — a level with no matching
+    entries is absent, not present with a zero. Zero-filling here would erase the difference
+    between "this service produced nothing matching" and "this service does not exist", which is
+    exactly the difference an operator is looking at the panel to find. The histogram *is*
+    zero-filled, because a time series with holes is a chart that lies; a key-value tally with
+    holes is just a tally.
+    """
+
+    total: int = Field(
+        description="Entries matching the filter. Equals `page.total` from `GET /logs` for the "
+        "same filter."
+    )
+    by_level: dict[str, int] = Field(
+        description="`level -> count` over the match set. Observed levels only.",
+        examples=[{"INFO": 812, "WARN": 140, "ERROR": 44, "FATAL": 4}],
+    )
+    by_service: dict[str, int] = Field(
+        description="`service -> count` over the match set. Observed services only.",
+        examples=[{"auth-svc": 400, "payments-api": 388}],
+    )
+    buckets: list[BucketPoint] = Field(
+        description="Time histogram over the match set, oldest first, contiguous and "
+        "zero-filled at `window.bucket_sec` resolution. Empty when nothing matched."
+    )
+    top_errors: list[TopMessage] = Field(
+        description="Most frequent ERROR/FATAL messages, most frequent first, ties broken "
+        "lexicographically so the ranking is a total order."
+    )
+    window: StatsWindow = Field(
+        description="Bounds of the match set and the effective histogram resolution."
+    )
+    ingest: IngestStats = Field(
+        description="Store-level throughput and occupancy. Deliberately NOT filtered."
+    )
+
+
+class MemorySnapshot(BaseModel):
+    """The body of ``GET /api/v1/debug/memory`` — the admin-only operational probe.
+
+    **Server-reported, never client-side.** The number that matters is this process's resident
+    set as the kernel sees it; a harness measuring its own memory, or inferring the server's from
+    response sizes, is measuring something else entirely. C12's E2E verifier and load harness both
+    gate on ``memory_mb`` from this route, which is why it exists at all.
+
+    Everything a load harness wants arrives in one call — RSS, ring occupancy, eviction count,
+    live SSE subscriptions and the limiter's bucket table — because a harness that has to make
+    four requests to build one picture is sampling four different instants and calling it a
+    snapshot.
+    """
+
+    memory_mb: float = Field(
+        description="Resident set size of the API process in MiB, as reported by the OS. "
+        "`0.0` if the platform refused to answer — a probe must never be the thing that 500s."
+    )
+    entries: int = Field(description="Entries currently resident in the ring.")
+    capacity: int = Field(description="The ring's fixed capacity.")
+    evicted: int = Field(description="Entries dropped from the ring to make room.")
+    subscribers: int = Field(description="Live SSE subscriptions process-wide.")
+    rate_buckets: int = Field(
+        description="Token buckets the rate limiter is currently holding — one per recently "
+        "seen principal, swept when idle, so this is the limiter's live memory footprint."
+    )
+
+
 def clamp_limit(requested: int | None, settings: Settings) -> tuple[int, bool]:
     """Resolve a client's ``limit`` into an effective page size. **Never raises.**
 
