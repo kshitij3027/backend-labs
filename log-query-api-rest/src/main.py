@@ -41,6 +41,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
+from src.api.dashboard import STATIC_DIR, NoCacheStaticFiles
+from src.api.dashboard import router as dashboard_router
 from src.api.health import router as health_router
 from src.api.v1 import router as v1_router
 from src.config import Settings, get_settings
@@ -507,6 +509,23 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     # a THIRD `include_router` line here beside v1; it never edits v1's shapes.
     app.include_router(health_router)
     app.include_router(v1_router)
+
+    # The dashboard, last, and mounted at its own prefix rather than at the root. Starlette
+    # matches routes and mounts in registration order, so a `StaticFiles` mounted at `/` would
+    # sit in front of everything registered after it — and, being a mount, it swallows the whole
+    # subtree rather than one path. `/static` cannot collide with `/api/v1`, `/health` or the
+    # docs paths by construction. `GET /` itself is an ordinary route on the dashboard router
+    # (see `src/api/dashboard.py`), not a mount, so it matches exactly one path and nothing else.
+    #
+    # Guarded on existence because `StaticFiles` raises at CONSTRUCTION time when its directory
+    # is absent — that is an import-time crash of the whole API over an optional UI, which is
+    # precisely backwards. Without the assets the API still serves; the dashboard route 404s.
+    # `NoCacheStaticFiles`, not the stock `StaticFiles`: these filenames carry no content hash,
+    # so without an explicit `Cache-Control` a browser is free to reuse a cached `app.js` across
+    # a redeploy without asking. See `src/api/dashboard.py` for the full reasoning.
+    if STATIC_DIR.is_dir():
+        app.mount("/static", NoCacheStaticFiles(directory=STATIC_DIR), name="static")
+    app.include_router(dashboard_router)
 
     return app
 

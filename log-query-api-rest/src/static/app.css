@@ -1,0 +1,340 @@
+/* Log Query API dashboard — dark, plain CSS, no framework and no build step.
+ *
+ * The layout rule that matters: nothing on this page may make the BODY scroll sideways. Wide
+ * things (the log table, the tail rows) get their own `overflow-x: auto` container instead, so
+ * at a 375px viewport the page reflows and only the table slides. That is why the table lives
+ * inside `.table-scroll` and why every grid below collapses to one column under 720px.
+ */
+
+:root {
+  --bg: #0f1115;
+  --bg-elev: #171a21;
+  --bg-input: #10131a;
+  --border: #272c38;
+  --border-soft: #1e222c;
+  --text: #e6e8ee;
+  --text-dim: #98a1b2;
+  --accent: #6aa9ff;
+  --accent-strong: #4d8dff;
+  --ok: #4cc38a;
+
+  --lvl-DEBUG: #6c7893;
+  --lvl-INFO: #4cc38a;
+  --lvl-WARN: #f5a623;
+  --lvl-ERROR: #ff6a6a;
+  --lvl-FATAL: #ff3b3b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  /* The page-level guarantee. Anything that wants to be wider than the viewport has to say so
+   * inside its own scroll container. */
+  overflow-x: hidden;
+}
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: var(--bg-input);
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+a { color: var(--accent); }
+
+.muted { color: var(--text-dim); }
+.small { font-size: 12px; }
+
+/* ---------------------------------------------------------------- topbar -- */
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 16px;
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+}
+.brand { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.brand-mark { color: var(--accent); font-size: 12px; }
+.brand h1 { font-size: 16px; margin: 0; font-weight: 600; }
+.brand-sub { font-size: 11px; color: var(--text-dim); letter-spacing: 0.04em; }
+.topbar-right { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.chip, .badge {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.chip-role { color: var(--accent); border-color: rgba(106, 169, 255, 0.4); }
+.chip-tier { color: var(--ok); border-color: rgba(76, 195, 138, 0.4); }
+.badge-rl[data-level="ok"]   { color: var(--ok); border-color: rgba(76, 195, 138, 0.4); }
+.badge-rl[data-level="low"]  { color: var(--lvl-WARN); border-color: rgba(245, 166, 35, 0.5); }
+.badge-rl[data-level="none"] { color: var(--lvl-ERROR); border-color: rgba(255, 106, 106, 0.6); }
+
+/* --------------------------------------------------------------- banners -- */
+.banner {
+  padding: 10px 16px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border);
+}
+.banner-429   { background: rgba(245, 166, 35, 0.14); color: #ffd79a; }
+.banner-error { background: rgba(255, 106, 106, 0.14); color: #ffc0c0; }
+
+/* ---------------------------------------------------------------- layout -- */
+.layout { padding: 16px; max-width: 1400px; margin: 0 auto; }
+
+.panel {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-bottom: 16px;
+}
+.panel h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.panel h3 { font-size: 12px; margin: 12px 0 6px; color: var(--text-dim); font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+
+/* ----------------------------------------------------------------- forms -- */
+label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin: 8px 0 3px;
+  letter-spacing: 0.02em;
+}
+input[type="text"], input[type="password"], select {
+  width: 100%;
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 9px;
+  font-size: 13px;
+  font-family: inherit;
+}
+input:focus, select:focus, button:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 1px;
+}
+select[multiple] { padding: 4px; }
+select[multiple] option { padding: 3px 6px; border-radius: 4px; }
+
+.btn {
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text);
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--accent); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-primary { background: var(--accent-strong); border-color: var(--accent-strong); color: #06111f; font-weight: 600; }
+.btn-primary:hover:not(:disabled) { background: var(--accent); }
+.btn-ghost { background: transparent; }
+
+.linkish {
+  font: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ----------------------------------------------------------------- login -- */
+.panel-login { max-width: 620px; }
+.panel-login form { margin-top: 6px; }
+.panel-login .btn-primary { margin-top: 12px; width: 100%; }
+.login-error {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: rgba(255, 106, 106, 0.14);
+  border: 1px solid rgba(255, 106, 106, 0.4);
+  color: #ffc0c0;
+  font-size: 12px;
+}
+.demo-accounts ul { list-style: none; margin: 0; padding: 0; }
+.demo-accounts li {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border-soft);
+  font-size: 12px;
+}
+.tag {
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+/* --------------------------------------------------------------- filters -- */
+.filter-grid { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
+.filter-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+
+/* ----------------------------------------------------------------- stats -- */
+.stat-cards, .level-cards {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.stat-cards  { grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); }
+.level-cards { grid-template-columns: repeat(auto-fit, minmax(88px, 1fr)); }
+
+.stat-card, .level-card {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.stat-label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.06em; }
+.stat-value { font-size: 19px; font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+.level-card.lvl-DEBUG { border-left: 3px solid var(--lvl-DEBUG); }
+.level-card.lvl-INFO  { border-left: 3px solid var(--lvl-INFO); }
+.level-card.lvl-WARN  { border-left: 3px solid var(--lvl-WARN); }
+.level-card.lvl-ERROR { border-left: 3px solid var(--lvl-ERROR); }
+.level-card.lvl-FATAL { border-left: 3px solid var(--lvl-FATAL); }
+
+.charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 6px; }
+.chart-box {
+  margin: 0;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  min-width: 0;
+}
+.chart-box figcaption { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+/* The definite height a responsive Chart.js canvas needs from its parent. See index.html. */
+.chart-canvas-wrap { position: relative; height: 180px; width: 100%; }
+.chart-box canvas { max-width: 100%; }
+
+/* ------------------------------------------------------------- log table -- */
+.count-pill {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+}
+.count-pill strong { color: var(--text); font-variant-numeric: tabular-nums; }
+
+/* The only element allowed to scroll horizontally. */
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+.log-table { width: 100%; border-collapse: collapse; font-size: 12px; min-width: 720px; }
+.log-table th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+}
+.log-table td { padding: 6px 10px; border-bottom: 1px solid var(--border-soft); vertical-align: top; }
+.log-table tbody tr:hover { background: rgba(106, 169, 255, 0.06); }
+.log-table .col-ts { white-space: nowrap; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.log-table .col-msg { overflow-wrap: anywhere; }
+
+.lvl {
+  display: inline-block;
+  min-width: 52px;
+  text-align: center;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.lvl-tag-DEBUG { color: var(--lvl-DEBUG); background: rgba(108, 120, 147, 0.16); }
+.lvl-tag-INFO  { color: var(--lvl-INFO);  background: rgba(76, 195, 138, 0.14); }
+.lvl-tag-WARN  { color: var(--lvl-WARN);  background: rgba(245, 166, 35, 0.16); }
+.lvl-tag-ERROR { color: var(--lvl-ERROR); background: rgba(255, 106, 106, 0.16); }
+.lvl-tag-FATAL { color: #fff; background: rgba(255, 59, 59, 0.75); }
+
+.table-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+
+/* -------------------------------------------------------------- live tail -- */
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); display: inline-block; }
+.dot[data-state="open"]  { background: var(--ok); box-shadow: 0 0 0 3px rgba(76, 195, 138, 0.18); }
+.dot[data-state="retry"] { background: var(--lvl-WARN); }
+.dot[data-state="error"] { background: var(--lvl-ERROR); }
+
+.tail-rows {
+  margin-top: 10px;
+  max-height: 340px;
+  overflow-y: auto;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-input);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+.tail-row {
+  display: flex;
+  gap: 8px;
+  padding: 3px 9px;
+  border-bottom: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.tail-row .t-msg { white-space: normal; overflow-wrap: anywhere; }
+.tail-row .t-ts { color: var(--text-dim); }
+.tail-row .t-svc { color: var(--accent); }
+.tail-note { padding: 6px 9px; color: var(--text-dim); }
+
+/* ------------------------------------------------------------------ foot -- */
+.foot { padding: 8px 16px 28px; text-align: center; }
+
+/* --------------------------------------------------------------- narrow --- */
+@media (max-width: 720px) {
+  .filter-grid { grid-template-columns: 1fr; }
+  .charts { grid-template-columns: 1fr; }
+  .layout { padding: 12px; }
+  .panel { padding: 12px; }
+  .topbar { padding: 10px 12px; }
+  /* At 375px the level select is otherwise the tallest thing on screen for no benefit. A fixed
+   * height rather than max-height: `size="5"` wins over max-height in several engines. */
+  select[multiple] { height: 118px; }
+}

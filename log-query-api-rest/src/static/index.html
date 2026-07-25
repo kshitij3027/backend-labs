@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Log Query API — Dashboard</title>
+<!-- An inline favicon. Not decoration: without it every page load costs a 404 on
+     /favicon.ico, which is noise in the very access log this project is about. -->
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>%F0%9F%93%9C</text></svg>">
+<link rel="stylesheet" href="/static/app.css">
+<!--
+  Chart.js, pinned, from jsDelivr. `defer` so it does not block parsing, and app.js checks for
+  `window.Chart` before touching it — the charts are the one part of this page that depends on
+  the network reaching outside the container, and an air-gapped run should lose two canvases,
+  not the dashboard.
+-->
+<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script defer src="/static/app.js"></script>
+</head>
+<body data-testid="dashboard-root">
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">&#9632;</span>
+    <h1>Log Query API</h1>
+    <span class="brand-sub">REST &middot; SSE &middot; RBAC</span>
+  </div>
+  <div class="topbar-right">
+    <span class="badge badge-rl" data-testid="ratelimit-badge" title="X-RateLimit-Remaining, read off the last response">rate limit: &mdash;</span>
+    <span class="chip chip-role" data-testid="chip-role" hidden>role: &mdash;</span>
+    <span class="chip chip-tier" data-testid="chip-tier" hidden>tier: &mdash;</span>
+    <span class="chip chip-subject" data-testid="chip-subject" hidden>&mdash;</span>
+    <button type="button" class="btn btn-ghost" data-testid="logout-button" hidden>Sign out</button>
+  </div>
+</header>
+
+<!-- Two banners, deliberately distinct. A 429 is a pacing signal the client is expected to
+     recover from; an error banner is a request that failed. Collapsing them would hide the
+     single most interesting thing this API does. -->
+<div class="banner banner-429" data-testid="ratelimit-banner" hidden></div>
+<div class="banner banner-error" data-testid="error-banner" hidden></div>
+
+<main class="layout">
+
+  <!-- ============================ LOGIN ============================ -->
+  <section class="panel panel-login" data-testid="login-panel">
+    <h2>Sign in</h2>
+    <p class="muted">
+      Exchanges credentials for a short-lived JWT at <code>POST /api/v1/auth/token</code>.
+      The token is held in <code>sessionStorage</code> — it dies with this tab.
+    </p>
+    <form data-testid="login-form" autocomplete="off">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" data-testid="login-username"
+             autocomplete="username" spellcheck="false" required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" data-testid="login-password"
+             autocomplete="current-password" required>
+      <button type="submit" class="btn btn-primary" data-testid="login-submit">Get token</button>
+    </form>
+    <div class="login-error" data-testid="login-error" hidden></div>
+
+    <!-- These four accounts are seeded in `src/auth.py` and are already public in this
+         repository. This is a learning project with an in-memory corpus of generated logs;
+         listing them here is what makes the RBAC ladder explorable in thirty seconds. -->
+    <div class="demo-accounts" data-testid="demo-accounts">
+      <h3>Demo accounts</h3>
+      <ul>
+        <li><button type="button" class="linkish" data-user="viewer"  data-pass="viewer-dev-pw">viewer</button>  <span class="muted">/ viewer-dev-pw</span>  <span class="tag">free &middot; read only</span></li>
+        <li><button type="button" class="linkish" data-user="analyst" data-pass="analyst-dev-pw">analyst</button> <span class="muted">/ analyst-dev-pw</span> <span class="tag">pro &middot; + search, stream</span></li>
+        <li><button type="button" class="linkish" data-user="writer"  data-pass="writer-dev-pw">writer</button>  <span class="muted">/ writer-dev-pw</span>  <span class="tag">pro &middot; + append</span></li>
+        <li><button type="button" class="linkish" data-user="admin"   data-pass="admin-dev-pw">admin</button>   <span class="muted">/ admin-dev-pw</span>   <span class="tag">enterprise &middot; everything</span></li>
+      </ul>
+      <p class="muted small">Sign in as <strong>viewer</strong> then try the live tail: the 403 is the point.</p>
+    </div>
+  </section>
+
+  <!-- ============================ SIGNED-IN SURFACE ============================ -->
+  <div class="signed-in" data-testid="signed-in" hidden>
+
+    <!-- ---- filters ---- -->
+    <section class="panel panel-filters">
+      <h2>Filters</h2>
+      <form data-testid="filter-form">
+        <div class="filter-grid">
+          <div class="field">
+            <label for="f-level">Level <span class="muted small">(multi)</span></label>
+            <select id="f-level" multiple size="5" data-testid="filter-level">
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARN">WARN</option>
+              <option value="ERROR">ERROR</option>
+              <option value="FATAL">FATAL</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="f-service">Service</label>
+            <input id="f-service" type="text" placeholder="auth-api" data-testid="filter-service" spellcheck="false">
+            <label for="f-host">Host</label>
+            <input id="f-host" type="text" placeholder="node-3" data-testid="filter-host" spellcheck="false">
+            <label for="f-q">Message contains</label>
+            <input id="f-q" type="text" placeholder="timeout" data-testid="filter-q" spellcheck="false">
+          </div>
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn btn-primary" data-testid="filter-apply">Apply</button>
+          <button type="button" class="btn btn-ghost" data-testid="filter-reset">Reset</button>
+          <span class="muted small">Applies to the table, the stats and the live tail.</span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ---- stats ---- -->
+    <section class="panel panel-stats" data-testid="stats-panel">
+      <h2>Statistics <span class="muted small" data-testid="stats-poll-state">polling every 5s</span></h2>
+      <div class="stat-cards">
+        <div class="stat-card"><span class="stat-label">matching</span><span class="stat-value" data-testid="stat-total">&mdash;</span></div>
+        <div class="stat-card"><span class="stat-label">ingest/sec</span><span class="stat-value" data-testid="stat-ingest">&mdash;</span></div>
+        <div class="stat-card"><span class="stat-label">resident</span><span class="stat-value" data-testid="stat-resident">&mdash;</span></div>
+        <div class="stat-card"><span class="stat-label">evicted</span><span class="stat-value" data-testid="stat-evicted">&mdash;</span></div>
+      </div>
+      <div class="level-cards" data-testid="stat-levels">
+        <div class="level-card lvl-DEBUG"><span class="stat-label">DEBUG</span><span class="stat-value" data-testid="stat-level-DEBUG">0</span></div>
+        <div class="level-card lvl-INFO"><span class="stat-label">INFO</span><span class="stat-value" data-testid="stat-level-INFO">0</span></div>
+        <div class="level-card lvl-WARN"><span class="stat-label">WARN</span><span class="stat-value" data-testid="stat-level-WARN">0</span></div>
+        <div class="level-card lvl-ERROR"><span class="stat-label">ERROR</span><span class="stat-value" data-testid="stat-level-ERROR">0</span></div>
+        <div class="level-card lvl-FATAL"><span class="stat-label">FATAL</span><span class="stat-value" data-testid="stat-level-FATAL">0</span></div>
+      </div>
+      <div class="charts">
+        <!-- The `.chart-canvas-wrap` is not decoration. A responsive Chart.js canvas sizes
+             itself to its parent, so with `maintainAspectRatio: false` the parent must have a
+             definite height or the chart collapses to zero (or grows without bound). A
+             positioned, fixed-height wrapper is the documented pattern. -->
+        <figure class="chart-box">
+          <figcaption>Level distribution</figcaption>
+          <div class="chart-canvas-wrap"><canvas data-testid="chart-levels"></canvas></div>
+        </figure>
+        <figure class="chart-box">
+          <figcaption>Entries per time bucket</figcaption>
+          <div class="chart-canvas-wrap"><canvas data-testid="chart-buckets"></canvas></div>
+        </figure>
+      </div>
+      <p class="muted small chart-fallback" data-testid="chart-fallback" hidden>
+        Chart.js could not be loaded from the CDN — the numbers above are unaffected.
+      </p>
+    </section>
+
+    <!-- ---- log table ---- -->
+    <section class="panel panel-logs">
+      <h2>
+        Log entries
+        <span class="count-pill">total <strong data-testid="log-total">&mdash;</strong></span>
+        <span class="count-pill">shown <strong data-testid="log-shown">0</strong></span>
+      </h2>
+      <div class="table-scroll">
+        <table class="log-table" data-testid="log-table">
+          <thead>
+            <tr><th>timestamp</th><th>level</th><th>service</th><th>host</th><th>message</th></tr>
+          </thead>
+          <tbody data-testid="log-tbody"></tbody>
+        </table>
+      </div>
+      <div class="table-actions">
+        <button type="button" class="btn btn-ghost" data-testid="load-more" hidden>Load more</button>
+        <span class="muted small" data-testid="log-status">&mdash;</span>
+      </div>
+    </section>
+
+    <!-- ---- live tail ---- -->
+    <section class="panel panel-tail" data-testid="tail-panel">
+      <h2>
+        Live tail
+        <span class="dot" data-testid="tail-state" data-state="idle"></span>
+        <span class="muted small" data-testid="tail-status">disconnected</span>
+      </h2>
+      <p class="muted small">
+        Native <code>EventSource</code> against <code>/api/v1/logs/stream</code>. Requires the
+        <strong>analyst</strong> role. Rendering is capped at 200 rows.
+      </p>
+      <div class="table-actions">
+        <button type="button" class="btn btn-primary" data-testid="tail-toggle">Connect</button>
+        <button type="button" class="btn btn-ghost" data-testid="tail-clear">Clear</button>
+        <span class="muted small" data-testid="tail-count">0 frames</span>
+      </div>
+      <div class="tail-rows" data-testid="tail-rows"></div>
+    </section>
+
+  </div>
+</main>
+
+<footer class="foot muted small">
+  Static page served by the API itself &mdash; same origin, no build step, no CORS in this path.
+  <a href="/docs">Swagger UI</a> &middot; <a href="/health">/health</a> &middot; <a href="/openapi.json">OpenAPI</a>
+</footer>
+
+</body>
+</html>
