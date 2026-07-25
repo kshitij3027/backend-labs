@@ -10,17 +10,19 @@ variable names are the upper-cased field names (``case_sensitive=False``), e.g. 
 <- ``STORE_CAPACITY``.
 
 C1 carries the **entire** settings surface up front — all sixteen rows of the README's config
-table, plus two documented extras (see below) — even though most keys are not read until a later
-commit. That is deliberate: ``docker-compose.yml`` passes every key through as ``${VAR:-default}``,
+table, plus ``bcrypt_rounds`` (seventeen fields; see below) — even though most keys are not read
+until a later commit. That is deliberate: ``docker-compose.yml`` passes every key through as ``${VAR:-default}``,
 and declaring them all now means the compose file never has to change again as features land.
 
-Two fields are NOT in the README's table:
+Two fields deserve a note:
 
 * ``api_port`` — host-side only and purely informational. The container CMD hard-codes
-  ``--port 8000``; compose maps ``${API_PORT:-8010}:8000``. Default is **8010**, not the
-  README's 8000, because sibling projects in this repo routinely hold ``:8000`` (the README's
-  own *How It Will Run* section already uses ``API_PORT=8010 make up``; C14 corrects the row).
-* ``bcrypt_rounds`` — the bcrypt work factor for the demo user hashes (C6). Production cost 12
+  ``--port 8000``; compose maps ``${API_PORT:-8010}:8000``. Default is **8010** because sibling
+  projects in this repo routinely hold ``:8000``. The README's config table documents 8010 to
+  match.
+* ``bcrypt_rounds`` — the one setting with no README table row, and the only field here that is
+  a test-speed knob rather than an operational one. The bcrypt work factor for the demo user
+  hashes (C6). Production cost 12
   is ~250 ms per hash, which would add minutes to the suite, so tests construct Settings with
   ``bcrypt_rounds=4`` (~2 ms). It is a knob purely so the tests can be fast without the
   production default being weak.
