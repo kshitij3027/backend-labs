@@ -1,0 +1,275 @@
+# GraphQL Log Query Platform — service topology (Commit C1).
+#
+# THREE long-lived services make up the stack, and `docker compose up` starts exactly those:
+#
+#   postgres  16-alpine   the durable store: log_entries + the C10 e-commerce event tables.
+#   redis     7-alpine    query-result cache, persisted-query documents, subscription pub/sub.
+#   api                   one uvicorn/FastAPI process on :8000 serving the WHOLE surface from a
+#                         single origin — POST /graphql, WS /graphql, GET /health, GET /metrics
+#                         and (from C13) the React SPA at / and /assets/*.
+#
+# `api` starts only once postgres AND redis report healthy (`condition: service_healthy`), so it
+# never races a database that is still running its own initdb. Both dependencies are internal to
+# the compose network: no host ports are published for them, because nothing outside the network
+# has any business talking to them and publishing 5432/6379 is the fastest way to collide with a
+# host-local Postgres or Redis.
+#
+# The profile-gated `test`, `e2e` (C12) and `loadtest` (C14) services run the pytest suite, the
+# black-box E2E verifier and the perf/load harness respectively — all three built from the SAME
+# Dockerfile.test image. None of them starts on a bare `docker compose up`. The two harnesses
+# reach the API by SERVICE NAME over the compose network (http://api:8000), never via a published
+# host port, so they are immune to an API_PORT collision on the host.
+#
+# `scripts/verify_e2e.py` and `scripts/load_test.py` do not exist yet — they land at C12 and C14.
+# Their services are DECLARED here anyway so this file never has to change as features arrive;
+# because both are profile-gated, a bare `docker compose up` is completely unaffected, and
+# `make e2e` / `make load` simply fail loudly ("No module named scripts.verify_e2e") until the
+# commit that writes them.
+#
+# Every one of src/config.py's settings keys is passed to `api` as ${VAR:-default}. That is the
+# point of declaring the entire settings surface at C1: the whole config is host-overridable and
+# this file never has to be revisited as later commits start reading those keys.
+#
+# TWO p95 CEILINGS, AND THEY MUST NEVER SHARE A NUMBER. `MAX_P95_MS` (the e2e service) bounds
+# SEQUENTIAL reads — one request in flight, so it measures service time and nothing else.
+# `LOAD_MAX_P95_MS` (the loadtest service) bounds the same operation at LOAD_CONCURRENCY in front
+# of a SINGLE uvicorn process, where Little's Law alone puts mean latency at
+# concurrency/throughput before the server has done anything wrong, and the tail sits well above
+# that. A p95 measured under queueing and a p95 measured without it are different quantities;
+# giving them one variable fails a healthy server on arithmetic.
+
+services:
+  # PostgreSQL — the durable store. Schema (log_entries, order_events, user_events,
+  # payment_events) is created by C2's retry-on-boot `create_all`, not by a migration tool: this
+  # is a single-service learning project, and an Alembic setup would be more machinery than the
+  # thing it manages.
+  #
+  # The mounted init directory creates the SEPARATE `gqllogs_test` database the `test` service
+  # points at. POSTGRES_DB only ever creates one database, and the suite must not share a
+  # database with a stack an operator may have running — a test that drops a table would
+  # otherwise drop THEIR table. The scripts in /docker-entrypoint-initdb.d run only on a FIRST
+  # init of an empty data directory, which is exactly why `make test` opens with
+  # `docker compose down -v`: pruning the volume guarantees the script has run.
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=gqllogs
+      - POSTGRES_PASSWORD=gqllogs
+      - POSTGRES_DB=gqllogs
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # CMD-SHELL (not CMD) because pg_isready's exit status is what we want and the shell form
+      # is how the official image documents it. -U/-d are required: without them pg_isready
+      # probes the `root` user and reports the server up while the target database is still
+      # being created, which is precisely the race `condition: service_healthy` exists to close.
+      test: ["CMD-SHELL", "pg_isready -U gqllogs -d gqllogs"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Redis — query-result cache (C7), persisted-query document store (C9) and the pub/sub bridge
+  # that lets subscriptions survive `uvicorn --workers N` (C6).
+  #
+  # `--save "" --appendonly no` disables BOTH persistence mechanisms. That is a correctness
+  # statement, not a performance tweak: everything Redis holds here is derived state with a TTL,
+  # so surviving a restart buys nothing and an RDB snapshot of a cache is a stale cache waiting
+  # to be served. The app treats every Redis miss — including "Redis is down" — as a cache miss
+  # and falls through to Postgres, so an empty Redis is a slow request, never a failed one.
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # Live production API — built from the production Dockerfile and the only service published on
+  # the host. No container_name (sibling convention: Docker refuses `--scale api=N` for N>1 when
+  # a custom container_name is set, and the Redis pub/sub bridge exists precisely so that scaling
+  # this service keeps subscriptions working).
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # An operator-supplied .env is optional: `required: false` keeps a clean clone runnable.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # --- Server / logging ---
+      # HOST/PORT are the spec's §7 names and are informational INSIDE the container: the image
+      # CMD hard-codes `--host 0.0.0.0 --port 8000`. The host-side port is the mapping below.
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8000}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # --- Database (C2) --- reached by SERVICE NAME over the compose network, never localhost.
+      - "DATABASE_URL=${DATABASE_URL:-postgresql+asyncpg://gqllogs:gqllogs@postgres:5432/gqllogs}"
+      - DB_POOL_SIZE=${DB_POOL_SIZE:-10}
+      - DB_MAX_OVERFLOW=${DB_MAX_OVERFLOW:-5}
+      - DB_INIT_RETRIES=${DB_INIT_RETRIES:-10}
+      - DB_INIT_RETRY_DELAY_SECONDS=${DB_INIT_RETRY_DELAY_SECONDS:-2.0}
+      # --- Redis (C6/C7/C9) ---
+      - "REDIS_URL=${REDIS_URL:-redis://redis:6379/0}"
+      # --- Seed corpus (C2/C10) --- deterministic, so the E2E verifier can grade against it.
+      - SEED_ENTRIES=${SEED_ENTRIES:-2000}
+      - SEED_ORDERS=${SEED_ORDERS:-200}
+      - RANDOM_SEED=${RANDOM_SEED:-20260725}
+      # --- Query limits (C3) ---
+      - DEFAULT_QUERY_LIMIT=${DEFAULT_QUERY_LIMIT:-100}
+      - MAX_QUERY_LIMIT=${MAX_QUERY_LIMIT:-500}
+      # --- Caching (C7/C11) ---
+      - CACHE_ENABLED=${CACHE_ENABLED:-true}
+      - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-30}
+      - AGG_CACHE_TTL_SECONDS=${AGG_CACHE_TTL_SECONDS:-60}
+      # --- Cost gating (C8) ---
+      - MAX_QUERY_DEPTH=${MAX_QUERY_DEPTH:-10}
+      - MAX_QUERY_COMPLEXITY=${MAX_QUERY_COMPLEXITY:-1000}
+      - MAX_QUERY_TOKENS=${MAX_QUERY_TOKENS:-2000}
+      - MAX_QUERY_ALIASES=${MAX_QUERY_ALIASES:-30}
+      # --- Persisted queries (C9) ---
+      - PERSISTED_QUERIES_ENABLED=${PERSISTED_QUERIES_ENABLED:-true}
+      - PERSISTED_QUERY_TTL_SECONDS=${PERSISTED_QUERY_TTL_SECONDS:-3600}
+      # --- DataLoader (C5) ---
+      - DATALOADER_BATCH_WINDOW_MS=${DATALOADER_BATCH_WINDOW_MS:-5}
+      # --- Subscriptions (C6/C12) ---
+      - SUBSCRIPTION_QUEUE_MAXSIZE=${SUBSCRIPTION_QUEUE_MAXSIZE:-500}
+      - MAX_SUBSCRIPTIONS_PER_CONNECTION=${MAX_SUBSCRIPTIONS_PER_CONNECTION:-10}
+      - SUBSCRIPTION_CHANNEL=${SUBSCRIPTION_CHANNEL:-graphql-log-query:events}
+      # --- GraphQL IDE / metrics / CORS ---
+      - GRAPHQL_PLAYGROUND_ENABLED=${GRAPHQL_PLAYGROUND_ENABLED:-true}
+      - METRICS_ENABLED=${METRICS_ENABLED:-true}
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    # The container always binds :8000; only the host side is tunable. The default is 8020, not
+    # 8000 or 8010, because sibling projects in this repo already hold both of those.
+    ports:
+      - "${API_PORT:-8020}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free (it touches neither Postgres nor Redis), so the app is healthy
+      # as soon as uvicorn binds; 25s covers image start plus C2's schema-create retry loop
+      # without flapping the container.
+      start_period: 25s
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code and
+  # requirements as `api`, plus tests/ and scripts/) and runs pytest. Profile-gated so it never
+  # starts on a bare `docker compose up`. Run via `make test`.
+  #
+  # TWO deliberate differences from the `api` service, and both are about determinism:
+  #   * DATABASE_URL points at a SEPARATE database (`gqllogs_test`, created by the postgres init
+  #     script above). The suite creates and drops tables; pointing it at `gqllogs` would let a
+  #     `make test` destroy the corpus of a stack the operator has running beside it.
+  #   * SEED_ENTRIES=0 / SEED_ORDERS=0 leave that database EMPTY. A test that needs a corpus
+  #     builds one explicitly with a known seed, so every expected count is derived from the
+  #     fixture rather than inherited from 2000 rows nobody in the test wrote down.
+  # It waits on postgres + redis healthy for the same reason `api` does: from C2 the integration
+  # tests open real connections to both by service name.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      # LITERALS, not ${VAR:-default}, and that is the one place in this file where a value is
+      # deliberately NOT host-overridable. Every other key here is a tuning knob; these two are a
+      # safety boundary. An operator who exports DATABASE_URL to point at their own Postgres and
+      # then runs `make test` would have the suite create and drop tables in it — so the suite's
+      # target is pinned in the file rather than inherited from an environment that has no idea a
+      # test run is about to happen. `.env` cannot reach these either: compose `environment`
+      # entries win over `env_file`.
+      - "DATABASE_URL=postgresql+asyncpg://gqllogs:gqllogs@postgres:5432/gqllogs_test"
+      # Redis logical DB 1, not 0: the suite flushes keys, and 0 is what a `make up` stack uses.
+      - "REDIS_URL=redis://redis:6379/1"
+      - SEED_ENTRIES=0
+      - SEED_ORDERS=0
+      # Quieter than the api's INFO so a failing assertion is not buried under startup lines.
+      # Literal for the same reason as above, and so LOG_LEVEL has exactly ONE host-overridable
+      # declaration in this file (on `api`) rather than two defaults that can disagree.
+      - LOG_LEVEL=WARNING
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # No -q: verbosity is centralized in pytest.ini (`addopts = -q --tb=short`). A second -q here
+    # would stack to -qq and suppress the "N passed in Xs" summary line.
+    command: ["pytest"]
+
+  # Black-box E2E verifier (C12). Reuses the tester image and runs scripts/verify_e2e.py against
+  # the LIVE api over the compose network (HTTP POST /graphql + a real graphql-transport-ws
+  # socket), reaching it by service name (TARGET_URL=http://api:8000), never a host port. Waits
+  # on the api healthcheck first, so it can never race a still-seeding corpus. Every gate below
+  # is host-overridable via ${VAR:-default} so a deliberately impossible bar proves the gate
+  # actually bites (`MAX_P95_MS=0 make e2e` MUST fail).
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - TARGET_URL=http://api:8000
+      - E2E_READY_TIMEOUT=${E2E_READY_TIMEOUT:-90}
+      # The SEQUENTIAL read ceiling — one request in flight, so it bounds service time. The load
+      # harness deliberately uses a DIFFERENT variable (LOAD_MAX_P95_MS) because a p95 taken at
+      # LOAD_CONCURRENCY is a different quantity and cannot share this number. See the header.
+      - MAX_P95_MS=${MAX_P95_MS:-250}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-600}
+      # Subscription checks: how long to wait for a frame at all, and the spec's Feature Area C
+      # ceiling on createLog -> socket end-to-end delivery latency.
+      - E2E_SUB_TIMEOUT=${E2E_SUB_TIMEOUT:-20}
+      - E2E_SUB_LATENCY_MS=${E2E_SUB_LATENCY_MS:-100}
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
+
+  # Load / performance harness (C14). Same tester image, running scripts/load_test.py against the
+  # same live api over the compose network. Gates are host-overridable (e.g.
+  # `LOAD_MIN_RPS=1000000 make load` MUST fail, which is how we prove the gates are real rather
+  # than decorative). Profile-gated so it never starts on a bare `docker compose up`.
+  #
+  # NOTE the latency gates here are LOAD_MAX_P95_MS and LOAD_MAX_AVG_MS, NOT the MAX_P95_MS the
+  # e2e service uses — see the two-p95 note in this file's header. MAX_P95_MS is deliberately NOT
+  # declared on this service: scripts/load_test.py does not read it, and an env var a script
+  # never reads is a false contract in the one file that is supposed to BE the contract.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - TARGET_URL=http://api:8000
+      - LOAD_READY_TIMEOUT=${LOAD_READY_TIMEOUT:-90}
+      - LOAD_REQUESTS=${LOAD_REQUESTS:-2000}
+      # 100 in flight because that is the spec's own success criterion ("100 concurrent requests
+      # complete with sub-100ms average per request"), not a round number.
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-100}
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-100}
+      - LOAD_MAX_ERROR_RATE=${LOAD_MAX_ERROR_RATE:-0.0}
+      - LOAD_MAX_P95_MS=${LOAD_MAX_P95_MS:-2000}
+      - LOAD_MAX_AVG_MS=${LOAD_MAX_AVG_MS:-1500}
+      - LOAD_SUB_CLIENTS=${LOAD_SUB_CLIENTS:-8}
+      - LOAD_SUB_SECONDS=${LOAD_SUB_SECONDS:-10}
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-600}
+    depends_on:
+      api:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]
+
+# One named volume: Postgres' data directory. Redis is deliberately volume-less (see its
+# `--save ""` above) and the api writes nothing to disk.
+volumes:
+  pgdata: {}

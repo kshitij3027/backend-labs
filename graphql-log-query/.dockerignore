@@ -1,0 +1,68 @@
+# Keep junk and bulky artifacts out of the build context / image. The production Dockerfile
+# copies only src/ (+ requirements.txt) and Dockerfile.test additionally copies tests/ +
+# scripts/ + pytest.ini, so most of this is belt-and-braces.
+#
+# THREE things are deliberately NOT ignored, and each would break something if it were:
+#   * tests/ and scripts/  — the tester image needs them in its build context.
+#   * web/                 — C13's node:20-alpine stage builds the SPA from it. Only its
+#                            install/build output (node_modules, dist) is excluded, and
+#                            excluding those is what keeps a host-side `npm install` from
+#                            shipping a few hundred MB of context to the daemon on every build.
+#   * schema.graphql       — a COMMITTED build output. C3 exports the SDL to it and a test
+#                            fails when the committed file drifts from the live schema, so the
+#                            tester image has to be able to COPY it.
+
+# VCS
+.git
+.gitignore
+
+# Planning docs and the spec. `project_requirments.md` is spelled that way upstream (missing an
+# `e`); listed literally so the glob is not the only thing standing between it and the image.
+*.md
+README.md
+plan.md
+project_requirments.md
+
+# Python caches / build artifacts
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+build
+dist
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Secrets / env — a real .env must never be baked into an image layer. Compose reads it at run
+# time via `env_file`, which is the correct seam. `.env.example` is excluded too: it is a
+# committed template for humans, and nothing in either image ever reads it.
+.env
+.env.*
+
+# Node install/build output (see the note above about why web/ ITSELF stays in context)
+node_modules
+web/node_modules
+web/dist
+web/build
+.vite
+.parcel-cache
+
+# Local data (sqlite scratch files, exports, scratch results)
+data/
+*.db
+*.sqlite3
+
+# OS / logs
+.DS_Store
+*.log

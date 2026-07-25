@@ -1,0 +1,16 @@
+-- Create the SEPARATE database the compose `test` service points at.
+--
+-- The postgres image's POSTGRES_DB only ever creates one database (`gqllogs`), and the pytest
+-- suite must not share a database with a stack an operator may have running beside it: the
+-- suite creates and drops tables, so sharing would mean `make test` can destroy the corpus a
+-- `make up` is serving. `gqllogs_test` is that separation, and the test service's DATABASE_URL
+-- in docker-compose.yml is the other half of it.
+--
+-- Everything in /docker-entrypoint-initdb.d runs ONCE, on a FIRST init of an empty data
+-- directory — which is exactly why `make test` opens with `docker compose down -v`: pruning the
+-- pgdata volume is what guarantees this script has run against the container the suite then
+-- connects to.
+--
+-- OWNER is the same role the application connects as, so the suite can CREATE/DROP freely
+-- without a second grant step.
+CREATE DATABASE gqllogs_test OWNER gqllogs;

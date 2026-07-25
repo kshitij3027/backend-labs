@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1.6
+#
+# Test-runner image for the GraphQL Log Query Platform.
+#
+# Same base, env and dependency layers as the production image — deliberately identical so the
+# suite exercises the real code path against the real pinned versions — but it additionally
+# COPYs the test suite, pytest config and scripts/, and runs as ROOT so tests can write temp
+# files freely (the production image runs as uid 1000 appuser; a test runner has no reason to).
+#
+# This ONE image backs three profile-gated compose services:
+#   * `test`     -> pytest (unit + integration), against the gqllogs_test database
+#   * `e2e`      -> scripts/verify_e2e.py  (C12), black-box against the LIVE api
+#   * `loadtest` -> scripts/load_test.py   (C14), perf gates against the LIVE api
+# None of them starts on a bare `docker compose up`. Shipping src/ here is what lets the
+# verifier and the harness import src.config and src.generators for settings and ground truth
+# instead of hardcoding a second copy of both that can drift.
+#
+# It stays SINGLE-STAGE even after C13 makes the production Dockerfile multi-stage: nothing in
+# the suite or either harness needs the built SPA bundle, and adding a five-minute `npm ci` to
+# the inner test loop to produce assets no test reads would be a pure tax.
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Parity with production: curl, handy for in-container probes against the live `api`, `postgres`
+# and `redis` services over the compose network. No build toolchain needed (all wheels are
+# prebuilt manylinux).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Dependencies first (cached unless requirements.txt changes) — same layer as production.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# App code + the test suite and its config, plus scripts/ (the C12 E2E verifier and the C14 load
+# harness live there; the e2e/loadtest compose profiles run them from this same image).
+# scripts/ ships an __init__.py from C1 so `python -m scripts.verify_e2e` resolves as a package
+# module and this COPY always succeeds even before the scripts themselves exist.
+COPY src/ ./src/
+COPY tests/ ./tests/
+COPY scripts/ ./scripts/
+COPY pytest.ini ./
+
+# No flags here: verbosity lives in pytest.ini so it cannot drift between the image default, the
+# compose `test` service and the Makefile targets. A second -q stacks to -qq, which suppresses
+# pytest's own "N passed in Xs" summary line — the one line the verification report quotes.
+CMD ["pytest"]

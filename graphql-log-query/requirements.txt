@@ -1,0 +1,69 @@
+# graphql-log-query — Python dependencies (pinned Strawberry + FastAPI + SQLAlchemy stack).
+#
+# Pins are EXACT so image builds are reproducible. This layer installs BEFORE the app source
+# is copied, so it caches once and an ordinary code change only rebuilds the thin source layer
+# above it — the whole reason `COPY requirements.txt .` sits on its own line in both Dockerfiles.
+#
+# Everything here resolves to a prebuilt manylinux wheel on python:3.11-slim, asyncpg very much
+# included, so the image needs no build-essential/gcc toolchain and stays small.
+#
+# A previous revision of this file declared that the project deliberately shipped "no database
+# driver, ORM, Redis client, or message-queue library". That premise is dead: the spec mandates
+# SQLAlchemy 2.x against a real database (§2) and Redis result caching at a 30s TTL (§2), and the
+# Compose stack is API + Redis + database (§2). The persistence and cache layers are the point,
+# not an accident that leaked in through this file.
+#
+# NOTE: these pins are the intended starting point. `docker compose build` is what actually
+# proves the set resolves together; adjust HERE (never inside a Dockerfile) if it does not.
+
+# --- GraphQL ---------------------------------------------------------------------------------
+# The [fastapi] extra pulls the ASGI GraphQLRouter, which serves BOTH transports on one path:
+# HTTP POST for queries/mutations and graphql-transport-ws (plus the legacy graphql-ws) for
+# subscriptions. One mount, one origin, no second endpoint to keep in sync.
+#
+# graphql-core is deliberately NOT pinned here even though C8's cost gate walks its AST and
+# subclasses its ValidationRule. Strawberry declares its own compatible range (>=3.2,<3.4) and a
+# separate hard pin on this line could only ever agree with that range or fight it — and when it
+# fights, pip resolves the conflict at build time in the one file that is supposed to be the
+# record of what we chose. The transitive version is the one Strawberry was tested against.
+strawberry-graphql[fastapi]==0.324.0
+
+# --- Web / ASGI ------------------------------------------------------------------------------
+# uvicorn[standard] brings websockets + httptools + uvloop; the websockets extra is not optional
+# here, because the subscription transport is a real WebSocket upgrade on /graphql.
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+python-multipart==0.0.20     # required by Strawberry's [fastapi] extra for multipart requests
+
+# --- Persistence (C2) ------------------------------------------------------------------------
+# SQLAlchemy 2.x with the asyncio extra + asyncpg: the whole request path is async, so a
+# blocking DBAPI driver would park the event loop for the duration of every query and turn a
+# concurrency test into a measurement of psycopg's GIL behaviour.
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+
+# --- Cache + pub/sub (C6, C7, C9) ------------------------------------------------------------
+# One client, three jobs: the query-result cache (sha256(sorted-JSON) keys, TTL), the persisted
+# query document store, and the cross-worker subscription fan-out via PUBLISH/PSUBSCRIBE.
+# redis-py ships redis.asyncio in-tree, so there is no separate aioredis dependency.
+redis==5.2.1
+
+# --- Observability (C9) ----------------------------------------------------------------------
+prometheus-client==0.21.1    # explicit CollectorRegistry + text exposition on GET /metrics
+
+# --- Serialization / runtime helpers ---------------------------------------------------------
+orjson==3.10.12              # faster encoder for the list-heavy GraphQL result payloads
+psutil==6.1.0                # backs the backend RSS probe the load harness gates on (C14).
+                             #   The memory number has to come from the SERVER's own process,
+                             #   not the client's — a harness measuring itself measures nothing.
+
+# --- Testing ---------------------------------------------------------------------------------
+# pytest-asyncio is load-bearing rather than incidental: pytest.ini sets `asyncio_mode = auto`,
+# so every `async def test_` is collected without a per-test marker.
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx==0.27.2                # ASGI transport for the suite + HTTP client for the live harnesses
+websockets==13.1             # raw graphql-transport-ws client for the E2E subscription checks

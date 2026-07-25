@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Environment / secrets
+.env
+.env.*
+*.env
+!.env.example
+
+# Testing / tooling caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime state written by start.sh / stop.sh
+*.pid
+run/
+logs/
+
+# Local data (seeded shard snapshots, exports, scratch results)
+data/
+*.db
+*.sqlite3
+*.log
+*.ndjson
+
+# React SPA — sources are tracked, install + build output is not
+node_modules/
+web/node_modules/
+web/dist/
+web/build/
+.parcel-cache/
+.vite/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Planning docs (per root CLAUDE.md rule 6)
+plan.md
+project_requirements.md
+# ^ correctly-spelled name, kept so a future rename is already covered. The file ACTUALLY on
+#   disk is spelled `project_requirments.md` — missing the second `e` — which is how it arrived
+#   from upstream and is deliberately NOT renamed (the plan and every reference to the spec use
+#   that spelling). Without the line below the pattern above matches nothing and the spec gets
+#   committed.
+project_requirments.md
+
+# NOTE: `schema.graphql` is deliberately absent from this file. It is a COMMITTED build output —
+# C3 exports the SDL to it and a test fails when the committed copy drifts from the live schema,
+# which only works if the copy is in version control. Do not add it here.
