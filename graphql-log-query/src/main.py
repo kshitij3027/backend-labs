@@ -2,10 +2,12 @@
 
 Three things live here, and they are the seams the rest of the project hangs off:
 
-* :func:`lifespan` — the production startup/shutdown path. At C1 it only configures the process
-  and logs; C2 hangs the SQLAlchemy engine on it, C6 the Redis client and the subscription
-  broker. Every one of those is a resource whose *shutdown* matters as much as its startup, which
-  is why they belong in a lifespan and not in a module-level ``__init__``.
+* :func:`lifespan` — the production startup/shutdown path. It owns the
+  :class:`~src.db.session.Database` (engine, session factory, schema creation, seeding) and will
+  own the Redis client and the subscription broker from C6. Every one of those is a resource
+  whose *shutdown* matters as much as its startup, which is why they belong in a lifespan and not
+  in a module-level ``__init__``: an engine that is never disposed leaks connections, and a
+  psubscribe reader that is never cancelled keeps uvicorn from exiting.
 * :func:`create_app` — the construction site. Passing a pre-built ``settings`` skips
   :func:`~src.config.get_settings` entirely, which is the hermetic test seam: no ``.env``, no
   environment dependency, no shared LRU cache between tests.
@@ -32,6 +34,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
+from src.db.session import Database
 
 logger = logging.getLogger(__name__)
 
@@ -72,21 +75,17 @@ def configure_logging(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own every process-scoped resource: build it on startup, tear it down on exit.
 
-    At C1 this only logs — there is nothing to build yet — but the shape is already the one the
-    later commits need, and each of them is marked below. Resources are attached to
-    ``app.state`` so handlers reach them through the request (``request.app.state``) rather than
-    through module globals, which is what keeps two apps in one test process independent.
+    Currently that is the :class:`~src.db.session.Database`; C6 adds the Redis client and the
+    subscription broker at the marked seams. Resources are attached to ``app.state`` so handlers
+    reach them through the request (``request.app.state.db``) rather than through module globals,
+    which is what keeps two apps in one test process independent.
     """
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
 
-    # === C2 ===  engine = create_async_engine(settings.database_url, pool_pre_ping=True, …)
-    #             await init_db(engine)   # retry-on-boot create_all, db_init_retries x delay
-    #             app.state.engine, app.state.session_factory = engine, async_sessionmaker(engine)
     # === C6 ===  app.state.redis = redis.asyncio.from_url(settings.redis_url)
     #             app.state.broker = Broker(...); await broker.start()   # psubscribe reader task
-    # Each lands here rather than at import time because each also needs the matching teardown
-    # in the `finally` below — an engine that is never disposed leaks connections, and a
-    # psubscribe reader that is never cancelled keeps uvicorn from exiting.
+    # Lands here rather than at import time because it also needs the matching teardown in the
+    # `finally` below — a psubscribe reader that is never cancelled keeps uvicorn from exiting.
 
     logger.info(
         "starting %s v%s (log_level=%s, seed_entries=%d, default_query_limit=%d, "
@@ -107,14 +106,47 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.metrics_enabled,
     )
 
+    # The store. Built and attached BEFORE `init_db` is awaited, so the `finally` below owns the
+    # engine even if startup fails partway through — an engine that raised during schema creation
+    # still holds whatever connections it opened, and leaving them to the garbage collector is
+    # how a restart loop turns into "too many clients already" on the database.
+    db = Database.create(settings)
+    app.state.db = db
+
     try:
+        # Ordered: schema first (it retries while Postgres finishes coming up), then seeding,
+        # which is a no-op unless the store is empty. Both are awaited here rather than lazily on
+        # first request so a broken database is a container that fails to start — visible — rather
+        # than a container that reports healthy and 500s on its first query.
+        await db.init_db()
+        seeded = await db.seed_if_empty(settings.seed_entries, settings.random_seed)
+        logger.info(
+            "store ready (rows_written=%d, seed_entries_configured=%d, random_seed=%d)",
+            seeded,
+            settings.seed_entries,
+            settings.random_seed,
+        )
+
+        # NOTE: /health is deliberately NOT wired to any of this. The container HEALTHCHECK and
+        # compose's `condition: service_healthy` both target it, so a probe that queried Postgres
+        # would report the API unhealthy for as long as its dependency was reconnecting — and
+        # Docker would restart a process that is working perfectly, turning a transient database
+        # blip into a restart loop and flapping the gate the e2e/loadtest services wait on. Worse,
+        # a probe that runs a query inherits that query's latency: one slow plan and the
+        # healthcheck times out. Data-layer readiness is a startup concern, and it is handled
+        # above, by failing startup.
+
         yield
     finally:
         # === C6 ===  await broker.close_all_subscribers(); await broker.stop()
         # === C6 ===  await app.state.redis.aclose()
-        # === C2 ===  await app.state.engine.dispose()
         # Teardown is best-effort by construction: it runs on the way out, and a failure here
-        # must not replace whatever actually caused the shutdown with a traceback from cleanup.
+        # must not replace whatever actually caused the shutdown with a traceback from cleanup —
+        # hence the swallow-and-log rather than letting `dispose` propagate out of a `finally`.
+        try:
+            await db.dispose()
+        except Exception:  # pragma: no cover - defensive; disposal has no expected failure mode
+            logger.exception("failed to dispose the database engine during shutdown")
         logger.info("shutdown complete")
 
 
@@ -182,7 +214,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     #             NOTE for C3: `context_getter` resolves ONCE PER WEBSOCKET CONNECTION, not per
     #             operation. Anything session- or loader-shaped created in it would live for the
     #             life of the socket and serve stale rows; those belong in a SchemaExtension's
-    #             `on_operation` hook instead.
+    #             `on_operation` hook instead. So the context carries
+    #             `request.app.state.db.session_factory` — the FACTORY, never a session. See the
+    #             module docstring of src/db/session.py for the full argument.
 
     # === C9 ===  GET /metrics — Prometheus text exposition from an explicit CollectorRegistry,
     #             gated on `resolved.metrics_enabled`.
