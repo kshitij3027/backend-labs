@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help build up down logs test test-unit test-int e2e load ui clean
+.PHONY: help build up down logs test test-unit test-int sdl e2e load ui clean
 
 help:
 	@echo "GraphQL Log Query Platform — make targets:"
@@ -10,6 +10,7 @@ help:
 	@echo "  test       - full pytest suite in Docker (rebuilds the test image first)"
 	@echo "  test-unit  - unit tests only in Docker"
 	@echo "  test-int   - integration tests only in Docker"
+	@echo "  sdl        - print the live GraphQL SDL (paste into schema.graphql when it drifts)"
 	@echo "  e2e        - black-box E2E verifier vs the live stack"
 	@echo "  load       - perf/load gates vs the live stack (throughput, latency, memory)"
 	@echo "  ui         - run the stack (detached) and print the dashboard URL"
@@ -72,6 +73,18 @@ test-int:
 	docker compose --profile test run --rm test pytest tests/integration || status=$$?; \
 	docker compose down -v; \
 	exit $$status
+
+# Print the SDL the CURRENT code produces, to stdout, from inside the image. This is the companion
+# to tests/unit/test_schema_sdl.py: when that test reports drift, the fix is to paste this output
+# over schema.graphql — deliberately intended and reviewed, rather than auto-applied.
+#
+# --stdout, not a file write, because the container's filesystem is discarded on exit and there is
+# no bind mount; a written file could never reach the repository. --no-deps because rendering a
+# schema touches neither Postgres nor Redis, and waiting on two healthchecks to print a string is
+# pure latency.
+sdl:
+	docker compose build test
+	docker compose --profile test run --rm --no-deps test python -m scripts.export_sdl --stdout
 
 # Black-box E2E: boot the stack fresh and WAIT on the api healthcheck (--wait), so the verifier
 # can never race a still-seeding corpus, then run the verifier in a throwaway container (rebuilt

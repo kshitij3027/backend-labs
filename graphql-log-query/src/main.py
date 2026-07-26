@@ -31,10 +31,14 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from strawberry.fastapi import GraphQLRouter
+from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
 from src.db.session import Database
+from src.graphql.context import get_context
+from src.graphql.schema import schema as graphql_schema
 
 logger = logging.getLogger(__name__)
 
@@ -197,26 +201,35 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     #    `condition: service_healthy` both target it.
     app.include_router(health_router)
 
-    # === C3 ===  The GraphQL surface, mounted at /graphql, serving BOTH transports on one path:
-    #             HTTP POST for queries/mutations and graphql-transport-ws (+ the legacy
-    #             graphql-ws) for subscriptions.
+    # 2. The GraphQL surface, on ONE path serving BOTH transports: HTTP POST for queries and
+    #    mutations, and a WebSocket upgrade for subscriptions. Registered after /health so a
+    #    dependency-free liveness probe can never be shadowed, and before the C13 SPA catch-all.
     #
-    #                 graphql_app = GraphQLRouter(
-    #                     schema,
-    #                     graphiql=resolved.graphql_playground_enabled,
-    #                     subscription_protocols=[
-    #                         GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL,
-    #                     ],
-    #                     context_getter=get_context,
-    #                 )
-    #                 app.include_router(graphql_app, prefix="/graphql")
+    #    `context_getter` resolves ONCE PER WEBSOCKET CONNECTION, not once per operation
+    #    (strawberry-graphql#1754). `get_context` therefore creates nothing that has a lifetime —
+    #    it hands the resolvers `app.state.db.session_factory`, the FACTORY, never a session. See
+    #    the module docstrings of src/graphql/context.py and src/db/session.py for what a
+    #    per-socket session would actually do (pinned connections, permanently stale reads).
     #
-    #             NOTE for C3: `context_getter` resolves ONCE PER WEBSOCKET CONNECTION, not per
-    #             operation. Anything session- or loader-shaped created in it would live for the
-    #             life of the socket and serve stale rows; those belong in a SchemaExtension's
-    #             `on_operation` hook instead. So the context carries
-    #             `request.app.state.db.session_factory` — the FACTORY, never a session. See the
-    #             module docstring of src/db/session.py for the full argument.
+    #    `graphql_ide` (not the deprecated `graphiql=`) takes the name of an IDE or None: GET
+    #    /graphql serves GraphiQL when GRAPHQL_PLAYGROUND_ENABLED is set, and 404s when it is not.
+    #    POST is unaffected either way, so disabling the IDE in a hostile environment does not
+    #    disable the API.
+    #
+    #    `subscription_protocols` is declared NOW even though `Subscription` does not exist until
+    #    C6. The list is a property of the transport, not of the schema — it decides which
+    #    `Sec-WebSocket-Protocol` values the server will negotiate — so declaring it here means C6
+    #    adds a schema field and changes nothing about the mount. Both protocols are offered:
+    #    `graphql-transport-ws` is the current one (what graphql-ws@5 speaks, which is what the
+    #    C13 Apollo client uses), and the legacy `graphql-ws` is kept because older clients and
+    #    some tooling still only speak that one.
+    graphql_router = GraphQLRouter(
+        graphql_schema,
+        context_getter=get_context,
+        graphql_ide="graphiql" if resolved.graphql_playground_enabled else None,
+        subscription_protocols=[GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL],
+    )
+    app.include_router(graphql_router, prefix="/graphql")
 
     # === C9 ===  GET /metrics — Prometheus text exposition from an explicit CollectorRegistry,
     #             gated on `resolved.metrics_enabled`.

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.expression import ColumnElement
 
@@ -201,6 +201,69 @@ def build_log_select(query: LogQuery, settings: Settings) -> Select[tuple[LogEnt
     ).limit(clamp_limit(query.limit, settings))
 
 
+def build_keyset_log_select(
+    query: LogQuery,
+    settings: Settings,
+    *,
+    after: tuple[datetime, int] | None = None,
+    lookahead: int = 0,
+) -> Select[tuple[LogEntryORM]]:
+    """Build the SELECT for **one keyset page** of the same filtered, newest-first result.
+
+    Added at C3, alongside :func:`build_log_select` rather than instead of it, because the two
+    answer different questions: ``build_log_select`` serves ``Query.logs`` ("the newest N rows
+    matching these filters", the spec's core requirement) and this serves
+    ``Query.logsConnection`` ("the next N rows after this position", the §4 pagination bonus).
+    They share :func:`build_predicates`, the ordering and the clamp, so the two can never disagree
+    about what a filter *means* — only about where a page starts.
+
+    .. rubric:: Keyset, not OFFSET
+
+    ``LIMIT n OFFSET k`` numbers rows by their position in the current result, and this result is
+    over an **append-heavy** table: ``createLog`` writes rows that sort to the very front of a
+    ``timestamp DESC`` ordering. A row inserted between the client's page 1 and page 2 shifts every
+    later row one position down, so page 2 re-serves the row that ended page 1 — a duplicate. A
+    deletion shifts them the other way and page 2 skips one. Neither raises; the client just sees a
+    list with a row twice, or missing one, and no request in the sequence was wrong.
+
+    A keyset cursor names a **row**, not a position: ``WHERE (timestamp, id) < (:ts, :id)`` resumes
+    strictly after the last row the client actually saw, so concurrent writes in front of the
+    cursor are simply not in the page — which is correct, and is what "stable pagination" means.
+    It also costs the same at page 1000 as at page 1 (the index seeks straight to the key), where
+    OFFSET has to walk and discard every skipped row.
+
+    The comparison is a **row-value** expression rather than the expanded
+    ``ts < :ts OR (ts = :ts AND id < :id)``, matching what ``ix_log_entries_ts_id`` was declared
+    for (see its comment in :mod:`src.db.models`): PostgreSQL turns it into a single ordered index
+    range scan, where the OR form is a BitmapOr over two.
+
+    Args:
+        query: Filters and page size. ``query.limit`` is the page size, clamped exactly as it is
+            for every other path.
+        settings: Supplies ``DEFAULT_QUERY_LIMIT`` / ``MAX_QUERY_LIMIT``.
+        after: The ``(timestamp, id)`` of the last row of the previous page, or ``None`` to start
+            at the newest row. Normalised to UTC for the same reason filter bounds are.
+        lookahead: Extra rows to fetch **beyond** the page, so the caller can tell whether another
+            page exists without issuing a second COUNT. These rows are a probe: they are never
+            returned to a client (:meth:`LogRepository.list_logs_page` truncates), so the clamped
+            page size remains the cap on what any caller can actually receive.
+    """
+    statement = select(LogEntryORM)
+    for predicate in build_predicates(query):
+        statement = statement.where(predicate)
+
+    if after is not None:
+        after_timestamp, after_id = after
+        statement = statement.where(
+            tuple_(LogEntryORM.timestamp, LogEntryORM.id) < (as_utc(after_timestamp), after_id)
+        )
+
+    page_size = clamp_limit(query.limit, settings)
+    return statement.order_by(LogEntryORM.timestamp.desc(), LogEntryORM.id.desc()).limit(
+        page_size + max(0, lookahead)
+    )
+
+
 def build_count_select(query: LogQuery) -> Select[tuple[int]]:
     """Build ``SELECT count(*)`` over the **same predicates**, with no LIMIT and no ORDER BY.
 
@@ -258,6 +321,30 @@ class LogRepository:
         """Return matching rows, newest first, capped at the clamped limit."""
         result = await self._session.execute(build_log_select(query, self._settings))
         return list(result.scalars().all())
+
+    async def list_logs_page(
+        self, query: LogQuery, *, after: tuple[datetime, int] | None = None
+    ) -> tuple[list[LogEntryORM], bool]:
+        """Return one keyset page and whether another page follows it.
+
+        The "another page follows" half is answered by fetching **one row more than the page** and
+        checking whether it arrived, rather than by a second ``COUNT(*)`` over the remainder. One
+        extra row is free (the index scan is already positioned there); a count over the remainder
+        is a second full scan of everything the client has not read yet, which grows as the client
+        pages *backwards* through history — the opposite of what pagination is for.
+
+        The probe row is dropped before returning, so what a caller receives is still capped at
+        the clamped page size.
+
+        Returns:
+            ``(rows, has_next_page)`` — at most ``clamp_limit(query.limit, settings)`` rows,
+            newest first.
+        """
+        page_size = clamp_limit(query.limit, self._settings)
+        statement = build_keyset_log_select(query, self._settings, after=after, lookahead=1)
+        result = await self._session.execute(statement)
+        rows = list(result.scalars().all())
+        return rows[:page_size], len(rows) > page_size
 
     async def count_logs(self, query: LogQuery) -> int:
         """Return how many rows match ``query``'s filters, **ignoring its limit**.

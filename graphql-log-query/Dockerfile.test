@@ -47,6 +47,14 @@ COPY tests/ ./tests/
 COPY scripts/ ./scripts/
 COPY pytest.ini ./
 
+# The committed SDL (C3). This is a build OUTPUT that is kept in version control precisely so a
+# schema change shows up as a reviewable diff — and tests/unit/test_schema_sdl.py compares it, byte
+# for byte, against what the live schema renders. That comparison only exists if the file is in the
+# image, which is why `.dockerignore` deliberately does not exclude it. The production image does
+# NOT copy it: nothing at run time reads the SDL, it is regenerated on demand from the schema
+# object, and shipping a stale copy into a runtime image would only invite somebody to trust it.
+COPY schema.graphql ./
+
 # No flags here: verbosity lives in pytest.ini so it cannot drift between the image default, the
 # compose `test` service and the Makefile targets. A second -q stacks to -qq, which suppresses
 # pytest's own "N passed in Xs" summary line — the one line the verification report quotes.

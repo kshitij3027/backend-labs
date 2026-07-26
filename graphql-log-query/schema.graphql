@@ -1,0 +1,58 @@
+"""Date with time (isoformat)"""
+scalar DateTime
+
+"""
+The `JSON` scalar type represents JSON values as specified by [ECMA-404](https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf).
+"""
+scalar JSON @specifiedBy(url: "https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf")
+
+type LogConnection {
+  edges: [LogEdge!]!
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+type LogEdge {
+  cursor: String!
+  node: LogEntry!
+}
+
+type LogEntry {
+  id: ID!
+  timestamp: DateTime!
+  service: String!
+  level: LogLevel!
+  message: String!
+  metadata: JSON
+  traceId: String
+}
+
+input LogFilterInput {
+  service: String = null
+  level: LogLevel = null
+  startTime: DateTime = null
+  endTime: DateTime = null
+  searchText: String = null
+  limit: Int = null
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}
+
+type Query {
+  logs(filters: LogFilterInput = null): [LogEntry!]!
+  log(id: ID!): LogEntry
+  logsConnection(filters: LogFilterInput = null, first: Int = null, after: String = null): LogConnection!
+}

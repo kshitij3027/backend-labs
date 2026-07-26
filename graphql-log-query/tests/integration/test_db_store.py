@@ -15,48 +15,39 @@ independent computations. The alternative — asserting that a ``service`` filte
 service is the one asked for — is a tautology: it would pass against a repository that returned
 one arbitrary matching row and dropped the other forty.
 
-.. rubric:: Schema and isolation
+.. rubric:: Schema, isolation and the corpus live in ``conftest.py`` / ``corpus.py``
 
-A **session-scoped** fixture creates the schema once (through the real
-:meth:`~src.db.session.Database.init_db`, so the extension and the trigram index are exercised
-too) and drops it at the end. Each test then gets a freshly **truncated** table.
+C3 added a second consumer of the same machinery (``test_graphql_query.py`` grades the GraphQL
+layer against the identical oracle), so the fixtures — session-scoped schema creation through the
+real :meth:`~src.db.session.Database.init_db`, per-test ``TRUNCATE … RESTART IDENTITY``, and the
+seeded corpus — moved to ``tests/integration/conftest.py``, and the constants and oracle
+projections to ``tests/integration/corpus.py``. Both files carry the reasoning. Nothing about the
+arrangement changed; it just stopped living in one test module.
 
-Truncation rather than a rolled-back outer transaction, deliberately: the repository leaves
-committing to its caller, so these tests commit — and a write that commits escapes a
-rollback-based fixture unless every commit is wrapped in a restarting SAVEPOINT, which is a lot of
-machinery whose failure mode is silent cross-test leakage. ``RESTART IDENTITY`` additionally
-resets the id sequence, so ids are small and predictable in every test and the ``(timestamp, id)``
-tiebreak assertions can be read at a glance.
+The oracle helpers are imported under their original private names so the assertions below read
+exactly as they did when they were local.
 """
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from datetime import datetime, timedelta, timezone
-from typing import TypeVar
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import Settings
-from src.db.base import Base
-from src.db.models import LogEntryORM, LogRecord
+from src.db.models import LogRecord
 from src.db.repository import LogQuery, LogRepository
 from src.db.session import SEED_INSERT_CHUNK_SIZE, Database
-from src.generators import generate_log_records
-
-#: Fixed corpus parameters. ANCHOR is a constant instant, so the oracle a test computes and the
-#: rows the database holds describe the same corpus no matter when the suite runs.
-#:
-#: 1200 rather than a couple of hundred because the level mix has a 1% CRITICAL tail: at 300 rows
-#: the expected count is three, and "does the CRITICAL filter return the right rows" would be one
-#: unlucky seed away from asserting that an empty set equals an empty set. At 1200 the thinnest
-#: bucket is a dozen rows and every filter test grades a real subset.
-CORPUS_SIZE = 1200
-SEED = 20260725
-ANCHOR = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
+from tests.integration.corpus import (
+    ANCHOR,
+    CORPUS_SIZE,
+    SEED,
+    as_records as _as_records,
+    matching as _matching,
+    newest_first as _newest_first,
+)
 
 #: Every index the model declares, by name. Asserted as a set so an index that is silently dropped
 #: from ``__table_args__`` fails here rather than as an unexplained slow query at C14.
@@ -67,146 +58,6 @@ EXPECTED_INDEXES = {
     "ix_log_entries_trace_id",
     "ix_log_entries_message_trgm",
 }
-
-_T = TypeVar("_T")
-
-
-def _run_sync(coro: Awaitable[_T]) -> _T:
-    """Run ``coro`` on a private event loop, leaving the ambient loop policy untouched.
-
-    Used by the session-scoped schema fixture, which is synchronous. ``asyncio.run`` would also
-    work but it *sets* and then clears the current event loop, and pytest-asyncio manages that
-    same global around every test — so this creates a loop, uses it, and closes it without ever
-    touching :func:`asyncio.set_event_loop`. Anything opened inside the coroutine (the engine, its
-    connections) must also be closed inside it, since the loop does not outlive the call.
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)  # type: ignore[arg-type]
-    finally:
-        loop.close()
-
-
-@pytest.fixture(scope="session")
-def db_settings() -> Settings:
-    """Configuration for the test database, read from the environment compose supplies.
-
-    ``_env_file=None`` so a stray ``.env`` in the working directory cannot redirect the suite;
-    environment variables still apply, which is the point — ``DATABASE_URL`` here is the compose
-    ``test`` service's literal, pinned value pointing at ``gqllogs_test``.
-
-    ``max_query_limit`` is raised above :data:`CORPUS_SIZE` so the oracle comparisons can ask for
-    the whole corpus in one query. That deliberately takes the production clamp *out* of the way
-    of these tests — the clamp itself is proved separately, by
-    :func:`test_the_limit_is_clamped_on_every_path`, against a repository built with a small
-    ceiling. Leaving the production 500 here would silently truncate every full-corpus comparison
-    to 500 rows and turn a set-equality assertion into a prefix check.
-    """
-    return Settings(
-        _env_file=None,
-        seed_entries=0,
-        seed_orders=0,
-        log_level="WARNING",
-        max_query_limit=CORPUS_SIZE * 5,
-    )
-
-
-@pytest.fixture(scope="session")
-def _schema(db_settings: Settings) -> Iterator[None]:
-    """Create the schema once per session through the real :meth:`Database.init_db`; drop it after.
-
-    Going through ``init_db`` rather than a bare ``create_all`` is deliberate: it is what installs
-    ``pg_trgm`` and creates the trigram index, and two tests below assert on exactly those. A
-    fixture that took a shortcut would leave the production startup path untested by the suite
-    that exists to test it.
-    """
-
-    async def _create() -> None:
-        database = Database.create(db_settings)
-        try:
-            await database.init_db()
-        finally:
-            await database.dispose()
-
-    async def _drop() -> None:
-        database = Database.create(db_settings)
-        try:
-            async with database.engine.begin() as conn:
-                await conn.run_sync(Base.metadata.drop_all)
-        finally:
-            await database.dispose()
-
-    _run_sync(_create())
-    yield
-    _run_sync(_drop())
-
-
-@pytest.fixture()
-async def database(_schema: None, db_settings: Settings) -> AsyncIterator[Database]:
-    """A :class:`Database` over an empty ``log_entries``, disposed at the end of the test."""
-    db = Database.create(db_settings)
-    try:
-        async with db.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE TABLE log_entries RESTART IDENTITY"))
-        yield db
-    finally:
-        # Every test disposes its own engine. An engine left open holds its pooled connections
-        # until the process exits, and a suite that opens one per test would eventually meet
-        # PostgreSQL's connection limit — as a failure in whichever test happened to run then.
-        await db.dispose()
-
-
-@pytest.fixture()
-async def session(database: Database) -> AsyncIterator[AsyncSession]:
-    """One session for the test, from the same factory the application uses."""
-    async with database.session_factory() as async_session:
-        yield async_session
-
-
-@pytest.fixture()
-def repo(session: AsyncSession, db_settings: Settings) -> LogRepository:
-    """A repository bound to the test session, with configuration passed explicitly."""
-    return LogRepository(session, db_settings)
-
-
-@pytest.fixture()
-async def seeded(database: Database) -> list[LogRecord]:
-    """Seed the fixed corpus and return **the oracle**: the same records, in Python.
-
-    The returned list is what every expectation below is computed from. It is generated a second
-    time rather than captured from the seeder, so the two sides of each comparison come from
-    independent calls — a generator that was accidentally stateful would be caught here rather
-    than agreeing with itself.
-    """
-    written = await database.seed_if_empty(CORPUS_SIZE, SEED, end_time=ANCHOR)
-    assert written == CORPUS_SIZE, "the fixture expected to seed an empty table"
-    return generate_log_records(CORPUS_SIZE, seed=SEED, end_time=ANCHOR)
-
-
-# --- Oracle helpers ------------------------------------------------------------------------------
-
-
-def _newest_first(records: list[LogRecord]) -> list[LogRecord]:
-    """Put a generated corpus into the order the database returns it in.
-
-    The generator emits oldest-first with strictly increasing timestamps, and seeding inserts in
-    that order — so ``BIGSERIAL`` ids ascend with time and ``ORDER BY timestamp DESC, id DESC`` is
-    exactly the reverse of generation order. Reversing (rather than re-sorting) states that
-    relationship instead of re-deriving it, so a test would notice if it ever stopped holding.
-    """
-    return list(reversed(records))
-
-
-def _matching(
-    records: list[LogRecord], predicate: Callable[[LogRecord], bool]
-) -> list[LogRecord]:
-    """The subset of the corpus a filter should select, newest first."""
-    return _newest_first([record for record in records if predicate(record)])
-
-
-def _as_records(rows: list[LogEntryORM]) -> list[LogRecord]:
-    """Project database rows onto the identity-free value objects the oracle is made of."""
-    return [LogRecord.from_orm_row(row) for row in rows]
 
 
 async def _metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, str | None]:
