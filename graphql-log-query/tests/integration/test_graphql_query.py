@@ -39,6 +39,7 @@ from src.db.models import LogRecord
 from src.db.repository import LogQuery, LogRepository
 from src.db.session import Database
 from src.graphql.context import Context
+from src.graphql.errors import MASKED_ERROR_MESSAGE
 from src.graphql.schema import schema
 from tests.integration.corpus import CORPUS_SIZE, matching, newest_first
 
@@ -530,6 +531,45 @@ async def test_an_invalid_level_supplied_as_a_variable_is_also_rejected(
     assert "NOT_A_LEVEL" in str(result.errors[0])
 
 
+async def test_the_two_paths_answer_one_bad_enum_with_one_explanation(
+    seeded: list[LogRecord], gql_context: Context
+) -> None:
+    """The contract the two tests above only imply separately, and the one that actually broke.
+
+    Each of them passes against a server that rejects both paths but *explains* only one of them —
+    which is precisely the state this suite was in: the literal came back with graphql-core's
+    message and the variable came back as ``an unexpected internal error occurred``, because the
+    error-masking predicate keyed on ``original_error`` and the two paths differ in exactly that
+    attribute (see :mod:`src.graphql.errors`). A client sending variables, which is every client,
+    could not tell its own typo from an outage.
+
+    So the assertion is an equivalence, not a pair of independent checks: the variable response
+    must carry graphql-core's explanation **verbatim**, with only the variable's name and the path
+    inside it prefixed. Comparing the two responses is what makes a divergence impossible to miss.
+    """
+    literal = await _execute(gql_context, '{ logs(filters: {level: NOT_A_LEVEL}) { id } }')
+    variable = await _execute(gql_context, LOGS_DOCUMENT, filters={"level": "NOT_A_LEVEL"})
+
+    assert literal.errors and variable.errors
+    assert literal.data is None and variable.data is None
+
+    literal_message = literal.errors[0].message
+    variable_message = variable.errors[0].message
+
+    assert literal_message != MASKED_ERROR_MESSAGE
+    assert variable_message != MASKED_ERROR_MESSAGE, (
+        "the variable path is the one every real client uses; masking it is the regression"
+    )
+    assert literal_message in variable_message, (
+        f"the same rejection must read the same both ways: literal said {literal_message!r}, "
+        f"variable said {variable_message!r}"
+    )
+
+    for path, error in (("literal", literal.errors[0]), ("variable", variable.errors[0])):
+        code = (error.extensions or {}).get("code")
+        assert code != "INTERNAL_ERROR", f"{path} was classified as a server fault"
+
+
 # --- Query.log -------------------------------------------------------------------------------------
 
 
@@ -843,17 +883,31 @@ async def test_a_graphql_error_is_a_200_with_an_errors_envelope_not_a_500(
     GraphQL reports failures inside the response body; a transport-level 500 would break every
     client that reads ``data``/``errors``, and would leak whatever the framework decided to print.
     Asserted over HTTP because the status code simply does not exist at the schema level.
+
+    Both spellings of the same mistake are sent, because the body is where a client actually reads
+    the message and the two coercion paths reach it through different code in graphql-core. A
+    literal-only version of this test stayed green while the variable form — the one every client
+    sends — came back as the generic masked message.
     """
-    response = await http_client.post(
-        "/graphql", json={"query": '{ logs(filters: {level: NOT_A_LEVEL}) { id } }'}
-    )
+    for label, body in (
+        ("literal", {"query": '{ logs(filters: {level: NOT_A_LEVEL}) { id } }'}),
+        (
+            "variable",
+            {"query": LOGS_DOCUMENT, "variables": {"filters": {"level": "NOT_A_LEVEL"}}},
+        ),
+    ):
+        response = await http_client.post("/graphql", json=body)
 
-    assert response.status_code == 200
-    payload = response.json()
+        assert response.status_code == 200, label
+        payload = response.json()
 
-    assert payload.get("errors"), "the failure must be reported in the envelope"
-    assert payload.get("data") is None
-    assert "Traceback" not in response.text
+        assert payload.get("errors"), f"{label}: the failure must be reported in the envelope"
+        assert payload.get("data") is None, label
+        assert "Traceback" not in response.text, label
+
+        message = payload["errors"][0]["message"]
+        assert message != MASKED_ERROR_MESSAGE, f"{label}: a client typo is not a server fault"
+        assert "NOT_A_LEVEL" in message, f"{label}: the client cannot fix what it is not told"
 
 
 async def test_the_playground_is_served_on_get(http_client: httpx.AsyncClient) -> None:

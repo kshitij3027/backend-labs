@@ -16,6 +16,13 @@ returns one arbitrary matching row and silently drops the other forty.
 
 That only works because the generator is pure: fixed seed, fixed anchor instant, no wall clock.
 See its module docstring for the contract.
+
+.. rubric:: It also holds the probes that ask PostgreSQL something Python cannot answer
+
+:func:`metadata_storage` is here rather than in one test module because two of them need it
+(``test_db_store.py`` for the seeding and repository write paths, ``test_graphql_mutation.py`` for
+the ``createLog`` path) and a second copy would be a second chance to write the check wrong — in a
+way that, by construction, passes.
 """
 
 from __future__ import annotations
@@ -24,6 +31,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import TypeVar
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import LogEntryORM, LogRecord
 
@@ -84,3 +94,29 @@ def matching(
 def as_records(rows: list[LogEntryORM]) -> list[LogRecord]:
     """Project database rows onto the identity-free value objects the oracle is made of."""
     return [LogRecord.from_orm_row(row) for row in rows]
+
+
+async def metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, str | None]:
+    """Ask **PostgreSQL** how one row's ``metadata`` is stored: ``(is_sql_null, json_type)``.
+
+    Python cannot answer this question. A JSONB column can hold the JSON scalar ``null``, which is
+    not SQL ``NULL`` — and asyncpg deserialises *both* of them to the Python ``None``. So
+    ``row.metadata_ is None`` is true in either case and an assertion built on it cannot fail.
+
+    These two expressions can:
+
+    * ``metadata IS NULL`` is true only for SQL ``NULL``. For the JSONB value ``'null'`` the column
+      is not null at all, so it is false.
+    * ``jsonb_typeof(metadata)`` returns SQL ``NULL`` (``None`` here) for SQL ``NULL``, and the
+      **string** ``'null'`` for the JSON scalar — the one place the two are told apart by name.
+    """
+    row = (
+        await session.execute(
+            text(
+                "SELECT metadata IS NULL AS is_sql_null, jsonb_typeof(metadata) AS json_type "
+                "FROM log_entries WHERE id = :id"
+            ),
+            {"id": log_id},
+        )
+    ).one()
+    return bool(row.is_sql_null), row.json_type

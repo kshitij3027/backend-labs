@@ -159,9 +159,13 @@ def test_metadata_is_published_under_that_exact_name() -> None:
 # --- Query.logs: the shape the spec's acceptance command depends on --------------------------------
 
 
-def test_query_publishes_exactly_the_three_read_entry_points() -> None:
-    """``logs``, ``log``, ``logsConnection`` — and camel-casing is on, so it is not ``logs_connection``."""
-    assert set(_field_types("Query")) == {"logs", "log", "logsConnection"}
+def test_query_publishes_exactly_the_four_read_entry_points() -> None:
+    """``logs``, ``log``, ``logsConnection``, ``logStats``.
+
+    Camel-casing is on, so it is not ``logs_connection`` or ``log_stats`` — the spec's own
+    acceptance commands are written in that casing and would not validate otherwise.
+    """
+    assert set(_field_types("Query")) == {"logs", "log", "logsConnection", "logStats"}
 
 
 def test_logs_returns_a_non_null_list_of_non_null_log_entries() -> None:
@@ -253,3 +257,119 @@ def test_logs_connection_takes_filters_first_and_after() -> None:
     }
 
     assert args == {"filters": "LogFilterInput", "first": "Int", "after": "String"}
+
+
+# --- logStats: the shape the spec's OTHER acceptance command depends on (C4) ------------------------
+
+
+def test_log_stats_takes_two_optional_time_bounds() -> None:
+    """Spec §5 runs ``{ logStats { … } }`` with **no arguments**.
+
+    A single ``NON_NULL`` here would make that document fail validation, so the optionality is not
+    a convenience — it is what the acceptance command requires. Omitting a bound means that end is
+    unbounded, matching ``LogFilterInput``.
+    """
+    args = {arg["name"]: _render_type(arg["type"]) for arg in _field("Query", "logStats")["args"]}
+
+    assert args == {"startTime": "DateTime", "endTime": "DateTime"}
+    assert _field_types("Query")["logStats"] == "LogStats!"
+
+
+def test_services_is_a_leaf_list_so_the_spec_acceptance_command_validates() -> None:
+    """``{ logStats { totalLogs errorCount services } }`` selects ``services`` with NO sub-selection.
+
+    GraphQL forbids a sub-selection on a scalar field and *requires* one on an object field, so
+    this single rendered type decides whether the spec's §5 command parses at all. Publishing
+    ``services`` as ``[ServiceCount!]!`` would break it — which is why the richer per-service view
+    lives on the separate ``serviceBreakdown`` field instead of replacing this one. See the block
+    comment above ``LogStats`` in ``src/graphql/types.py``.
+    """
+    assert _field_types("LogStats")["services"] == "[String!]!"
+
+
+def test_log_stats_publishes_the_spec_minimum_plus_the_dashboard_extras() -> None:
+    """Asserted as an equality, so an added or removed field fails here rather than in a client.
+
+    ``earliest``/``latest`` are the two nullable fields and must stay nullable: they are SQL
+    ``min``/``max`` over the matching rows, which are ``NULL`` when a window matched nothing — and
+    "no logs in this window" has to be an ordinary answer, not an error.
+    """
+    assert _field_types("LogStats") == {
+        "totalLogs": "Int!",
+        "errorCount": "Int!",
+        "services": "[String!]!",
+        "serviceBreakdown": "[ServiceCount!]!",
+        "levelBreakdown": "[LevelCount!]!",
+        "earliest": "DateTime",
+        "latest": "DateTime",
+    }
+
+
+def test_the_breakdown_types_are_name_count_pairs() -> None:
+    """``levelBreakdown`` carries the **enum**, not a string — the same contract ``LogEntry`` has."""
+    assert _field_types("ServiceCount") == {"service": "String!", "count": "Int!"}
+    assert _field_types("LevelCount") == {"level": "LogLevel!", "count": "Int!"}
+
+
+def test_error_count_counts_the_published_error_enum_member() -> None:
+    """The string the aggregate filters on is the enum member's value, not a lookalike.
+
+    ``ERROR_LEVEL`` lives in the store (which must not import the API layer) and ``LogLevel`` is
+    the published contract. Nothing at run time forces them to agree, and a typo would make
+    ``errorCount`` a permanent zero — a plausible number, in a field the spec verifies by eye.
+    """
+    from src.db.repository import ERROR_LEVEL
+    from src.graphql.enums import LogLevel
+
+    assert ERROR_LEVEL == LogLevel.ERROR.value
+    assert ERROR_LEVEL in LOG_LEVELS
+
+
+# --- Mutation.createLog (C4) -----------------------------------------------------------------------
+
+
+def test_the_schema_publishes_a_mutation_root_with_create_log() -> None:
+    """Spec §2 item 24. A schema with no ``Mutation`` type makes every write document invalid."""
+    assert set(_field_types("Mutation")) == {"createLog"}
+    assert _field_types("Mutation")["createLog"] == "LogEntry!", (
+        "the spec requires the created object back, and non-null because a successful mutation "
+        "always has one — a nullable return would force every client to branch on a case that "
+        "cannot happen"
+    )
+
+
+def test_create_log_takes_an_argument_literally_named_log_data() -> None:
+    """Spec §5 writes ``createLog(logData: {...})``.
+
+    ``input`` (the Relay convention) or ``entry`` would read just as well and would break the
+    acceptance command while every behavioural test stayed green. The name is the contract.
+    """
+    args = {arg["name"]: _render_type(arg["type"]) for arg in _field("Mutation", "createLog")["args"]}
+
+    assert args == {"logData": "CreateLogInput!"}
+
+
+def test_create_log_input_requires_a_source_a_severity_and_a_message() -> None:
+    """Three required, three optional — and the split is the domain's, not a convenience.
+
+    ``level`` being the enum is what makes ``level: "EROR"`` a validation error naming the five
+    legal values instead of a stored row nothing can ever filter for.
+    """
+    assert _input_field_types("CreateLogInput") == {
+        "service": "String!",
+        "level": "LogLevel!",
+        "message": "String!",
+        "timestamp": "DateTime",
+        "metadata": "JSON",
+        "traceId": "String",
+    }
+
+
+def test_create_log_input_publishes_metadata_and_trace_id_under_the_wire_names() -> None:
+    """``metadata`` (no underscore, matching the column) and ``traceId`` (camel-cased).
+
+    The write input and the read type have to agree on both, or a client would create an entry
+    with ``trace_id`` and read it back as ``traceId``.
+    """
+    assert set(_input_field_types("CreateLogInput")) >= {"metadata", "traceId"}
+    assert set(_input_field_types("CreateLogInput")) & {"metadata_", "trace_id"} == set()

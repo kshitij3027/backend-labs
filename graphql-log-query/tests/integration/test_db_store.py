@@ -46,6 +46,7 @@ from tests.integration.corpus import (
     SEED,
     as_records as _as_records,
     matching as _matching,
+    metadata_storage as _metadata_storage,
     newest_first as _newest_first,
 )
 
@@ -60,30 +61,10 @@ EXPECTED_INDEXES = {
 }
 
 
-async def _metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, str | None]:
-    """Ask **PostgreSQL** how one row's ``metadata`` is stored: ``(is_sql_null, json_type)``.
-
-    Python cannot answer this question. A JSONB column can hold the JSON scalar ``null``, which is
-    not SQL ``NULL`` — and asyncpg deserialises *both* of them to the Python ``None``. So
-    ``row.metadata_ is None`` is true in either case and an assertion built on it cannot fail.
-
-    These two expressions can:
-
-    * ``metadata IS NULL`` is true only for SQL ``NULL``. For the JSONB value ``'null'`` the column
-      is not null at all, so it is false.
-    * ``jsonb_typeof(metadata)`` returns SQL ``NULL`` (``None`` here) for SQL ``NULL``, and the
-      **string** ``'null'`` for the JSON scalar — the one place the two are told apart by name.
-    """
-    row = (
-        await session.execute(
-            text(
-                "SELECT metadata IS NULL AS is_sql_null, jsonb_typeof(metadata) AS json_type "
-                "FROM log_entries WHERE id = :id"
-            ),
-            {"id": log_id},
-        )
-    ).one()
-    return bool(row.is_sql_null), row.json_type
+# NOTE: `_metadata_storage` moved to ``tests/integration/corpus.py`` at C4, unchanged, because
+# ``test_graphql_mutation.py`` needs the identical probe for the ``createLog`` write path. It is
+# imported above under its original private name, matching the convention this module already uses
+# for the oracle helpers, so every assertion below reads exactly as it did when it was local.
 
 
 # --- Round trip ----------------------------------------------------------------------------------

@@ -45,15 +45,24 @@ identical, so no test of the payload can notice. The seam is marked in
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from typing import Optional
 
 import strawberry
-from graphql import GraphQLError
 
+from src.db.repository import LogQuery
+from src.graphql import errors
 from src.graphql.context import Context
+
+# Two exception types spell "bad cursor" in this project and they are not interchangeable. The one
+# imported here is the codec's plain `ValueError`, raised by `decode_cursor`; the one this module
+# raises in its place is `errors.InvalidCursorError`, which carries `extensions.code`. Keeping the
+# `errors.` qualifier on the second is what makes the translation visible at the point it happens
+# rather than hidden behind two identical-looking names. See src/graphql/cursor.py.
 from src.graphql.cursor import InvalidCursorError, decode_cursor, encode_cursor
 from src.graphql.inputs import LogFilterInput, to_log_query
-from src.graphql.types import LogConnection, LogEdge, LogEntry, PageInfo
+from src.graphql.types import LogConnection, LogEdge, LogEntry, LogStats, PageInfo
+from src.graphql.validation import validate_time_range
 
 
 def _parse_log_id(raw: str) -> int:
@@ -66,12 +75,14 @@ def _parse_log_id(raw: str) -> int:
     that forever.
 
     Raises:
-        GraphQLError: If ``raw`` is not a run of digits. Raising the GraphQL error type (rather
-            than a ``ValueError`` the executor would wrap) keeps the message intact and the
-            response a normal ``errors`` envelope — never a 500.
+        src.graphql.errors.ValidationError: If ``raw`` is not a run of digits. C4 gave this the
+            ``VALIDATION_ERROR`` code it had been missing — it was a bare ``GraphQLError``, which
+            reached the client with a good message and no way to branch on it. Raising a
+            :class:`~src.graphql.errors.DomainError` also keeps it out of the masking path and out
+            of the stack-trace log, both of which treat an uncoded resolver exception as a fault.
     """
     if not raw.isascii() or not raw.isdigit():
-        raise GraphQLError(
+        raise errors.ValidationError(
             f"invalid LogEntry id {raw!r}: ids issued by this server are decimal integers"
         )
     return int(raw)
@@ -79,7 +90,10 @@ def _parse_log_id(raw: str) -> int:
 
 @strawberry.type
 class Query:
-    """The read surface. C4 adds ``logStats``; C10/C11 add the e-commerce entry points."""
+    """The read surface: ``logs``, ``log``, ``logsConnection`` and ``logStats``.
+
+    C10/C11 add the e-commerce entry points alongside these.
+    """
 
     @strawberry.field
     async def logs(
@@ -171,7 +185,12 @@ class Query:
                 # produce an `errors` envelope, but C4 installs `MaskErrors`, after which an
                 # unrecognised exception becomes "an unexpected error occurred" — hiding a problem
                 # the client could have fixed itself.
-                raise GraphQLError(str(exc), extensions={"code": "INVALID_CURSOR"}) from exc
+                #
+                # C4 also unified the code: this used to be a bare `GraphQLError` with a
+                # hand-written `extensions={"code": "INVALID_CURSOR"}` dict, i.e. a second
+                # convention for spelling something the taxonomy now owns. The wire format is
+                # identical; what changed is that the string lives in one enum.
+                raise errors.InvalidCursorError(str(exc)) from exc
 
         async with context.repository() as repository:
             rows, has_next_page = await repository.list_logs_page(page_query, after=after_key)
@@ -199,3 +218,50 @@ class Query:
             ),
             total_count=total_count,
         )
+
+    @strawberry.field
+    async def log_stats(
+        self,
+        info: strawberry.Info[Context, None],
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> LogStats:
+        """Aggregate summary of the entries in a time window — spec §2 item 23.
+
+        Published as ``logStats``, with ``startTime`` / ``endTime`` arguments. **Both optional**,
+        because the spec's own acceptance command supplies neither::
+
+            { logStats { totalLogs errorCount services } }
+
+        Omitting a bound means that end is unbounded, exactly as it does on ``LogFilterInput`` —
+        the two share :func:`src.db.repository.build_predicates`, so "the last hour" means the same
+        instant range to ``logs`` and to ``logStats``, and a dashboard's summary can never describe
+        a different window from the table beneath it.
+
+        The arguments are the spec's two and no more. It would be easy to accept the whole
+        ``LogFilterInput`` here — the repository already takes a full :class:`LogQuery` and would
+        apply every predicate — but ``limit`` is meaningless for an aggregate and ``searchText``
+        would turn a summary into a trigram scan. C11 widens this deliberately, for the
+        multi-dimensional aggregations that need it.
+
+        Every number is computed by PostgreSQL. See the section comment above
+        :class:`~src.db.repository.LogStatsResult` for what pulling rows and counting in Python
+        would cost, and why the silently-capped total it produces is the failure that would survive
+        a casual test.
+
+        Raises:
+            src.graphql.errors.ValidationError: If ``startTime`` is after ``endTime``. That range
+                cannot match a row, so without the check it would return a confident set of zeros
+                indistinguishable from a genuinely quiet window.
+        """
+        # Returns the bounds normalised to UTC. Passing those on rather than the raw arguments
+        # keeps the value that was *validated* and the value that reaches the WHERE clause the
+        # same object — `build_predicates` would normalise again, identically, but a check made
+        # against one instant and a query run against another is a bug waiting for a mixed-offset
+        # client to find it.
+        start, end = validate_time_range(start_time, end_time)
+
+        async with info.context.repository() as repository:
+            return LogStats.from_result(
+                await repository.log_stats(LogQuery(start_time=start, end_time=end))
+            )

@@ -25,10 +25,15 @@ produces an import error that reads like a missing dependency rather than like a
 .. rubric:: Module map
 
 * :mod:`src.graphql.enums` — ``LogLevel``, pinned to :data:`src.generators.LOG_LEVELS`.
-* :mod:`src.graphql.types` — ``LogEntry`` plus the cursor-connection view of it.
-* :mod:`src.graphql.inputs` — ``LogFilterInput`` and its mapping onto C2's ``LogQuery``.
+* :mod:`src.graphql.types` — ``LogEntry``, the cursor-connection view of it, and ``LogStats``.
+* :mod:`src.graphql.inputs` — ``LogFilterInput`` / ``CreateLogInput`` and their mappings.
 * :mod:`src.graphql.cursor` — opaque keyset cursor encode/decode (pure, stdlib only).
+* :mod:`src.graphql.errors` — the ``extensions.code`` taxonomy, the masking predicate and the
+  ``MaskErrors`` install. Read it before adding a new failure mode.
+* :mod:`src.graphql.validation` — every rule applied to every filter and mutation input, in one
+  place. Both funnels (``LogFilterInput.to_log_query`` and ``createLog``) call into it.
 * :mod:`src.graphql.context` — the request context and the router's ``context_getter``.
 * :mod:`src.graphql.query` — the ``Query`` root type.
+* :mod:`src.graphql.mutation` — the ``Mutation`` root type.
 * :mod:`src.graphql.schema` — the assembled :class:`strawberry.Schema`, exported as ``schema``.
 """

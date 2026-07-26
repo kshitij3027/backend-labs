@@ -51,6 +51,19 @@ LIKE_ESCAPE_CHARACTER = "\\"
 #: from :data:`LIKE_ESCAPE_CHARACTER` makes that ordering structural rather than remembered.
 _LIKE_METACHARACTERS: tuple[str, ...] = (LIKE_ESCAPE_CHARACTER, "%", "_")
 
+#: The severity ``logStats.errorCount`` counts, as stored in the ``level`` column.
+#:
+#: **ERROR only — CRITICAL is deliberately not folded in.** ``errorCount`` is one of the spec's own
+#: verification commands (§5) and it names one severity; a client that wants "errors and worse"
+#: sums the ``levelBreakdown``, which is why that field exists. Silently including CRITICAL would
+#: make the headline number disagree with the breakdown printed beside it in the same response.
+#:
+#: A module constant rather than a literal inside the statement builder so the string appears once,
+#: and so ``tests/unit/test_graphql_schema.py`` can pin it against ``LogLevel.ERROR`` — the
+#: published enum member — instead of against a copy of itself. Not imported from
+#: :mod:`src.graphql.enums`: the store must not depend on the API layer above it.
+ERROR_LEVEL = "ERROR"
+
 
 def escape_like(value: str) -> str:
     """Neutralise LIKE metacharacters so ``value`` matches itself literally.
@@ -283,6 +296,128 @@ def build_count_select(query: LogQuery) -> Select[tuple[int]]:
     return statement
 
 
+# =================================================================================================
+# Aggregates — spec §2 item 23 (`Query.logStats`)
+#
+# THE ONE RULE THIS SECTION EXISTS TO ENFORCE: every number below is computed BY POSTGRESQL. There
+# is no `SELECT *` here and there must never be one. The tempting implementation —
+# `rows = await repository.list_logs(LogQuery(start_time=…, end_time=…))` followed by
+# `len(rows)` and a `Counter` — is wrong three times over and only one of the three is visible in
+# a test:
+#
+#   1. It is silently CAPPED. `list_logs` clamps to MAX_QUERY_LIMIT, so `totalLogs` over a
+#      million-row window would confidently report 500. The response looks perfectly healthy.
+#   2. It transfers every matching row over the wire to count them. A stats call on a dashboard
+#      refresh becomes the most expensive query the server serves, and its cost grows with the
+#      corpus while the answer stays a handful of numbers long.
+#   3. It holds them all in memory at once, in a process that is also serving 100 concurrent
+#      requests (the C14 gate).
+#
+# Only (1) changes an assertion, which is why the tests grade `totalLogs` against the generator
+# oracle at a corpus size ABOVE the default limit.
+#
+# TWO statements, not one, and the split is deliberate:
+#
+#   * `build_stats_totals_select` is a scalar aggregate — one row, always, whatever the data looks
+#     like. It answers the spec's three headline numbers and cannot be affected by how many
+#     distinct services exist.
+#   * `build_stats_breakdown_select` is the GROUP BY that feeds the dashboard extras. Its result
+#     size is bounded by the *vocabulary* (distinct service x level pairs: 50 for the seeded
+#     corpus), never by the row count.
+#
+# Folding them into one `GROUP BY service, level` and summing in Python would work and would be one
+# round trip — but then the spec's headline numbers would be a Python sum over a result whose size
+# is a property of the data, and `totalLogs` would inherit any cardinality surprise the breakdown
+# has. Keeping them apart makes `sum(serviceBreakdown) == totalLogs` an assertion across two
+# independent statements, which is a real cross-check rather than a restatement.
+#
+# Both share `build_predicates`, so a filter means precisely what it means in `Query.logs`.
+# Neither applies a LIMIT — for the same reason `build_count_select` ignores one.
+# =================================================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceLevelCount:
+    """One ``(service, level)`` bucket and how many entries fell in it."""
+
+    service: str
+    level: str
+    entries: int
+
+
+@dataclass(frozen=True, slots=True)
+class LogStatsResult:
+    """Everything ``logStats`` publishes, in plain Python.
+
+    Not a GraphQL type, for the same reason :class:`LogQuery` is not: the repository stays usable
+    (and unit-testable) without importing Strawberry, and C7's aggregate cache will serialise
+    *this* rather than a schema object. :meth:`src.graphql.types.LogStats.from_result` is the only
+    place it is projected onto the published shape.
+
+    Attributes:
+        total_logs: Rows matching the filters. Exact — no limit was applied.
+        error_count: How many of them are :data:`ERROR_LEVEL`.
+        earliest: Oldest matching ``timestamp``, or ``None`` when nothing matched.
+        latest: Newest matching ``timestamp``, or ``None`` when nothing matched.
+        breakdown: One entry per non-empty ``(service, level)`` bucket, ordered by service then
+            level. Buckets with no rows are absent rather than reported as zero — the database has
+            nothing to say about a combination that never occurred.
+    """
+
+    total_logs: int
+    error_count: int
+    earliest: datetime | None
+    latest: datetime | None
+    breakdown: tuple[ServiceLevelCount, ...]
+
+
+def build_stats_totals_select(query: LogQuery) -> Select[Any]:
+    """Build the one-row scalar aggregate: totals, error count, and the observed time span.
+
+    ``count(*) FILTER (WHERE level = 'ERROR')`` rather than a second query or a
+    ``sum(CASE WHEN …)``: the filtered aggregate is evaluated in the same pass over the same rows,
+    so the error count costs nothing beyond the total and — the part that matters — is guaranteed
+    to be counted over *exactly* the same set. Two separate statements could disagree if a write
+    landed between them.
+
+    ``min``/``max`` on ``timestamp`` come along in the same pass and answer "what span does this
+    result actually cover", which is a different question from the window that was *requested*: a
+    dashboard asking for the last 24 hours wants to know the newest entry is 40 minutes old. Both
+    are ``NULL`` when nothing matched, which is why the published fields are nullable.
+    """
+    statement = select(
+        func.count().label("total_logs"),
+        func.count().filter(LogEntryORM.level == ERROR_LEVEL).label("error_count"),
+        func.min(LogEntryORM.timestamp).label("earliest"),
+        func.max(LogEntryORM.timestamp).label("latest"),
+    ).select_from(LogEntryORM)
+    for predicate in build_predicates(query):
+        statement = statement.where(predicate)
+    return statement
+
+
+def build_stats_breakdown_select(query: LogQuery) -> Select[Any]:
+    """Build the ``GROUP BY service, level`` breakdown behind the per-service and per-level views.
+
+    Grouped on both columns at once rather than run twice, because the per-service and per-level
+    breakdowns are two projections of the same cross-tabulation: one statement, one scan, and the
+    two views cannot disagree with each other about which rows they counted.
+
+    ``ORDER BY service, level`` is for determinism, not presentation — the published ordering
+    (services by descending volume, levels by ascending severity) is applied where the projection
+    happens. Without any ORDER BY, PostgreSQL is free to return groups in whatever order the
+    aggregation produced them, which can differ between two identical calls and would make a
+    response diff-unstable for no reason.
+    """
+    entries = func.count().label("entries")
+    statement = select(LogEntryORM.service, LogEntryORM.level, entries).select_from(LogEntryORM)
+    for predicate in build_predicates(query):
+        statement = statement.where(predicate)
+    return statement.group_by(LogEntryORM.service, LogEntryORM.level).order_by(
+        LogEntryORM.service.asc(), LogEntryORM.level.asc()
+    )
+
+
 class LogRepository:
     """Executes the builders above against one :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
 
@@ -355,6 +490,38 @@ class LogRepository:
         # `scalar()` returns None only when the statement produced no row at all, which a bare
         # aggregate cannot do; the coalesce is there so a caller never has to consider `None`.
         return int(total or 0)
+
+    async def log_stats(self, query: LogQuery) -> LogStatsResult:
+        """Aggregate the rows matching ``query`` **in SQL**, ignoring ``query.limit``.
+
+        Two statements, both explained in the section comment above :class:`LogStatsResult`. The
+        limit is ignored for the same reason :meth:`count_logs` ignores it: these numbers describe
+        the whole matching set, and an aggregate that silently stopped at ``MAX_QUERY_LIMIT`` would
+        report a plausible, wrong total with no indication anything had been truncated.
+
+        An empty result is a normal answer, not an error: the scalar aggregate still returns its
+        one row (zeros and two ``NULL`` timestamps), the breakdown returns no rows, and the caller
+        gets zeros rather than an exception. A dashboard filtering to a quiet window must render
+        "0", not a failure.
+
+        Returns:
+            A :class:`LogStatsResult`. Every number in it was computed by PostgreSQL.
+        """
+        totals = (await self._session.execute(build_stats_totals_select(query))).one()
+        groups = (await self._session.execute(build_stats_breakdown_select(query))).all()
+
+        return LogStatsResult(
+            total_logs=int(totals.total_logs or 0),
+            error_count=int(totals.error_count or 0),
+            earliest=totals.earliest,
+            latest=totals.latest,
+            breakdown=tuple(
+                ServiceLevelCount(
+                    service=row.service, level=row.level, entries=int(row.entries)
+                )
+                for row in groups
+            ),
+        )
 
     async def get_by_id(self, log_id: int) -> LogEntryORM | None:
         """Fetch one row by primary key, or ``None``.

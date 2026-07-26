@@ -36,6 +36,19 @@ function that constructs the statement makes "every path is capped" structurally
 ``DEFAULT_QUERY_LIMIT``, so resolving here changes no behaviour. It is done anyway because a
 ``LogQuery`` that leaves ``limit`` as ``None`` carries less information than one that says what it
 wants, and both read the same ``settings.default_query_limit`` so the two cannot disagree.)
+
+.. rubric:: Validation happens in the conversion, and that placement is the requirement
+
+Spec §2 item 34 asks for validation on **all** filter and mutation inputs.
+:meth:`LogFilterInput.to_log_query` is the single conversion every read path performs — ``logs``,
+``logsConnection``, and whatever C7's cache warm path turns out to be — so calling
+:func:`src.graphql.validation.validate_log_filter` from inside it makes "the filters were checked"
+a structural property rather than a line each resolver has to remember. A resolver added later
+cannot forget it, because a resolver that skipped it would have no ``LogQuery`` to run.
+
+It does mean a *conversion* function raises, which is worth stating out loud rather than
+discovering. The alternative — validating in each resolver — puts the guarantee back in the hands
+of whoever writes the next one.
 """
 
 from __future__ import annotations
@@ -44,10 +57,12 @@ from datetime import datetime
 from typing import Optional
 
 import strawberry
+from strawberry.scalars import JSON
 
 from src.config import Settings
 from src.db.repository import LogQuery
 from src.graphql.enums import LogLevel
+from src.graphql.validation import validate_log_filter
 
 
 @strawberry.input
@@ -66,7 +81,7 @@ class LogFilterInput:
     limit: Optional[int] = None
 
     def to_log_query(self, settings: Settings) -> LogQuery:
-        """Map this input onto the plain-Python request object the repository understands.
+        """Validate this input, then map it onto the request object the repository understands.
 
         The only interesting conversion is ``level``: Strawberry hands the resolver a
         :class:`~src.graphql.enums.LogLevel` **member**, and the ``level`` column holds the
@@ -75,7 +90,18 @@ class LogFilterInput:
         through would compare an ``Enum`` against a ``VARCHAR`` — asyncpg would reject it, and a
         driver rejection surfaces to the client as an opaque internal error rather than as the
         clean answer this conversion produces.
+
+        Raises:
+            src.graphql.errors.ValidationError: If any supplied filter breaks a rule in
+                :mod:`src.graphql.validation` — an over-long or blank ``service``, an over-long
+                ``searchText``, a NUL byte, or a ``startTime`` after its ``endTime``. Carries
+                ``extensions.code = "VALIDATION_ERROR"`` and reaches the client as a normal errors
+                envelope.
         """
+        # Before the mapping, not after: a value that fails here must never reach a statement
+        # builder, and validating the LogQuery instead would lose which GraphQL field to name.
+        validate_log_filter(self)
+
         return LogQuery(
             service=self.service,
             level=self.level.value if self.level is not None else None,
@@ -87,6 +113,39 @@ class LogFilterInput:
         )
 
 
+@strawberry.input
+class CreateLogInput:
+    """The ``createLog`` payload — spec §2 item 24, published as ``logData``.
+
+    Three required fields and three optional ones, and the split is the domain's rather than a
+    convenience: a log line without a source, a severity or a message is not a log line, while a
+    timestamp, a metadata object and a correlation id are all things a real emitter legitimately
+    does not have.
+
+    ``level`` is the :class:`~src.graphql.enums.LogLevel` **enum**, so ``level: "EROR"`` is
+    rejected during validation with a message naming the five legal values — before a resolver
+    runs, before a session is opened. That is the same guarantee ``LogFilterInput`` gets, applied
+    to the write path, and it is why nothing in :mod:`src.graphql.validation` checks ``level``.
+
+    ``timestamp`` omitted means **now, server-side**. Not "now, client-side": a client's clock is
+    not something this server can vouch for, and the C6 subscription stream orders by this column.
+    The default is applied in :meth:`src.db.repository.LogRepository.insert_log`, which is the one
+    place in the project allowed to read the wall clock for a stored row.
+
+    ``metadata`` is a ``JSON`` scalar — untyped on the wire — so
+    :func:`src.graphql.validation.validate_metadata` is what enforces that it is an *object* of
+    bounded depth and size. Omitted, it is stored as SQL ``NULL`` rather than the JSONB scalar
+    ``'null'``; see the ``none_as_null`` note on :class:`src.db.models.LogEntryORM`.
+    """
+
+    service: str
+    level: LogLevel
+    message: str
+    timestamp: Optional[datetime] = None
+    metadata: Optional[JSON] = None
+    trace_id: Optional[str] = None
+
+
 def to_log_query(filters: Optional[LogFilterInput], settings: Settings) -> LogQuery:
     """``LogFilterInput | None`` -> :class:`LogQuery`, with ``None`` meaning "no filters at all".
 
@@ -94,6 +153,8 @@ def to_log_query(filters: Optional[LogFilterInput], settings: Settings) -> LogQu
     same way. ``filters: null`` and an omitted ``filters`` argument both arrive here as ``None``
     and both produce an unfiltered query capped at ``DEFAULT_QUERY_LIMIT`` — which is precisely
     the spec's "omitted filters are ignored", applied one level up from the individual fields.
+
+    Nothing to validate in the ``None`` branch: "no filters" cannot break a rule.
     """
     if filters is None:
         return LogQuery(limit=settings.default_query_limit)

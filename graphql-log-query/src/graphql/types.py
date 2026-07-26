@@ -44,6 +44,7 @@ import strawberry
 from strawberry.scalars import JSON
 
 from src.db.models import LogEntryORM
+from src.db.repository import LogStatsResult
 from src.graphql.enums import LogLevel
 
 
@@ -96,8 +97,14 @@ class LogEntry:
         ``LogLevel(row.level)`` raises :class:`ValueError` for a stored level outside the enum.
         That is deliberate and loud: the enum is the published contract, the column is a plain
         ``String``, and a row that cannot be represented is a data-integrity problem rather than
-        something to paper over with a default severity. C4's error taxonomy gives it a typed
-        code; until then it surfaces as a GraphQL error rather than as a wrong answer.
+        something to paper over with a default severity.
+
+        C4 settled what the client sees when that happens, and it is **not** a member of the
+        :class:`~src.graphql.errors.ErrorCode` taxonomy: a stored level the schema cannot express
+        is a *server* fault, not something a client can act on, so it is masked as
+        ``INTERNAL_ERROR`` with the real ``ValueError`` and its trace going to the server log. The
+        codes exist to tell a client what to change about its request; there is nothing to change
+        here.
         """
         return cls(
             id=strawberry.ID(str(row.id)),
@@ -148,3 +155,135 @@ class LogConnection:
     edges: list[LogEdge]
     page_info: PageInfo
     total_count: int
+
+
+# =================================================================================================
+# logStats — spec §2 item 23
+#
+# ############################################################################################
+# ##  READ THIS BEFORE "IMPROVING" `services` INTO A LIST OF OBJECTS.                        ##
+# ############################################################################################
+#
+# Spec §5 lists this as a literal acceptance command:
+#
+#     { logStats { totalLogs errorCount services } }
+#
+# `services` is selected there as a LEAF — no sub-selection. GraphQL requires a sub-selection on
+# every field of an object type and FORBIDS one on every field of a scalar type, so the moment
+# `services` becomes `[ServiceCount!]!` that document stops validating: "Field 'services' of type
+# '[ServiceCount!]!' must have a selection of subfields." The acceptance command would break while
+# every test asserting on the richer shape stayed green — the failure would surface as a support
+# ticket, not as a red build.
+#
+# It is still true that a bare list of names is a thin answer for a dashboard. Both things are
+# satisfied by publishing BOTH, from ONE query:
+#
+#     services:         [String!]!         <- the spec's field. Leaf. Selectable exactly as written.
+#     serviceBreakdown: [ServiceCount!]!   <- the useful one. `{ service count }`.
+#
+# `services` is DERIVED from `serviceBreakdown` in `from_result` (it is literally the `service`
+# column of the same list, in the same order), so the two cannot disagree about which services
+# exist, and there is no second aggregation to keep in sync. `tests/unit/test_graphql_schema.py`
+# pins `services: [String!]!`, and the integration suite executes the spec document verbatim.
+# =================================================================================================
+
+
+@strawberry.type
+class ServiceCount:
+    """How many entries one service contributed to a window."""
+
+    service: str
+    count: int
+
+
+@strawberry.type
+class LevelCount:
+    """How many entries one severity contributed to a window."""
+
+    level: LogLevel
+    count: int
+
+
+@strawberry.type
+class LogStats:
+    """The aggregate summary ``Query.logStats`` returns. Every number computed in SQL.
+
+    The spec (§2 item 23) requires ``totalLogs``, ``errorCount`` and ``services`` *at minimum*. The
+    other four exist because a stats endpoint that answers only "how many" forces a dashboard to
+    issue a second, third and fourth query to draw anything — which is the exact multiplication of
+    round trips this project is a demonstration against. All seven come out of the same two
+    statements, so the extras are free.
+
+    Attributes:
+        total_logs: Rows matching the window. Exact: no limit is applied to an aggregate.
+        error_count: How many of them are ``ERROR``. **ERROR only** — see
+            :data:`src.db.repository.ERROR_LEVEL` for why CRITICAL is not folded in, and use
+            ``levelBreakdown`` to sum severities yourself.
+        services: Distinct service names, busiest first. The spec's field, kept a leaf.
+        service_breakdown: The same services with their counts, busiest first, ties broken by
+            name so the ordering is total and a response is diff-stable.
+        level_breakdown: Counts by severity, in ascending severity order (the ``LogLevel``
+            declaration order). Only severities that actually occurred appear; an absent one had
+            zero entries.
+        earliest: Oldest matching ``timestamp``, ``null`` when nothing matched. This is the span
+            the data **actually** covers, not the window that was asked for — "the newest entry is
+            40 minutes old" is a different and more useful fact than "I asked for 24 hours".
+        latest: Newest matching ``timestamp``, ``null`` when nothing matched.
+    """
+
+    total_logs: int
+    error_count: int
+    services: list[str]
+    service_breakdown: list[ServiceCount]
+    level_breakdown: list[LevelCount]
+    earliest: Optional[datetime]
+    latest: Optional[datetime]
+
+    @classmethod
+    def from_result(cls, result: LogStatsResult) -> LogStats:
+        """Project the repository's ``(service, level)`` cross-tabulation onto the published shape.
+
+        The two breakdowns are two *marginals* of one cross-tabulation, folded here rather than
+        asked of the database twice. That is what makes them consistent by construction: both sum
+        to the same number because both are sums over the same buckets.
+
+        Ordering is applied here rather than in SQL because the two views want different orders
+        from the same rows — services by descending volume (what a dashboard leads with), levels
+        by ascending severity (what a legend reads in). Sorting at most ``services x levels``
+        entries in Python is nothing; asking PostgreSQL for the same rows twice in two orders is a
+        second scan.
+        """
+        per_service: dict[str, int] = {}
+        per_level: dict[str, int] = {}
+        for bucket in result.breakdown:
+            per_service[bucket.service] = per_service.get(bucket.service, 0) + bucket.entries
+            per_level[bucket.level] = per_level.get(bucket.level, 0) + bucket.entries
+
+        # Busiest first, ties broken by name: without the name tiebreak two services with equal
+        # counts could swap places between two identical requests, which makes a response
+        # needlessly unstable and a test needlessly flaky.
+        service_breakdown = [
+            ServiceCount(service=service, count=count)
+            for service, count in sorted(per_service.items(), key=lambda item: (-item[1], item[0]))
+        ]
+
+        # Ascending severity — `LogLevel` is declared in that order, so enumerating it IS the
+        # ordering, and a severity added to the enum lands in the right place automatically.
+        severity = {member.value: index for index, member in enumerate(LogLevel)}
+        level_breakdown = [
+            LevelCount(level=LogLevel(level), count=count)
+            for level, count in sorted(
+                per_level.items(), key=lambda item: severity.get(item[0], len(severity))
+            )
+        ]
+
+        return cls(
+            total_logs=result.total_logs,
+            error_count=result.error_count,
+            # Derived, never computed separately. See the block comment above.
+            services=[entry.service for entry in service_breakdown],
+            service_breakdown=service_breakdown,
+            level_breakdown=level_breakdown,
+            earliest=result.earliest,
+            latest=result.latest,
+        )
