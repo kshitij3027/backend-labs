@@ -3,11 +3,13 @@
 Three things live here, and they are the seams the rest of the project hangs off:
 
 * :func:`lifespan` — the production startup/shutdown path. It owns the
-  :class:`~src.db.session.Database` (engine, session factory, schema creation, seeding) and will
-  own the Redis client and the subscription broker from C6. Every one of those is a resource
+  :class:`~src.db.session.Database` (engine, session factory, schema creation, seeding), the Redis
+  client, and the subscription :class:`~src.broker.LogBroker`. Every one of those is a resource
   whose *shutdown* matters as much as its startup, which is why they belong in a lifespan and not
-  in a module-level ``__init__``: an engine that is never disposed leaks connections, and a
-  psubscribe reader that is never cancelled keeps uvicorn from exiting.
+  in a module-level ``__init__``: an engine that is never disposed leaks connections, a pub/sub
+  reader that is never cancelled keeps uvicorn from exiting, and subscribers that are never closed
+  leave it waiting on generators parked on a queue nothing will ever write to again. The teardown
+  order of the three is itself a correctness property — it is argued at the ``finally``.
 * :func:`create_app` — the construction site. Passing a pre-built ``settings`` skips
   :func:`~src.config.get_settings` entirely, which is the hermetic test seam: no ``.env``, no
   environment dependency, no shared LRU cache between tests.
@@ -35,6 +37,7 @@ from strawberry.fastapi import GraphQLRouter
 from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
 
 from src.api.health import router as health_router
+from src.broker import LogBroker, create_redis_client
 from src.config import Settings, get_settings
 from src.db.session import Database
 from src.graphql.context import get_context
@@ -79,22 +82,35 @@ def configure_logging(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own every process-scoped resource: build it on startup, tear it down on exit.
 
-    Currently that is the :class:`~src.db.session.Database`; C6 adds the Redis client and the
-    subscription broker at the marked seams. Resources are attached to ``app.state`` so handlers
-    reach them through the request (``request.app.state.db``) rather than through module globals,
-    which is what keeps two apps in one test process independent.
+    Currently that is the :class:`~src.db.session.Database`, the Redis client and the subscription
+    :class:`~src.broker.LogBroker`. Resources are attached to ``app.state`` so handlers reach them
+    through the request (``request.app.state.db``) rather than through module globals, which is what
+    keeps two apps in one test process independent.
     """
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
 
-    # === C6 ===  app.state.redis = redis.asyncio.from_url(settings.redis_url)
-    #             app.state.broker = Broker(...); await broker.start()   # psubscribe reader task
-    # Lands here rather than at import time because it also needs the matching teardown in the
-    # `finally` below — a psubscribe reader that is never cancelled keeps uvicorn from exiting.
+    # The Redis client and the subscription broker (C6). Built here rather than at import time
+    # because each has a teardown that matters as much as its construction: a pub/sub reader task
+    # that is never cancelled keeps uvicorn from exiting, and subscribers that are never closed
+    # keep it waiting on generators parked on a queue nothing will write to again.
+    #
+    # `create_redis_client` never raises and may return None (a malformed REDIS_URL, a broken
+    # install); `LogBroker.start()` does not connect — `Redis.from_url` is lazy, so an unreachable
+    # Redis is a reader that logs one warning and retries with backoff, NOT a container that
+    # refuses to start. Cross-worker fan-out is a §4 bonus; nothing in the core spec depends on it,
+    # so its absence degrades `logStream` to in-process delivery and nothing else.
+    redis_client = create_redis_client(settings)
+    broker = LogBroker(settings, redis_client=redis_client)
+    app.state.redis = redis_client
+    app.state.broker = broker
+    await broker.start()
 
     logger.info(
         "starting %s v%s (log_level=%s, seed_entries=%d, default_query_limit=%d, "
         "max_query_limit=%d, cache_enabled=%s, cache_ttl_seconds=%d, max_query_depth=%d, "
-        "max_query_complexity=%d, subscription_queue_maxsize=%d, playground=%s, metrics=%s)",
+        "max_query_complexity=%d, subscription_queue_maxsize=%d, "
+        "max_subscriptions_per_connection=%d, subscription_channel=%s, pubsub_bridge=%s, "
+        "publisher_id=%s, playground=%s, metrics=%s)",
         API_TITLE,
         API_VERSION,
         settings.log_level,
@@ -106,6 +122,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.max_query_depth,
         settings.max_query_complexity,
         settings.subscription_queue_maxsize,
+        settings.max_subscriptions_per_connection,
+        settings.subscription_channel,
+        "enabled" if redis_client is not None else "disabled (in-process fan-out only)",
+        broker.publisher_id,
         settings.graphql_playground_enabled,
         settings.metrics_enabled,
     )
@@ -142,11 +162,50 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         yield
     finally:
-        # === C6 ===  await broker.close_all_subscribers(); await broker.stop()
-        # === C6 ===  await app.state.redis.aclose()
         # Teardown is best-effort by construction: it runs on the way out, and a failure here
         # must not replace whatever actually caused the shutdown with a traceback from cleanup —
-        # hence the swallow-and-log rather than letting `dispose` propagate out of a `finally`.
+        # hence the swallow-and-log around every step rather than letting one propagate.
+        #
+        # ================= THE ORDER OF THE NEXT THREE STEPS IS LOAD-BEARING =================
+        #
+        # 1. STOP THE READER FIRST. While it is running, a message arriving off the channel is
+        #    fanned out to live subscribers — so doing this after step 2 would let a remote event
+        #    land on a subscriber that has just been terminated (harmless) or, worse, arrive
+        #    between the sweep and the reader's death and leave a queue with entries and no
+        #    terminal sentinel behind it: a generator parked forever on `queue.get()`, which is
+        #    exactly what step 2 exists to prevent. `stop()` also settles in-flight PUBLISH tasks,
+        #    so an event a peer worker's subscriber is entitled to is not cancelled mid-flight.
+        #
+        # 2. CLOSE THE SUBSCRIBERS SECOND. This enqueues the terminal sentinel on every live
+        #    subscriber so each streaming generator wakes, returns, and lets its task finish.
+        #    Without it the ASGI server waits on tasks that can never complete and the container
+        #    has to be killed rather than stopped.
+        #
+        # 3. CLOSE THE REDIS CLIENT LAST — after both of its users are done with it. Closing it
+        #    first would turn the reader's in-flight read and every pending publish into connection
+        #    errors logged during what is otherwise a clean shutdown, which is a log full of
+        #    alarming noise describing nothing that went wrong.
+        try:
+            await broker.stop()
+        except Exception:  # pragma: no cover - defensive; stop() swallows its own failures
+            logger.exception("failed to stop the subscription pub/sub reader during shutdown")
+
+        try:
+            closed = broker.close_all_subscribers()
+            if closed:
+                logger.info("closed %d live subscription(s) during shutdown", closed)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("failed to close live subscriptions during shutdown")
+
+        if redis_client is not None:
+            try:
+                # redis-py renamed the async closer to `aclose()` and kept `close()` as a
+                # deprecated alias; tolerate either so a version bump is not a shutdown traceback.
+                closer = getattr(redis_client, "aclose", None) or redis_client.close
+                await closer()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("failed to close the Redis client during shutdown")
+
         try:
             await db.dispose()
         except Exception:  # pragma: no cover - defensive; disposal has no expected failure mode
@@ -216,10 +275,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     #    POST is unaffected either way, so disabling the IDE in a hostile environment does not
     #    disable the API.
     #
-    #    `subscription_protocols` is declared NOW even though `Subscription` does not exist until
-    #    C6. The list is a property of the transport, not of the schema — it decides which
-    #    `Sec-WebSocket-Protocol` values the server will negotiate — so declaring it here means C6
-    #    adds a schema field and changes nothing about the mount. Both protocols are offered:
+    #    `subscription_protocols` was declared at C1, before `Subscription` existed. The list is a
+    #    property of the transport, not of the schema — it decides which `Sec-WebSocket-Protocol`
+    #    values the server will negotiate — which is why C6 added a subscription root to the schema
+    #    and changed nothing at all about this mount. Both protocols are offered:
     #    `graphql-transport-ws` is the current one (what graphql-ws@5 speaks, which is what the
     #    C13 Apollo client uses), and the legacy `graphql-ws` is kept because older clients and
     #    some tooling still only speak that one.

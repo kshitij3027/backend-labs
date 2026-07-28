@@ -49,6 +49,8 @@ from src.graphql.errors import (
     MaskInternalErrors,
     NotFoundError,
     PersistedQueryNotFoundError,
+    SlowConsumerError,
+    SubscriptionLimitError,
     ValidationError,
     error_code,
     is_expected_error,
@@ -62,6 +64,8 @@ DOMAIN_ERRORS = [
     (InvalidCursorError, ErrorCode.INVALID_CURSOR),
     (CostLimitExceededError, ErrorCode.COST_LIMIT_EXCEEDED),
     (PersistedQueryNotFoundError, ErrorCode.PERSISTED_QUERY_NOT_FOUND),
+    (SlowConsumerError, ErrorCode.SLOW_CONSUMER),
+    (SubscriptionLimitError, ErrorCode.SUBSCRIPTION_LIMIT_EXCEEDED),
 ]
 
 
@@ -126,6 +130,10 @@ def test_the_codes_are_distinct_and_include_the_placeholders_later_commits_need(
 
     Defining them now is what stops C8 and C9 from each inventing their own spelling
     (``COST_EXCEEDED``? ``QUERY_TOO_COMPLEX``?) in a client-visible contract.
+
+    ``SLOW_CONSUMER`` and ``SUBSCRIPTION_LIMIT_EXCEEDED`` arrived with C6, which is when the two
+    failures they name became possible. They are pinned here for the reason every other code is:
+    the strings are the contract a client branches on, and a rename is a silent break.
     """
     values = [code.value for code in ErrorCode]
 
@@ -136,6 +144,8 @@ def test_the_codes_are_distinct_and_include_the_placeholders_later_commits_need(
         "INVALID_CURSOR",
         "COST_LIMIT_EXCEEDED",
         "PERSISTED_QUERY_NOT_FOUND",
+        "SLOW_CONSUMER",
+        "SUBSCRIPTION_LIMIT_EXCEEDED",
         "INTERNAL_ERROR",
     } == set(values)
 

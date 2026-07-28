@@ -37,8 +37,16 @@ that operation, closed when the operation ends.
 scope is the whole life of the stream — Strawberry wraps the entire ``async for`` yield loop in
 ``on_operation`` — so a session opened there would be exactly the per-socket session this module
 exists to argue against, just reached by a different route. Under a subscription the resources
-object hands out a short-lived session per request instead, and C6's resolver opens one per yielded
-item.
+object hands out a **short-lived** session per unit of work instead, opened and closed inside the
+block that asked for it.
+
+C6 went one better and needs none at all: the broker's payload already carries the whole entry, so
+:meth:`src.graphql.subscription.Subscription.log_stream` yields reconstructed objects and issues
+zero statements for the life of the stream (there is an integration test counting them). The
+short-lived-session policy still matters, because a client is free to select
+``logStream { relatedLogs { id } }`` — that resolves through the per-operation DataLoader like any
+other field, on a session that is opened for the batch and released immediately rather than held
+across a yield.
 
 .. rubric:: Why the resources live in a ContextVar and not on the context object
 
@@ -79,6 +87,13 @@ from src.graphql.loaders import LoaderRegistry
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` makes them strings
     from strawberry.types import ExecutionContext
+
+    # Imported only for the annotation. `src.broker` imports `src.graphql.types`, which this module
+    # already sits above in the import graph — a runtime import here would work today and would
+    # become a cycle the moment the broker needed anything from the context. The type-only form
+    # costs nothing (`from __future__ import annotations` makes every annotation a string) and
+    # removes the question.
+    from src.broker import LogBroker
 
 logger = logging.getLogger(__name__)
 
@@ -284,6 +299,27 @@ class Context(BaseContext):
         db: The owning :class:`~src.db.session.Database`, for the rare caller that needs the
             engine itself (schema-level work, the C14 memory probe). Optional so tests can build a
             context from a bare factory.
+        broker: The process-wide :class:`~src.broker.LogBroker` (C6), or ``None`` when the
+            application was assembled without a lifespan. ``createLog`` publishes to it and
+            ``logStream`` subscribes to it.
+
+            **Optional, and the asymmetry between the two consumers is deliberate.** A subscription
+            with no broker raises — a stream that connects and yields nothing forever looks exactly
+            like a quiet server, so it must fail loudly. A mutation with no broker still writes the
+            row and returns it, because the write is the thing the client asked for and fan-out is
+            an additional delivery guarantee, not part of the contract of ``createLog``. That is
+            also what keeps every C4 mutation test — which builds a bare ``Context`` and never wants
+            a broker — meaningful rather than accidentally exercising the publish path.
+
+    .. rubric:: The context object IS the WebSocket connection's identity
+
+    Strawberry resolves ``context_getter`` exactly once per WebSocket connection (see the module
+    docstring), so one ``Context`` instance serves every operation multiplexed on one socket and no
+    two sockets share one. :meth:`src.graphql.subscription.Subscription.log_stream` passes ``self``
+    to :meth:`src.broker.LogBroker.subscribe` as the connection key on exactly that basis, which is
+    how ``MAX_SUBSCRIPTIONS_PER_CONNECTION`` counts the right thing without a connection id being
+    invented and threaded through. Note the corollary: on the HTTP transport a context is per
+    *request*, so a mutation never contributes to anybody's subscription count.
     """
 
     def __init__(
@@ -291,11 +327,13 @@ class Context(BaseContext):
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         db: Optional[Database] = None,
+        broker: Optional["LogBroker"] = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.session_factory = session_factory
         self.db = db
+        self.broker = broker
 
     def _resources(self) -> Optional[OperationResources]:
         """The current operation's resources, or ``None`` outside an operation.
@@ -468,4 +506,16 @@ async def get_context(connection: HTTPConnection) -> Context:
     # an application assembled some other way. It resolves configuration the same way production
     # does rather than inventing a default.
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
-    return Context(settings=settings, session_factory=db.session_factory, db=db)
+
+    # The broker is read with a default rather than demanded, unlike `db` above. Every GraphQL
+    # request needs a database; only a subscription needs a broker, and `logStream` raises its own
+    # (much more specific) error if one is missing. Failing every `{ logs { id } }` because the
+    # fan-out layer is absent would be the wrong blast radius.
+    broker: Optional["LogBroker"] = getattr(app.state, "broker", None)
+
+    return Context(
+        settings=settings,
+        session_factory=db.session_factory,
+        db=db,
+        broker=broker,
+    )

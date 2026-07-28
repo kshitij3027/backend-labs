@@ -95,3 +95,10 @@ type ServiceCount {
   service: String!
   count: Int!
 }
+
+type Subscription {
+  """
+  Live log entries, pushed over WebSocket as `createLog` commits them. `service` and `level` are applied SERVER-SIDE, before an entry is queued for this subscriber — so a narrow subscription costs neither bandwidth nor queue depth for traffic it did not ask for. Each subscriber gets its own bounded queue: a client that stops reading long enough to fill it is disconnected with a SLOW_CONSUMER error rather than being buffered without limit, so a gap is always reported and never silent.
+  """
+  logStream(service: String = null, level: LogLevel = null): LogEntry!
+}

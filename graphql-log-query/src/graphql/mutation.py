@@ -106,16 +106,32 @@ class Mutation:
             await session.commit()
             entry = LogEntry.from_orm(row)
 
-        # === C6 ===  PUBLISH THE COMMITTED ENTRY TO THE BROKER — `createLog` is the event source
-        #             for `Subscription.logStream`, and this is the only place an entry enters the
-        #             system at run time:
+        # PUBLISH THE COMMITTED ENTRY (C6). `createLog` is the event source for
+        # `Subscription.logStream`, and this is the only place an entry enters the system at run
+        # time.
         #
-        #                 await info.context.broker.publish(entry)
+        # THE PUBLISH IS HERE — OUTSIDE THE SESSION BLOCK, AFTER `await session.commit()` — AND THE
+        # ORDER IS NOT INTERCHANGEABLE. Publishing first would announce a row to every live
+        # subscriber before the transaction that creates it has succeeded, so a commit that then
+        # failed (a constraint, a lost connection, a serialisation failure) would leave every
+        # dashboard rendering an entry that does not exist, cannot be fetched again, and will never
+        # appear in a query. The reverse mistake — committing and then failing to publish — costs a
+        # subscriber one missed frame on a stream that is *explicitly* lossy under back-pressure
+        # (see src/broker.py). One of those is a correctness bug visible to users; the other is
+        # within the stream's documented guarantees. So: commit, then publish.
         #
-        #             It goes HERE, outside the session block and after the commit, for the reason
-        #             in this module's docstring: a subscriber must never be shown a row that a
-        #             rolled-back transaction never stored. The broker's `publish` is non-blocking
-        #             and never raises (bounded per-subscriber queues, drop on overflow), so a slow
-        #             or dead subscriber cannot turn a successful write into a failed mutation —
-        #             which is why no try/except is needed around it and why one would be wrong.
+        # No try/except, and adding one would be wrong: `LogBroker.publish` has no await points and
+        # never raises by construction (bounded queues, `put_nowait`, drop-on-overflow, every
+        # per-subscriber step in its own `try`, the Redis hop handed to a background task). A slow
+        # subscriber, a dead subscriber or a Redis that is entirely down therefore cannot add
+        # latency to — or fail — a write that already committed.
+        broker = context.broker
+        if broker is not None:
+            # `None` only when the app was assembled without a lifespan, which is how the C4
+            # mutation tests build their context. The write is what `createLog` promises; fan-out is
+            # an additional delivery guarantee, so its absence must not fail the mutation. See the
+            # `broker` note on `src.graphql.context.Context` for why `logStream` treats it as fatal
+            # and this does not.
+            await broker.publish(entry)
+
         return entry

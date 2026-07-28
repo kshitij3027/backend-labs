@@ -158,6 +158,18 @@ class ErrorCode(Enum):
     #: The client's correct response is to resend with the document attached, which is why this is
     #: a distinct code and not a generic validation failure.
     PERSISTED_QUERY_NOT_FOUND = "PERSISTED_QUERY_NOT_FOUND"
+    #: C6: a subscriber fell far enough behind that its bounded queue filled, and the server dropped
+    #: it rather than buffer without limit or block every other client (see :mod:`src.broker`). The
+    #: code exists so a dashboard can say "you were disconnected because you could not keep up, and
+    #: you have a gap" instead of silently believing it saw every entry — a **lossy** stream that
+    #: does not say so is worse than one that ends. The client's correct response is to resubscribe,
+    #: ideally with a narrower filter.
+    SLOW_CONSUMER = "SLOW_CONSUMER"
+    #: C6: one WebSocket connection tried to open more concurrent subscriptions than
+    #: ``MAX_SUBSCRIPTIONS_PER_CONNECTION`` allows. Distinct from ``VALIDATION_ERROR`` because
+    #: nothing about the *request* is wrong — the same operation would succeed on a fresh socket, or
+    #: after the client completes one it already holds.
+    SUBSCRIPTION_LIMIT_EXCEEDED = "SUBSCRIPTION_LIMIT_EXCEEDED"
     #: Something escaped. The only code a client can never act on, and the only one this module
     #: ever *invents* — see :class:`MaskInternalErrors`.
     INTERNAL_ERROR = "INTERNAL_ERROR"
@@ -249,6 +261,31 @@ class PersistedQueryNotFoundError(DomainError):
     """C9: a persisted-query hash arrived with no document and nothing cached under it."""
 
     code = ErrorCode.PERSISTED_QUERY_NOT_FOUND
+
+
+class SlowConsumerError(DomainError):
+    """C6: this subscriber's bounded queue overflowed and the server dropped the subscription.
+
+    Raised by :mod:`src.graphql.subscription` when it reads the terminal sentinel off a subscriber
+    the broker marked ``dropped``. It is the **client-visible half** of the back-pressure policy in
+    :mod:`src.broker`: the server chose to lose this consumer rather than lose its memory, and
+    ending the stream with a nameable code is what turns "you have a gap" from an invisible fact
+    into an actionable one.
+    """
+
+    code = ErrorCode.SLOW_CONSUMER
+
+
+class SubscriptionLimitError(DomainError):
+    """C6: this WebSocket connection is at ``MAX_SUBSCRIPTIONS_PER_CONNECTION``.
+
+    The typed counterpart of :class:`src.broker.SubscriptionLimitExceeded`, which is a plain
+    ``RuntimeError`` so the broker stays free of the GraphQL layer. The resolver translates one into
+    the other, exactly as ``logsConnection`` translates the cursor codec's ``ValueError`` into
+    :class:`InvalidCursorError`.
+    """
+
+    code = ErrorCode.SUBSCRIPTION_LIMIT_EXCEEDED
 
 
 def error_code(error: GraphQLError) -> str | None:

@@ -444,3 +444,51 @@ def test_create_log_input_publishes_metadata_and_trace_id_under_the_wire_names()
     """
     assert set(_input_field_types("CreateLogInput")) >= {"metadata", "traceId"}
     assert set(_input_field_types("CreateLogInput")) & {"metadata_", "trace_id"} == set()
+
+
+# --- Subscription.logStream (C6) ---------------------------------------------------------------
+
+
+def test_the_schema_publishes_a_subscription_root_with_log_stream() -> None:
+    """Spec §2 item 25.
+
+    Declaring a subscription root is also what makes ``GraphQLRouter``'s WebSocket half reachable:
+    the mount and its ``subscription_protocols`` have been in place since C1, so without this type
+    a ``graphql-transport-ws`` client negotiates a socket successfully and then finds that no
+    ``subscribe`` message can ever validate.
+    """
+    assert set(_field_types("Subscription")) == {"logStream"}
+    assert _field_types("Subscription")["logStream"] == "LogEntry!", (
+        "a streamed entry is never null — a null frame would be a payload a client has to branch "
+        "on for a case the server cannot produce"
+    )
+
+
+def test_log_stream_takes_two_optional_server_side_filters() -> None:
+    """Spec §2 item 26: ``service`` and ``level``, both optional, filtered on the server.
+
+    Optional in both directions matters. Required arguments would make "stream everything" —
+    which is what the C13 dashboard's live tail asks for — impossible to express. And ``level``
+    being the enum rather than ``String`` is what makes ``level: EROR`` a validation error that
+    names the five legal values, rather than a socket that opens, validates, and then stays
+    silent forever because nothing can match.
+    """
+    args = {
+        arg["name"]: _render_type(arg["type"]) for arg in _field("Subscription", "logStream")["args"]
+    }
+
+    assert args == {"service": "String", "level": "LogLevel"}
+
+
+def test_log_stream_documents_its_back_pressure_policy() -> None:
+    """The lossiness has to reach a client, not just a code reviewer.
+
+    A subscriber that falls far enough behind is **dropped**, not buffered without limit. That is
+    the right trade for a server, and it is a surprise to a client that has not been told — so the
+    description carries it into the SDL and into GraphiQL, where somebody writing a subscription
+    will actually read it.
+    """
+    description = _field("Subscription", "logStream")["description"] or ""
+
+    assert "SLOW_CONSUMER" in description
+    assert "SERVER-SIDE" in description

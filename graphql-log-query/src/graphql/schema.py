@@ -58,11 +58,11 @@ from src.graphql.context import PerOperationResources
 from src.graphql.errors import MaskInternalErrors, is_expected_error, log_expected_error
 from src.graphql.mutation import Mutation
 from src.graphql.query import Query
+from src.graphql.subscription import Subscription
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` makes them strings
     from strawberry.types import ExecutionContext
 
-# === C6 ===   from src.graphql.subscription import Subscription
 # === C7-C9 == from src.graphql.apq import PersistedQueries
 #              from src.graphql.cost import build_cost_validation_rules
 #              from src.metrics import MetricsExtension
@@ -114,7 +114,13 @@ class LogQuerySchema(strawberry.Schema):
 schema = LogQuerySchema(
     query=Query,
     mutation=Mutation,  # createLog
-    # === C6 ===  subscription=Subscription,  # logStream, orderStatusStream
+    # C6: logStream. C12 adds orderStatusStream to the same type.
+    #
+    # Declaring a subscription root is what makes `GraphQLRouter`'s WebSocket half reachable — the
+    # mount and its `subscription_protocols` have been in place since C1 (see src/main.py), so this
+    # one keyword is the whole difference between a socket that negotiates and immediately has
+    # nothing to offer and a working `graphql-transport-ws` endpoint.
+    subscription=Subscription,
     #
     # ORDER IS SIGNIFICANT and the list is not a set.
     #

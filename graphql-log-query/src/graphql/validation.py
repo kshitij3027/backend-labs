@@ -327,6 +327,33 @@ def validate_log_filter(filters: LogFilterInput) -> None:
     validate_time_range(filters.start_time, filters.end_time)
 
 
+def validate_subscription_filter(service: str | None) -> None:
+    """Check ``Subscription.logStream``'s ``service`` argument — spec §2 item 33, on the WS path.
+
+    ``level`` needs nothing here for the same reason ``LogFilterInput.level`` does not: it is the
+    :class:`~src.graphql.enums.LogLevel` enum, so an unknown severity is rejected during validation
+    with a message naming the five legal values, before the resolver runs and before a queue is
+    allocated.
+
+    ``service`` is the one free-form argument, and the rules are deliberately **the same three**
+    ``validate_log_filter`` applies. A subscription filter and a query filter that disagreed about
+    what a legal service name is would be a genuinely confusing surface: the same string would be
+    accepted by ``logs`` and rejected by ``logStream``, or worse, accepted by both and match on one.
+
+    Nothing is trimmed, for the same reason nothing is trimmed in ``validate_log_filter``: the
+    filter is compared against stored values, and silently normalising a name the client typed
+    would change which entries stream without saying so.
+
+    Raises:
+        ValidationError: ``service`` is blank, over-long, or contains a NUL byte.
+    """
+    if service is None:
+        return
+    _reject_nul("service", service)
+    _require_non_blank("service", service)
+    _require_max_length("service", service, MAX_SERVICE_LENGTH)
+
+
 def validate_create_log(log_data: CreateLogInput) -> CreateLogParams:
     """Validate and normalise a ``createLog`` payload.
 
