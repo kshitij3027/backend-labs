@@ -28,6 +28,7 @@ then a thin thing that executes them.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -297,6 +298,85 @@ def build_count_select(query: LogQuery) -> Select[tuple[int]]:
 
 
 # =================================================================================================
+# Batch loads — spec §2 item 29: "N field resolutions produce one database round trip, not N"
+#
+# The two builders below are the SQL half of C5's DataLoaders. They are the only statements in the
+# project that take a *set* of keys, and the shape is the whole point: ONE statement per batch,
+# never one per key.
+#
+# THE ORDERING CONTRACT LIVES ABOVE THIS LAYER, NOT IN IT. Both return a flat list of rows in the
+# store's usual `(timestamp DESC, id DESC)` order — NOT one bucket per key, and NOT in key order.
+# Re-aligning the rows with the keys the loader was called with is
+# :mod:`src.graphql.loaders`'s job, because that is a pure function over the result and is worth
+# unit testing without a database. What this module guarantees is only that every row matching any
+# of the keys is in the result exactly once.
+#
+# Keys are DEDUPLICATED, order-preservingly, before they reach the IN clause. A DataLoader batch
+# can legitimately contain the same key twice (two entries sharing a trace id ask for the same
+# group), and PostgreSQL's extended protocol caps a statement at 32767 bound parameters — sending
+# the duplicates would spend that budget on nothing. `dict.fromkeys` rather than `set` because a
+# stable parameter order keeps two identical batches compiling to two identical statements, which
+# is what makes a statement counter in a test readable.
+# =================================================================================================
+
+
+def build_logs_by_trace_ids_select(
+    trace_ids: Sequence[str], settings: Settings
+) -> Select[tuple[LogEntryORM]]:
+    """Build the ONE SELECT that fetches every entry belonging to any of ``trace_ids``.
+
+    ``ix_log_entries_trace_id`` exists for exactly this statement (see its comment in
+    :mod:`src.db.models`): without it, a batch of 25 trace ids is 25 sequential scans folded into
+    one query — batched, and still O(corpus) work per operation.
+
+    .. rubric:: The LIMIT is a transfer bound, and it is deliberately NOT a per-group one
+
+    ``max_query_limit * len(keys)`` — the same ceiling every other read path clamps to, multiplied
+    by how many groups were asked for. It exists so that a single pathological ``trace_id``
+    (a retry storm that tagged a million lines with one correlation id) cannot pull the whole table
+    through one field selection.
+
+    Its cost, stated rather than hidden: because the ordering is global, a hot trace *could* in
+    principle consume the whole allowance and leave another key in the same batch with no rows —
+    a parent whose ``relatedLogs`` is then wrongly empty. That needs one trace with more rows than
+    the entire allowance, so it cannot happen at any corpus this project builds (groups are 2-5
+    entries). The clean fix, if it ever does, is a
+    ``ROW_NUMBER() OVER (PARTITION BY trace_id ORDER BY timestamp DESC, id DESC) <= cap`` filter,
+    which caps each group independently in the same single statement. It is not written now because
+    an untriggerable optimisation is a maintenance cost with no reader.
+
+    Args:
+        trace_ids: The batch's keys. Duplicates are collapsed; an empty sequence still produces a
+            valid statement, but :meth:`LogRepository.list_logs_by_trace_ids` short-circuits before
+            building one so an empty batch costs no round trip at all.
+        settings: Supplies ``MAX_QUERY_LIMIT``.
+    """
+    keys = list(dict.fromkeys(trace_ids))
+    return (
+        select(LogEntryORM)
+        .where(LogEntryORM.trace_id.in_(keys))
+        .order_by(LogEntryORM.timestamp.desc(), LogEntryORM.id.desc())
+        .limit(settings.max_query_limit * max(1, len(keys)))
+    )
+
+
+def build_logs_by_ids_select(log_ids: Sequence[int]) -> Select[tuple[LogEntryORM]]:
+    """Build the ONE SELECT that fetches every entry named by ``log_ids``.
+
+    No ``LIMIT`` clause, and that is not an oversight: ``id`` is the primary key, so the result can
+    never exceed the number of distinct keys asked for — the batch size *is* the cap, and a
+    ``LIMIT`` on top of it could only ever silently drop a row a caller explicitly named. Every
+    other read path is capped because its predicate is open-ended; this one is not.
+    """
+    keys = list(dict.fromkeys(log_ids))
+    return (
+        select(LogEntryORM)
+        .where(LogEntryORM.id.in_(keys))
+        .order_by(LogEntryORM.timestamp.desc(), LogEntryORM.id.desc())
+    )
+
+
+# =================================================================================================
 # Aggregates — spec §2 item 23 (`Query.logStats`)
 #
 # THE ONE RULE THIS SECTION EXISTS TO ENFORCE: every number below is computed BY POSTGRESQL. There
@@ -527,11 +607,51 @@ class LogRepository:
         """Fetch one row by primary key, or ``None``.
 
         ``Session.get`` rather than a hand-written SELECT, because it consults the identity map
-        first: within one GraphQL operation the same entry is frequently reached twice (once
-        through ``logs``, once through another entry's ``related_logs``), and this makes the
-        second reach free rather than a second round trip.
+        first — within one unit of work the same entry is frequently reached twice, and this makes
+        the second reach free rather than a second round trip.
+
+        **``Query.log`` no longer comes through here.** Since C5 it goes through the by-id
+        DataLoader (:meth:`get_logs_by_ids`), because a document naming several entries under
+        aliases is several resolver calls and this method can only ever answer one of them per
+        statement. This remains the right call for a single, known lookup that is not part of a
+        GraphQL selection set — the mutation and store tests use it, and C10's writes will.
         """
         return await self._session.get(LogEntryORM, log_id)
+
+    async def list_logs_by_trace_ids(self, trace_ids: Sequence[str]) -> list[LogEntryORM]:
+        """Fetch every entry belonging to any of ``trace_ids`` in **one** statement.
+
+        The store half of C5's ``LogEntry.relatedLogs`` batching. Returns a flat list in
+        ``(timestamp DESC, id DESC)`` order — grouping the rows back onto the keys is
+        :func:`src.graphql.loaders.group_logs_by_trace_id`'s job, for the reason given in the
+        section comment above :func:`build_logs_by_trace_ids_select`.
+
+        An empty batch returns ``[]`` **without executing anything**. That is load-bearing rather
+        than tidy: ``WHERE trace_id IN ()`` is a statement that cannot match, and issuing it would
+        put a round trip on the wire for a question whose answer is already known — which is
+        exactly what the statement-counting tests exist to catch.
+        """
+        if not trace_ids:
+            return []
+        result = await self._session.execute(
+            build_logs_by_trace_ids_select(trace_ids, self._settings)
+        )
+        return list(result.scalars().all())
+
+    async def get_logs_by_ids(self, log_ids: Sequence[int]) -> list[LogEntryORM]:
+        """Fetch every entry named by ``log_ids`` in **one** statement.
+
+        The batched counterpart of :meth:`get_by_id`. An id with no row is simply absent from the
+        result: "no such entry" is an ordinary answer, and
+        :func:`src.graphql.loaders.align_logs_by_id` turns it into a ``None`` at the right
+        position rather than into an error.
+
+        As above, an empty batch costs no round trip.
+        """
+        if not log_ids:
+            return []
+        result = await self._session.execute(build_logs_by_ids_select(log_ids))
+        return list(result.scalars().all())
 
     async def insert_log(
         self,

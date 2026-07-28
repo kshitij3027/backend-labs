@@ -39,6 +39,11 @@ type LogEntry {
   message: String!
   metadata: JSON
   traceId: String
+
+  """
+  Every OTHER entry sharing this entry's traceId, newest first. The entry itself is deliberately excluded: a uniquely-traced entry would otherwise answer with itself, which is not what any caller means by 'related'. Empty when traceId is null. Batched across the whole selection set by a per-operation DataLoader, so N entries cost one query rather than N.
+  """
+  relatedLogs: [LogEntry!]!
 }
 
 input LogFilterInput {

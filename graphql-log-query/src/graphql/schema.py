@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING, Optional
 import strawberry
 from graphql import GraphQLError
 
+from src.graphql.context import PerOperationResources
 from src.graphql.errors import MaskInternalErrors, is_expected_error, log_expected_error
 from src.graphql.mutation import Mutation
 from src.graphql.query import Query
@@ -158,7 +159,16 @@ schema = LogQuerySchema(
     #                                                 src/graphql/context.py for why they cannot
     #                                                 be created in `context_getter`.
     #   ResultCache                              (C7) cache-aside on Query.logs / Query.logStats.
+    #
+    # C5 NOTE — `PerOperationResources` is INNERMOST of the two installed so far, and that is the
+    # position it wants: it sets up last, so nothing it allocates is held while an outer extension
+    # is still deciding whether to reject the operation, and it tears down FIRST, so the operation's
+    # database session is closed before `MaskInternalErrors` inspects the result. It also makes
+    # this schema **async-only** — its hook is an async generator, so `schema.execute_sync()` on it
+    # raises "failed to complete synchronously". That was already effectively true (every resolver
+    # is a coroutine, so `execute_sync` could only ever serve introspection); it is now enforced.
     extensions=[
         MaskInternalErrors,
+        PerOperationResources,
     ],
 )

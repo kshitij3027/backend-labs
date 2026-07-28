@@ -60,22 +60,63 @@ class LogEntry:
     metadata: Optional[JSON]
     trace_id: Optional[str]
 
-    # === C5 ===  `related_logs` lands here:
+    # `related_logs` is a FIELD RESOLVER rather than a value computed in `from_orm`, and that is
+    # the whole requirement (spec §2 items 17 and 28): a client that asks for `{ logs { id } }`
+    # must not pay for a correlated lookup per row. Strawberry only invokes a field resolver when
+    # the field appears in the selection set, so the cost is opt-in — which is exactly what C5's
+    # DataLoader then batches. Computing related entries eagerly here would defeat both
+    # requirements at once and would be invisible in any test that only checks the response shape.
     #
-    #     @strawberry.field
-    #     async def related_logs(self, info: strawberry.Info[Context, None]) -> list[LogEntry]:
-    #         """Every entry sharing this one's trace_id; [] when trace_id is null."""
-    #         if self.trace_id is None:
-    #             return []
-    #         rows = await info.context.loaders.logs_by_trace_id.load(self.trace_id)
-    #         return [LogEntry.from_orm(row) for row in rows]
-    #
-    # It is a FIELD RESOLVER rather than a value computed in `from_orm`, and that is the whole
-    # requirement (spec §2 items 17 and 28): a client that asks for `{ logs { id } }` must not pay
-    # for a second query per row. Strawberry only invokes a field resolver when the field appears
-    # in the selection set, so the cost is opt-in — which is exactly what the DataLoader in C5 is
-    # then batching. Computing related entries eagerly here would defeat both requirements at once
-    # and would be invisible in any test that only checks the response shape.
+    # NOTE THE BARE `strawberry.Info` ANNOTATION BELOW. It is not laziness and it is not a lost
+    # type parameter: `strawberry.Info[Context, None]` would require `Context` to be importable
+    # *here*, at schema-construction time, and this module is imported BY the loaders that
+    # `Context` imports (types -> loaders -> context -> types). Strawberry resolves the parameter
+    # annotation whether or not it carries type arguments, so dropping them breaks the cycle at no
+    # runtime cost. Every other resolver in the project keeps the parameterised form, because none
+    # of them sits underneath `Context` in the import graph.
+    @strawberry.field(
+        description=(
+            "Every OTHER entry sharing this entry's traceId, newest first. The entry itself is "
+            "deliberately excluded: a uniquely-traced entry would otherwise answer with itself, "
+            "which is not what any caller means by 'related'. Empty when traceId is null. "
+            "Batched across the whole selection set by a per-operation DataLoader, so N entries "
+            "cost one query rather than N."
+        )
+    )
+    async def related_logs(self, info: strawberry.Info) -> list[LogEntry]:
+        """Every other entry carrying this entry's ``trace_id`` — spec §2 item 17.
+
+        .. rubric:: The entry itself is excluded, and that is a decision
+
+        Read literally, "all logs sharing the same trace_id" includes the row being resolved from.
+        That reading makes the field almost useless: a client rendering "related entries" under a
+        log line would get that same line back at the top of its own list, and an entry whose trace
+        has no other members would answer ``[itself]`` rather than ``[]`` — indistinguishable, to a
+        client counting results, from a correlation that actually found something. So *related*
+        here means *other*, the exclusion is stated in the field description so it reaches the SDL
+        and GraphiQL, and a test pins it.
+
+        The exclusion happens **here rather than in the loader** because the loader's result is
+        shared by every entry in the group and each of them excludes a different row. Filtering
+        inside the batch would mean one query per parent, which is the thing this field exists to
+        demonstrate the absence of.
+
+        .. rubric:: A null trace_id costs ZERO round trips
+
+        The early return is above every ``await``: an entry with no correlation id never reaches
+        the loader, so a selection over a hundred untraced entries issues no batch at all — not one
+        batch that returns nothing. That is observable (the integration suite counts statements)
+        and it is the difference between "cheap" and "free" on the ~40% of the corpus that carries
+        no trace id.
+        """
+        if self.trace_id is None:
+            return []
+
+        group = await info.context.loaders.logs_by_trace_id.load(self.trace_id)
+        # `id` is a GraphQL ID, i.e. a string on both sides — `LogEntry.from_orm` is the only
+        # constructor of these objects and it always renders the primary key the same way, so the
+        # comparison cannot be an int/str mismatch that silently excludes nothing.
+        return [entry for entry in group if entry.id != self.id]
 
     @classmethod
     def from_orm(cls, row: LogEntryORM) -> LogEntry:

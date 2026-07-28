@@ -23,17 +23,26 @@ See its module docstring for the contract.
 (``test_db_store.py`` for the seeding and repository write paths, ``test_graphql_mutation.py`` for
 the ``createLog`` path) and a second copy would be a second chance to write the check wrong — in a
 way that, by construction, passes.
+
+.. rubric:: And the statement counter, for the same reason
+
+:func:`count_statements` records every SQL statement PostgreSQL is actually sent while a block
+runs. It is what turns "DataLoader prevents N+1 queries" (spec §5) from a comment into an
+assertion, and C7 needs the identical instrument to prove a cache hit issues **zero** statements.
+One implementation, so the two commits cannot end up measuring subtly different things.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import event, text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src.db.models import LogEntryORM, LogRecord
 
@@ -94,6 +103,93 @@ def matching(
 def as_records(rows: list[LogEntryORM]) -> list[LogRecord]:
     """Project database rows onto the identity-free value objects the oracle is made of."""
     return [LogRecord.from_orm_row(row) for row in rows]
+
+
+# =================================================================================================
+# Counting the statements the database actually received
+#
+# WHY AN EVENT LISTENER AND NOT A SPY ON THE REPOSITORY: a spy proves the repository was called
+# once, which is a statement about the code the test's author already read. `before_cursor_execute`
+# fires inside SQLAlchemy's execution path, once per statement handed to the DBAPI cursor, so what
+# it counts is what PostgreSQL was actually asked — including the statements a lazy load, an
+# identity-map miss or a helpful `.refresh()` would emit behind the resolver's back. Those are
+# exactly the N+1s that survive a mocked test.
+#
+# WHAT IT DOES NOT SEE, stated so a count is not over-read: transaction control (BEGIN / COMMIT /
+# ROLLBACK go through the dialect on the raw connection, not through a cursor) and `pool_pre_ping`'s
+# liveness check (which asyncpg answers at the driver level). Both absences are what make an exact
+# count like "two statements" stable rather than a hostage to connection-pool timing.
+# =================================================================================================
+
+
+@dataclass
+class StatementCounter:
+    """Every SQL statement executed while a :func:`count_statements` block was open."""
+
+    statements: list[str] = field(default_factory=list)
+
+    def __len__(self) -> int:
+        return len(self.statements)
+
+    def matching(self, *fragments: str) -> list[str]:
+        """Statements containing **all** of ``fragments``, compared case-insensitively.
+
+        Case-insensitive because the two halves of a statement do not agree on case: SQLAlchemy
+        renders keywords upper (``IN``, ``ORDER BY``) and identifiers lower (``log_entries``,
+        ``trace_id``), so a test that hardcoded either would be pinning a rendering detail rather
+        than the query it means.
+        """
+        needles = [fragment.lower() for fragment in fragments]
+        return [
+            statement
+            for statement in self.statements
+            if all(needle in statement.lower() for needle in needles)
+        ]
+
+    def count(self, *fragments: str) -> int:
+        """How many statements match every fragment. ``count()`` with no fragments is the total."""
+        return len(self.matching(*fragments))
+
+    def report(self) -> str:
+        """The recorded statements, one per line, for an assertion message.
+
+        A failing count is unreadable without this: "expected 2, got 27" says nothing about which
+        query multiplied, and the whole diagnosis is in the shape of the 27.
+        """
+        if not self.statements:
+            return "(no statements)"
+        return "\n".join(
+            f"  {index}. {' '.join(statement.split())[:160]}"
+            for index, statement in enumerate(self.statements, start=1)
+        )
+
+
+@contextmanager
+def count_statements(engine: AsyncEngine) -> Iterator[StatementCounter]:
+    """Record every statement executed on ``engine`` for the duration of the block.
+
+    Attached to ``engine.sync_engine``: SQLAlchemy's event system is defined over the synchronous
+    core, and the async engine is a façade over it, so this is where the async engine's statements
+    actually surface. Removed in a ``finally``, because a listener left attached would keep
+    appending to a dead counter for the rest of the session — and the engine outlives the block.
+    """
+    counter = StatementCounter()
+
+    def _record(
+        conn: Any,  # noqa: ANN401 - SQLAlchemy's event signature, positional and untyped
+        cursor: Any,  # noqa: ANN401
+        statement: str,
+        parameters: Any,  # noqa: ANN401
+        context: Any,  # noqa: ANN401
+        executemany: bool,
+    ) -> None:
+        counter.statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", _record)
+    try:
+        yield counter
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", _record)
 
 
 async def metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, str | None]:

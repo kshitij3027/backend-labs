@@ -64,7 +64,12 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "persisted_queries_enabled": True,
     "persisted_query_ttl_seconds": 3600,
     # DataLoader
-    "dataloader_batch_window_ms": 5,
+    #: 0 = dispatch on the next event-loop tick. C5 changed this from 5: Strawberry's DataLoader
+    #: has no batch-window knob (it dispatches with `loop.call_soon`), so 5 was a documented
+    #: default the implementation could not honour. A positive value now opens a real window via
+    #: `src.graphql.loaders.WindowedDataLoader`; 0 is the default because a selection set's fields
+    #: already resolve in one tick, so a window would add latency and widen nothing.
+    "dataloader_batch_window_ms": 0,
     # Subscriptions
     "subscription_queue_maxsize": 500,
     "max_subscriptions_per_connection": 10,

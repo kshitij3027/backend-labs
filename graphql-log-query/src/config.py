@@ -118,10 +118,21 @@ class Settings(BaseSettings):
     persisted_query_ttl_seconds: int = 3600
 
     # --- DataLoader (C5, C11) -------------------------------------------------------------
-    #: Batch window in milliseconds. 0 means "batch within one event-loop tick", which is the
-    #: usual DataLoader behaviour; a small non-zero window trades a little latency for wider
-    #: batches when resolutions are spread across awaits.
-    dataloader_batch_window_ms: int = 5
+    #: How long a DataLoader holds a batch open before dispatching it, in milliseconds.
+    #:
+    #: **0 (the default) means "dispatch on the next event-loop tick"** — every key loaded in the
+    #: current tick joins one batch. That is Strawberry's native behaviour and the only point on
+    #: this scale its `DataLoader` implements (it dispatches with `loop.call_soon`; there is no
+    #: window knob in its constructor). It is also the right default for this schema: Strawberry
+    #: resolves a selection set's fields concurrently, so all N `relatedLogs` calls are issued in
+    #: one tick and are already maximally batched — a window would add latency and widen nothing.
+    #:
+    #: A positive value opens a real window, implemented in `src.graphql.loaders`
+    #: (`WindowedDataLoader`) because Strawberry has none. It buys wider batches only when loads
+    #: straddle awaits, and costs up to its own length in latency on the fields that use it. C5
+    #: changed the default from 5 to 0 rather than leave a documented knob whose value the pinned
+    #: Strawberry could not honour; see that module's docstring for the whole argument.
+    dataloader_batch_window_ms: int = 0
 
     # --- Subscriptions (C6, C12) ----------------------------------------------------------
     #: Per-subscriber bounded queue. Overflow DROPS the slow consumer rather than growing server
@@ -148,7 +159,7 @@ class Settings(BaseSettings):
 
     # -- Validators ---------------------------------------------------------------------------
     #
-    # Four checks, each guarding a configuration that is *accepted* by the type system and
+    # Five checks, each guarding a configuration that is *accepted* by the type system and
     # *catastrophic* at run time. A `bool`/`int` annotation cannot express "0 means the opposite
     # of what you intended", which is exactly the first case below.
 
@@ -179,6 +190,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "MAX_QUERY_DEPTH must be >= 1: a budget below 1 rejects every operation the "
                 f"server can be sent, including introspection and GraphiQL itself (got {value})"
+            )
+        return value
+
+    @field_validator("dataloader_batch_window_ms")
+    @classmethod
+    def _check_dataloader_batch_window(cls, value: int) -> int:
+        """Refuse a negative window, which would read as "dispatch before the keys arrive".
+
+        Zero is legal and is the default — it means next-tick dispatch. A negative value has no
+        meaning at all, and the loader would clamp it to zero anyway, so accepting it would leave
+        an operator believing they had configured something.
+        """
+        if value < 0:
+            raise ValueError(
+                "DATALOADER_BATCH_WINDOW_MS must be >= 0: 0 means 'dispatch on the next "
+                f"event-loop tick' and a positive value is a real hold-open window (got {value})"
             )
         return value
 

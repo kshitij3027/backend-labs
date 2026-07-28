@@ -16,7 +16,7 @@ A single endpoint answering questions that would otherwise be three round trips 
 | **Aggregate stats** | `Query.logStats(startTime, endTime)` | `totalLogs` / `errorCount` / `services` computed in SQL with `GROUP BY`, never by pulling rows into Python | C4 |
 | **Log creation** | `Mutation.createLog(logData)` | Persists an entry, returns the created object, and publishes it to every matching subscriber | C4 / C6 |
 | **Real-time streaming** | `Subscription.logStream(service, level)` | New entries over WebSocket, filtered **server-side before yielding**, one bounded queue per subscriber | C6 |
-| **Trace correlation** | `LogEntry.relatedLogs` | Everything sharing a `traceId` — and an empty list, not an error, when there is no trace id | C5 |
+| **Trace correlation** | `LogEntry.relatedLogs` | Every **other** entry sharing a `traceId` (the entry itself is excluded) — and an empty list, not an error, when there is no trace id | C5 |
 | **Cross-entity query** | `Query.orders(filters)` + nested `user` / `payments` / `logs` | One query returning what REST would need 3+ calls for, with filters composing across dimensions | C10 / C11 |
 | **Order status stream** | `Subscription.orderStatusStream(orderId, status, userId)` | Status transitions as they happen, under a 100 ms end-to-end delivery budget | C12 |
 
@@ -155,7 +155,7 @@ One endpoint, three operation types. `POST /graphql` carries queries and mutatio
 Field-level notes worth knowing before you write a query:
 
 - **`level` is a `LogLevel` enum**, never a free string. An invalid level is a validation error against the schema, not a query that quietly matches nothing.
-- **`LogEntry.relatedLogs`** returns every entry sharing this one's `traceId`, and an **empty list** when `traceId` is null — a null trace id is an ordinary state, not an error.
+- **`LogEntry.relatedLogs`** returns every **other** entry sharing this one's `traceId`, and an **empty list** when `traceId` is null — a null trace id is an ordinary state, not an error. The entry itself is deliberately excluded: read literally the requirement would include it, and a uniquely-traced entry would then answer with itself, which is not what any caller means by *related*. The exclusion is stated in the field's own description, so it reaches GraphiQL and the committed SDL. A null trace id costs **zero** database round trips — the resolver returns before it touches the loader.
 - **`limit` is clamped, not rejected.** Asking for 10,000 returns `MAX_QUERY_LIMIT` rows. Every list path applies the cap, including nested ones, so a nested traversal cannot escape it.
 - **A `LogEvent` interface** (from C10) carries the fields every event type shares — `timestamp`, `service`, `level`, correlation id — and is implemented by `LogEntry`, `OrderEvent`, `UserEvent` and `PaymentEvent`, so a client can query across all four in one selection.
 - **Errors are GraphQL errors.** Every failure carries a typed `extensions.code` (`VALIDATION_ERROR`, `NOT_FOUND`, `COST_LIMIT_EXCEEDED`, `PERSISTED_QUERY_NOT_FOUND`, `INTERNAL_ERROR`); `MaskErrors` keeps stack traces off the wire, and no operation ever produces a bare HTTP 500.
@@ -254,7 +254,7 @@ Settings are read from **field defaults → optional `.env` → environment vari
 | `MAX_QUERY_ALIASES` | `30` | Alias ceiling — closes one field requested ten thousand times under ten thousand names |
 | `PERSISTED_QUERIES_ENABLED` | `true` | Accept `extensions.persistedQuery` hash-only requests |
 | `PERSISTED_QUERY_TTL_SECONDS` | `3600` | How long a registered query document is retained in Redis |
-| `DATALOADER_BATCH_WINDOW_MS` | `5` | Batch window; `0` batches within one event-loop tick |
+| `DATALOADER_BATCH_WINDOW_MS` | `0` | How long a loader holds a batch open. `0` = dispatch on the next event-loop tick (Strawberry's own behaviour, and already the maximal batch here). A positive value opens a real hold-open window — implemented in `src/graphql/loaders.py`, since Strawberry's `DataLoader` has no such knob — which widens batches only when loads straddle awaits |
 | `SUBSCRIPTION_QUEUE_MAXSIZE` | `500` | Per-subscriber bounded queue; overflow drops the slow consumer. **Must be ≥ 1** — `asyncio.Queue` reads `0` as *unbounded* |
 | `MAX_SUBSCRIPTIONS_PER_CONNECTION` | `10` | Cap on operations multiplexed over one WebSocket |
 | `SUBSCRIPTION_CHANNEL` | `graphql-log-query:events` | Redis pub/sub channel bridging workers |

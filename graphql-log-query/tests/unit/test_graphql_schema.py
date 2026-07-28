@@ -17,14 +17,40 @@ These are also the tests that would catch a real regression rather than restate 
 * the ``LogLevel`` enum drifting from the corpus vocabulary
 
 No database, no lifespan, no HTTP — the schema is a pure function of the source.
+
+.. rubric:: Why introspection runs through ``schema.execute`` on a private event loop (C5)
+
+It used to be ``schema.execute_sync``, which was simpler and is no longer available: the schema
+carries :class:`~src.graphql.context.PerOperationResources`, whose ``on_operation`` hook is an
+**async generator** (closing a database session requires an await), and Strawberry refuses to enter
+an async extension hook from a synchronous execution — ``RuntimeError: SchemaExtension hook …
+failed to complete synchronously``.
+
+Nothing is lost by that. Every resolver in this project is a coroutine, so ``execute_sync`` could
+only ever have served introspection in the first place; the schema is async-only in exactly the way
+the server always was. The loop is created, used and closed by :func:`_run` rather than through
+:func:`asyncio.run`, so the ambient event-loop policy pytest-asyncio manages is never touched.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import asyncio
+from collections.abc import Awaitable
+from typing import Any, Optional, TypeVar
 
 from src.generators import LOG_LEVELS
 from src.graphql.schema import schema
+
+_T = TypeVar("_T")
+
+
+def _run(coro: Awaitable[_T]) -> _T:
+    """Run ``coro`` to completion on a private event loop. See the module docstring."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)  # type: ignore[arg-type]
+    finally:
+        loop.close()
 
 #: One introspection document reused for every type. ``fields`` is null for input objects,
 #: ``inputFields`` for output objects and ``enumValues`` for both — the introspection schema makes
@@ -36,6 +62,7 @@ query Shape($name: String!) {
     name
     fields {
       name
+      description
       args { name type { ...Ref } }
       type { ...Ref }
     }
@@ -70,7 +97,7 @@ def _render_type(ref: Optional[dict[str, Any]]) -> str:
 
 def _introspect(name: str) -> dict[str, Any]:
     """Return the introspection record for one named type, failing loudly if it is absent."""
-    result = schema.execute_sync(SHAPE_QUERY, variable_values={"name": name})
+    result = _run(schema.execute(SHAPE_QUERY, variable_values={"name": name}))
 
     assert result.errors is None, f"introspecting {name} failed: {result.errors}"
     assert result.data is not None
@@ -122,13 +149,17 @@ def test_log_level_publishes_exactly_the_corpus_vocabulary() -> None:
 # --- LogEntry ------------------------------------------------------------------------------------
 
 
-def test_log_entry_publishes_exactly_the_seven_spec_fields_with_the_right_nullability() -> None:
-    """Spec §2 item 15, asserted as an equality so extra and missing fields both fail.
+def test_log_entry_publishes_the_seven_spec_fields_plus_related_logs() -> None:
+    """Spec §2 items 15 and 17, asserted as an equality so extra and missing fields both fail.
 
     The nullability half is the part that is easy to get wrong and expensive to notice:
     ``metadata`` and ``traceId`` are the two nullable columns, and roughly a third of the seeded
     corpus has each of them null. Publishing either as non-null would make those rows unresolvable
     — a client would get an error for data that is perfectly valid.
+
+    ``relatedLogs`` (C5) is the eighth field and the only one backed by a resolver rather than a
+    column. It is pinned here as well as in its own tests below so that "the published type is
+    exactly this" stays a single assertion.
     """
     assert _field_types("LogEntry") == {
         "id": "ID!",
@@ -138,7 +169,47 @@ def test_log_entry_publishes_exactly_the_seven_spec_fields_with_the_right_nullab
         "message": "String!",
         "metadata": "JSON",
         "traceId": "String",
+        "relatedLogs": "[LogEntry!]!",
     }
+
+
+# --- LogEntry.relatedLogs (C5) ---------------------------------------------------------------
+
+
+def test_related_logs_is_a_non_null_list_of_non_null_entries_taking_no_arguments() -> None:
+    """``relatedLogs: [LogEntry!]!`` — and specifically **not** nullable at either level.
+
+    "No correlated entries" is an empty list, never ``null``: a nullable list would give a client
+    two spellings of the same fact and force it to handle both. Non-null *elements* say the same
+    thing about the members — a correlation group cannot contain a hole.
+
+    No arguments, deliberately. Filtering related entries is a different feature (and one the cost
+    gate in C8 would have to price), and adding an argument later is backwards-compatible while
+    removing one is not.
+    """
+    field = _field("LogEntry", "relatedLogs")
+
+    assert _render_type(field["type"]) == "[LogEntry!]!"
+    assert field["args"] == []
+
+
+def test_related_logs_documents_that_it_excludes_the_entry_itself() -> None:
+    """The exclude-self decision has to reach a client, not just a code reviewer.
+
+    "All logs sharing the same trace_id" read literally includes the entry being resolved from.
+    This server deliberately returns the *others* — see the resolver's docstring for why
+    ``[itself]`` is a useless answer — and a deliberate departure from the obvious reading is only
+    a decision if it is published. The description is what GraphiQL shows on hover and what lands
+    in the committed ``schema.graphql``, so this assertion is the one that keeps the two honest.
+    """
+    description = _field("LogEntry", "relatedLogs")["description"] or ""
+
+    assert description, "relatedLogs must carry a description; it is the only place this is stated"
+    assert "excluded" in description.lower()
+    assert "traceid is null" in description.lower(), (
+        "the null-trace behaviour is half the requirement (spec §2 item 17) and belongs in the "
+        "published description too"
+    )
 
 
 def test_metadata_is_published_under_that_exact_name() -> None:

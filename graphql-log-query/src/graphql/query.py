@@ -35,11 +35,11 @@ take end to end. The driver is asyncpg for the same reason (see ``database_url``
 Strawberry invokes a field resolver only when the field appears in the selection set, and
 serialises only the selected fields. Nothing here defeats that: :meth:`Query.logs` builds
 :class:`~src.graphql.types.LogEntry` objects out of rows the database returned anyway, so a
-``{ logs { id } }`` response carries exactly one key per entry. The place this becomes load-bearing
-is C5's ``related_logs``, which must stay a *field resolver* — the moment it is computed eagerly in
-``from_orm``, every query pays for correlated lookups it never asked for, and the response shape is
-identical, so no test of the payload can notice. The seam is marked in
-:mod:`src.graphql.types`.
+``{ logs { id } }`` response carries exactly one key per entry. Where this becomes load-bearing is
+``LogEntry.relatedLogs`` (C5), which is a *field resolver* precisely so that it costs nothing until
+a client selects it — computed eagerly in ``from_orm``, every query would pay for correlated
+lookups it never asked for while the response shape stayed identical, so no test of the payload
+could notice.
 """
 
 from __future__ import annotations
@@ -133,16 +133,25 @@ class Query:
 
         ``null`` with **no** ``errors`` entry for a miss: absence is an ordinary answer to
         "is there a row with this id", not a failure. (C4 gives genuinely exceptional lookups a
-        ``NOT_FOUND`` code; a single-entity fetch is not one of them.) Routed through
-        :meth:`~src.db.repository.LogRepository.get_by_id` so it goes through the session identity
-        map — within one operation the same entry is often reached twice, once through ``logs`` and
-        once through another entry's ``related_logs``.
+        ``NOT_FOUND`` code; a single-entity fetch is not one of them.)
+
+        .. rubric:: Routed through the by-id DataLoader (C5)
+
+        Not because one lookup needs batching — because a *document* is not one lookup. A client
+        hydrating a list of ids writes ``{ a: log(id:"1"){…} b: log(id:"2"){…} … }``, and every
+        alias is a separate resolver call; without the loader that is one statement per alias.
+        Through it, the whole selection set collapses into a single
+        ``WHERE id IN (…)``. The loader also memoises within the operation, so an entry reached
+        twice — once here, once through another entry's ``relatedLogs`` — is fetched once.
+
+        The loader is per-operation (see :class:`src.graphql.context.PerOperationResources`), so
+        that memoisation can never serve a stale row to a later request.
         """
         log_id = _parse_log_id(id)
 
-        async with info.context.repository() as repository:
-            row = await repository.get_by_id(log_id)
-            return None if row is None else LogEntry.from_orm(row)
+        # Already a published `LogEntry` (or None): the projection happens inside the batch, while
+        # the rows are still attached to the session that loaded them.
+        return await info.context.loaders.log_by_id.load(log_id)
 
     @strawberry.field
     async def logs_connection(
