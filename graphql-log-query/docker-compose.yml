@@ -195,6 +195,27 @@ services:
       - "REDIS_URL=redis://redis:6379/1"
       - SEED_ENTRIES=0
       - SEED_ORDERS=0
+      # THE RESULT CACHE IS OFF FOR THE SUITE, AND THIS IS A CORRECTNESS BOUNDARY RATHER THAN A
+      # SPEED ONE. The leak is RUN-TO-RUN, not test-to-test — the distinction matters, so here is
+      # the mechanism that was actually reproduced rather than the one first guessed at. `make test`
+      # tears down Postgres with `down -v` but never flushes Redis, and the TTL is 30s, so a second
+      # `make test` inside that window is served the FIRST run's rows. Observed: a mutation test
+      # asserting the row it just wrote got `['1'] == ['2']` — the previous run's id, arriving as a
+      # plausible answer rather than an obviously broken one, and attributed to the mutation.
+      #
+      # The in-run case is currently harmless for a reason that is not worth depending on: most
+      # integration tests build `Context(...)` with no cache at all, so the resolver short-circuits
+      # and this variable never reaches them. Only the `http_client`/`real_app` tests go through the
+      # lifespan-built cache, and for those the deterministic corpus makes a leaked value correct.
+      # That is luck, not isolation.
+      #
+      # The cache is not left untested by this: tests/unit/test_cache.py and
+      # tests/integration/test_cache.py construct their own `ResultCache` under a namespace unique
+      # to each test (which is the isolation this variable cannot express), and one of them drives
+      # a real HTTP request through the mounted router against a cache installed on `app.state` to
+      # prove the lifespan wiring. A literal, like the two above it, because it is a property of
+      # "this is a test run" rather than a knob.
+      - CACHE_ENABLED=false
       # Quieter than the api's INFO so a failing assertion is not buried under startup lines.
       # Literal for the same reason as above, and so LOG_LEVEL has exactly ONE host-overridable
       # declaration in this file (on `api`) rather than two defaults that can disagree.

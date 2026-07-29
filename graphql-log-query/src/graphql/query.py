@@ -50,7 +50,8 @@ from typing import Optional
 
 import strawberry
 
-from src.db.repository import LogQuery
+from src.cache import cached_log_stats, cached_logs
+from src.db.repository import LogQuery, LogStatsResult
 from src.graphql import errors
 from src.graphql.context import Context
 
@@ -111,17 +112,41 @@ class Query:
         clamp — lives in :mod:`src.db.repository` and is exercised identically by every other
         caller. This resolver's whole job is the translation at the edges: GraphQL input in,
         published type out.
+
+        .. rubric:: Cached, cache-aside, keyed on the filters — and STALE FOR UP TO THE TTL
+
+        C7 wraps the load in :func:`src.cache.cached_logs`. A hit returns fully reconstructed
+        :class:`~src.graphql.types.LogEntry` objects and issues **zero** SQL (spec §2 item 31,
+        proven by a statement counter in the integration suite).
+
+        **This is not write-through.** A ``createLog`` does not invalidate anything, so a result
+        already in the cache keeps answering without the new row for up to ``CACHE_TTL_SECONDS``
+        (30). That is the spec's own choice of TTL-over-invalidation and it is argued in full in
+        :mod:`src.cache`; the short version is that invalidating "every key whose filters this row
+        matches" needs either a reverse index or a keyspace scan per write, and both are elaborate
+        machinery guarding a window that is thirty seconds wide anyway. Clients that need the live
+        view subscribe to ``logStream``, which is never cached.
+
+        The key is the **filter set**, not the selection set — so ``{ logs { id } }`` populates the
+        same entry ``{ logs { id message metadata } }`` reads. That is safe precisely because
+        :meth:`~src.graphql.types.LogEntry.from_orm` always projects the whole row: what is cached
+        is the complete entry, and the selection set is applied by Strawberry afterwards, on the
+        way out, exactly as it is on a miss.
         """
         context = info.context
         query = to_log_query(filters, context.settings)
 
-        async with context.repository() as repository:
-            rows = await repository.list_logs(query)
-            # Projected INSIDE the block. `expire_on_commit=False` means detached instances stay
-            # usable, so doing it outside would also work today — but it would work by relying on
-            # a session-configuration detail rather than on the object still being attached, and
-            # that is the kind of dependency that breaks silently when somebody adds a commit.
-            return [LogEntry.from_orm(row) for row in rows]
+        async def load() -> list[LogEntry]:
+            async with context.repository() as repository:
+                rows = await repository.list_logs(query)
+                # Projected INSIDE the block. `expire_on_commit=False` means detached instances stay
+                # usable, so doing it outside would also work today — but it would work by relying
+                # on a session-configuration detail rather than on the object still being attached,
+                # and that is the kind of dependency that breaks silently when somebody adds a
+                # commit.
+                return [LogEntry.from_orm(row) for row in rows]
+
+        return await cached_logs(context.cache, query, context.settings, load)
 
     @strawberry.field
     async def log(
@@ -258,6 +283,23 @@ class Query:
         would cost, and why the silently-capped total it produces is the failure that would survive
         a casual test.
 
+        .. rubric:: Cached under its OWN TTL, and the cached thing is the repository's result
+
+        ``AGG_CACHE_TTL_SECONDS`` (60), not ``CACHE_TTL_SECONDS`` (30) — spec §3 Feature Area D
+        asks for a TTL policy defined per aggregation, and an aggregate earns a longer one on both
+        counts: it is the more expensive query (two ``GROUP BY``-class scans over the whole window
+        rather than a limited index read) and the less sensitive answer (one new row moves a count
+        of thousands by one). The policy table lives in :data:`src.cache.TTL_POLICY`.
+
+        What is cached is :class:`~src.db.repository.LogStatsResult`, the *repository's* value —
+        and :meth:`~src.graphql.types.LogStats.from_result` then runs on the hit path and the miss
+        path alike. Caching the published object instead would have made that projection skippable,
+        and a skippable projection is a second implementation of the ordering and the derived
+        ``services`` list waiting to be written.
+
+        The staleness note on :meth:`logs` applies here too, with the longer bound: a ``createLog``
+        is invisible to an already-cached summary for up to a minute. See :mod:`src.cache`.
+
         Raises:
             src.graphql.errors.ValidationError: If ``startTime`` is after ``endTime``. That range
                 cannot match a row, so without the check it would return a confident set of zeros
@@ -267,10 +309,14 @@ class Query:
         # keeps the value that was *validated* and the value that reaches the WHERE clause the
         # same object — `build_predicates` would normalise again, identically, but a check made
         # against one instant and a query run against another is a bug waiting for a mixed-offset
-        # client to find it.
+        # client to find it. It is also what the cache key is derived from, so two clients asking
+        # for the same instant in two different offsets land on one key rather than two.
         start, end = validate_time_range(start_time, end_time)
+        query = LogQuery(start_time=start, end_time=end)
+        context = info.context
 
-        async with info.context.repository() as repository:
-            return LogStats.from_result(
-                await repository.log_stats(LogQuery(start_time=start, end_time=end))
-            )
+        async def load() -> LogStatsResult:
+            async with context.repository() as repository:
+                return await repository.log_stats(query)
+
+        return LogStats.from_result(await cached_log_stats(context.cache, query, load))

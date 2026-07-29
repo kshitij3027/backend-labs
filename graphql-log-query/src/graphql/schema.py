@@ -63,7 +63,7 @@ from src.graphql.subscription import Subscription
 if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` makes them strings
     from strawberry.types import ExecutionContext
 
-# === C7-C9 == from src.graphql.apq import PersistedQueries
+# === C8-C9 == from src.graphql.apq import PersistedQueries
 #              from src.graphql.cost import build_cost_validation_rules
 #              from src.metrics import MetricsExtension
 #              from strawberry.extensions import (
@@ -139,9 +139,10 @@ schema = LogQuerySchema(
     #
     # `Schema.get_extensions()` resolves each entry with `ext if isinstance(ext, SchemaExtension)
     # else ext()`, so a class is constructed fresh for every request while an instance is shared
-    # by all of them — extensions hold per-operation state (`execution_context`, and C7's cache
-    # keys), so sharing one is a cross-request leak under concurrency. Strawberry deprecated the
-    # instance form for that reason (#4369) and warns at Schema construction. A parameterised
+    # by all of them — extensions hold per-operation state (`execution_context`, and C9's resolved
+    # persisted-query document), so sharing one is a cross-request leak under concurrency.
+    # Strawberry deprecated the instance form for that reason (#4369) and warns at Schema
+    # construction. A parameterised
     # extension therefore goes in as a factory: `lambda: QueryDepthLimiter(MAX_QUERY_DEPTH)`,
     # not `QueryDepthLimiter(MAX_QUERY_DEPTH)`.
     #
@@ -164,7 +165,17 @@ schema = LogQuerySchema(
     #                                                 session in `on_operation` — see
     #                                                 src/graphql/context.py for why they cannot
     #                                                 be created in `context_getter`.
-    #   ResultCache                              (C7) cache-aside on Query.logs / Query.logStats.
+    #
+    # C7 NOTE — THE RESULT CACHE IS **NOT** AN EXTENSION, and the plan's sketch of one here was
+    # wrong. An extension sees the operation, not the resolved arguments: to key on the filter set
+    # it would have to re-derive `LogFilterInput` -> `LogQuery` from the AST and the variables,
+    # duplicating `to_log_query` (including its validation and its limit resolution) in a second
+    # place that could disagree with the first. Worse, a whole-operation cache keys on the DOCUMENT
+    # as well as the filters, so `{ logs { id } }` and `{ logs { id message } }` would be two
+    # entries holding the same rows, and any operation selecting a cached field beside an uncached
+    # one could not be cached at all. So the cache-aside sits in the two resolvers, around the
+    # repository call, keyed on the `LogQuery` they were about to run — one wrapper each. See
+    # src/cache.py.
     #
     # C5 NOTE — `PerOperationResources` is INNERMOST of the two installed so far, and that is the
     # position it wants: it sets up last, so nothing it allocates is held while an outer extension

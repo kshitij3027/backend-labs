@@ -92,8 +92,10 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` make
     # already sits above in the import graph — a runtime import here would work today and would
     # become a cycle the moment the broker needed anything from the context. The type-only form
     # costs nothing (`from __future__ import annotations` makes every annotation a string) and
-    # removes the question.
+    # removes the question. `src.cache` is held at arm's length for the same reason, and for one
+    # more: the cache must stay constructible and testable without a GraphQL context in the way.
     from src.broker import LogBroker
+    from src.cache import ResultCache
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +312,21 @@ class Context(BaseContext):
             an additional delivery guarantee, not part of the contract of ``createLog``. That is
             also what keeps every C4 mutation test — which builds a bare ``Context`` and never wants
             a broker — meaningful rather than accidentally exercising the publish path.
+        cache: The process-wide :class:`~src.cache.ResultCache` (C7), or ``None``. ``Query.logs``
+            and ``Query.logStats`` read through it.
+
+            **Optional, and ``None`` means "no caching" rather than "an error".** That is the same
+            asymmetry the broker gets on the mutation side and for the same reason: a cache is an
+            optimisation, and a read that cannot be cached is still a correct read. It also means
+            every C3/C4 test that builds a bare ``Context`` keeps grading the database rather than
+            accidentally grading a cache — which matters, because a test that unknowingly hits a
+            cache is a test that stopped exercising the query it was written for.
+
+            Note the cache is process-wide while the loaders are per-operation, and the difference
+            is deliberate: a DataLoader's memoisation has no expiry and no key discipline, so its
+            lifetime *is* its correctness (see the module docstring). This cache has an explicit
+            TTL and a key that names every filter it depends on, which is exactly what makes a
+            longer life safe.
 
     .. rubric:: The context object IS the WebSocket connection's identity
 
@@ -328,12 +345,14 @@ class Context(BaseContext):
         session_factory: async_sessionmaker[AsyncSession],
         db: Optional[Database] = None,
         broker: Optional["LogBroker"] = None,
+        cache: Optional["ResultCache"] = None,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.session_factory = session_factory
         self.db = db
         self.broker = broker
+        self.cache = cache
 
     def _resources(self) -> Optional[OperationResources]:
         """The current operation's resources, or ``None`` outside an operation.
@@ -507,15 +526,18 @@ async def get_context(connection: HTTPConnection) -> Context:
     # does rather than inventing a default.
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
 
-    # The broker is read with a default rather than demanded, unlike `db` above. Every GraphQL
-    # request needs a database; only a subscription needs a broker, and `logStream` raises its own
-    # (much more specific) error if one is missing. Failing every `{ logs { id } }` because the
-    # fan-out layer is absent would be the wrong blast radius.
+    # The broker and the cache are read with a default rather than demanded, unlike `db` above.
+    # Every GraphQL request needs a database; only a subscription needs a broker, and `logStream`
+    # raises its own (much more specific) error if one is missing. The cache is an optimisation and
+    # its absence is a slower correct answer. Failing every `{ logs { id } }` because either of the
+    # two optional layers is absent would be the wrong blast radius.
     broker: Optional["LogBroker"] = getattr(app.state, "broker", None)
+    cache: Optional["ResultCache"] = getattr(app.state, "cache", None)
 
     return Context(
         settings=settings,
         session_factory=db.session_factory,
         db=db,
         broker=broker,
+        cache=cache,
     )

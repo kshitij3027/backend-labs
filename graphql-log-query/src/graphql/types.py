@@ -37,8 +37,9 @@ Consistency is the point: one spelling everywhere beats two that differ per fiel
 
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 import strawberry
 from strawberry.scalars import JSON
@@ -46,6 +47,55 @@ from strawberry.scalars import JSON
 from src.db.models import LogEntryORM
 from src.db.repository import LogStatsResult
 from src.graphql.enums import LogLevel
+
+# =================================================================================================
+# The instant codec — ONE definition, used by every JSON representation of a stored timestamp
+#
+# Two subsystems serialise entries out of this process and read them back: C6's Redis pub/sub
+# bridge (`src.broker.encode_event` / `decode_event`) and C7's result cache (`src.cache`). Both need
+# the same answer to the same two questions — how is an instant written, and what comes back — and
+# a second copy of that answer is how "the same entry" starts meaning two things depending on which
+# path it arrived by.
+#
+# They live HERE, next to the type they encode, rather than in either consumer: `src.cache` imports
+# `src.broker` for nothing else, and a shared helper that lives in one consumer makes the other
+# depend on a module it has no other business with.
+# =================================================================================================
+
+
+def to_wire_timestamp(value: datetime) -> str:
+    """Render a stored ``timestamp`` for JSON, in UTC, with its offset attached.
+
+    ``log_entries.timestamp`` is ``TIMESTAMP WITH TIME ZONE`` and asyncpg hands back aware values,
+    so the ``tzinfo is None`` branch cannot fire on the production read path. It is here because
+    ``createLog`` accepts a client-supplied timestamp, and a naive value that reached this far would
+    otherwise be written without an offset and read back as naive — a value that compares unequal to
+    every aware datetime in the system, including the one the mutation itself returned.
+
+    Normalising to UTC loses the *original* offset and keeps the *instant*. That is the right trade
+    here: the column stores instants, ``datetime`` equality compares instants, and neither a
+    subscriber nor a cache reader has any use for the wall-clock zone a writer happened to be in.
+    It is also what makes two logically identical filter sets — one written ``+00:00``, one
+    ``+05:30`` for the same moment — hash to the same cache key.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def from_wire_timestamp(raw: str) -> datetime:
+    """Parse what :func:`to_wire_timestamp` wrote back into an aware UTC ``datetime``.
+
+    Raises:
+        ValueError: If ``raw`` is not an ISO-8601 instant. Callers decide what to do with that —
+            :func:`src.broker.decode_event` drops the message, :mod:`src.cache` treats the entry as
+            a cache miss — because "a peer published nonsense" and "a cached blob is stale garbage"
+            deserve different responses and neither is this function's business.
+    """
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:  # pragma: no cover - only reachable via a hand-written payload
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 @strawberry.type
@@ -129,11 +179,17 @@ class LogEntry:
         * ``int`` id -> :class:`strawberry.ID`. GraphQL's ``ID`` serialises as a string; a bare
           ``int`` would publish ``id: Int`` and change the contract.
 
-        C4's ``createLog``, C5's ``related_logs``, C6's ``logStream`` and C7's cache-hit
-        reconstruction all funnel through this classmethod. A second copy of the mapping is how
-        two representations of one row drift — one path returning ``metadata`` and another
-        returning ``null`` for it is the kind of bug that survives a full test suite because every
-        test happens to exercise only one of the two paths.
+        C4's ``createLog``, C5's ``related_logs``, C6's ``logStream`` and C7's cache **miss** path
+        all funnel through this classmethod. A second copy of the mapping is how two
+        representations of one row drift — one path returning ``metadata`` and another returning
+        ``null`` for it is the kind of bug that survives a full test suite because every test
+        happens to exercise only one of the two paths.
+
+        A cache **hit** cannot come through here — there is no row to project, only the JSON the
+        miss path stored — so it comes through :meth:`from_wire` instead. That is the second
+        mapping in this class and the only one, and it is why :meth:`to_wire` exists on the same
+        object: the pair is written together, tested together (a round trip through both must be
+        the identity), and shared with C6's pub/sub bridge rather than reimplemented by it.
 
         ``LogLevel(row.level)`` raises :class:`ValueError` for a stored level outside the enum.
         That is deliberate and loud: the enum is the published contract, the column is a plain
@@ -155,6 +211,72 @@ class LogEntry:
             message=row.message,
             metadata=row.metadata_,
             trace_id=row.trace_id,
+        )
+
+    # =============================================================================================
+    # The JSON representation. ONE mapping, two consumers — see the module-level note above
+    # `to_wire_timestamp`. C6 wraps `to_wire()` in a pub/sub envelope; C7 stores a list of them
+    # under a filter-hash key. Neither owns the mapping, so neither can drift from the other.
+    # =============================================================================================
+
+    def to_wire(self) -> dict[str, Any]:
+        """This entry as a JSON-serialisable dict. Every published field, no envelope.
+
+        Deliberately carries **all seven** fields rather than the ones a caller happens to need.
+        A reader reconstructs a complete :class:`LogEntry` and never consults the database to fill
+        a gap — which is precisely what spec §2 item 31 ("the cache hit path returns fully
+        reconstructed typed objects without touching the database") asks for, and what lets a
+        subscriber on another worker receive exactly what a local one does.
+
+        ``metadata`` round-trips as ``null`` when it is absent and as an object when it is present,
+        and the two stay distinguishable. That distinction is *already collapsed* by the time an
+        entry gets here — PostgreSQL's SQL ``NULL`` and the JSONB scalar ``'null'`` both arrive in
+        Python as ``None`` (see the ``none_as_null`` note on :class:`src.db.models.LogEntryORM`) —
+        so what this guarantees is that the collapse happens identically on both sides, which makes
+        the round trip lossless *as observed through the schema*. That is the only observation a
+        client can make.
+
+        Key order is fixed and matches the declaration order of the type. Nothing depends on it
+        semantically (JSON objects are unordered), but it keeps two encodings of one entry
+        byte-identical, which is what makes a cached blob diffable and a pub/sub payload greppable.
+        """
+        return {
+            "id": str(self.id),
+            "timestamp": to_wire_timestamp(self.timestamp),
+            "service": self.service,
+            "level": self.level.value,
+            "message": self.message,
+            "metadata": self.metadata,
+            "trace_id": self.trace_id,
+        }
+
+    @classmethod
+    def from_wire(cls, body: Mapping[str, Any]) -> LogEntry:
+        """Rebuild an entry from what :meth:`to_wire` produced. The inverse, and nothing else.
+
+        **Raises rather than tolerating.** The five required fields are read with ``[]`` and the two
+        optional ones with ``.get``, so a truncated payload is a ``KeyError`` and a severity outside
+        :class:`~src.graphql.enums.LogLevel` is a ``ValueError``. Both callers want that: the
+        pub/sub reader turns any failure into "drop this message" (a peer with the Redis credentials
+        can write anything to the channel) and the cache turns it into "treat this key as a miss"
+        (a blob written by an older build). Neither wants a half-populated entry, and an entry the
+        published schema cannot express must never reach a client — the failure would otherwise
+        happen during serialisation, mid-response, after the server has already committed to
+        answering.
+
+        ``id`` is coerced through ``str`` because GraphQL's ``ID`` is a string on the wire and a
+        JSON document that spelled it as a number would otherwise produce an entry whose ``id``
+        compares unequal to every other representation of the same row — including the one
+        :meth:`related_logs` filters the parent out with.
+        """
+        return cls(
+            id=strawberry.ID(str(body["id"])),
+            timestamp=from_wire_timestamp(body["timestamp"]),
+            service=body["service"],
+            level=LogLevel(body["level"]),
+            message=body["message"],
+            metadata=body.get("metadata"),
+            trace_id=body.get("trace_id"),
         )
 
 

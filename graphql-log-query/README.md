@@ -25,7 +25,7 @@ And the four things standing between that surface and a denial of service:
 | Guard | Mechanism | Lands |
 |---|---|---|
 | **N+1 elimination** | Per-**operation** DataLoaders — N field resolutions become one SQL round trip, proven by a statement counter, not a comment | C5 |
-| **Result caching** | Redis cache-aside keyed by `sha256` of the sorted-JSON filter set, 30 s TTL; a hit reconstructs fully typed objects with **zero** SQL | C7 |
+| **Result caching** | Redis cache-aside keyed by `sha256` of the sorted-JSON filter set, 30 s TTL; a hit reconstructs fully typed objects with **zero** SQL. TTL-bounded, **not** write-through — see decision 4 below | C7 |
 | **Cost gating** | A custom `ValidationRule` scoring the AST *before* execution — over-budget operations are refused with the computed cost and the limit in `extensions` | C8 |
 | **Persisted queries** | Clients send a `sha256` instead of a document; the server recomputes the hash on registration and refuses a mismatch | C9 |
 
@@ -68,13 +68,17 @@ GET  / , /assets/* ← React SPA (StaticFiles, same origin)            │
                      └────────────────────────────────────────┘
 ```
 
-**Three decisions worth stating up front.**
+**Four decisions worth stating up front.**
 
 1. **Loaders and sessions are per-*operation*, not per-connection.** Strawberry resolves `context_getter` **once per WebSocket connection**, not once per operation. A DataLoader or `AsyncSession` created there would live for the entire life of the socket — a stale-cache and connection-leak bug that looks fine in an HTTP test and misbehaves only over a long subscription. So a `PerOperationResources` `SchemaExtension` owns the lifecycle in `on_operation`: it mints a fresh loader registry and, for query/mutation operations only, one `AsyncSession` shared by every loader batch in that operation. **Subscription operations get no long-lived session** — the resolver opens a short-lived one per yielded item.
 
 2. **The cost gate runs in validation, before execution.** Rejecting inside a resolver is too late: by then the expensive part has started. A custom `graphql.validation.ValidationRule` walks the operation AST, giving each field a static weight and multiplying list fields by their requested `first`/`limit` (assuming `DEFAULT_QUERY_LIMIT` when omitted, so an unbounded list cannot score zero), resolving fragments as it goes. Stacked with `QueryDepthLimiter`, `MaxTokensLimiter` and `MaxAliasesLimiter`, which close the amplification routes complexity alone does not.
 
 3. **The broker publishes locally *and* to Redis.** In-process fan-out serves subscribers on this worker; a `PUBLISH` on the same event, plus a background `psubscribe` reader, lets subscriptions survive `uvicorn --workers N`. A worker ignores its own echo via a per-process publisher id, and Redis being unreachable degrades to in-process delivery rather than crashing — the same rule the cache follows.
+
+4. **The result cache is TTL-bounded, not write-through — a `createLog` is invisible to an already-cached query for up to the TTL.** This is the one place where the system is deliberately, boundedly inconsistent, so it is stated here rather than discovered. `Query.logs` results live 30 s (`CACHE_TTL_SECONDS`) and `Query.logStats` results 60 s (`AGG_CACHE_TTL_SECONDS`); nothing invalidates them on write. That is the spec's own choice (item 30 asks for "a short TTL"; nothing asks for invalidation) and it is the right one here for three reasons. **Correct invalidation is not cheap:** a write would have to invalidate every cached key whose *filters* the new row satisfies, and since keys are opaque hashes of arbitrary filter combinations that means either a reverse index from filter dimensions to keys (a second consistency problem, in a store that can be down) or a keyspace `SCAN` per write (which costs more than the query it saves) — elaborate machinery guarding a window that is thirty seconds wide anyway. **A uniform bound is more useful than a partial guarantee:** "up to 30 s stale" is something a dashboard can be built against; "usually fresh, except for the filter shapes the invalidator forgot" is not. **And live data has a different route entirely:** the real-time view is `Subscription.logStream`, fed by the broker directly from the mutation and never cached, so freshness here is a streaming concern rather than a caching one. An integration test asserts the stale read *by name*, so a future change to this contract fails a test rather than surprising a reader.
+
+   Three things the cache never does, each proven rather than asserted: it never **fails** a request (every Redis error — unreachable, timed out, a blob from an older build — falls through to PostgreSQL and bumps an error counter), it never **falsifies** one (the key hashes every filter, the resolved-and-clamped limit, the UTC-normalised bounds *and* the query kind, so `logs` and `logStats` cannot collide and neither can two windows one microsecond apart), and it never lets N concurrent misses on one key become N queries (an in-process single-flight map, so the moment a hot key expires under load is not the moment the database gets hit twenty times).
 
 ### Module layout
 
@@ -245,9 +249,9 @@ Settings are read from **field defaults → optional `.env` → environment vari
 | `RANDOM_SEED` | `20260725` | RNG seed — fixed so the corpus is reproducible and the E2E verifier can grade against it |
 | `DEFAULT_QUERY_LIMIT` | `100` | `limit` when the client omits it; also the multiplier the cost gate assumes for an unbounded list |
 | `MAX_QUERY_LIMIT` | `500` | Hard ceiling `limit` is clamped to on every path. Must be ≥ `DEFAULT_QUERY_LIMIT` or startup fails |
-| `CACHE_ENABLED` | `true` | Operability switch for the Redis result cache |
-| `CACHE_TTL_SECONDS` | `30` | Result-cache TTL — deliberately short; a log query is a point-in-time answer |
-| `AGG_CACHE_TTL_SECONDS` | `60` | Separate, longer TTL for aggregations: costlier to compute, far less sensitive to one new row |
+| `CACHE_ENABLED` | `true` | Operability switch for the Redis result cache. `false` is a true bypass — no client is constructed and no Redis command is issued |
+| `CACHE_TTL_SECONDS` | `30` | `Query.logs` TTL — deliberately short; a log query is a point-in-time answer. **Also the staleness bound after a write**, since nothing invalidates on `createLog` (decision 4). `0` means "read through, never store" |
+| `AGG_CACHE_TTL_SECONDS` | `60` | Separate, longer TTL for `Query.logStats`: costlier to compute (two `GROUP BY`-class scans), far less sensitive to one new row. The per-aggregation TTL policy C11 extends |
 | `MAX_QUERY_DEPTH` | `10` | Max operation nesting. Must be ≥ 1 — a budget below 1 rejects every possible operation |
 | `MAX_QUERY_COMPLEXITY` | `1000` | Complexity budget, scored from the AST before any resolver runs |
 | `MAX_QUERY_TOKENS` | `2000` | Document-size ceiling — closes the "enormous but shallow" document depth does not catch |

@@ -80,10 +80,7 @@ import threading
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
-
-import strawberry
 
 from src.config import Settings
 from src.graphql.enums import LogLevel
@@ -100,6 +97,12 @@ logger = logging.getLogger(__name__)
 # One envelope, one version field, one kind discriminator. C12 adds `orderStatusStream` by adding a
 # kind rather than by changing the shape, which is the whole reason the discriminator exists before
 # there is a second kind to discriminate.
+#
+# THE ENVELOPE IS THIS MODULE'S; THE ENTRY BODY INSIDE IT IS NOT. `LogEntry.to_wire()` /
+# `LogEntry.from_wire()` in `src.graphql.types` are the project's single JSON representation of a
+# published entry, shared with C7's result cache. C6 wrote that mapping and C7 lifted it up rather
+# than copying it — an entry that crossed the pub/sub bridge and one that came back out of the cache
+# are then the same object by construction, instead of by two implementations agreeing today.
 # =================================================================================================
 
 #: Bumped only for a **breaking** envelope change. A reader that meets a version it does not know
@@ -119,34 +122,17 @@ class RemoteEvent:
     entry: LogEntry
 
 
-def _encode_timestamp(value: datetime) -> str:
-    """Render a stored ``timestamp`` for the wire, in UTC, with its offset attached.
-
-    ``log_entries.timestamp`` is ``TIMESTAMP WITH TIME ZONE`` and asyncpg hands back aware values,
-    so the ``tzinfo is None`` branch cannot fire on the production path. It is here because
-    ``createLog`` accepts a client-supplied timestamp and a naive value that reached this far would
-    otherwise be encoded without an offset and decoded as naive — a value that compares unequal to
-    every aware datetime in the system, including the one the mutation returned.
-
-    Normalising to UTC loses the *original* offset and keeps the *instant*. That is the right
-    trade for this system: the column stores instants, ``datetime`` equality compares instants, and
-    a subscriber has no use for the wall-clock zone a writer happened to be in.
-    """
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat()
-
-
-def _decode_timestamp(raw: str) -> datetime:
-    """Parse what :func:`_encode_timestamp` wrote back into an aware UTC ``datetime``."""
-    parsed = datetime.fromisoformat(raw)
-    if parsed.tzinfo is None:  # pragma: no cover - only reachable via a hand-written payload
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
 def encode_event(entry: LogEntry, *, origin: str) -> str:
     """Serialise one entry into the JSON envelope published on the pub/sub channel.
+
+    .. rubric:: The ENVELOPE is this module's; the ENTRY BODY is not
+
+    ``origin``, ``v`` and ``kind`` exist for the bridge and mean nothing anywhere else, so they are
+    built here. The entry itself is rendered by :meth:`src.graphql.types.LogEntry.to_wire`, which is
+    the project's single JSON representation of a published entry — C7's result cache stores lists
+    of exactly that dict. Two encoders for one type is how two representations of one row start
+    disagreeing about whether ``metadata`` came back, and the disagreement survives a full test
+    suite because each test exercises only one of the two paths.
 
     Args:
         entry: The committed entry. Every field of the published type is carried, so a subscriber
@@ -156,27 +142,14 @@ def encode_event(entry: LogEntry, *, origin: str) -> str:
             suppress this process's own echo.
 
     Returns:
-        Compact JSON. ``metadata`` round-trips as ``null`` when it is absent and as an object when
-        it is present; the two are distinguishable on the wire even though PostgreSQL's SQL ``NULL``
-        and the JSONB scalar ``'null'`` both arrive in Python as ``None`` (see the ``none_as_null``
-        note on :class:`src.db.models.LogEntryORM` — by the time an entry reaches here that
-        distinction has already collapsed, and collapsing it identically on both sides is what makes
-        the round trip lossless *as observed through the schema*, which is the only observation a
-        client can make).
+        Compact JSON. See :meth:`~src.graphql.types.LogEntry.to_wire` for what the body guarantees
+        — in particular that ``metadata`` absent and ``metadata`` present stay distinguishable.
     """
     payload = {
         "v": EVENT_FORMAT_VERSION,
         "kind": EVENT_KIND_LOG,
         "origin": origin,
-        "entry": {
-            "id": str(entry.id),
-            "timestamp": _encode_timestamp(entry.timestamp),
-            "service": entry.service,
-            "level": entry.level.value,
-            "message": entry.message,
-            "metadata": entry.metadata,
-            "trace_id": entry.trace_id,
-        },
+        "entry": entry.to_wire(),
     }
     # `separators` because this is a hot path in aggregate (one document per ingested log line) and
     # the default separators add a space per key for a machine-only payload.
@@ -194,7 +167,9 @@ def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[R
     * an envelope version this build does not know (see :data:`EVENT_FORMAT_VERSION`);
     * a kind this build does not handle (a C12 order event reaching a C6 binary during a rolling
       deploy is exactly this case, and dropping it beats mis-decoding it);
-    * a missing required field, or a ``level`` outside :class:`~src.graphql.enums.LogLevel`.
+    * a missing required field, or a ``level`` outside :class:`~src.graphql.enums.LogLevel` —
+      both of which :meth:`src.graphql.types.LogEntry.from_wire` raises on, deliberately, so that
+      each caller can decide what a malformed body means. Here it means "drop the message".
     """
     if raw is None:
         return None
@@ -219,15 +194,7 @@ def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[R
         return None
 
     try:
-        entry = LogEntry(
-            id=strawberry.ID(str(body["id"])),
-            timestamp=_decode_timestamp(body["timestamp"]),
-            service=body["service"],
-            level=LogLevel(body["level"]),
-            message=body["message"],
-            metadata=body.get("metadata"),
-            trace_id=body.get("trace_id"),
-        )
+        entry = LogEntry.from_wire(body)
     except Exception:  # noqa: BLE001 - a missing key, a bad level, an unparseable timestamp
         logger.debug("dropping a malformed subscription message", exc_info=True)
         return None

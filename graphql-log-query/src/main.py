@@ -38,6 +38,7 @@ from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_P
 
 from src.api.health import router as health_router
 from src.broker import LogBroker, create_redis_client
+from src.cache import create_result_cache
 from src.config import Settings, get_settings
 from src.db.session import Database
 from src.graphql.context import get_context
@@ -105,9 +106,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.broker = broker
     await broker.start()
 
+    # The C7 result cache. It builds its OWN Redis client rather than borrowing the broker's, and
+    # the reason is a timeout rather than an oversight — see `src.cache.create_cache_redis_client`:
+    # the request path needs a bounded socket read timeout, and the pub/sub reader's steady state is
+    # a blocking long poll that such a timeout would turn into a reconnect loop. When
+    # `CACHE_ENABLED` is false no client is constructed at all, so a disabled cache holds no
+    # connection pool.
+    cache = create_result_cache(settings)
+    app.state.cache = cache
+
     logger.info(
         "starting %s v%s (log_level=%s, seed_entries=%d, default_query_limit=%d, "
-        "max_query_limit=%d, cache_enabled=%s, cache_ttl_seconds=%d, max_query_depth=%d, "
+        "max_query_limit=%d, cache_enabled=%s, cache_ttl_seconds=%d, agg_cache_ttl_seconds=%d, "
+        "result_cache=%s, max_query_depth=%d, "
         "max_query_complexity=%d, subscription_queue_maxsize=%d, "
         "max_subscriptions_per_connection=%d, subscription_channel=%s, pubsub_bridge=%s, "
         "publisher_id=%s, playground=%s, metrics=%s)",
@@ -119,6 +130,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.max_query_limit,
         settings.cache_enabled,
         settings.cache_ttl_seconds,
+        settings.agg_cache_ttl_seconds,
+        "enabled" if cache.enabled else "disabled (every query reads through to PostgreSQL)",
         settings.max_query_depth,
         settings.max_query_complexity,
         settings.subscription_queue_maxsize,
@@ -181,10 +194,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         #    Without it the ASGI server waits on tasks that can never complete and the container
         #    has to be killed rather than stopped.
         #
-        # 3. CLOSE THE REDIS CLIENT LAST — after both of its users are done with it. Closing it
-        #    first would turn the reader's in-flight read and every pending publish into connection
-        #    errors logged during what is otherwise a clean shutdown, which is a log full of
-        #    alarming noise describing nothing that went wrong.
+        # 3. CLOSE THE REDIS CLIENTS LAST — each after its own users are done with it. Closing the
+        #    pub/sub client first would turn the reader's in-flight read and every pending publish
+        #    into connection errors logged during what is otherwise a clean shutdown, which is a log
+        #    full of alarming noise describing nothing that went wrong. The cache's client is a
+        #    SEPARATE one (see its construction above) and is closed on its own, after it, for the
+        #    same reason applied to its own user: nothing is reading through the cache by the time
+        #    the ASGI server has stopped accepting requests, so this is the point at which its pool
+        #    has no work left.
         try:
             await broker.stop()
         except Exception:  # pragma: no cover - defensive; stop() swallows its own failures
@@ -205,6 +222,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await closer()
             except Exception:  # pragma: no cover - defensive
                 logger.exception("failed to close the Redis client during shutdown")
+
+        try:
+            # `ResultCache.aclose` closes the client only because THIS cache built it
+            # (`create_result_cache` passes `owns_client=True`). A cache handed somebody else's
+            # client leaves it alone — which is what stops a future refactor that shares one pool
+            # from taking the pub/sub bridge down as a side effect of a cache shutdown.
+            await cache.aclose()
+        except Exception:  # pragma: no cover - defensive; aclose swallows its own failures
+            logger.exception("failed to close the result cache during shutdown")
 
         try:
             await db.dispose()
