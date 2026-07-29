@@ -215,6 +215,28 @@ DEFAULT_WEIGHTS: Mapping[str, FieldCost] = MappingProxyType(
         #: Two GROUP BY-class scans over the whole window with **no LIMIT at all** — the one field
         #: here whose work does not shrink when the client asks for less.
         "Query.logStats": FieldCost(weight=30),
+        # --- Query roots: the C10 e-commerce entry points -----------------------------------------
+        #
+        # A list field with NO entry in this table is priced at DEFAULT_COST — weight 1 — which is a
+        # hole in the gate, not a neutral default: `orderEvents(filters: {limit: 500})` would score
+        # 1 for the read itself and be indistinguishable from selecting a scalar. So every new list
+        # field gets a row here, and `tests/unit/test_cost.py` asserts that (the table is checked
+        # against the schema's actual list fields rather than against a hand-written list).
+        #
+        #: One filtered SELECT over an indexed column, capped by `limit` — the same work `Query.logs`
+        #: does against a table with the same index shape, so deliberately the same weight. Pricing
+        #: them differently would be a claim about relative cost that nothing has measured.
+        "Query.orderEvents": FieldCost(weight=10),
+        "Query.userEvents": FieldCost(weight=10),
+        "Query.paymentEvents": FieldCost(weight=10),
+        #: FOUR indexed reads across four tables in one field, each capped independently — so the
+        #: worst case is 4 x MAX_QUERY_LIMIT rows from one selection. Priced at 4x a single list
+        #: read for exactly that reason: the multiplier the walker applies to the sub-selection is
+        #: the client's `limit`, which prices the ROWS, and this weight prices the four ROUND TRIPS
+        #: the field costs however few rows come back. `{ correlatedEvents(traceId: "…") { timestamp
+        #: service } }` therefore prices at 40 + 2 x 100 = 240, comfortably inside the 25,000 budget
+        #: and comfortably above a scalar.
+        "Query.correlatedEvents": FieldCost(weight=40),
         # --- LogEntry ----------------------------------------------------------------------------
         #: The correlated lookup. C5's DataLoader collapses N of these into one statement, so the
         #: weight prices rows rather than round trips: batching bounds the number of queries, not

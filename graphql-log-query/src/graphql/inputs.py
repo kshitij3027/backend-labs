@@ -60,9 +60,25 @@ import strawberry
 from strawberry.scalars import JSON
 
 from src.config import Settings
-from src.db.repository import LogQuery
-from src.graphql.enums import LogLevel
-from src.graphql.validation import validate_log_filter
+from src.db.repository import (
+    LogQuery,
+    OrderEventQuery,
+    PaymentEventQuery,
+    UserEventQuery,
+)
+from src.graphql.enums import (
+    LogLevel,
+    OrderStatus,
+    PaymentMethod,
+    PaymentOutcome,
+    UserActivity,
+)
+from src.graphql.validation import (
+    validate_log_filter,
+    validate_order_event_filter,
+    validate_payment_event_filter,
+    validate_user_event_filter,
+)
 
 
 @strawberry.input
@@ -146,6 +162,136 @@ class CreateLogInput:
     trace_id: Optional[str] = None
 
 
+# =================================================================================================
+# C10 — the e-commerce event filters (spec §3 Feature Area A)
+#
+# Three inputs, written out FLAT rather than derived from a shared base. Strawberry builds each
+# input type from the dataclass fields it can see, and a shared `@strawberry.input` base would be a
+# fourth input type in the schema that nothing references — or, if left undecorated, a base whose
+# fields Strawberry's collection is not contractually obliged to pick up. The published SDL is flat
+# either way, so the only thing inheritance would save here is nine lines of source, at the cost of
+# making the published contract depend on an inheritance detail. The five shared fields ARE shared
+# where it matters: `validation._validate_common_event_filter` checks them once, and
+# `repository.build_common_event_predicates` turns them into WHERE clauses once.
+#
+# Every field is optional, and an omitted field is IGNORED rather than matched against NULL — the
+# same rule `LogFilterInput` documents at the top of this module, and the same reason a supplied
+# `null` and an omitted key cannot diverge.
+#
+# The `limit` discipline is also identical: resolved here to `DEFAULT_QUERY_LIMIT`, CLAMPED in the
+# statement builder, so "the cap applies on every query path" stays structurally true.
+# =================================================================================================
+
+
+@strawberry.input(description="Filters for Query.orderEvents. Every field is optional and ANDed.")
+class OrderEventFilterInput:
+    """The order-event filter set: the shared five, plus the three order dimensions."""
+
+    service: Optional[str] = None
+    level: Optional[LogLevel] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    trace_id: Optional[str] = None
+    order_id: Optional[str] = None
+    user_id: Optional[str] = None
+    status: Optional[OrderStatus] = None
+    #: Substring match on ``orderId``. Not on a message — an order event has no free text.
+    search_text: Optional[str] = None
+    limit: Optional[int] = None
+
+    def to_query(self, settings: Settings) -> OrderEventQuery:
+        """Validate, then map onto the request object the repository understands.
+
+        Enum members are reduced to their ``value`` for the same reason
+        :meth:`LogFilterInput.to_log_query` reduces ``level``: the column holds the string, and
+        passing an ``Enum`` through would have asyncpg compare it against a ``VARCHAR`` — a driver
+        rejection, which reaches the client as an opaque internal error rather than an answer.
+
+        Raises:
+            src.graphql.errors.ValidationError: If any supplied filter breaks a rule in
+                :mod:`src.graphql.validation`.
+        """
+        validate_order_event_filter(self)
+        return OrderEventQuery(
+            service=self.service,
+            level=self.level.value if self.level is not None else None,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            trace_id=self.trace_id,
+            order_id=self.order_id,
+            user_id=self.user_id,
+            status=self.status.value if self.status is not None else None,
+            search_text=self.search_text,
+            limit=self.limit if self.limit is not None else settings.default_query_limit,
+        )
+
+
+@strawberry.input(description="Filters for Query.paymentEvents. Every field is optional and ANDed.")
+class PaymentEventFilterInput:
+    """The payment-event filter set: the shared five, plus order id, method and outcome."""
+
+    service: Optional[str] = None
+    level: Optional[LogLevel] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    trace_id: Optional[str] = None
+    order_id: Optional[str] = None
+    method: Optional[PaymentMethod] = None
+    outcome: Optional[PaymentOutcome] = None
+    #: Substring match on ``orderId`` — the identifier a payment event is filed under.
+    search_text: Optional[str] = None
+    limit: Optional[int] = None
+
+    def to_query(self, settings: Settings) -> PaymentEventQuery:
+        """Validate, then map onto :class:`~src.db.repository.PaymentEventQuery`."""
+        validate_payment_event_filter(self)
+        return PaymentEventQuery(
+            service=self.service,
+            level=self.level.value if self.level is not None else None,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            trace_id=self.trace_id,
+            order_id=self.order_id,
+            method=self.method.value if self.method is not None else None,
+            outcome=self.outcome.value if self.outcome is not None else None,
+            search_text=self.search_text,
+            limit=self.limit if self.limit is not None else settings.default_query_limit,
+        )
+
+
+@strawberry.input(description="Filters for Query.userEvents. Every field is optional and ANDed.")
+class UserEventFilterInput:
+    """The user-event filter set: the shared five, plus user id and activity type."""
+
+    service: Optional[str] = None
+    level: Optional[LogLevel] = None
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
+    trace_id: Optional[str] = None
+    user_id: Optional[str] = None
+    activity_type: Optional[UserActivity] = None
+    #: Substring match on ``userId``.
+    search_text: Optional[str] = None
+    limit: Optional[int] = None
+
+    def to_query(self, settings: Settings) -> UserEventQuery:
+        """Validate, then map onto :class:`~src.db.repository.UserEventQuery`."""
+        validate_user_event_filter(self)
+        return UserEventQuery(
+            service=self.service,
+            level=self.level.value if self.level is not None else None,
+            start_time=self.start_time,
+            end_time=self.end_time,
+            trace_id=self.trace_id,
+            user_id=self.user_id,
+            activity_type=(
+                self.activity_type.value if self.activity_type is not None else None
+            ),
+            search_text=self.search_text,
+            limit=self.limit if self.limit is not None else settings.default_query_limit,
+        )
+
+
 def to_log_query(filters: Optional[LogFilterInput], settings: Settings) -> LogQuery:
     """``LogFilterInput | None`` -> :class:`LogQuery`, with ``None`` meaning "no filters at all".
 
@@ -159,3 +305,30 @@ def to_log_query(filters: Optional[LogFilterInput], settings: Settings) -> LogQu
     if filters is None:
         return LogQuery(limit=settings.default_query_limit)
     return filters.to_log_query(settings)
+
+
+def to_order_event_query(
+    filters: Optional[OrderEventFilterInput], settings: Settings
+) -> OrderEventQuery:
+    """``OrderEventFilterInput | None`` -> query object, ``None`` meaning "no filters at all"."""
+    if filters is None:
+        return OrderEventQuery(limit=settings.default_query_limit)
+    return filters.to_query(settings)
+
+
+def to_payment_event_query(
+    filters: Optional[PaymentEventFilterInput], settings: Settings
+) -> PaymentEventQuery:
+    """``PaymentEventFilterInput | None`` -> query object, ``None`` meaning "no filters at all"."""
+    if filters is None:
+        return PaymentEventQuery(limit=settings.default_query_limit)
+    return filters.to_query(settings)
+
+
+def to_user_event_query(
+    filters: Optional[UserEventFilterInput], settings: Settings
+) -> UserEventQuery:
+    """``UserEventFilterInput | None`` -> query object, ``None`` meaning "no filters at all"."""
+    if filters is None:
+        return UserEventQuery(limit=settings.default_query_limit)
+    return filters.to_query(settings)

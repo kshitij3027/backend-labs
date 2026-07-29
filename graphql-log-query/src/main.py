@@ -198,11 +198,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # first request so a broken database is a container that fails to start — visible — rather
         # than a container that reports healthy and 500s on its first query.
         await db.init_db()
-        seeded = await db.seed_if_empty(settings.seed_entries, settings.random_seed)
+        seeded = await db.seed_if_empty(
+            settings.seed_entries, settings.random_seed, orders=settings.seed_orders
+        )
         logger.info(
-            "store ready (rows_written=%d, seed_entries_configured=%d, random_seed=%d)",
+            "store ready (log_rows_written=%d, seed_entries_configured=%d, "
+            "seed_orders_configured=%d, random_seed=%d)",
             seeded,
             settings.seed_entries,
+            settings.seed_orders,
             settings.random_seed,
         )
 

@@ -230,13 +230,28 @@ def test_metadata_is_published_under_that_exact_name() -> None:
 # --- Query.logs: the shape the spec's acceptance command depends on --------------------------------
 
 
-def test_query_publishes_exactly_the_four_read_entry_points() -> None:
-    """``logs``, ``log``, ``logsConnection``, ``logStats``.
+def test_query_publishes_exactly_the_expected_read_entry_points() -> None:
+    """The four §2 log entry points, plus the four C10 e-commerce ones and nothing else.
 
     Camel-casing is on, so it is not ``logs_connection`` or ``log_stats`` — the spec's own
-    acceptance commands are written in that casing and would not validate otherwise.
+    acceptance commands are written in that casing and would not validate otherwise, and the same
+    goes for ``orderEvents`` / ``userEvents`` / ``paymentEvents`` / ``correlatedEvents``.
+
+    Exact equality rather than a subset, deliberately: a field added to the read surface without a
+    row in ``src.graphql.cost.DEFAULT_WEIGHTS`` is a hole in C8's gate (it would be priced at the
+    default weight of 1), so "a new Query field appeared" is something a reviewer should be made to
+    look at rather than something the suite absorbs.
     """
-    assert set(_field_types("Query")) == {"logs", "log", "logsConnection", "logStats"}
+    assert set(_field_types("Query")) == {
+        "logs",
+        "log",
+        "logsConnection",
+        "logStats",
+        "orderEvents",
+        "userEvents",
+        "paymentEvents",
+        "correlatedEvents",
+    }
 
 
 def test_logs_returns_a_non_null_list_of_non_null_log_entries() -> None:

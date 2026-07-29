@@ -53,10 +53,17 @@ from src.db.base import Base
 from src.db.models import LogRecord
 from src.db.repository import LogRepository
 from src.db.session import Database
-from src.generators import generate_log_records
+from src.generators import EventCorpus, generate_event_corpus, generate_log_records
 from src.graphql.context import Context
 from src.main import create_app
-from tests.integration.corpus import ANCHOR, CORPUS_SIZE, SEED, run_sync
+from tests.integration.corpus import (
+    ANCHOR,
+    CORPUS_SIZE,
+    EVENT_CORPUS_ORDERS,
+    SEED,
+    CorrelatedCorpus,
+    run_sync,
+)
 
 
 # --- The application, as production builds it ----------------------------------------------------
@@ -160,11 +167,27 @@ def _schema(db_settings: Settings) -> Iterator[None]:
 
 @pytest.fixture()
 async def database(_schema: None, db_settings: Settings) -> AsyncIterator[Database]:
-    """A :class:`Database` over an empty ``log_entries``, disposed at the end of the test."""
+    """A :class:`Database` over an **empty store**, disposed at the end of the test.
+
+    All four tables are truncated, not just ``log_entries``. C10's event tables are seeded by the
+    same :meth:`~src.db.session.Database.seed_if_empty` call, and that call's idempotency check is
+    "does this table already hold rows" — so a test that left order events behind would silently
+    turn the *next* test's seeding into a no-op, and the failure would land wherever the empty
+    corpus happened to be noticed rather than where it was caused.
+
+    One statement rather than four: ``TRUNCATE a, b, c, d`` takes all four locks at once, which
+    cannot deadlock against another session doing the same, and ``RESTART IDENTITY`` resets every
+    sequence so ids stay small and readable in every test.
+    """
     db = Database.create(db_settings)
     try:
         async with db.engine.begin() as conn:
-            await conn.execute(text("TRUNCATE TABLE log_entries RESTART IDENTITY"))
+            await conn.execute(
+                text(
+                    "TRUNCATE TABLE log_entries, order_events, payment_events, user_events "
+                    "RESTART IDENTITY"
+                )
+            )
         yield db
     finally:
         # Every test disposes its own engine. An engine left open holds its pooled connections
@@ -194,10 +217,71 @@ async def seeded(database: Database) -> list[LogRecord]:
     than captured from the seeder, so the two sides of each comparison come from independent calls
     — a generator that was accidentally stateful would be caught here rather than agreeing with
     itself.
+
+    ``orders`` is left at 0, so this corpus is **uncorrelated**: every trace here belongs to log rows
+    only. That is what the filter and ``relatedLogs`` tests want, and it is why neither this fixture
+    nor any expectation graded against it moved when C10 correlated the two corpora — the correlation
+    is an argument the seeder only passes when there are orders to correlate with. Tests that need
+    the joined corpus use :func:`seeded_correlated`.
     """
     written = await database.seed_if_empty(CORPUS_SIZE, SEED, end_time=ANCHOR)
     assert written == CORPUS_SIZE, "the fixture expected to seed an empty table"
     return generate_log_records(CORPUS_SIZE, seed=SEED, end_time=ANCHOR)
+
+
+@pytest.fixture()
+async def seeded_events(database: Database) -> EventCorpus:
+    """Seed the fixed **e-commerce** corpus and return the oracle for it.
+
+    Deliberately a separate fixture from :func:`seeded` rather than one that seeds both: most
+    integration tests grade log queries and would otherwise pay for three extra tables of inserts,
+    and — more importantly — a test that asks only for events proves the event seeding works with
+    ``SEED_ENTRIES`` effectively 0, which is the compose ``test`` service's own configuration.
+
+    ``count=0`` for the log corpus is what makes that explicit.
+
+    **A test that needs both corpora asks for** :func:`seeded_correlated`, not for this fixture and
+    :func:`seeded` together. Requesting both would populate both tables, but the log corpus would be
+    generated with no ``order_traces`` — i.e. correlated with nothing — so ``correlatedEvents`` would
+    return three ``__typename``s and the fourth would look like a resolver bug.
+
+    Regenerated rather than captured from the seeder, for the same reason :func:`seeded` regenerates
+    — the two sides of every comparison must come from independent calls, or a stateful generator
+    would agree with itself.
+    """
+    await database.seed_if_empty(0, SEED, orders=EVENT_CORPUS_ORDERS, end_time=ANCHOR)
+    return generate_event_corpus(EVENT_CORPUS_ORDERS, seed=SEED, end_time=ANCHOR)
+
+
+@pytest.fixture()
+async def seeded_correlated(database: Database) -> CorrelatedCorpus:
+    """Seed **both** corpora in one call — the only fixture where a log line joins an order.
+
+    :func:`seeded` and :func:`seeded_events` deliberately fill one side each, because most tests
+    grade one surface and should not pay for the other's inserts. But the schema's flagship claim —
+    ``correlatedEvents(traceId:)`` returning all four ``__typename``s in one round trip, the thing
+    that would otherwise be four REST calls — is only observable when both are present, so it gets
+    its own fixture rather than being wedged into either of those.
+
+    .. rubric:: The oracle is regenerated the way the seeder generated it, and that is not optional
+
+    :meth:`~src.db.session.Database.seed_if_empty` generates the event corpus first and hands its
+    trace ids to the log generator, because a declared fraction of orders also carry log lines (see
+    :data:`~src.generators.ORDER_TRACE_LOG_RATIO`). Regenerating the log corpus *without*
+    ``order_traces`` here would produce a corpus with different trace ids from the one in the
+    database — so every assertion graded against it would fail, and it would fail somewhere far away
+    from the mistake. The two calls below mirror the seeder's exactly.
+    """
+    written = await database.seed_if_empty(
+        CORPUS_SIZE, SEED, orders=EVENT_CORPUS_ORDERS, end_time=ANCHOR
+    )
+    assert written == CORPUS_SIZE, "the fixture expected to seed an empty store"
+
+    events = generate_event_corpus(EVENT_CORPUS_ORDERS, seed=SEED, end_time=ANCHOR)
+    logs = generate_log_records(
+        CORPUS_SIZE, seed=SEED, end_time=ANCHOR, order_traces=events.trace_ids()
+    )
+    return CorrelatedCorpus(logs=logs, events=events)
 
 
 # --- The GraphQL layer over that store -----------------------------------------------------------

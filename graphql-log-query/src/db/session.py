@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import func, insert, select, text
 from sqlalchemy.exc import InterfaceError, OperationalError
@@ -45,8 +47,13 @@ from src.db.base import Base
 # Imported for its side effect as much as for the name: defining a mapped class is what registers
 # its table in `Base.metadata`, and `create_all` only creates tables that are registered by the
 # time it runs. See the note in src/db/base.py — this import is what makes it true.
-from src.db.models import LogEntryORM
-from src.generators import generate_log_records
+from src.db.models import LogEntryORM, OrderEventORM, PaymentEventORM, UserEventORM
+from src.generators import (
+    EventCorpus,
+    generate_event_corpus,
+    generate_log_records,
+    order_traces_with_logs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +80,9 @@ _RETRYABLE_BOOT_ERRORS: tuple[type[BaseException], ...] = (
 #: row that is ~5400 rows, and a chunk size chosen without knowing this is a bug that only appears
 #: once ``SEED_ENTRIES`` is raised. 1000 rows (6000 parameters) sits comfortably below it while
 #: still turning a 2000-row seed into two statements instead of 2000.
+#:
+#: C10's widest event table binds **eight** columns a row, i.e. 8000 parameters per chunk — still
+#: less than a quarter of the ceiling, which is why one chunk size serves all four tables.
 SEED_INSERT_CHUNK_SIZE = 1000
 
 #: Advisory-lock key that serialises **the whole bootstrap** — schema creation and seeding — across
@@ -217,62 +227,175 @@ class Database:
         count: int,
         seed: int,
         *,
+        orders: int = 0,
         end_time: datetime | None = None,
     ) -> int:
-        """Fill an empty ``log_entries`` with a deterministic corpus. Idempotent.
+        """Fill an empty store with the deterministic corpora. Idempotent.
 
-        Counts first and returns ``0`` without writing anything if the table already holds rows,
-        so a container restart against a persisted volume does not double the corpus, and so
-        ``make up`` twice is the same as ``make up`` once.
+        Counts first and writes nothing to a table that already holds rows, so a container restart
+        against a persisted volume does not double the corpus, and so ``make up`` twice is the same
+        as ``make up`` once.
+
+        .. rubric:: C10 — two corpora, ONE lock, ONE transaction, TWO independent emptiness checks
+
+        ``log_entries`` and the three e-commerce event tables are seeded together here rather than
+        from a second method, because the guarantee that matters is a property of the *bootstrap*,
+        not of either corpus: under ``uvicorn --workers N`` the lifespan runs once per worker, and
+        two workers that both found a table empty would both fill it. One advisory lock held across
+        both writes is what makes "check then insert" atomic for all four tables at once. Splitting
+        them into two methods would need two locks (or one taken twice), and the second worker could
+        then interleave between them.
+
+        The **emptiness checks are separate**, though, and that is deliberate: an operator raising
+        ``SEED_ORDERS`` from 0 on an existing deployment should get the event corpus written without
+        being told the store is already populated because ``log_entries`` has rows in it. Each
+        corpus is skipped only when *its own* table is non-empty.
+
+        .. rubric:: The event corpus is generated FIRST, because the log corpus takes it as input
+
+        A declared fraction of the order traces also carry log lines — see
+        :data:`~src.generators.ORDER_TRACE_LOG_RATIO`; it is what makes ``correlatedEvents`` return
+        all four ``__typename``s rather than three-and-a-lucky-collision. So the order of the two
+        generator calls is not cosmetic: ``generate_event_corpus(...).trace_ids()`` is an *argument*
+        to :func:`~src.generators.generate_log_records`.
+
+        Which means the event corpus is generated whenever **either** write needs it, not only when
+        the event tables are empty. A deployment whose event rows already exist but whose
+        ``log_entries`` is being filled for the first time still has to know the order traces, or it
+        would write an uncorrelated log corpus and the correlation would silently be missing from
+        exactly one deployment. Regenerating is pure and costs milliseconds; the "already populated"
+        checks still decide what is *written*, which is the expensive half.
 
         Args:
-            count: How many rows to write. ``0`` (the compose ``test`` service) is a no-op.
-            seed: RNG seed handed to :func:`~src.generators.generate_log_records`.
-            end_time: Newest instant in the generated corpus. Defaults to now, which is what
+            count: How many log rows to write. ``0`` (the compose ``test`` service) is a no-op.
+            seed: RNG seed handed to both generators. They keep private
+                :class:`random.Random` instances, so the two corpora are independent draws from one
+                configured seed rather than one stream split in two — which is what lets
+                ``SEED_ENTRIES`` and ``SEED_ORDERS`` be changed independently. Their only
+                relationship is the explicit ``order_traces`` argument below, which is a *declared*
+                correlation rather than an artefact of the shared seed.
+            orders: How many order lifecycles to generate (spec §3 Feature Area A). Each produces
+                several rows across ``order_events``, ``payment_events`` and ``user_events``.
+                Defaults to ``0`` so every existing caller — and every test written before C10 —
+                keeps seeding exactly the log corpus and nothing else.
+            end_time: Newest instant in the generated corpora. Defaults to now, which is what
                 production wants — a dashboard whose newest log line is from container build time
                 looks broken. Tests and the E2E verifier pass a **fixed** instant instead, which
                 is the whole point of the parameter: it is what lets them regenerate the identical
                 corpus locally and use it as an oracle for what the database should return.
 
         Returns:
-            The number of rows actually written — ``0`` when the table was already populated, so
-            the lifespan can log which of the two happened rather than guessing.
+            The number of **log** rows actually written — ``0`` when ``log_entries`` was already
+            populated. Deliberately unchanged by C10: this number is what the lifespan logs and
+            what several tests assert against ``SEED_ENTRIES``, and folding a second, differently
+            scaled count into it would silently break both. The event row counts are logged
+            separately and are countable from the tables themselves.
         """
-        if count <= 0:
+        if count <= 0 and orders <= 0:
             return 0
 
         anchor = end_time if end_time is not None else datetime.now(timezone.utc)
 
         async with self._session_factory() as session, session.begin():
-            # Taken BEFORE the count and held until this transaction commits, which is what makes
+            # Taken BEFORE the counts and held until this transaction commits, which is what makes
             # "check then insert" atomic across processes. See BOOTSTRAP_ADVISORY_LOCK_KEY.
             await session.execute(_ADVISORY_LOCK_SQL)
 
-            existing = await session.scalar(select(func.count()).select_from(LogEntryORM))
-            if existing:
-                logger.info("store already holds %d rows; skipping seed", existing)
-                return 0
+            write_logs = count > 0
+            if write_logs:
+                existing = await session.scalar(select(func.count()).select_from(LogEntryORM))
+                if existing:
+                    logger.info("store already holds %d log rows; skipping log seed", existing)
+                    write_logs = False
 
-            # Generated only once the table is known to be empty and the lock is held, so a
-            # restart against a populated volume does no work at all.
-            records = generate_log_records(count, seed=seed, end_time=anchor)
-
-            # Core multi-row INSERT against the Table rather than the ORM: the ORM's unit of work
-            # would build `count` mapped instances, put every one of them in an identity map and
-            # then flush them, which is a lot of machinery for rows nobody is going to mutate.
-            # `as_insert_params()` supplies COLUMN names (so `metadata`, not `metadata_`) and
-            # deliberately omits `id`, letting BIGSERIAL assign ids in insert order — which is
-            # ascending timestamp order, because the generator emits oldest first.
-            table = LogEntryORM.__table__
-            for start in range(0, len(records), SEED_INSERT_CHUNK_SIZE):
-                chunk = records[start : start + SEED_INSERT_CHUNK_SIZE]
-                await session.execute(
-                    insert(table).values([record.as_insert_params() for record in chunk])
+            write_events = orders > 0
+            if write_events:
+                # `order_events` is the sentinel for all three event tables: they are written in one
+                # transaction from one corpus, so either all three are populated or none of them is,
+                # and checking one is checking all three.
+                existing_orders = await session.scalar(
+                    select(func.count()).select_from(OrderEventORM)
                 )
-            written = len(records)
+                if existing_orders:
+                    logger.info(
+                        "store already holds %d order events; skipping event seed", existing_orders
+                    )
+                    write_events = False
 
-        logger.info("seeded %d log rows (seed=%d, newest=%s)", written, seed, anchor.isoformat())
+            # Generated once the lock is held and only if one of the two writes actually needs it,
+            # so a restart against a fully populated volume still does no work at all. The `or` is
+            # the load-bearing part — see the rubric in this method's docstring: the order traces
+            # are an *input* to the log corpus, so seeding logs beside an already-populated event
+            # table still has to regenerate them.
+            corpus: EventCorpus | None = None
+            if orders > 0 and (write_events or write_logs):
+                corpus = generate_event_corpus(orders, seed=seed, end_time=anchor)
+            order_traces: tuple[str, ...] = () if corpus is None else tuple(corpus.trace_ids())
+
+            written = 0
+            if write_logs:
+                records = generate_log_records(
+                    count, seed=seed, end_time=anchor, order_traces=order_traces
+                )
+                await self._insert_records(session, LogEntryORM.__table__, records)
+                written = len(records)
+                # The correlated count is counted off the records rather than off
+                # `order_traces_with_logs`, so the number in the log is what was WRITTEN rather than
+                # what was asked for — the two differ only in degenerate configurations (far more
+                # orders than log rows), and that is exactly when an operator wants to be told.
+                correlated = {record.trace_id for record in records} & set(order_traces)
+                logger.info(
+                    "seeded %d log rows (seed=%d, newest=%s, order_traces_with_logs=%d of %d "
+                    "declared)",
+                    written,
+                    seed,
+                    anchor.isoformat(),
+                    len(correlated),
+                    len(order_traces_with_logs(order_traces)),
+                )
+
+            if write_events and corpus is not None:
+                await self._insert_records(session, OrderEventORM.__table__, corpus.orders)
+                await self._insert_records(session, PaymentEventORM.__table__, corpus.payments)
+                await self._insert_records(session, UserEventORM.__table__, corpus.user_activity)
+                logger.info(
+                    "seeded %d orders as %d order / %d payment / %d user events "
+                    "(seed=%d, newest=%s)",
+                    orders,
+                    len(corpus.orders),
+                    len(corpus.payments),
+                    len(corpus.user_activity),
+                    seed,
+                    anchor.isoformat(),
+                )
+
         return written
+
+    @staticmethod
+    async def _insert_records(
+        session: AsyncSession, table: Any, records: Sequence[Any]
+    ) -> None:
+        """Write ``records`` into ``table`` with chunked Core multi-row INSERTs.
+
+        Core against the ``Table`` rather than the ORM: the unit of work would build one mapped
+        instance per row, put every one of them in an identity map and then flush them, which is a
+        lot of machinery for rows nobody is going to mutate. ``as_insert_params()`` supplies COLUMN
+        names (so ``metadata``, not ``metadata_``) and deliberately omits ``id``, letting BIGSERIAL
+        assign ids in insert order — which is ascending timestamp order, because every generator
+        emits oldest first.
+
+        Chunked because PostgreSQL's extended query protocol carries the parameter count as a
+        16-bit integer; see :data:`SEED_INSERT_CHUNK_SIZE`. An empty sequence issues **no**
+        statement at all — ``INSERT … VALUES ()`` is not valid SQL, and a lifecycle roster that
+        happened to produce no rows of one kind must not turn seeding into a syntax error.
+        """
+        if not records:
+            return
+        for start in range(0, len(records), SEED_INSERT_CHUNK_SIZE):
+            chunk = records[start : start + SEED_INSERT_CHUNK_SIZE]
+            await session.execute(
+                insert(table).values([record.as_insert_params() for record in chunk])
+            )
 
     async def dispose(self) -> None:
         """Close every pooled connection. Called from the lifespan's shutdown path.

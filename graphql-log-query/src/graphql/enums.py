@@ -41,7 +41,13 @@ from enum import Enum
 
 import strawberry
 
-from src.generators import LOG_LEVELS
+from src.generators import (
+    LOG_LEVELS,
+    ORDER_STATUSES,
+    PAYMENT_METHODS,
+    PAYMENT_OUTCOMES,
+    USER_ACTIVITIES,
+)
 
 
 # NOTE: deliberately no class docstring. Descriptions on this schema are opt-in — the SDL is a
@@ -84,3 +90,99 @@ def _assert_levels_match_the_corpus() -> None:
 
 
 _assert_levels_match_the_corpus()
+
+
+# =================================================================================================
+# C10 — the e-commerce vocabularies (spec §3 Feature Area A)
+#
+# Four more enums, each pinned to its roster in `src.generators` by the same import-time guard, for
+# the same reason argued at the top of this module: an unknown status must die during VALIDATION
+# with a message naming the legal values, not reach a resolver, become
+# `WHERE status = 'SHIPED'`, and return an empty list a client cannot tell from a quiet period.
+#
+# THE COLUMNS STAY `String`. See the note on `OrderEventORM.status` — a database-level ENUM makes
+# adding a status a migration to gain a constraint that is already enforced one layer earlier and
+# produces a far better error there.
+# =================================================================================================
+
+
+@strawberry.enum
+class OrderStatus(Enum):
+    CREATED = "CREATED"
+    PAID = "PAID"
+    PACKED = "PACKED"
+    SHIPPED = "SHIPPED"
+    DELIVERED = "DELIVERED"
+    CANCELLED = "CANCELLED"
+    REFUNDED = "REFUNDED"
+
+
+@strawberry.enum
+class PaymentMethod(Enum):
+    CARD = "CARD"
+    PAYPAL = "PAYPAL"
+    APPLE_PAY = "APPLE_PAY"
+    BANK_TRANSFER = "BANK_TRANSFER"
+    GIFT_CARD = "GIFT_CARD"
+
+
+@strawberry.enum
+class PaymentOutcome(Enum):
+    AUTHORIZED = "AUTHORIZED"
+    CAPTURED = "CAPTURED"
+    DECLINED = "DECLINED"
+    REFUNDED = "REFUNDED"
+
+
+@strawberry.enum
+class UserActivity(Enum):
+    SIGNUP = "SIGNUP"
+    LOGIN = "LOGIN"
+    BROWSE = "BROWSE"
+    ADD_TO_CART = "ADD_TO_CART"
+    CHECKOUT = "CHECKOUT"
+    REVIEW = "REVIEW"
+    LOGOUT = "LOGOUT"
+
+
+def _assert_enum_matches_roster(
+    enum_class: type[Enum], roster: tuple[str, ...], roster_name: str
+) -> None:
+    """Fail at import if ``enum_class`` and the generator roster it publishes have drifted.
+
+    Both halves are checked, and they play different roles — the same split
+    :func:`_assert_levels_match_the_corpus` makes for ``LogLevel``:
+
+    * the member **name** is what a client writes in a query (``status: SHIPPED``) and what appears
+      in the SDL;
+    * the member **value** is the string written to and compared against the column.
+
+    Order is checked too, because the SDL prints members in declaration order and a reordering is a
+    (cosmetic, but real) contract diff that should arrive as a reviewed SDL change rather than as a
+    surprise.
+
+    Raises:
+        ValueError: If the names or the values, in order, differ from ``roster``.
+    """
+    names = tuple(member.name for member in enum_class)
+    values = tuple(member.value for member in enum_class)
+
+    if names != roster:
+        raise ValueError(
+            f"{enum_class.__name__} member names {names!r} do not match "
+            f"src.generators.{roster_name} {roster!r}: the names are what a client writes in a "
+            "query, so a mismatch means either a value the corpus contains cannot be asked for, "
+            "or a value that can be asked for matches nothing that exists"
+        )
+    if values != roster:
+        raise ValueError(
+            f"{enum_class.__name__} member values {values!r} do not match "
+            f"src.generators.{roster_name} {roster!r}: the values are the strings compared against "
+            "the column, so a mismatch means a validated query still selects the wrong rows"
+        )
+
+
+_assert_enum_matches_roster(OrderStatus, ORDER_STATUSES, "ORDER_STATUSES")
+_assert_enum_matches_roster(PaymentMethod, PAYMENT_METHODS, "PAYMENT_METHODS")
+_assert_enum_matches_roster(PaymentOutcome, PAYMENT_OUTCOMES, "PAYMENT_OUTCOMES")
+_assert_enum_matches_roster(UserActivity, USER_ACTIVITIES, "USER_ACTIVITIES")

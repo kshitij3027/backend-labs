@@ -17,6 +17,14 @@ returns one arbitrary matching row and silently drops the other forty.
 That only works because the generator is pure: fixed seed, fixed anchor instant, no wall clock.
 See its module docstring for the contract.
 
+.. rubric:: And the pairing of the two corpora, because they are only an oracle together
+
+:class:`CorrelatedCorpus` carries the seeded log corpus, the seeded event corpus **and** the trace
+ids that deliberately join them (:data:`~src.generators.ORDER_TRACE_LOG_RATIO`). It is here rather
+than in a test module because the log half has to be regenerated with the event half's trace ids or
+it is not the corpus the seeder wrote — a mistake that would fail every assertion graded against it,
+loudly but a long way from the cause.
+
 .. rubric:: It also holds the probes that ask PostgreSQL something Python cannot answer
 
 :func:`metadata_storage` is here rather than in one test module because two of them need it
@@ -45,6 +53,7 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from src.db.models import LogEntryORM, LogRecord
+from src.generators import EventCorpus, order_traces_with_logs
 
 #: Rows in the fixed corpus.
 #:
@@ -63,7 +72,70 @@ SEED = 20260725
 #: runs.
 ANCHOR = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 
+#: Orders in the fixed e-commerce corpus (C10).
+#:
+#: 120 rather than a handful for the same reason ``CORPUS_SIZE`` is 1200: the rosters have thin
+#: buckets. Seven lifecycle paths are drawn uniformly, so 120 orders expects ~17 of each — enough
+#: that "every declared status appears" is a statement about the generator rather than about luck,
+#: and enough that a status filter grades a real subset. It also stays well under
+#: ``db_settings.max_query_limit`` (``CORPUS_SIZE * 5``), so a test can pull a whole stream in one
+#: query and compare it against the oracle as a set rather than as a prefix.
+EVENT_CORPUS_ORDERS = 120
+
 _T = TypeVar("_T")
+
+#: One of the three C10 event record types. Generic rather than a union so
+#: :func:`matching_events` returns the *same* record type it was handed, which is what lets a test
+#: compare its result against a stream without a cast.
+_R = TypeVar("_R")
+
+
+@dataclass(frozen=True, slots=True)
+class CorrelatedCorpus:
+    """Both seeded corpora **and** the trace ids that deliberately join them.
+
+    One object rather than two fixtures, because the two halves are only an oracle *together*: the
+    log corpus is generated from the event corpus's trace ids (see
+    :data:`~src.generators.ORDER_TRACE_LOG_RATIO`), so a test that regenerated the log corpus
+    without them would be grading the database against a different corpus and would fail for a
+    reason that has nothing to do with the code under test.
+
+    It exists at all because ``Query.correlatedEvents(traceId:)`` returning all **four**
+    ``__typename``s is the flagship claim of spec §3 Feature Area A, and proving it needs a store
+    holding both corpora at once — which no other fixture does.
+    """
+
+    logs: list[LogRecord]
+    events: EventCorpus
+
+    @property
+    def shared_traces(self) -> tuple[str, ...]:
+        """The order traces the log corpus files log lines under. **Declared, not discovered.**
+
+        Read from :func:`~src.generators.order_traces_with_logs` rather than by intersecting the two
+        corpora, which is the whole point: a test that searched for a trace carrying both kinds of
+        row would silently pass on an accidental collision — the thing this correlation replaced —
+        and would silently *skip* on a seed that produced none.
+        """
+        return order_traces_with_logs(self.events.trace_ids())
+
+    def log_only_trace(self) -> str:
+        """A trace carried by log rows and by no order — the independent population C5 needs.
+
+        Sorted before picking so the choice is stable across runs rather than dependent on set
+        iteration order, and asserted non-empty here so a corpus that correlated *everything* fails
+        as a missing precondition rather than as a confusing assertion three lines later.
+        """
+        order_traces = set(self.events.trace_ids())
+        candidates = sorted(
+            {
+                record.trace_id
+                for record in self.logs
+                if record.trace_id is not None and record.trace_id not in order_traces
+            }
+        )
+        assert candidates, "the corpus must keep log-only traces; relatedLogs depends on them"
+        return candidates[0]
 
 
 def run_sync(coro: Awaitable[_T]) -> _T:
@@ -192,6 +264,21 @@ def count_statements(engine: AsyncEngine) -> Iterator[StatementCounter]:
         event.remove(engine.sync_engine, "before_cursor_execute", _record)
 
 
+def matching_events(
+    records: list[_R], predicate: Callable[[_R], bool]
+) -> list[_R]:
+    """The subset of one event stream a filter should select, **newest first**.
+
+    The event-stream twin of :func:`matching`, and it relies on the same property: every generator
+    in this project emits oldest-first with ``(timestamp, id)`` strictly increasing down the list
+    (see :meth:`src.generators.EventCorpus`), and seeding inserts in that order — so the database's
+    ``ORDER BY timestamp DESC, id DESC`` is exactly ``reversed(...)``. Reversing rather than
+    re-sorting states that relationship instead of re-deriving it, so a test notices if it ever
+    stops holding.
+    """
+    return list(reversed([record for record in records if predicate(record)]))
+
+
 async def metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, str | None]:
     """Ask **PostgreSQL** how one row's ``metadata`` is stored: ``(is_sql_null, json_type)``.
 
@@ -216,3 +303,31 @@ async def metadata_storage(session: AsyncSession, log_id: int) -> tuple[bool, st
         )
     ).one()
     return bool(row.is_sql_null), row.json_type
+
+
+async def event_metadata_counts(session: AsyncSession, table: str) -> tuple[int, int, int]:
+    """``(sql_nulls, json_nulls, objects)`` for one event table's ``metadata`` column.
+
+    The same question :func:`metadata_storage` asks about one log row, asked about a whole event
+    table — because the C10 seeding path writes those tables through the identical Core multi-row
+    INSERT, and the identical ``none_as_null=True`` flag is what keeps a Python ``None`` a SQL NULL
+    rather than the JSONB scalar ``'null'``. Python cannot tell the two apart (asyncpg deserialises
+    both to ``None``), so the assertion has to be made in SQL or it cannot fail.
+
+    ``table`` is interpolated rather than bound because a table name cannot be a bind parameter in
+    PostgreSQL. It is safe here and only here: every caller passes a literal from this test suite,
+    never anything a client can influence.
+    """
+    if table not in {"order_events", "payment_events", "user_events"}:
+        raise ValueError(f"unexpected table {table!r}")
+    row = (
+        await session.execute(
+            text(
+                "SELECT count(*) FILTER (WHERE metadata IS NULL) AS sql_nulls, "
+                "count(*) FILTER (WHERE jsonb_typeof(metadata) = 'null') AS json_nulls, "
+                "count(*) FILTER (WHERE jsonb_typeof(metadata) = 'object') AS objects "
+                f"FROM {table}"
+            )
+        )
+    ).one()
+    return int(row.sql_nulls), int(row.json_nulls), int(row.objects)

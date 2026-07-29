@@ -98,17 +98,80 @@ def from_wire_timestamp(raw: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-@strawberry.type
-class LogEntry:
-    """One log line, as published. Field-for-field the spec's §2 item 15 shape."""
+# =================================================================================================
+# The shared interface — spec §3 Feature Area A, and the heart of C10
+#
+# "A shared interface for common log fields (timestamp, service, level, trace/correlation id)
+# implemented by all event types."
+#
+# ############################################################################################
+# ##  `LogEntry` IMPLEMENTS THIS TOO, AND THAT IS THE POINT — DO NOT "SIMPLIFY" IT AWAY.     ##
+# ############################################################################################
+#
+# An interface implemented only by the three e-commerce types would be a PARALLEL HIERARCHY: two
+# unrelated notions of "an event with a correlation id" living in one schema, and a client unable to
+# ask the one question the correlation id exists for — "give me everything that happened under this
+# trace" — because the log line it started from would not be in the answer. Making `LogEntry` an
+# implementor turns `LogEvent` into a GENERALISATION of what the schema already had, which is what
+# `Query.correlatedEvents` returns and what a `... on LogEntry` inline fragment selects out of it.
+#
+# WHAT IT COSTS, stated so nobody has to discover it: `LogEntry`'s fields are reordered in the SDL
+# (a dataclass puts base-class fields first, so `timestamp`/`service`/`level`/`traceId` now precede
+# `id`/`message`/`metadata`). Field ORDER in an SDL is cosmetic — GraphQL responses are keyed by the
+# client's selection set, not by declaration order — so the C3 acceptance command
+# `{ logs { id service level message } }` validates and executes exactly as before. Every field
+# keeps its name, its type and its nullability; `schema.graphql` needs regenerating, and the SDL
+# drift test is what says so.
+#
+# WHY `id` IS NOT ON THE INTERFACE: the spec names four fields and identity is not one of them.
+# Every implementor publishes its own `id: ID!`, selected inside the inline fragment a client
+# already needs in order to read anything type-specific. Hoisting `id` up here would also invite a
+# client to treat `LogEntry` 42 and `OrderEvent` 42 as the same object — they are two different
+# BIGSERIAL sequences in two different tables that happen to have reached the same number.
+# =================================================================================================
 
-    id: strawberry.ID
+
+@strawberry.interface(
+    description=(
+        "The correlation envelope every event in this system carries, whatever kind of event it "
+        "is: when it happened, which service emitted it, how severe it was, and the trace id that "
+        "ties it to everything else in the same unit of work. Implemented by LogEntry, OrderEvent, "
+        "PaymentEvent and UserEvent, so a single selection with inline fragments can return a "
+        "heterogeneous timeline — see Query.correlatedEvents."
+    )
+)
+class LogEvent:
+    """The four fields spec §3 Feature Area A calls "common log fields".
+
+    Deliberately **four and no more**. Everything on it must be genuinely shared by a log line, an
+    order status transition, a payment attempt and a user action — and must mean the *same thing*
+    on all four, because a client selecting ``level`` off the interface has no idea which concrete
+    type it is reading. ``message`` is not here (an order event has no free text), ``metadata`` is
+    not here (it is present on all four today but is an implementation convenience rather than part
+    of the correlation contract), and ``id`` is not here for the reason argued above.
+    """
+
     timestamp: datetime
     service: str
     level: LogLevel
+    #: Nullable across every implementor, and it has to be: ~40% of the log corpus carries no trace
+    #: id (C5's ``relatedLogs`` empty-list branch depends on exactly those rows), and an interface
+    #: field cannot be non-null on one implementor and nullable on another.
+    trace_id: Optional[str]
+
+
+@strawberry.type
+class LogEntry(LogEvent):
+    """One log line, as published. Field-for-field the spec's §2 item 15 shape.
+
+    Implements :class:`LogEvent` — see the block comment above for why that is a generalisation of
+    this type rather than a new hierarchy beside it, and for what it does and does not change about
+    the published contract.
+    """
+
+    id: strawberry.ID
     message: str
     metadata: Optional[JSON]
-    trace_id: Optional[str]
 
     # `related_logs` is a FIELD RESOLVER rather than a value computed in `from_orm`, and that is
     # the whole requirement (spec §2 items 17 and 28): a client that asks for `{ logs { id } }`

@@ -31,19 +31,29 @@ type LogEdge {
   node: LogEntry!
 }
 
-type LogEntry {
-  id: ID!
+type LogEntry implements LogEvent {
   timestamp: DateTime!
   service: String!
   level: LogLevel!
+  traceId: String
+  id: ID!
   message: String!
   metadata: JSON
-  traceId: String
 
   """
   Every OTHER entry sharing this entry's traceId, newest first. The entry itself is deliberately excluded: a uniquely-traced entry would otherwise answer with itself, which is not what any caller means by 'related'. Empty when traceId is null. Batched across the whole selection set by a per-operation DataLoader, so N entries cost one query rather than N.
   """
   relatedLogs: [LogEntry!]!
+}
+
+"""
+The correlation envelope every event in this system carries, whatever kind of event it is: when it happened, which service emitted it, how severe it was, and the trace id that ties it to everything else in the same unit of work. Implemented by LogEntry, OrderEvent, PaymentEvent and UserEvent, so a single selection with inline fragments can return a heterogeneous timeline — see Query.correlatedEvents.
+"""
+interface LogEvent {
+  timestamp: DateTime!
+  service: String!
+  level: LogLevel!
+  traceId: String
 }
 
 input LogFilterInput {
@@ -77,6 +87,45 @@ type Mutation {
   createLog(logData: CreateLogInput!): LogEntry!
 }
 
+"""
+One transition in an order's lifecycle. Orders are stored as an append-only event stream, so an order's current state is the status of its newest event rather than a mutable column — which is what makes the whole history queryable and what orderStatusStream replays.
+"""
+type OrderEvent implements LogEvent {
+  timestamp: DateTime!
+  service: String!
+  level: LogLevel!
+  traceId: String
+  id: ID!
+  orderId: String!
+  userId: String!
+  status: OrderStatus!
+  metadata: JSON
+}
+
+"""Filters for Query.orderEvents. Every field is optional and ANDed."""
+input OrderEventFilterInput {
+  service: String = null
+  level: LogLevel = null
+  startTime: DateTime = null
+  endTime: DateTime = null
+  traceId: String = null
+  orderId: String = null
+  userId: String = null
+  status: OrderStatus = null
+  searchText: String = null
+  limit: Int = null
+}
+
+enum OrderStatus {
+  CREATED
+  PAID
+  PACKED
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
 type PageInfo {
   hasNextPage: Boolean!
   hasPreviousPage: Boolean!
@@ -84,11 +133,75 @@ type PageInfo {
   endCursor: String
 }
 
+"""
+One event in a payment's life: authorized, captured, declined or refunded. Several events share one orderId — a payment is a stream, not a record with a status column — so `method` is a property of the attempt and `outcome` is the event's own verb.
+"""
+type PaymentEvent implements LogEvent {
+  timestamp: DateTime!
+  service: String!
+  level: LogLevel!
+  traceId: String
+  id: ID!
+  orderId: String!
+  method: PaymentMethod!
+  outcome: PaymentOutcome!
+  metadata: JSON
+}
+
+"""Filters for Query.paymentEvents. Every field is optional and ANDed."""
+input PaymentEventFilterInput {
+  service: String = null
+  level: LogLevel = null
+  startTime: DateTime = null
+  endTime: DateTime = null
+  traceId: String = null
+  orderId: String = null
+  method: PaymentMethod = null
+  outcome: PaymentOutcome = null
+  searchText: String = null
+  limit: Int = null
+}
+
+enum PaymentMethod {
+  CARD
+  PAYPAL
+  APPLE_PAY
+  BANK_TRANSFER
+  GIFT_CARD
+}
+
+enum PaymentOutcome {
+  AUTHORIZED
+  CAPTURED
+  DECLINED
+  REFUNDED
+}
+
 type Query {
   logs(filters: LogFilterInput = null): [LogEntry!]!
   log(id: ID!): LogEntry
   logsConnection(filters: LogFilterInput = null, first: Int = null, after: String = null): LogConnection!
   logStats(startTime: DateTime = null, endTime: DateTime = null): LogStats!
+
+  """
+  Order lifecycle events matching every supplied filter, newest first, capped by `limit`. Orders are an append-only stream, so an order's current status is the status of its newest event.
+  """
+  orderEvents(filters: OrderEventFilterInput = null): [OrderEvent!]!
+
+  """
+  User activity events matching every supplied filter, newest first, capped by `limit`.
+  """
+  userEvents(filters: UserEventFilterInput = null): [UserEvent!]!
+
+  """
+  Payment events matching every supplied filter, newest first, capped by `limit`. A payment is a stream of outcomes (authorized, captured, declined, refunded) filed under one orderId, not a single mutable record.
+  """
+  paymentEvents(filters: PaymentEventFilterInput = null): [PaymentEvent!]!
+
+  """
+  Every event of every kind carrying this trace id, newest first — log lines, order status transitions, payment outcomes and user actions in one heterogeneous list. Returns the LogEvent interface, so a client selects per-type fields with inline fragments (`... on OrderEvent { orderId status }`). This is the question a correlation id exists to answer, and answering it in one round trip is what would otherwise take four REST calls.
+  """
+  correlatedEvents(traceId: String!, limit: Int = null): [LogEvent!]!
 }
 
 type ServiceCount {
@@ -101,4 +214,41 @@ type Subscription {
   Live log entries, pushed over WebSocket as `createLog` commits them. `service` and `level` are applied SERVER-SIDE, before an entry is queued for this subscriber — so a narrow subscription costs neither bandwidth nor queue depth for traffic it did not ask for. Each subscriber gets its own bounded queue: a client that stops reading long enough to fill it is disconnected with a SLOW_CONSUMER error rather than being buffered without limit, so a gap is always reported and never silent.
   """
   logStream(service: String = null, level: LogLevel = null): LogEntry!
+}
+
+enum UserActivity {
+  SIGNUP
+  LOGIN
+  BROWSE
+  ADD_TO_CART
+  CHECKOUT
+  REVIEW
+  LOGOUT
+}
+
+"""
+One thing a user did — signing up, logging in, browsing, adding to cart, checking out, reviewing, logging out. Shares a traceId with the order and payment events from the same session, which is what makes correlatedEvents return a story rather than a list.
+"""
+type UserEvent implements LogEvent {
+  timestamp: DateTime!
+  service: String!
+  level: LogLevel!
+  traceId: String
+  id: ID!
+  userId: String!
+  activityType: UserActivity!
+  metadata: JSON
+}
+
+"""Filters for Query.userEvents. Every field is optional and ANDed."""
+input UserEventFilterInput {
+  service: String = null
+  level: LogLevel = null
+  startTime: DateTime = null
+  endTime: DateTime = null
+  traceId: String = null
+  userId: String = null
+  activityType: UserActivity = null
+  searchText: String = null
+  limit: Int = null
 }

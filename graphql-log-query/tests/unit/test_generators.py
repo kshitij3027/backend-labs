@@ -27,11 +27,14 @@ from src.generators import (
     LEVEL_WEIGHTS,
     LOG_LEVELS,
     METADATA_RATIO,
+    ORDER_TRACE_LOG_RATIO,
     SERVICES,
     TRACE_GROUP_MAX,
     TRACE_GROUP_MIN,
     TRACE_ID_RATIO,
+    generate_event_corpus,
     generate_log_records,
+    order_traces_with_logs,
 )
 
 #: A **fixed** instant, deliberately years away from any plausible test-run wall clock. Every
@@ -45,6 +48,10 @@ ANCHOR = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 SAMPLE_SIZE = 4000
 
 SEED = 20260725
+
+#: Orders for the correlation section, matching the shipped ``SEED_ORDERS`` so the numbers pinned
+#: below are the numbers a running container actually produces.
+SAMPLE_ORDERS = 200
 
 
 # --- Purity: the property the entire test strategy rests on ------------------------------------
@@ -341,6 +348,204 @@ def test_trace_groups_are_not_merely_adjacent_rows() -> None:
     assert any(
         indices[-1] - indices[0] > len(indices) - 1 for indices in positions.values()
     ), "every trace group is a contiguous run of records"
+
+
+# --- The deliberate correlation with the order corpus (C10) --------------------------------------
+#
+# WHAT THESE PIN AND WHY IT MATTERS MORE THAN IT LOOKS: `Query.correlatedEvents(traceId:)` is the
+# only interface-typed field in the schema, and its point is returning a MIX of __typenames.
+# `OrderEvent`, `PaymentEvent` and `UserEvent` come free — one order's events share one trace by
+# construction. `LogEntry` does not, and until `ORDER_TRACE_LOG_RATIO` existed it appeared only
+# because both generators run on the same seed and both render `getrandbits(64)`, so aligned stream
+# positions produced identical ids (about fifteen of two hundred at the shipped defaults, and ZERO
+# at 4000 log rows — the same corpus, one setting away from an `... on LogEntry` fragment that
+# matches nothing, with no test failing).
+#
+# So the correlation is declared, and these tests pin the declaration: a non-zero, deterministic
+# number of order traces carry log lines, it is exactly the set `order_traces_with_logs` names, and
+# the two independent populations C5 depends on are still there.
+# -------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def order_traces() -> tuple[str, ...]:
+    """The e-commerce corpus's trace ids — the input the log corpus correlates against."""
+    return tuple(generate_event_corpus(SAMPLE_ORDERS, seed=SEED, end_time=ANCHOR).trace_ids())
+
+
+@pytest.fixture(scope="module")
+def correlated(order_traces: tuple[str, ...]) -> list[LogRecord]:
+    """A log corpus generated with the order traces threaded in. Never mutated, so module-scoped."""
+    return generate_log_records(
+        SAMPLE_SIZE, seed=SEED, end_time=ANCHOR, order_traces=order_traces
+    )
+
+
+def test_a_deterministic_non_zero_set_of_order_traces_carries_log_lines(
+    correlated: list[LogRecord], order_traces: tuple[str, ...]
+) -> None:
+    """The count is a function of the ratio, and the set is **exactly** the declared one.
+
+    Equality rather than ``>= 1`` on purpose, and it is a strictly stronger statement than "some
+    log line shares an order's trace":
+
+    * ``>=`` would hold for the accident this replaced — and the accident is a function of the seed,
+      so it can be zero;
+    * equality also says no *undeclared* correlation crept in, which is what the redraw in
+      :func:`~src.generators._assign_trace_ids` is for. Without it an independently drawn log trace
+      could collide with an order's, and that log group would silently join a timeline it has
+      nothing to do with.
+    """
+    declared = order_traces_with_logs(order_traces)
+
+    assert len(declared) == int(len(order_traces) * ORDER_TRACE_LOG_RATIO)
+    assert len(declared) >= 10, (
+        "the ratio dropped so low the correlation is barely demonstrable; correlatedEvents is the "
+        "schema's flagship field and it needs real material"
+    )
+
+    observed = {record.trace_id for record in correlated if record.trace_id is not None} & set(
+        order_traces
+    )
+
+    assert observed == set(declared)
+
+
+def test_the_oldest_order_always_carries_log_lines(order_traces: tuple[str, ...]) -> None:
+    """``order_id_for(0)``'s trace is always selected, and one order is enough to select it.
+
+    That is what lets a test, C12's verifier and the C13 dashboard name a trace **by construction**
+    rather than scanning the corpus for a lucky one — and it is what makes the zero case
+    unreachable: ``int(1 * 0.25)`` is 0, so the floor of one is doing real work here.
+    """
+    assert order_traces_with_logs(order_traces)[0] == order_traces[0]
+    assert order_traces_with_logs(order_traces[:1]) == order_traces[:1]
+    assert order_traces_with_logs(()) == ()
+
+
+def test_the_selection_is_spread_across_the_corpus_rather_than_a_prefix(
+    order_traces: tuple[str, ...]
+) -> None:
+    """A stride, not the first quarter.
+
+    ``trace_ids()`` is in first-appearance order, i.e. oldest order first. Taking a prefix would
+    correlate only the oldest quarter of the corpus and leave every recent order — the top of any
+    dashboard, which sorts newest first — with no log lines at all.
+    """
+    declared = order_traces_with_logs(order_traces)
+    positions = [order_traces.index(trace) for trace in declared]
+
+    assert positions == sorted(positions)
+    assert positions[-1] > len(order_traces) * 0.9, (
+        f"the last correlated order sits at {positions[-1]} of {len(order_traces)}, so the newest "
+        "orders have no log lines"
+    )
+
+
+def test_correlation_leaves_the_log_only_and_untraced_populations_intact(
+    correlated: list[LogRecord], order_traces: tuple[str, ...]
+) -> None:
+    """Both branches C5 depends on survive, and the traced share is unchanged.
+
+    ``related_logs`` needs traces that only log rows carry, and spec §2 item 17 needs rows whose
+    ``trace_id`` is NULL. Correlating *everything* would satisfy this module's other assertions
+    while quietly making both branches unreachable — which is why the ratio is a quarter and why
+    this test asserts the majority stayed independent rather than merely that something did.
+    """
+    traced = [record for record in correlated if record.trace_id is not None]
+    untraced = [record for record in correlated if record.trace_id is None]
+    log_only = {record.trace_id for record in traced} - set(order_traces)
+
+    assert untraced, "no untraced row: related_logs' empty-list branch is unreachable"
+    assert len(log_only) > 10 * len(order_traces_with_logs(order_traces)), (
+        "the log-only population is no longer the majority of traces"
+    )
+    # And the correlation moved trace ids around WITHOUT changing how many rows carry one.
+    assert abs(len(traced) / len(correlated) - TRACE_ID_RATIO) < 0.05
+
+
+def test_group_size_bounds_survive_the_adoption(correlated: list[LogRecord]) -> None:
+    """No trace grew past :data:`TRACE_GROUP_MAX` when the order ids were adopted.
+
+    The failure this catches is specific: hand two log groups the *same* order trace — by selecting
+    a duplicate, or by letting an independently drawn id collide with an adopted one — and the two
+    merge into a single trace of up to ten records. Nothing else in the suite would notice, and
+    ``relatedLogs`` would start returning a group twice the size the corpus promises.
+    """
+    groups = Counter(
+        record.trace_id for record in correlated if record.trace_id is not None
+    )
+
+    assert groups
+    assert all(TRACE_GROUP_MIN <= size <= TRACE_GROUP_MAX for size in groups.values()), (
+        f"group sizes {sorted(set(groups.values()))} escape "
+        f"[{TRACE_GROUP_MIN}, {TRACE_GROUP_MAX}]"
+    )
+
+
+def test_passing_order_traces_is_pure_and_actually_changes_the_corpus(
+    order_traces: tuple[str, ...]
+) -> None:
+    """Same arguments in, equal corpus out — and the argument is not decorative.
+
+    The first half is the oracle guarantee extended to the new parameter: an integration fixture
+    regenerates the corpus the seeder wrote and grades the database against it, so the two calls
+    have to agree. The second half is what stops that from being vacuous.
+    """
+    first = generate_log_records(500, seed=SEED, end_time=ANCHOR, order_traces=order_traces)
+    second = generate_log_records(500, seed=SEED, end_time=ANCHOR, order_traces=order_traces)
+
+    assert first == second
+    assert first != generate_log_records(500, seed=SEED, end_time=ANCHOR)
+
+
+def test_omitting_order_traces_leaves_the_corpus_uncorrelated(
+    order_traces: tuple[str, ...]
+) -> None:
+    """The default is opt-out, so every pre-C10 caller and oracle is untouched.
+
+    Also the reason none of the assertions above this section moved: they call the generator without
+    the argument, and without the argument neither the adoption nor the redraw can fire.
+    """
+    plain = generate_log_records(SAMPLE_SIZE, seed=SEED, end_time=ANCHOR)
+
+    assert plain == generate_log_records(SAMPLE_SIZE, seed=SEED, end_time=ANCHOR, order_traces=())
+    # It is *not* asserted that the uncorrelated corpus shares no trace with the order corpus: it
+    # may, by the seed-alignment accident described at the top of this section. That accident is
+    # precisely what `order_traces` replaces with something a test can rely on.
+
+
+def test_a_log_corpus_with_fewer_groups_than_orders_adopts_what_it_can(
+    order_traces: tuple[str, ...]
+) -> None:
+    """A degenerate configuration truncates the selection instead of raising or indexing past it.
+
+    ``SEED_ENTRIES=20`` with ``SEED_ORDERS=200`` asks for fifty correlated traces from a corpus that
+    only has a handful of groups. Every group it does have is correlated, and nothing crashes.
+    """
+    records = generate_log_records(20, seed=SEED, end_time=ANCHOR, order_traces=order_traces)
+    traces = {record.trace_id for record in records if record.trace_id is not None}
+
+    assert traces
+    assert traces <= set(order_traces)
+
+
+@pytest.mark.parametrize(
+    "trace",
+    [
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="blank"),
+        pytest.param("x" * (TRACE_ID_MAX_LENGTH + 1), id="too-long"),
+    ],
+)
+def test_an_unusable_order_trace_is_rejected_up_front(trace: str) -> None:
+    """A trace id no ``trace_id`` column could hold fails here, not on the seeding INSERT.
+
+    The alternative is a driver error partway through a thousand-row chunk at container startup,
+    several layers from the caller that supplied the value.
+    """
+    with pytest.raises(ValueError):
+        generate_log_records(100, seed=SEED, end_time=ANCHOR, order_traces=[trace])
 
 
 # --- Metadata ----------------------------------------------------------------------------------

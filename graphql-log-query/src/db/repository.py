@@ -38,7 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.expression import ColumnElement
 
 from src.config import Settings, get_settings
-from src.db.models import LogEntryORM
+from src.db.models import LogEntryORM, OrderEventORM, PaymentEventORM, UserEventORM
 
 #: The character that turns the next LIKE metacharacter into a literal. Backslash is PostgreSQL's
 #: own default, so this only restates what the server would already do — but it is passed
@@ -498,6 +498,220 @@ def build_stats_breakdown_select(query: LogQuery) -> Select[Any]:
     )
 
 
+# =================================================================================================
+# C10 — the e-commerce event tables (spec §3 Feature Area A)
+#
+# Three more filter -> SELECT builders, in the same shape as the log ones above and reusing the same
+# three primitives rather than restating them:
+#
+#   * `clamp_limit`  — so "the cap applies on every query path" (spec §2 item 22) covers these too,
+#                      structurally, in the function that builds the statement;
+#   * `escape_like`  — so a `searchText` of `ord-6%` finds ids CONTAINING a percent sign rather than
+#                      every order in the table;
+#   * `as_utc`       — so a naive bound is never compared against a `timestamptz` under the server's
+#                      TimeZone setting.
+#
+# `build_common_event_predicates` factors out the four columns the three tables share, which is the
+# same four `src.graphql.types.LogEvent` publishes as an interface. That is not a coincidence to be
+# tidied away: it is the SAME abstraction seen from the storage side, and having one function build
+# it means "filter by service" cannot mean one thing for orders and another for payments.
+#
+# WHAT IS DELIBERATELY NOT HERE: no joins, no aggregates, no batch (`IN (...)`) loads. C11 owns
+# cross-entity traversal and the DataLoaders that batch it; these builders answer one flat question
+# about one table, which is exactly what C10's three top-level list fields need. The `trace_id`
+# filter below is the seam C11 widens into `... WHERE trace_id IN (:keys)` for its loaders.
+# =================================================================================================
+
+#: The three event models, as the union the shared predicate builder accepts. Spelled out rather
+#: than typed as ``type[Base]`` so a caller cannot hand it ``LogEntryORM`` — which has a ``message``
+#: column and no ``trace_id`` index shape in common with these — and get a statement that compiles
+#: but means something else.
+EventModel = type[OrderEventORM] | type[PaymentEventORM] | type[UserEventORM]
+
+
+@dataclass(frozen=True, slots=True)
+class EventQueryBase:
+    """The filters every event stream shares — the storage-side twin of the ``LogEvent`` interface.
+
+    A base class rather than four copies of five fields, because the subclasses genuinely *are* the
+    same request with extra dimensions, and because :func:`build_common_event_predicates` can then
+    be written once against this shape. Every field defaults to ``None``, and ``None`` means
+    **omitted**, which is ignored rather than treated as "match NULL" — the same rule
+    :class:`LogQuery` documents.
+
+    Attributes:
+        limit: ``None`` defers to ``DEFAULT_QUERY_LIMIT``; any supplied value is clamped to
+            ``[1, MAX_QUERY_LIMIT]`` by the builder. Same discipline as every other read path.
+    """
+
+    service: str | None = None
+    level: str | None = None
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    trace_id: str | None = None
+    limit: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderEventQuery(EventQueryBase):
+    """A read request against ``order_events``.
+
+    ``search_text`` is a substring match on ``order_id`` — the table's business identifier and the
+    only free-form thing an order event carries. It is **not** trigram-indexed, unlike
+    ``log_entries.message``: a leading-wildcard ILIKE over a few thousand short identifiers is a
+    cheap sequential scan, while `message` is long free text over a corpus two orders of magnitude
+    larger. If it ever becomes hot the fix is the identical ``gin_trgm_ops`` index, and this comment
+    is where to look.
+    """
+
+    order_id: str | None = None
+    user_id: str | None = None
+    status: str | None = None
+    search_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentEventQuery(EventQueryBase):
+    """A read request against ``payment_events``. ``search_text`` matches on ``order_id``."""
+
+    order_id: str | None = None
+    method: str | None = None
+    outcome: str | None = None
+    search_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UserEventQuery(EventQueryBase):
+    """A read request against ``user_events``. ``search_text`` matches on ``user_id``."""
+
+    user_id: str | None = None
+    activity_type: str | None = None
+    search_text: str | None = None
+
+
+def build_common_event_predicates(
+    model: EventModel, query: EventQueryBase
+) -> list[ColumnElement[bool]]:
+    """The WHERE conditions for the four columns every event stream shares, plus the time range.
+
+    Time-range semantics are :func:`build_predicates`'s, unchanged and deliberately so: **both
+    bounds inclusive**, normalised through :func:`as_utc`. "The last hour" must mean one instant
+    range across ``logs``, ``orderEvents``, ``paymentEvents`` and ``userEvents``, or a dashboard
+    whose panels share a time picker is showing four different windows.
+
+    Note ``trace_id`` is matched by equality and only when supplied, so it never contributes a
+    ``trace_id IS NULL`` clause — a client that omits it wants every event, correlated or not.
+    """
+    predicates: list[ColumnElement[bool]] = []
+
+    if query.service is not None:
+        predicates.append(model.service == query.service)
+    if query.level is not None:
+        predicates.append(model.level == query.level)
+    if query.trace_id is not None:
+        predicates.append(model.trace_id == query.trace_id)
+
+    start_time = as_utc(query.start_time)
+    if start_time is not None:
+        predicates.append(model.timestamp >= start_time)
+    end_time = as_utc(query.end_time)
+    if end_time is not None:
+        predicates.append(model.timestamp <= end_time)
+
+    return predicates
+
+
+def _ilike_predicate(column: Any, needle: str) -> ColumnElement[bool]:
+    """``column ILIKE '%needle%'`` with LIKE metacharacters neutralised.
+
+    One helper so the escape character is passed the same way on every table. See
+    :func:`escape_like` for why this is a *semantic* fix rather than an injection defence.
+    """
+    return column.ilike(f"%{escape_like(needle)}%", escape=LIKE_ESCAPE_CHARACTER)
+
+
+def build_order_event_predicates(query: OrderEventQuery) -> list[ColumnElement[bool]]:
+    """Turn an :class:`OrderEventQuery` into WHERE conditions; omitted filters contribute nothing."""
+    predicates = build_common_event_predicates(OrderEventORM, query)
+
+    if query.order_id is not None:
+        predicates.append(OrderEventORM.order_id == query.order_id)
+    if query.user_id is not None:
+        predicates.append(OrderEventORM.user_id == query.user_id)
+    if query.status is not None:
+        predicates.append(OrderEventORM.status == query.status)
+    if query.search_text is not None:
+        predicates.append(_ilike_predicate(OrderEventORM.order_id, query.search_text))
+
+    return predicates
+
+
+def build_payment_event_predicates(query: PaymentEventQuery) -> list[ColumnElement[bool]]:
+    """Turn a :class:`PaymentEventQuery` into WHERE conditions."""
+    predicates = build_common_event_predicates(PaymentEventORM, query)
+
+    if query.order_id is not None:
+        predicates.append(PaymentEventORM.order_id == query.order_id)
+    if query.method is not None:
+        predicates.append(PaymentEventORM.method == query.method)
+    if query.outcome is not None:
+        predicates.append(PaymentEventORM.outcome == query.outcome)
+    if query.search_text is not None:
+        predicates.append(_ilike_predicate(PaymentEventORM.order_id, query.search_text))
+
+    return predicates
+
+
+def build_user_event_predicates(query: UserEventQuery) -> list[ColumnElement[bool]]:
+    """Turn a :class:`UserEventQuery` into WHERE conditions."""
+    predicates = build_common_event_predicates(UserEventORM, query)
+
+    if query.user_id is not None:
+        predicates.append(UserEventORM.user_id == query.user_id)
+    if query.activity_type is not None:
+        predicates.append(UserEventORM.activity_type == query.activity_type)
+    if query.search_text is not None:
+        predicates.append(_ilike_predicate(UserEventORM.user_id, query.search_text))
+
+    return predicates
+
+
+def build_order_event_select(
+    query: OrderEventQuery, settings: Settings
+) -> Select[tuple[OrderEventORM]]:
+    """Filters, newest-first ordering with the ``id`` tiebreak, clamped LIMIT."""
+    statement = select(OrderEventORM)
+    for predicate in build_order_event_predicates(query):
+        statement = statement.where(predicate)
+    return statement.order_by(
+        OrderEventORM.timestamp.desc(), OrderEventORM.id.desc()
+    ).limit(clamp_limit(query.limit, settings))
+
+
+def build_payment_event_select(
+    query: PaymentEventQuery, settings: Settings
+) -> Select[tuple[PaymentEventORM]]:
+    """Filters, newest-first ordering with the ``id`` tiebreak, clamped LIMIT."""
+    statement = select(PaymentEventORM)
+    for predicate in build_payment_event_predicates(query):
+        statement = statement.where(predicate)
+    return statement.order_by(
+        PaymentEventORM.timestamp.desc(), PaymentEventORM.id.desc()
+    ).limit(clamp_limit(query.limit, settings))
+
+
+def build_user_event_select(
+    query: UserEventQuery, settings: Settings
+) -> Select[tuple[UserEventORM]]:
+    """Filters, newest-first ordering with the ``id`` tiebreak, clamped LIMIT."""
+    statement = select(UserEventORM)
+    for predicate in build_user_event_predicates(query):
+        statement = statement.where(predicate)
+    return statement.order_by(
+        UserEventORM.timestamp.desc(), UserEventORM.id.desc()
+    ).limit(clamp_limit(query.limit, settings))
+
+
 class LogRepository:
     """Executes the builders above against one :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
 
@@ -697,3 +911,31 @@ class LogRepository:
         # or roll back as one unit.
         await self._session.flush()
         return entry
+
+    # ---------------------------------------------------------------------------------------------
+    # C10 — the e-commerce event reads.
+    #
+    # Deliberately methods on THIS repository rather than a second `EventRepository` class. One
+    # repository per session is what `Context.repository()` hands out, and it is what every resolver
+    # and every DataLoader batch already goes through; a second class would need a second provider,
+    # a second lifetime rule and a second place for "which session does this run on" to be answered.
+    # The name stays `LogRepository` because everything in here is a log event — an order status
+    # transition IS a log line with a schema, which is the whole premise of `LogEvent`.
+    #
+    # Each is one statement over one table. C11 adds the batched (`IN (:keys)`) forms beside them.
+    # ---------------------------------------------------------------------------------------------
+
+    async def list_order_events(self, query: OrderEventQuery) -> list[OrderEventORM]:
+        """Matching order events, newest first, capped at the clamped limit."""
+        result = await self._session.execute(build_order_event_select(query, self._settings))
+        return list(result.scalars().all())
+
+    async def list_payment_events(self, query: PaymentEventQuery) -> list[PaymentEventORM]:
+        """Matching payment events, newest first, capped at the clamped limit."""
+        result = await self._session.execute(build_payment_event_select(query, self._settings))
+        return list(result.scalars().all())
+
+    async def list_user_events(self, query: UserEventQuery) -> list[UserEventORM]:
+        """Matching user activity events, newest first, capped at the clamped limit."""
+        result = await self._session.execute(build_user_event_select(query, self._settings))
+        return list(result.scalars().all())

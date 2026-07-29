@@ -53,7 +53,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from src.db.models import SERVICE_MAX_LENGTH, TRACE_ID_MAX_LENGTH
+from src.db.models import (
+    ORDER_ID_MAX_LENGTH,
+    SERVICE_MAX_LENGTH,
+    TRACE_ID_MAX_LENGTH,
+    USER_ID_MAX_LENGTH,
+)
 from src.db.repository import as_utc
 from src.graphql.errors import ValidationError
 
@@ -61,7 +66,13 @@ if TYPE_CHECKING:  # pragma: no cover - import-cycle break, evaluated by type ch
     # `src.graphql.inputs` imports this module, so importing it back at run time would be a cycle.
     # `from __future__ import annotations` makes the annotations below strings, so nothing here
     # needs the real classes.
-    from src.graphql.inputs import CreateLogInput, LogFilterInput
+    from src.graphql.inputs import (
+        CreateLogInput,
+        LogFilterInput,
+        OrderEventFilterInput,
+        PaymentEventFilterInput,
+        UserEventFilterInput,
+    )
 
 # ---------------------------------------------------------------------------------------------
 # Caps.
@@ -77,6 +88,12 @@ MAX_SERVICE_LENGTH = SERVICE_MAX_LENGTH
 
 #: Mirrors ``String(TRACE_ID_MAX_LENGTH)`` on ``log_entries.trace_id``.
 MAX_TRACE_ID_LENGTH = TRACE_ID_MAX_LENGTH
+
+#: Mirrors ``String(ORDER_ID_MAX_LENGTH)`` / ``String(USER_ID_MAX_LENGTH)`` on the C10 event tables.
+#: Re-exported rather than restated for the same reason as the two above: a validator that
+#: disagreed with its column would reject values the database accepts, or pass values it does not.
+MAX_ORDER_ID_LENGTH = ORDER_ID_MAX_LENGTH
+MAX_USER_ID_LENGTH = USER_ID_MAX_LENGTH
 
 #: ``message`` is a ``Text`` column, so PostgreSQL imposes no length of its own (its hard ceiling
 #: is ~1GB per value). This cap is therefore a **resource bound we choose**, not a column mirror:
@@ -325,6 +342,110 @@ def validate_log_filter(filters: LogFilterInput) -> None:
         _require_max_length("searchText", filters.search_text, MAX_SEARCH_TEXT_LENGTH)
 
     validate_time_range(filters.start_time, filters.end_time)
+
+
+# ---------------------------------------------------------------------------------------------
+# C10 — the e-commerce event filters (spec §3 Feature Area A)
+#
+# The rules are DELIBERATELY THE SAME ONES `validate_log_filter` applies, applied to the same
+# fields. A `service` that `logs` accepts and `orderEvents` rejects (or vice versa) would be a
+# genuinely confusing surface — the two are the same column in four tables — so the shared half is
+# validated by one function and only the per-table identifiers differ.
+#
+# `status` / `method` / `outcome` / `activityType` need nothing here for exactly the reason `level`
+# needs nothing: they are GraphQL enums, so an unknown value is rejected during validation, before a
+# resolver runs, by graphql-core itself. See src/graphql/enums.py.
+# ---------------------------------------------------------------------------------------------
+
+
+def _check_identifier(field: str, value: str | None, maximum: int) -> None:
+    """Apply the three identifier rules to an optional filter value; ``None`` is a no-op.
+
+    Blank is refused as well as over-long, because an identifier filter names something: an empty
+    ``orderId`` cannot match a stored row (they are all non-empty), so running it returns a
+    confident empty list rather than saying the request was malformed.
+    """
+    if value is None:
+        return
+    _reject_nul(field, value)
+    _require_non_blank(field, value)
+    _require_max_length(field, value, maximum)
+
+
+def _validate_common_event_filter(
+    service: str | None,
+    trace_id: str | None,
+    search_text: str | None,
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> None:
+    """Check the five filters every event stream shares — the validation twin of ``LogEvent``."""
+    _check_identifier("service", service, MAX_SERVICE_LENGTH)
+    _check_identifier("traceId", trace_id, MAX_TRACE_ID_LENGTH)
+
+    if search_text is not None:
+        _reject_nul("searchText", search_text)
+        # No blank check, exactly as on `LogFilterInput`: an empty needle means "no constraint".
+        _require_max_length("searchText", search_text, MAX_SEARCH_TEXT_LENGTH)
+
+    validate_time_range(start_time, end_time)
+
+
+def validate_order_event_filter(filters: OrderEventFilterInput) -> None:
+    """Check an ``OrderEventFilterInput`` in place. Raises on the first failure.
+
+    Called from :meth:`~src.graphql.inputs.OrderEventFilterInput.to_query`, which is the single
+    conversion ``Query.orderEvents`` performs — so "the filters were validated" is structural rather
+    than something each resolver has to remember, the same way it is for ``Query.logs``.
+    """
+    _validate_common_event_filter(
+        filters.service,
+        filters.trace_id,
+        filters.search_text,
+        filters.start_time,
+        filters.end_time,
+    )
+    _check_identifier("orderId", filters.order_id, MAX_ORDER_ID_LENGTH)
+    _check_identifier("userId", filters.user_id, MAX_USER_ID_LENGTH)
+
+
+def validate_payment_event_filter(filters: PaymentEventFilterInput) -> None:
+    """Check a ``PaymentEventFilterInput`` in place. Raises on the first failure."""
+    _validate_common_event_filter(
+        filters.service,
+        filters.trace_id,
+        filters.search_text,
+        filters.start_time,
+        filters.end_time,
+    )
+    _check_identifier("orderId", filters.order_id, MAX_ORDER_ID_LENGTH)
+
+
+def validate_user_event_filter(filters: UserEventFilterInput) -> None:
+    """Check a ``UserEventFilterInput`` in place. Raises on the first failure."""
+    _validate_common_event_filter(
+        filters.service,
+        filters.trace_id,
+        filters.search_text,
+        filters.start_time,
+        filters.end_time,
+    )
+    _check_identifier("userId", filters.user_id, MAX_USER_ID_LENGTH)
+
+
+def validate_trace_id(trace_id: str) -> str:
+    """Check the **required** ``traceId`` argument of ``Query.correlatedEvents``.
+
+    Required rather than optional, which is why this returns the value instead of ``None``: a
+    correlation lookup with no correlation id would be "every event in the system", which is what
+    the three list fields are for and which no cap short of ``MAX_QUERY_LIMIT`` per table would make
+    cheap.
+
+    Raises:
+        ValidationError: If it is blank, over-long or contains a NUL byte.
+    """
+    _check_identifier("traceId", trace_id, MAX_TRACE_ID_LENGTH)
+    return trace_id
 
 
 def validate_subscription_filter(service: str | None) -> None:

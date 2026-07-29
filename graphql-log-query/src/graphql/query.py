@@ -51,7 +51,7 @@ from typing import Optional
 import strawberry
 
 from src.cache import cached_log_stats, cached_logs
-from src.db.repository import LogQuery, LogStatsResult
+from src.db.repository import LogQuery, LogStatsResult, clamp_limit
 from src.graphql import errors
 from src.graphql.context import Context
 
@@ -61,9 +61,26 @@ from src.graphql.context import Context
 # `errors.` qualifier on the second is what makes the translation visible at the point it happens
 # rather than hidden behind two identical-looking names. See src/graphql/cursor.py.
 from src.graphql.cursor import InvalidCursorError, decode_cursor, encode_cursor
-from src.graphql.inputs import LogFilterInput, to_log_query
-from src.graphql.types import LogConnection, LogEdge, LogEntry, LogStats, PageInfo
-from src.graphql.validation import validate_time_range
+from src.graphql.ecommerce import OrderEvent, PaymentEvent, UserEvent
+from src.graphql.inputs import (
+    LogFilterInput,
+    OrderEventFilterInput,
+    PaymentEventFilterInput,
+    UserEventFilterInput,
+    to_log_query,
+    to_order_event_query,
+    to_payment_event_query,
+    to_user_event_query,
+)
+from src.graphql.types import (
+    LogConnection,
+    LogEdge,
+    LogEntry,
+    LogEvent,
+    LogStats,
+    PageInfo,
+)
+from src.graphql.validation import validate_time_range, validate_trace_id
 
 
 def _parse_log_id(raw: str) -> int:
@@ -320,3 +337,185 @@ class Query:
                 return await repository.log_stats(query)
 
         return LogStats.from_result(await cached_log_stats(context.cache, query, load))
+
+    # =============================================================================================
+    # C10 — the e-commerce entry points (spec §3 Feature Area A)
+    #
+    # FOUR fields, and the fourth is the one that matters. The three list fields are deliberately
+    # FLAT — one filtered index read each, the same shape as `logs`, no nesting and no aggregation —
+    # because C11 owns multi-dimensional composition, cross-entity traversal, the DataLoaders that
+    # batch it and the cached aggregates on top. Shipping a nested `OrderEvent.payments` here would
+    # mean shipping it without its loader, i.e. one SELECT per order.
+    #
+    # `correlatedEvents` is what makes `LogEvent` a real interface rather than a documentation
+    # device: it is the only field whose type is the interface, so it is the only place a client
+    # must write inline fragments, and it is what proves the four implementors are actually
+    # substitutable. It is also the single query the correlation id exists for.
+    #
+    # NOT CACHED, and that is a C11 decision rather than an oversight: spec §3 Feature Area D asks
+    # for a TTL policy defined PER AGGREGATION, and these are not aggregations — they are filtered
+    # row reads whose cache key would be a fourth entry in `src.cache.TTL_POLICY` written before
+    # anybody has measured what it should be. `Query.logs` is cached because C7 measured it.
+    # =============================================================================================
+
+    @strawberry.field(
+        description=(
+            "Order lifecycle events matching every supplied filter, newest first, capped by "
+            "`limit`. Orders are an append-only stream, so an order's current status is the "
+            "status of its newest event."
+        )
+    )
+    async def order_events(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[OrderEventFilterInput] = None,
+    ) -> list[OrderEvent]:
+        """Order events matching the supplied filters — spec §3 Feature Area A.
+
+        Structurally identical to :meth:`logs`: the filtering, AND-composition, ILIKE escaping, UTC
+        normalisation, ``(timestamp DESC, id DESC)`` ordering and ``MAX_QUERY_LIMIT`` clamp all live
+        in :mod:`src.db.repository` and are shared with every other read path. This resolver is the
+        translation at the edges and nothing else.
+        """
+        context = info.context
+        query = to_order_event_query(filters, context.settings)
+
+        async with context.repository() as repository:
+            rows = await repository.list_order_events(query)
+            # Projected inside the block, while the rows are still attached to the session that
+            # loaded them — the same rule every other read path follows.
+            return [OrderEvent.from_orm(row) for row in rows]
+
+    @strawberry.field(
+        description=(
+            "User activity events matching every supplied filter, newest first, capped by `limit`."
+        )
+    )
+    async def user_events(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[UserEventFilterInput] = None,
+    ) -> list[UserEvent]:
+        """User activity events matching the supplied filters — spec §3 Feature Area A."""
+        context = info.context
+        query = to_user_event_query(filters, context.settings)
+
+        async with context.repository() as repository:
+            rows = await repository.list_user_events(query)
+            return [UserEvent.from_orm(row) for row in rows]
+
+    @strawberry.field(
+        description=(
+            "Payment events matching every supplied filter, newest first, capped by `limit`. A "
+            "payment is a stream of outcomes (authorized, captured, declined, refunded) filed "
+            "under one orderId, not a single mutable record."
+        )
+    )
+    async def payment_events(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[PaymentEventFilterInput] = None,
+    ) -> list[PaymentEvent]:
+        """Payment events matching the supplied filters — spec §3 Feature Area A."""
+        context = info.context
+        query = to_payment_event_query(filters, context.settings)
+
+        async with context.repository() as repository:
+            rows = await repository.list_payment_events(query)
+            return [PaymentEvent.from_orm(row) for row in rows]
+
+    @strawberry.field(
+        description=(
+            "Every event of every kind carrying this trace id, newest first — log lines, order "
+            "status transitions, payment outcomes and user actions in one heterogeneous list. "
+            "Returns the LogEvent interface, so a client selects per-type fields with inline "
+            "fragments (`... on OrderEvent { orderId status }`). This is the question a "
+            "correlation id exists to answer, and answering it in one round trip is what would "
+            "otherwise take four REST calls."
+        )
+    )
+    async def correlated_events(
+        self,
+        info: strawberry.Info[Context, None],
+        trace_id: str,
+        limit: Optional[int] = None,
+    ) -> list[LogEvent]:
+        """Everything correlated with one trace id, across all four event types.
+
+        .. rubric:: Why this field is the proof that ``LogEvent`` is an interface and not a comment
+
+        Every other field in the schema returns a concrete type, so an interface implemented by
+        four of them would be unobservable: a client could never write a selection that needed it.
+        This one returns ``[LogEvent!]!``, so ``__typename`` and inline fragments are the *only* way
+        to read it — which means the interface is exercised by every caller rather than by a
+        docstring.
+
+        .. rubric:: Four statements, one per table, and the cap is per-table
+
+        Deliberately four flat SELECTs rather than a ``UNION ALL``: the four tables have different
+        columns, so a union would have to project them onto a common column list and then re-split
+        the rows in Python — more code, one statement, and a plan the planner cannot use each
+        table's own ``trace_id`` index for as cleanly. Four indexed equality reads on four small
+        result sets is the cheaper and far more legible shape.
+
+        ``limit`` is applied **per table** by the shared clamp, so the worst case is
+        ``4 x MAX_QUERY_LIMIT`` rows. That is stated rather than hidden: a single per-trace cap
+        would need the merge to happen in SQL, which is the union this deliberately is not. A trace
+        holding more than ``MAX_QUERY_LIMIT`` events of one kind is a retry storm, and truncating
+        the newest of each kind is the right answer for it.
+
+        C11 SEAM: the four loads are issued sequentially on one session, which is correct here (one
+        session is one connection, so concurrency would only queue) but is exactly where the
+        cross-entity DataLoaders go — at which point a batch of trace ids costs the same four
+        statements as one.
+
+        Raises:
+            src.graphql.errors.ValidationError: If ``traceId`` is blank, over-long or contains a
+                NUL byte.
+        """
+        context = info.context
+        # Required, so it is validated here rather than inside a filter conversion. See
+        # `validate_trace_id` for why the argument is required at all.
+        trace = validate_trace_id(trace_id)
+        settings = context.settings
+
+        order_query = to_order_event_query(
+            OrderEventFilterInput(trace_id=trace, limit=limit), settings
+        )
+        payment_query = to_payment_event_query(
+            PaymentEventFilterInput(trace_id=trace, limit=limit), settings
+        )
+        user_query = to_user_event_query(
+            UserEventFilterInput(trace_id=trace, limit=limit), settings
+        )
+
+        events: list[LogEvent] = []
+        async with context.repository() as repository:
+            # `list_logs_by_trace_ids` rather than a `LogQuery(trace_id=…)`: `LogQuery` has no
+            # trace filter (C2 built it for the spec's six filter fields), and the batch builder is
+            # the statement that already exists for exactly this lookup — it is what C5's
+            # DataLoader runs, so the correlation read here and the one behind `relatedLogs` cannot
+            # disagree about what "sharing a trace" means.
+            log_rows = await repository.list_logs_by_trace_ids([trace])
+            events.extend(LogEntry.from_orm(row) for row in log_rows[: clamp_limit(limit, settings)])
+            events.extend(
+                OrderEvent.from_orm(row)
+                for row in await repository.list_order_events(order_query)
+            )
+            events.extend(
+                PaymentEvent.from_orm(row)
+                for row in await repository.list_payment_events(payment_query)
+            )
+            events.extend(
+                UserEvent.from_orm(row)
+                for row in await repository.list_user_events(user_query)
+            )
+
+        # Merged newest-first in Python, because the four statements each ordered their own table
+        # and nothing has interleaved them yet. The `id` is NOT part of the sort key: it is unique
+        # only within its own table, so using it as a tiebreak across four BIGSERIAL sequences would
+        # order by an accident of which table happened to be written first. `__typename` is the
+        # tiebreak instead — arbitrary, but stable and total, which is what a diff-stable response
+        # needs.
+        events.sort(key=lambda event: (event.timestamp, type(event).__name__), reverse=True)
+        return events

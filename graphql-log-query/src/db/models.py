@@ -41,6 +41,21 @@ SERVICE_MAX_LENGTH = 64
 LEVEL_MAX_LENGTH = 16
 TRACE_ID_MAX_LENGTH = 64
 
+#: Business-key caps for the C10 e-commerce event tables. ``order_id`` and ``user_id`` are opaque
+#: identifiers minted upstream (``ord-60000``, ``u-1001``), so 64 characters is the same generous
+#: ceiling ``trace_id`` gets and for the same reason: it is wide enough for a UUID or a prefixed
+#: ULID, and narrow enough that a client cannot use the column as free-form storage.
+ORDER_ID_MAX_LENGTH = 64
+USER_ID_MAX_LENGTH = 64
+
+#: Caps for the four small controlled vocabularies (status / method / outcome / activity). They are
+#: stored as ``String`` rather than as PostgreSQL ``ENUM`` types — see the note on
+#: :attr:`OrderEventORM.status` — so the width is the only storage-level statement about them.
+ORDER_STATUS_MAX_LENGTH = 24
+PAYMENT_METHOD_MAX_LENGTH = 24
+PAYMENT_OUTCOME_MAX_LENGTH = 24
+USER_ACTIVITY_MAX_LENGTH = 24
+
 
 class LogEntryORM(Base):
     """One log line, as stored.
@@ -252,4 +267,357 @@ class LogRecord:
             message=row.message,
             metadata=row.metadata_,
             trace_id=row.trace_id,
+        )
+
+
+# =================================================================================================
+# C10 — the e-commerce event tables (spec §3 Feature Area A)
+#
+# Three more append-only streams beside `log_entries`: order events, payment events and user
+# activity events. Every one of them carries the SAME four correlation columns the log line does
+# (`timestamp`, `service`, `level`, `trace_id`), which is not a coincidence to be factored away —
+# it is the requirement. `src.graphql.types.LogEvent` publishes exactly those four as a GraphQL
+# interface implemented by all four types, so a client can ask one question ("everything correlated
+# with this trace") and get a heterogeneous answer.
+#
+# ---------------------------------------------------------------------------------------------
+# WHY THERE IS NO `relationship()` HERE, AND NO `ForeignKey` EITHER
+# ---------------------------------------------------------------------------------------------
+#
+# The spec asks for "modeled relationships between them" — order -> user, order -> payments. Those
+# relationships are modeled as an INDEXED SHARED KEY (`order_id`, `user_id`, `trace_id`) resolved
+# through the repository and, from C11, through cross-entity DataLoaders. Not as ORM relationships.
+# Three independent reasons, and the first one is decisive on its own:
+#
+#   1. THERE IS NO PARENT TABLE TO POINT AT. This system stores an event LOG, not entities: there
+#      is no `orders` table and no `users` table, because `order_events` IS the order's history and
+#      `user_events` IS the user's. `ForeignKey("orders.id")` cannot be written because `orders`
+#      does not exist, and inventing two entity tables to satisfy a `relationship()` would be
+#      modelling the ORM's preferences rather than the domain's.
+#
+#   2. A LAZY-LOADING RELATIONSHIP FIGHTS C11's DESIGN AND SILENTLY REINTRODUCES N+1. SQLAlchemy's
+#      default loader strategy emits one SELECT per parent on first attribute access. In an async
+#      resolver that access does not even get to be slow — a lazy load with no greenlet context
+#      raises `MissingGreenlet`, and with `expire_on_commit=False` the instances are frequently
+#      detached, so the failure is intermittent rather than immediate. Set `lazy="selectin"` to
+#      avoid that and the eager load fires for every query that touches the parent, including
+#      `{ orderEvents { id } }`, which asked for none of it. C11 batches these loads explicitly
+#      through DataLoaders keyed on `order_id` / `user_id`, where the batching is provable with a
+#      statement counter; a relationship would put a second, invisible path beside it.
+#
+#   3. THE JOIN IS NOT ALWAYS AN EQUALITY ON ONE ROW. "An order's payments" is every payment event
+#      sharing its `order_id` — a stream, ordered and capped like every other list this API
+#      publishes (spec §2 item 22). That capping and ordering lives in the statement builder, which
+#      a relationship would bypass.
+#
+# What the tables DO carry is an index on every column those joins and C11's filters use. The
+# trailing-`id` tiebreak on the composite indexes is the same decision argued at length on
+# `LogEntryORM.__table_args__` above; it is not restated here.
+# =================================================================================================
+
+
+class OrderEventORM(Base):
+    """One transition in an order's lifecycle — spec §3 Feature Area A ("order events carry status").
+
+    Two identifiers rather than one: ``order_id`` is what the event is *about* and ``user_id`` is
+    the modeled order -> user relationship, denormalised onto the row because there is no users
+    table to join to (see the section comment above). Both are indexed, so C11 can traverse in
+    either direction without a second lookup.
+    """
+
+    __tablename__ = "order_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    #: Same ``timestamptz`` contract as ``log_entries.timestamp``, for the same reason: a naive
+    #: value compared against this column would be interpreted in the *server's* TimeZone.
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    service: Mapped[str] = mapped_column(String(SERVICE_MAX_LENGTH), nullable=False)
+    level: Mapped[str] = mapped_column(String(LEVEL_MAX_LENGTH), nullable=False)
+
+    #: Nullable, and deliberately so even though the seeded corpus always sets one. The published
+    #: ``LogEvent.traceId`` is nullable because ``LogEntry.traceId`` is (60% of the log corpus
+    #: carries a trace id, and C5's empty-list branch depends on the other 40%), and an interface
+    #: field cannot be non-null on one implementor and null on another. A NOT NULL here would also
+    #: refuse a perfectly ordinary event: one ingested from a producer with no tracing configured.
+    trace_id: Mapped[str | None] = mapped_column(String(TRACE_ID_MAX_LENGTH), nullable=True)
+
+    order_id: Mapped[str] = mapped_column(String(ORDER_ID_MAX_LENGTH), nullable=False)
+
+    #: The order -> user edge. Denormalised onto every order event rather than reached through a
+    #: join, because there is no ``users`` table and because "which user placed this order" must be
+    #: answerable from the event alone — a subscriber receiving one status transition over
+    #: ``orderStatusStream`` (C12) has no other row to consult.
+    user_id: Mapped[str] = mapped_column(String(USER_ID_MAX_LENGTH), nullable=False)
+
+    #: A plain ``String`` and NOT a PostgreSQL ``ENUM``, for exactly the reason
+    #: :attr:`LogEntryORM.level` is one: a database-level enum makes adding a status an
+    #: ``ALTER TYPE … ADD VALUE`` plus a coordinated deploy, to gain a constraint this system
+    #: already enforces a layer earlier and far more usefully. ``src.graphql.enums.OrderStatus``
+    #: rejects an unknown status during GraphQL *validation*, before a resolver runs, with a message
+    #: naming every legal value. A constraint at the edge produces a good error message; the same
+    #: constraint in the storage engine produces a driver exception and a masked 500.
+    status: Mapped[str] = mapped_column(String(ORDER_STATUS_MAX_LENGTH), nullable=False)
+
+    # See the `none_as_null=True` essay on `LogEntryORM.metadata_`: without the flag a Python
+    # `None` is stored as the JSONB scalar `'null'` rather than SQL NULL, which reads back as
+    # `None` either way and is therefore invisible from Python — but breaks `metadata IS NULL`,
+    # `jsonb_typeof`, and every partial index or aggregation C11 builds over it. The attribute is
+    # `metadata_` because `metadata` is reserved on a declarative class.
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata", JSONB(none_as_null=True), nullable=True
+    )
+
+    __table_args__ = (
+        # The default ordering and the keyset shape, exactly as on `log_entries`.
+        Index("ix_order_events_ts_id", "timestamp", "id"),
+        # The order -> its own history read, and the join C11 traverses from a payment event.
+        Index("ix_order_events_order_ts", "order_id", "timestamp", "id"),
+        # The order -> user edge, read in the "everything this user did" direction.
+        Index("ix_order_events_user_ts", "user_id", "timestamp", "id"),
+        # `OrderEventFilterInput.status`, and C12's `orderStatusStream(status:)` replay.
+        Index("ix_order_events_status_ts", "status", "timestamp", "id"),
+        # The correlation lookup `Query.correlatedEvents` issues against all four tables.
+        Index("ix_order_events_trace_id", "trace_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"OrderEventORM(id={self.id!r}, order_id={self.order_id!r}, "
+            f"status={self.status!r}, timestamp={self.timestamp!r})"
+        )
+
+
+class PaymentEventORM(Base):
+    """One payment attempt event — "payment events carry method and outcome" (spec §3 Area A).
+
+    ``order_id`` is the modeled order -> payments edge. There is deliberately no separate payment
+    identifier: the primary key identifies the event, ``order_id`` identifies what it is about, and
+    a third id would be 1:1 with the order in this corpus and therefore dead weight a reader would
+    have to reason about.
+    """
+
+    __tablename__ = "payment_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    service: Mapped[str] = mapped_column(String(SERVICE_MAX_LENGTH), nullable=False)
+    level: Mapped[str] = mapped_column(String(LEVEL_MAX_LENGTH), nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(TRACE_ID_MAX_LENGTH), nullable=True)
+
+    #: The order -> payments edge. Several payment events share one ``order_id`` (a payment is
+    #: authorized, then captured, then possibly refunded), which is why this is the *many* side and
+    #: why the index below leads with it.
+    order_id: Mapped[str] = mapped_column(String(ORDER_ID_MAX_LENGTH), nullable=False)
+
+    #: How the customer paid. ``String`` + GraphQL enum, per the note on ``OrderEventORM.status``.
+    method: Mapped[str] = mapped_column(String(PAYMENT_METHOD_MAX_LENGTH), nullable=False)
+
+    #: What happened. The event's own verb — one payment (one ``order_id``) produces several rows
+    #: differing only in ``outcome`` and ``timestamp``, which is what makes a payment a *stream*
+    #: rather than a mutable record with a status column.
+    outcome: Mapped[str] = mapped_column(String(PAYMENT_OUTCOME_MAX_LENGTH), nullable=False)
+
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata", JSONB(none_as_null=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_payment_events_ts_id", "timestamp", "id"),
+        # The order -> payments join. C11's cross-entity DataLoader batches this into a single
+        # `WHERE order_id IN (…)`; without the index that batch is one sequential scan per
+        # operation rather than one per parent — batched, and still O(table).
+        Index("ix_payment_events_order_ts", "order_id", "timestamp", "id"),
+        # `outcome` is this table's analogue of `status`: the dimension a dashboard filters on
+        # ("show me declines"), and the one C11 aggregates by.
+        Index("ix_payment_events_outcome_ts", "outcome", "timestamp", "id"),
+        # `method` is published as a filter too, so it gets the same treatment. Its cardinality is
+        # tiny (five values), so the planner will often prefer a scan at the seeded corpus size —
+        # the index is here for the shape the filter has, not for a measured win at 1000 rows.
+        Index("ix_payment_events_method_ts", "method", "timestamp", "id"),
+        Index("ix_payment_events_trace_id", "trace_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"PaymentEventORM(id={self.id!r}, order_id={self.order_id!r}, "
+            f"method={self.method!r}, outcome={self.outcome!r})"
+        )
+
+
+class UserEventORM(Base):
+    """One user activity event — "user events carry activity type" (spec §3 Area A).
+
+    The third stream, and the one that closes the correlation triangle: an order's events, its
+    payment events and the acting user's activity all share a ``trace_id``, so a single
+    ``correlatedEvents(traceId:)`` returns the whole session as a heterogeneous list.
+    """
+
+    __tablename__ = "user_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    service: Mapped[str] = mapped_column(String(SERVICE_MAX_LENGTH), nullable=False)
+    level: Mapped[str] = mapped_column(String(LEVEL_MAX_LENGTH), nullable=False)
+    trace_id: Mapped[str | None] = mapped_column(String(TRACE_ID_MAX_LENGTH), nullable=True)
+
+    user_id: Mapped[str] = mapped_column(String(USER_ID_MAX_LENGTH), nullable=False)
+
+    #: What the user did. Named ``activity_type`` rather than ``activity`` because the spec names
+    #: it that way and because the published field is ``activityType`` — the two must agree, or the
+    #: SDL and the requirement stop being checkable against each other.
+    activity_type: Mapped[str] = mapped_column(String(USER_ACTIVITY_MAX_LENGTH), nullable=False)
+
+    metadata_: Mapped[dict[str, Any] | None] = mapped_column(
+        "metadata", JSONB(none_as_null=True), nullable=True
+    )
+
+    __table_args__ = (
+        Index("ix_user_events_ts_id", "timestamp", "id"),
+        # The order -> user edge, arrived at from the order side: given `OrderEventORM.user_id`,
+        # "what else was this user doing". C11 batches it as `WHERE user_id IN (…)`.
+        Index("ix_user_events_user_ts", "user_id", "timestamp", "id"),
+        Index("ix_user_events_activity_ts", "activity_type", "timestamp", "id"),
+        Index("ix_user_events_trace_id", "trace_id"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"UserEventORM(id={self.id!r}, user_id={self.user_id!r}, "
+            f"activity_type={self.activity_type!r})"
+        )
+
+
+# =================================================================================================
+# The identity-free value objects for the three event streams.
+#
+# Same argument as `LogRecord` above, unchanged: ORM instances compare by identity, so
+# `generate_event_corpus(...) == generate_event_corpus(...)` would be False for two byte-identical
+# corpora and the determinism test could not fail for the right reason. These compare by value.
+#
+# `as_insert_params()` keys by DATABASE COLUMN NAME (so `metadata`, never `metadata_`) because
+# seeding uses a Core multi-row INSERT against `Table.c`, and omits `id` so BIGSERIAL assigns ids in
+# insert order — which is timestamp order, which is what makes `ORDER BY timestamp DESC, id DESC`
+# exactly the reverse of the generated list.
+# =================================================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class OrderEventRecord:
+    """One generated order-lifecycle event, with no identity."""
+
+    timestamp: datetime
+    service: str
+    level: str
+    trace_id: str | None
+    order_id: str
+    user_id: str
+    status: str
+    metadata: dict[str, Any] | None
+
+    def as_insert_params(self) -> dict[str, Any]:
+        """This record keyed by database column name, ready for a Core INSERT."""
+        return {
+            "timestamp": self.timestamp,
+            "service": self.service,
+            "level": self.level,
+            "trace_id": self.trace_id,
+            "order_id": self.order_id,
+            "user_id": self.user_id,
+            "status": self.status,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_orm_row(cls, row: OrderEventORM) -> OrderEventRecord:
+        """Project a stored row back onto the value object the oracle is made of."""
+        return cls(
+            timestamp=row.timestamp,
+            service=row.service,
+            level=row.level,
+            trace_id=row.trace_id,
+            order_id=row.order_id,
+            user_id=row.user_id,
+            status=row.status,
+            metadata=row.metadata_,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentEventRecord:
+    """One generated payment event, with no identity."""
+
+    timestamp: datetime
+    service: str
+    level: str
+    trace_id: str | None
+    order_id: str
+    method: str
+    outcome: str
+    metadata: dict[str, Any] | None
+
+    def as_insert_params(self) -> dict[str, Any]:
+        """This record keyed by database column name, ready for a Core INSERT."""
+        return {
+            "timestamp": self.timestamp,
+            "service": self.service,
+            "level": self.level,
+            "trace_id": self.trace_id,
+            "order_id": self.order_id,
+            "method": self.method,
+            "outcome": self.outcome,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_orm_row(cls, row: PaymentEventORM) -> PaymentEventRecord:
+        """Project a stored row back onto the value object the oracle is made of."""
+        return cls(
+            timestamp=row.timestamp,
+            service=row.service,
+            level=row.level,
+            trace_id=row.trace_id,
+            order_id=row.order_id,
+            method=row.method,
+            outcome=row.outcome,
+            metadata=row.metadata_,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class UserEventRecord:
+    """One generated user activity event, with no identity."""
+
+    timestamp: datetime
+    service: str
+    level: str
+    trace_id: str | None
+    user_id: str
+    activity_type: str
+    metadata: dict[str, Any] | None
+
+    def as_insert_params(self) -> dict[str, Any]:
+        """This record keyed by database column name, ready for a Core INSERT."""
+        return {
+            "timestamp": self.timestamp,
+            "service": self.service,
+            "level": self.level,
+            "trace_id": self.trace_id,
+            "user_id": self.user_id,
+            "activity_type": self.activity_type,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_orm_row(cls, row: UserEventORM) -> UserEventRecord:
+        """Project a stored row back onto the value object the oracle is made of."""
+        return cls(
+            timestamp=row.timestamp,
+            service=row.service,
+            level=row.level,
+            trace_id=row.trace_id,
+            user_id=row.user_id,
+            activity_type=row.activity_type,
+            metadata=row.metadata_,
         )
