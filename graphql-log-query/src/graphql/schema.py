@@ -56,18 +56,17 @@ from graphql import GraphQLError
 from strawberry.extensions import MaxAliasesLimiter, MaxTokensLimiter, QueryDepthLimiter
 
 from src.config import Settings, get_settings
+from src.graphql.apq import PersistedQueries
 from src.graphql.context import PerOperationResources
 from src.graphql.cost import CostConfig, QueryCostLimiter
 from src.graphql.errors import MaskInternalErrors, is_expected_error, log_expected_error
 from src.graphql.mutation import Mutation
 from src.graphql.query import Query
 from src.graphql.subscription import Subscription
+from src.metrics import MetricsExtension
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` makes them strings
     from strawberry.types import ExecutionContext
-
-# === C9 ===== from src.graphql.apq import PersistedQueries
-#              from src.metrics import MetricsExtension
 
 
 class LogQuerySchema(strawberry.Schema):
@@ -163,16 +162,27 @@ def build_schema(settings: Settings) -> LogQuerySchema:
         # reason (#4369) and warns at Schema construction. A parameterised extension therefore goes
         # in as a factory: `lambda: QueryDepthLimiter(depth)`, not `QueryDepthLimiter(depth)`.
         #
-        # The stack, with the two C9 entries still to land:
+        # The stack:
         #
         #   MaskInternalErrors                       (C4) OUTERMOST — nothing below can leak a
         #                                                 stack trace past it.
-        #   MetricsExtension                         (C9) timings; wraps everything inside it.
+        #   MetricsExtension                         (C9) timings; wraps everything inside it. Its
+        #                                                 POST-yield code therefore runs second to
+        #                                                 last — before masking — which is the whole
+        #                                                 reason it can count errors by their real
+        #                                                 `extensions.code` instead of reporting
+        #                                                 every failure in the system as
+        #                                                 INTERNAL_ERROR. See src/metrics.py.
         #   PersistedQueries                         (C9) resolves a hash into a document, so it
         #                                                 has to run before anything reads the
         #                                                 document (its work is pre-yield, so any
         #                                                 position ahead of parsing does; parsing
         #                                                 happens inside every `on_operation`).
+        #                                                 THAT ORDERING IS WHY A PERSISTED QUERY IS
+        #                                                 STILL COST-GATED: the substituted document
+        #                                                 is what the four limiters below see, so a
+        #                                                 hash is never a cheaper way to run a
+        #                                                 document than sending its text.
         #   lambda: QueryCostLimiter(cost_config)    (C8) an AddValidationRules subclass. Rejects
         #                                                 over-budget operations during
         #                                                 VALIDATION, i.e. before a resolver runs.
@@ -213,6 +223,8 @@ def build_schema(settings: Settings) -> LogQuerySchema:
         # now enforced.
         extensions=[
             MaskInternalErrors,
+            MetricsExtension,
+            PersistedQueries,
             lambda: QueryCostLimiter(CostConfig.from_settings(settings)),
             lambda: QueryDepthLimiter(settings.max_query_depth),
             lambda: MaxTokensLimiter(settings.max_query_tokens),

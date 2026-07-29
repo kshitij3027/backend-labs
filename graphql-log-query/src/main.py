@@ -37,12 +37,15 @@ from strawberry.fastapi import GraphQLRouter
 from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
 
 from src.api.health import router as health_router
+from src.api.metrics import router as metrics_router
 from src.broker import LogBroker, create_redis_client
-from src.cache import create_result_cache
+from src.cache import create_request_redis_client, create_result_cache
 from src.config import Settings, get_settings
 from src.db.session import Database
+from src.graphql.apq import create_persisted_query_store
 from src.graphql.context import get_context
 from src.graphql.schema import schema as graphql_schema
+from src.metrics import create_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +86,16 @@ def configure_logging(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own every process-scoped resource: build it on startup, tear it down on exit.
 
-    Currently that is the :class:`~src.db.session.Database`, the Redis client and the subscription
-    :class:`~src.broker.LogBroker`. Resources are attached to ``app.state`` so handlers reach them
-    through the request (``request.app.state.db``) rather than through module globals, which is what
-    keeps two apps in one test process independent.
+    Six of them, in construction order: the pub/sub Redis client and the subscription
+    :class:`~src.broker.LogBroker` (C6), **one shared request-path Redis client** feeding both the
+    :class:`~src.cache.ResultCache` (C7) and the :class:`~src.graphql.apq.PersistedQueryStore` (C9),
+    the :class:`~src.metrics.Metrics` registry (C9), and the :class:`~src.db.session.Database`.
+
+    Every one is attached to ``app.state`` so handlers and resolvers reach them through the request
+    (``request.app.state.db``, ``info.context.cache``) rather than through module globals — which is
+    what keeps two apps in one test process independent, and, for the metrics registry specifically,
+    what stops the second application constructed in a process from raising ``Duplicated
+    timeseries`` against a shared default registry.
     """
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
 
@@ -106,14 +115,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.broker = broker
     await broker.start()
 
-    # The C7 result cache. It builds its OWN Redis client rather than borrowing the broker's, and
-    # the reason is a timeout rather than an oversight — see `src.cache.create_cache_redis_client`:
-    # the request path needs a bounded socket read timeout, and the pub/sub reader's steady state is
-    # a blocking long poll that such a timeout would turn into a reconnect loop. When
-    # `CACHE_ENABLED` is false no client is constructed at all, so a disabled cache holds no
-    # connection pool.
-    cache = create_result_cache(settings)
+    # ONE request-path Redis client, SHARED by the C7 result cache and the C9 persisted query
+    # store. It is a second client rather than the broker's because of a timeout rather than an
+    # oversight — see `src.cache.create_cache_redis_client`: the request path needs a bounded socket
+    # read timeout, and the pub/sub reader's steady state is a blocking long poll that such a
+    # timeout would turn into a reconnect loop. It is not a THIRD client, because a cache lookup and
+    # a persisted-query lookup want identical connection behaviour and there is nothing to gain from
+    # two pools doing the same thing.
+    #
+    # Built here rather than inside either helper for two reasons: the gate is the OR of the two
+    # features (turning the cache off must not silently turn persisted queries off — the compose
+    # `test` service runs with exactly that combination), and one owner means one close. Both
+    # consumers BORROW it (`owns_client=False`), so neither can pull the pool out from under the
+    # other during shutdown; the `finally` below closes it once.
+    request_redis = create_request_redis_client(settings)
+    app.state.request_redis = request_redis
+
+    cache = create_result_cache(settings, redis_client=request_redis)
     app.state.cache = cache
+
+    # The C9 persisted query store. `None` when PERSISTED_QUERIES_ENABLED is false, and that None is
+    # read as a decision rather than an absence: the APQ extension answers `PersistedQueryNotSupported`
+    # to a hash-only request when there is no store (so a client disables its APQ link) and
+    # `PersistedQueryNotFound` when there is one but nothing is registered (so the client retries
+    # with the document). See src/graphql/apq.py.
+    persisted_queries = create_persisted_query_store(settings, redis_client=request_redis)
+    app.state.apq = persisted_queries
+
+    # The C9 metrics registry, or None when METRICS_ENABLED is false or prometheus_client will not
+    # import. Built LAST of the four because it mirrors the other three at scrape time rather than
+    # keeping counters of its own — one number per fact, so the exposition cannot drift from the
+    # object it describes. `create_app` registers GET /metrics only when this is enabled.
+    metrics = create_metrics(
+        settings, broker=broker, cache=cache, persisted_queries=persisted_queries
+    )
+    app.state.metrics = metrics
 
     logger.info(
         "starting %s v%s (log_level=%s, seed_entries=%d, default_query_limit=%d, "
@@ -121,7 +157,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "result_cache=%s, max_query_depth=%d, "
         "max_query_complexity=%d, subscription_queue_maxsize=%d, "
         "max_subscriptions_per_connection=%d, subscription_channel=%s, pubsub_bridge=%s, "
-        "publisher_id=%s, playground=%s, metrics=%s)",
+        "publisher_id=%s, playground=%s, metrics=%s, persisted_queries=%s, "
+        "persisted_query_ttl_seconds=%d, metrics_registry=%s)",
         API_TITLE,
         API_VERSION,
         settings.log_level,
@@ -141,6 +178,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         broker.publisher_id,
         settings.graphql_playground_enabled,
         settings.metrics_enabled,
+        "disabled (a hash-only request is answered PersistedQueryNotSupported)"
+        if persisted_queries is None
+        else ("enabled" if persisted_queries.enabled else "enabled, but no Redis client"),
+        settings.persisted_query_ttl_seconds,
+        "built" if metrics is not None else "absent (GET /metrics is not registered)",
     )
 
     # The store. Built and attached BEFORE `init_db` is awaited, so the `finally` below owns the
@@ -197,11 +239,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # 3. CLOSE THE REDIS CLIENTS LAST — each after its own users are done with it. Closing the
         #    pub/sub client first would turn the reader's in-flight read and every pending publish
         #    into connection errors logged during what is otherwise a clean shutdown, which is a log
-        #    full of alarming noise describing nothing that went wrong. The cache's client is a
-        #    SEPARATE one (see its construction above) and is closed on its own, after it, for the
-        #    same reason applied to its own user: nothing is reading through the cache by the time
-        #    the ASGI server has stopped accepting requests, so this is the point at which its pool
-        #    has no work left.
+        #    full of alarming noise describing nothing that went wrong. The REQUEST-PATH client is a
+        #    SEPARATE one (see its construction above) shared by the result cache and the persisted
+        #    query store; both borrow it, so neither closes it, and the lifespan closes it exactly
+        #    once after both have been released. Nothing is reading through either by the time the
+        #    ASGI server has stopped accepting requests, so this is the point at which that pool has
+        #    no work left.
         try:
             await broker.stop()
         except Exception:  # pragma: no cover - defensive; stop() swallows its own failures
@@ -224,13 +267,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 logger.exception("failed to close the Redis client during shutdown")
 
         try:
-            # `ResultCache.aclose` closes the client only because THIS cache built it
-            # (`create_result_cache` passes `owns_client=True`). A cache handed somebody else's
-            # client leaves it alone — which is what stops a future refactor that shares one pool
-            # from taking the pub/sub bridge down as a side effect of a cache shutdown.
+            # `ResultCache.aclose` drops its reference to the client but does NOT close it: this
+            # cache borrowed it (`owns_client=False` — see `create_result_cache`). That is what
+            # stops one consumer of the shared pool from taking the other down as a side effect of
+            # its own shutdown. `enabled` goes false either way, which is how a test observes the
+            # release without touching a private attribute.
             await cache.aclose()
         except Exception:  # pragma: no cover - defensive; aclose swallows its own failures
             logger.exception("failed to close the result cache during shutdown")
+
+        if persisted_queries is not None:
+            try:
+                # Same borrowed-client rule as the cache above, for the same reason.
+                await persisted_queries.aclose()
+            except Exception:  # pragma: no cover - defensive; aclose swallows its own failures
+                logger.exception("failed to close the persisted query store during shutdown")
+
+        if request_redis is not None:
+            try:
+                # THE shared request-path pool, closed exactly once, after both of its users have
+                # let go of it. redis-py renamed the async closer to `aclose()` and kept `close()`
+                # as a deprecated alias; tolerate either so a version bump is not a shutdown
+                # traceback.
+                closer = getattr(request_redis, "aclose", None) or request_redis.close
+                await closer()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("failed to close the request-path Redis client during shutdown")
 
         try:
             await db.dispose()
@@ -316,8 +378,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(graphql_router, prefix="/graphql")
 
-    # === C9 ===  GET /metrics — Prometheus text exposition from an explicit CollectorRegistry,
-    #             gated on `resolved.metrics_enabled`.
+    # 3. GET /metrics — Prometheus text exposition from the explicit CollectorRegistry the lifespan
+    #    attaches to `app.state.metrics`. Registered ONLY when METRICS_ENABLED is set, so a disabled
+    #    deployment answers 404 rather than an empty 200 — the same shape GET /graphql takes when
+    #    the playground is disabled, and honest in a way that "0 series forever" is not. Registered
+    #    after /graphql (it cannot shadow anything either way — both paths are literals) and, like
+    #    everything else here, before the C13 SPA catch-all.
+    if resolved.metrics_enabled:
+        app.include_router(metrics_router)
 
     # === C13 ==  The React SPA, and it MUST BE REGISTERED LAST — after /graphql, /health and
     #             /metrics — because the SPA fallback is a catch-all:

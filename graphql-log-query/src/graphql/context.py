@@ -96,6 +96,8 @@ if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` make
     # more: the cache must stay constructible and testable without a GraphQL context in the way.
     from src.broker import LogBroker
     from src.cache import ResultCache
+    from src.graphql.apq import PersistedQueryStore
+    from src.metrics import Metrics
 
 logger = logging.getLogger(__name__)
 
@@ -327,6 +329,19 @@ class Context(BaseContext):
             lifetime *is* its correctness (see the module docstring). This cache has an explicit
             TTL and a key that names every filter it depends on, which is exactly what makes a
             longer life safe.
+        persisted_queries: The process-wide :class:`~src.graphql.apq.PersistedQueryStore` (C9), or
+            ``None``.
+
+            ``None`` is **meaningful here rather than merely permissive**, and it is the one
+            Optional on this class that a resolver reads as a decision instead of as an absence:
+            :class:`~src.graphql.apq.PersistedQueries` answers ``PersistedQueryNotSupported`` to a
+            hash-only request when this is ``None`` and ``PersistedQueryNotFound`` when a store
+            exists but has nothing registered. The first tells a client to stop using the protocol;
+            the second tells it to retry with the document. See that module's docstring.
+        metrics: The process-wide :class:`~src.metrics.Metrics` (C9), or ``None`` when
+            ``METRICS_ENABLED`` is false, when ``prometheus_client`` could not be imported, or when
+            the application was assembled without a lifespan. All three mean the same thing to
+            :class:`~src.metrics.MetricsExtension`: record nothing, and cost nothing doing it.
 
     .. rubric:: The context object IS the WebSocket connection's identity
 
@@ -346,6 +361,8 @@ class Context(BaseContext):
         db: Optional[Database] = None,
         broker: Optional["LogBroker"] = None,
         cache: Optional["ResultCache"] = None,
+        persisted_queries: Optional["PersistedQueryStore"] = None,
+        metrics: Optional["Metrics"] = None,
     ) -> None:
         super().__init__()
         self.settings = settings
@@ -353,6 +370,8 @@ class Context(BaseContext):
         self.db = db
         self.broker = broker
         self.cache = cache
+        self.persisted_queries = persisted_queries
+        self.metrics = metrics
 
     def _resources(self) -> Optional[OperationResources]:
         """The current operation's resources, or ``None`` outside an operation.
@@ -526,13 +545,20 @@ async def get_context(connection: HTTPConnection) -> Context:
     # does rather than inventing a default.
     settings: Settings = getattr(app.state, "settings", None) or get_settings()
 
-    # The broker and the cache are read with a default rather than demanded, unlike `db` above.
-    # Every GraphQL request needs a database; only a subscription needs a broker, and `logStream`
-    # raises its own (much more specific) error if one is missing. The cache is an optimisation and
-    # its absence is a slower correct answer. Failing every `{ logs { id } }` because either of the
-    # two optional layers is absent would be the wrong blast radius.
+    # The broker, the cache, the persisted query store and the metrics registry are read with a
+    # default rather than demanded, unlike `db` above. Every GraphQL request needs a database; only
+    # a subscription needs a broker, and `logStream` raises its own (much more specific) error if
+    # one is missing. The other three are optimisations and observability, whose absence is a
+    # slower or quieter correct answer. Failing every `{ logs { id } }` because one of the four
+    # optional layers is absent would be the wrong blast radius.
+    #
+    # C9 NOTE — `apq` is read into `persisted_queries` under a different name on purpose: the
+    # `app.state` key is the short operational one an operator greps for, and the context attribute
+    # is the one every reader of a resolver has to understand without expanding an acronym.
     broker: Optional["LogBroker"] = getattr(app.state, "broker", None)
     cache: Optional["ResultCache"] = getattr(app.state, "cache", None)
+    persisted_queries: Optional["PersistedQueryStore"] = getattr(app.state, "apq", None)
+    metrics: Optional["Metrics"] = getattr(app.state, "metrics", None)
 
     return Context(
         settings=settings,
@@ -540,4 +566,6 @@ async def get_context(connection: HTTPConnection) -> Context:
         db=db,
         broker=broker,
         cache=cache,
+        persisted_queries=persisted_queries,
+        metrics=metrics,
     )

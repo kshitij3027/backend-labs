@@ -483,6 +483,17 @@ class ResultCache:
         return self._namespace
 
     @property
+    def redis_client(self) -> Optional["Redis"]:
+        """The client this cache reads through, or ``None``.
+
+        Exposed so "one request-path pool, two consumers" is a claim a test can *check* rather than
+        one a comment asserts: C9's persisted query store is handed the same object by
+        :func:`src.main.lifespan`, and an integration test compares the two by identity. Read-only,
+        and it goes ``None`` at :meth:`aclose` whether or not this cache owned the client.
+        """
+        return self._redis
+
+    @property
     def stats(self) -> CacheStats:
         """A snapshot of every counter. See :class:`CacheStats`."""
         return CacheStats(
@@ -762,6 +773,12 @@ class ResultCache:
 # =================================================================================================
 
 
+#: "This argument was not supplied", as distinct from "``None`` was supplied". Needed by
+#: :func:`create_result_cache`, where omitting the client means *build and own one* while passing
+#: ``None`` explicitly means *this cache gets no client at all* — two different instructions that a
+#: plain ``None`` default could not tell apart.
+_UNSET: Any = object()
+
 #: How long a connect to an unreachable Redis may hold a resolver, in seconds.
 CACHE_CONNECT_TIMEOUT_SECONDS = 2.0
 
@@ -793,7 +810,9 @@ def create_cache_redis_client(settings: Settings) -> Optional["Redis"]:
     reconnect and a warning per poll. So the split is not "two pools because nobody looked": it is
     one client for the **request path**, where a read that does not return is a bug, and one for the
     **long-poll path**, where a read that does not return is the design. C9's persisted-query
-    documents belong to the first and will reuse this one.
+    documents belong to the first and reuse this one — see :func:`create_request_redis_client`,
+    which is what the lifespan actually calls, and which gates on *either* feature being enabled
+    rather than on the cache alone.
 
     ``decode_responses`` is left off, matching the broker: the payload is UTF-8 JSON either way and
     ``json.loads`` accepts ``bytes`` and ``str`` alike, so neither client's flag can surprise the
@@ -820,18 +839,60 @@ def create_cache_redis_client(settings: Settings) -> Optional["Redis"]:
         return None
 
 
-def create_result_cache(
-    settings: Settings, *, namespace: str = DEFAULT_CACHE_NAMESPACE
-) -> ResultCache:
-    """Build the process's :class:`ResultCache`, client and all. Used by :func:`src.main.lifespan`.
+def create_request_redis_client(settings: Settings) -> Optional["Redis"]:
+    """The **one** request-path Redis client, shared by this cache and C9's persisted query store.
 
-    **No client is constructed when ``CACHE_ENABLED`` is false.** Not a client that is never used —
-    none at all, so a disabled cache holds no connection pool, opens no socket and appears nowhere
-    in ``CLIENT LIST``. "Disabled" should be indistinguishable from "not built", and the cheapest
-    way to guarantee that is to not build it.
+    Both features live on the request path and both want the ``socket_timeout``
+    :func:`create_cache_redis_client` sets, so they share a connection pool rather than opening two.
+    (The broker's pub/sub client stays separate — see the long note on
+    :func:`create_cache_redis_client` for why a read timeout is required here and forbidden there.)
+
+    .. rubric:: THE GATE IS THE **OR** OF THE TWO FEATURES, AND THAT IS THE WHOLE POINT
+
+    ``CACHE_ENABLED`` and ``PERSISTED_QUERIES_ENABLED`` are independent switches, so a client built
+    only when the cache is on would silently disable persisted queries whenever an operator turned
+    the cache off — which is not hypothetical: the compose ``test`` service runs with exactly that
+    combination. Sharing a *pool* must not mean sharing a *gate*.
+
+    Returns ``None`` when neither feature is on, so a stack with both disabled holds no pool, opens
+    no socket, and appears nowhere in Redis' ``CLIENT LIST``. Never raises.
     """
-    client = create_cache_redis_client(settings) if settings.cache_enabled else None
-    return ResultCache(settings, redis_client=client, namespace=namespace, owns_client=True)
+    if not (settings.cache_enabled or settings.persisted_queries_enabled):
+        return None
+    return create_cache_redis_client(settings)
+
+
+def create_result_cache(
+    settings: Settings,
+    *,
+    namespace: str = DEFAULT_CACHE_NAMESPACE,
+    redis_client: Any = _UNSET,  # noqa: ANN401 - a sentinel, or Optional[Redis]
+) -> ResultCache:
+    """Build the process's :class:`ResultCache`. Used by :func:`src.main.lifespan`.
+
+    **No client is used when ``CACHE_ENABLED`` is false**, on either path below. Not a client that
+    is never used — none at all, so a disabled cache holds no connection pool, opens no socket and
+    appears nowhere in ``CLIENT LIST``. "Disabled" should be indistinguishable from "not built".
+
+    Args:
+        namespace: Key prefix. Overridden per test so two caches cannot answer each other's queries.
+        redis_client: An already-built client to **borrow**, or ``None`` for a cache that always
+            misses. Omitted (the sentinel) means "build and own one", which is the standalone
+            behaviour every caller before C9 relied on. When a client is passed, ``owns_client`` is
+            ``False``: the caller built it and the caller closes it, because C9 hands the same
+            object to the persisted query store and a cache that closed it on shutdown would take
+            persisted queries down as a side effect of its own teardown.
+    """
+    if redis_client is _UNSET:
+        client = create_cache_redis_client(settings) if settings.cache_enabled else None
+        return ResultCache(settings, redis_client=client, namespace=namespace, owns_client=True)
+
+    return ResultCache(
+        settings,
+        redis_client=redis_client if settings.cache_enabled else None,
+        namespace=namespace,
+        owns_client=False,
+    )
 
 
 # =================================================================================================
@@ -896,6 +957,7 @@ __all__ = [
     "cached_log_stats",
     "cached_logs",
     "create_cache_redis_client",
+    "create_request_redis_client",
     "create_result_cache",
     "decode_log_entries",
     "decode_log_stats",

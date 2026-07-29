@@ -98,7 +98,10 @@ graphql-log-query/
 │   ├── broker.py           # bounded per-subscriber queues + Redis pub/sub bridge
 │   ├── cache.py            # sha256(sorted-JSON) keys, TTL, single-flight, never-raises
 │   ├── generators.py       # deterministic seed corpus (startup seed + test oracle)
-│   ├── api/health.py       # GET /health, GET /metrics
+│   ├── api/health.py       # GET /health  — dependency-free liveness probe
+│   ├── api/metrics.py      # GET /metrics — Prometheus text exposition (registered only when
+│   │                       #   METRICS_ENABLED; kept apart from /health, whose whole value is
+│   │                       #   that it reads no application state at all)
 │   ├── db/
 │   │   ├── base.py         # DeclarativeBase
 │   │   ├── models.py       # LogEntryORM, OrderEventORM, UserEventORM, PaymentEventORM
