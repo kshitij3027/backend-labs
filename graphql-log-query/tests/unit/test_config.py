@@ -57,7 +57,10 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "agg_cache_ttl_seconds": 60,
     # Cost gating
     "max_query_depth": 10,
-    "max_query_complexity": 1000,
+    #: Calibrated so ONE level of `relatedLogs` at DEFAULT_QUERY_LIMIT is admitted (11,110) and
+    #: two levels are not (1,101,010). tests/unit/test_cost.py pins both sides of that boundary
+    #: against this very number; see the calibration note on the field in `src/config.py`.
+    "max_query_complexity": 25000,
     "max_query_tokens": 2000,
     "max_query_aliases": 30,
     # Persisted queries
@@ -197,7 +200,7 @@ def test_environment_variable_overrides_default(monkeypatch: pytest.MonkeyPatch)
 
     assert settings.max_query_complexity == 77
     assert settings.subscription_channel == "custom:channel"
-    assert Settings.model_fields["max_query_complexity"].default == 1000, (
+    assert Settings.model_fields["max_query_complexity"].default == 25000, (
         "overriding through the environment must not mutate the declared default"
     )
 

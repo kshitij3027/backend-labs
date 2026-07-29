@@ -128,7 +128,7 @@ services:
       - AGG_CACHE_TTL_SECONDS=${AGG_CACHE_TTL_SECONDS:-60}
       # --- Cost gating (C8) ---
       - MAX_QUERY_DEPTH=${MAX_QUERY_DEPTH:-10}
-      - MAX_QUERY_COMPLEXITY=${MAX_QUERY_COMPLEXITY:-1000}
+      - MAX_QUERY_COMPLEXITY=${MAX_QUERY_COMPLEXITY:-25000}
       - MAX_QUERY_TOKENS=${MAX_QUERY_TOKENS:-2000}
       - MAX_QUERY_ALIASES=${MAX_QUERY_ALIASES:-30}
       # --- Persisted queries (C9) ---
@@ -216,6 +216,48 @@ services:
       # prove the lifespan wiring. A literal, like the two above it, because it is a property of
       # "this is a test run" rather than a knob.
       - CACHE_ENABLED=false
+      # THE SUITE RUNS UNDER A RAISED COMPLEXITY BUDGET, AND THIS IS THE SMALLEST VALUE THAT LETS
+      # IT RUN — the same trade `db_settings` already makes with MAX_QUERY_LIMIT (see
+      # tests/integration/conftest.py). Exactly ONE document needs the headroom, at two of the
+      # limits it is sent with, and it is a legitimate test shape: RELATED_DETAIL_DOCUMENT in
+      # tests/integration/test_dataloader.py — `logs(limit: N) { id timestamp traceId relatedLogs
+      # { …every published field } }` — the oracle comparison that grades EVERY field of every
+      # correlated entry against a locally regenerated corpus. Proving that N parents still cost 2
+      # SQL statements requires a large N, and a set-equality assertion against 1200 generated
+      # records is what makes that test worth having.
+      #
+      # Costs are `10 + N x (P + 10 + 100 x R)`: 10 is the weight of `Query.logs` and again of
+      # `LogEntry.relatedLogs`, N is the requested limit, P and R are the fields selected on the
+      # parent and on the correlated entry, and 100 is DEFAULT_QUERY_LIMIT — what the cost model
+      # assumes an unbounded `relatedLogs` returns. Recompute them; do not trust them:
+      #
+      #   RELATED_DETAIL_DOCUMENT, limit=CORPUS_SIZE (1200):  10 + 1200 x (3+10+700) = 855,610
+      #   RELATED_DETAIL_DOCUMENT, limit=40:                  10 +   40 x (3+10+700) =  28,530
+      #   BATCHING_DOCUMENT,       limit=200:                 10 +  200 x (2+10+100) =  22,410
+      #
+      # The third needs NOTHING from this variable — it is inside the shipped 25,000 — and is listed
+      # because it is the largest document the suite sends over HTTP, where no injected `Settings`
+      # can reach it and only this variable could. It is what would break first if the shipped
+      # budget were lowered, and it is why that budget cannot be tuned by looking at this file.
+      #
+      # 980000 = the largest of those (855,610) plus one more field's worth of headroom under
+      # `relatedLogs` (CORPUS_SIZE x DEFAULT_QUERY_LIMIT = 120,000 per added field), i.e. a 14.5%
+      # margin — a bound with a reason rather than a number of zeros. It does NOT mean "off": two
+      # levels of correlation still price at 1,101,010, so a document that ran away is rejected
+      # here too. The 100000000 it replaced did mean "off", and a gate turned off for the whole
+      # suite is how a shipped budget of 1000 went on rejecting the project's own flagship query
+      # without a single test noticing.
+      #
+      # The gate is NOT left untested by this. tests/integration/test_cost_gate.py builds its own
+      # Settings with the SHIPPED default read off `Settings.model_fields` (constructor arguments
+      # outrank the environment in pydantic-settings, so this variable cannot reach them) and drives
+      # both `schema.execute` and a real HTTP app through it — including the flagship
+      # `logs { id relatedLogs { id } }` (11,110), which must be ADMITTED, and two levels of
+      # correlation, which must not be. The C12 E2E verifier then exercises the rejection against
+      # the `api` service above, which runs the real default. DEPTH, TOKENS and ALIASES are
+      # deliberately NOT overridden here: nothing the suite sends comes near them, so they stay at
+      # the shipped values and the tests that trip them test the numbers we actually ship.
+      - MAX_QUERY_COMPLEXITY=980000
       # Quieter than the api's INFO so a failing assertion is not buried under startup lines.
       # Literal for the same reason as above, and so LOG_LEVEL has exactly ONE host-overridable
       # declaration in this file (on `api`) rather than two defaults that can disagree.

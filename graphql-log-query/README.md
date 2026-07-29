@@ -253,7 +253,7 @@ Settings are read from **field defaults → optional `.env` → environment vari
 | `CACHE_TTL_SECONDS` | `30` | `Query.logs` TTL — deliberately short; a log query is a point-in-time answer. **Also the staleness bound after a write**, since nothing invalidates on `createLog` (decision 4). `0` means "read through, never store" |
 | `AGG_CACHE_TTL_SECONDS` | `60` | Separate, longer TTL for `Query.logStats`: costlier to compute (two `GROUP BY`-class scans), far less sensitive to one new row. The per-aggregation TTL policy C11 extends |
 | `MAX_QUERY_DEPTH` | `10` | Max operation nesting. Must be ≥ 1 — a budget below 1 rejects every possible operation |
-| `MAX_QUERY_COMPLEXITY` | `1000` | Complexity budget, scored from the AST before any resolver runs |
+| `MAX_QUERY_COMPLEXITY` | `25000` | Complexity budget, scored from the AST before any resolver runs. Calibrated so **one** level of `relatedLogs` at the default page size is admitted (`{ logs { id relatedLogs { id } } }` = 11,110; two fields on each level = 21,210) while two levels (1,101,010) and a wide page with correlation attached (`logs(limit: 500) { relatedLogs { id } }` = 55,010) are refused. Full calibration table in `.env.example` |
 | `MAX_QUERY_TOKENS` | `2000` | Document-size ceiling — closes the "enormous but shallow" document depth does not catch |
 | `MAX_QUERY_ALIASES` | `30` | Alias ceiling — closes one field requested ten thousand times under ten thousand names |
 | `PERSISTED_QUERIES_ENABLED` | `true` | Accept `extensions.persistedQuery` hash-only requests |

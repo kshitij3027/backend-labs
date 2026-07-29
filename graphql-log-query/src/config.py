@@ -105,7 +105,24 @@ class Settings(BaseSettings):
     #: write `logs { relatedLogs { relatedLogs { … } } }` forever; depth is the cheapest bound.
     max_query_depth: int = 10
     #: Complexity budget, computed from the AST BEFORE execution (field weights x list multipliers).
-    max_query_complexity: int = 1000
+    #:
+    #: 25,000 is calibrated on ONE requirement: the flagship correlated query — `logs` at
+    #: DEFAULT_QUERY_LIMIT with ONE level of `relatedLogs` — must be ADMITTED. That is spec §2
+    #: item 17 at item 29's default page size, the whole reason the C5 DataLoader exists, and the
+    #: query C13's dashboard and C11's traversals send. `{ logs { id relatedLogs { id } } }` prices
+    #: at 11,110 and `{ logs { id message relatedLogs { id message } } }` at 21,210, so the earlier
+    #: default of 1000 rejected this API's own headline capability — a broken default, not a strict
+    #: one.
+    #:
+    #: What it still refuses is what NESTING MULTIPLIES out of reach: a second level of correlation
+    #: (`logs { relatedLogs { relatedLogs { id } } }` = 1,101,010, forty-four times the budget) and
+    #: a wide page with correlation attached (`logs(limit: 500) { relatedLogs { id } }` = 55,010).
+    #: The boundary a reader should expect: at the default page size every extra field selected
+    #: under `relatedLogs` costs 100 x 100 = 10,000, so the budget affords two of them; the first
+    #: realistic shape it trips is the full seven-field projection on BOTH levels past 34 parents
+    #: (10 + N x 717 > 25,000 at N = 35). The calibration table lives in `.env.example` and the
+    #: weights it is computed from in `src/graphql/cost.py`.
+    max_query_complexity: int = 25_000
     #: Token and alias ceilings, enforced by Strawberry's own MaxTokensLimiter / MaxAliasesLimiter.
     #: They close the two amplification attacks depth and complexity do not: a document that is
     #: enormous but shallow, and one field requested 10,000 times under 10,000 aliases.

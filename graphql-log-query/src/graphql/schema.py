@@ -53,8 +53,11 @@ from typing import TYPE_CHECKING, Optional
 
 import strawberry
 from graphql import GraphQLError
+from strawberry.extensions import MaxAliasesLimiter, MaxTokensLimiter, QueryDepthLimiter
 
+from src.config import Settings, get_settings
 from src.graphql.context import PerOperationResources
+from src.graphql.cost import CostConfig, QueryCostLimiter
 from src.graphql.errors import MaskInternalErrors, is_expected_error, log_expected_error
 from src.graphql.mutation import Mutation
 from src.graphql.query import Query
@@ -63,12 +66,8 @@ from src.graphql.subscription import Subscription
 if TYPE_CHECKING:  # pragma: no cover - annotations only; `from __future__` makes them strings
     from strawberry.types import ExecutionContext
 
-# === C8-C9 == from src.graphql.apq import PersistedQueries
-#              from src.graphql.cost import build_cost_validation_rules
+# === C9 ===== from src.graphql.apq import PersistedQueries
 #              from src.metrics import MetricsExtension
-#              from strawberry.extensions import (
-#                  AddValidationRules, MaxAliasesLimiter, MaxTokensLimiter, QueryDepthLimiter,
-#              )
 
 
 class LogQuerySchema(strawberry.Schema):
@@ -108,84 +107,127 @@ class LogQuerySchema(strawberry.Schema):
             super().process_errors(unexpected, execution_context)
 
 
+def build_schema(settings: Settings) -> LogQuerySchema:
+    """Assemble the schema, with the four C8 budgets read off ``settings`` **here and once**.
+
+    The types are configuration-free; the *extensions* are not. ``QueryDepthLimiter``,
+    ``MaxTokensLimiter`` and ``MaxAliasesLimiter`` take plain integers, and they are constructed
+    when the schema is — so this function is where ``MAX_QUERY_DEPTH`` / ``MAX_QUERY_TOKENS`` /
+    ``MAX_QUERY_ALIASES`` stop being environment and become behaviour. Passing them in as an
+    argument rather than reaching for :func:`~src.config.get_settings` inside the extension list is
+    what makes that wiring visible in one place and testable in another: a test can build a schema
+    with ``max_query_depth=3`` and watch a four-deep query fail, which is not something a module
+    that read the global at import could ever be asked.
+
+    The **cost** budget is the one exception, and deliberately:
+    :class:`~src.graphql.cost.QueryCostLimiter` prefers the settings on the operation's ``Context``
+    and falls back to what is captured here. That is the same convention every resolver follows
+    (``info.context.settings``, never the global — see :class:`src.graphql.context.Context`), and
+    it is what lets an integration test drive the real HTTP surface under a deliberately different
+    budget by passing ``create_app(settings=…)``. Depth, tokens and aliases cannot join that
+    convention without reimplementing three Strawberry extensions, so they stay fixed at build
+    time; the asymmetry is written down here rather than discovered later.
+    """
+    return LogQuerySchema(
+        query=Query,
+        mutation=Mutation,  # createLog
+        # C6: logStream. C12 adds orderStatusStream to the same type.
+        #
+        # Declaring a subscription root is what makes `GraphQLRouter`'s WebSocket half reachable —
+        # the mount and its `subscription_protocols` have been in place since C1 (see
+        # src/main.py), so this one keyword is the whole difference between a socket that
+        # negotiates and immediately has nothing to offer and a working `graphql-transport-ws`
+        # endpoint.
+        subscription=Subscription,
+        #
+        # ORDER IS SIGNIFICANT and the list is not a set.
+        #
+        # Strawberry drives these like nested context managers: each extension's `on_operation`
+        # code BEFORE its `yield` runs in list order, and the code AFTER its `yield` runs in
+        # REVERSE list order. So the FIRST entry is the OUTERMOST wrapper — it sets up first and
+        # observes the result last. That is why masking leads the list rather than trailing it:
+        # whatever a later extension adds to the result, MaskInternalErrors still sees it.
+        #
+        # (It is written down because it is the opposite of what "outermost goes last" intuition
+        # suggests. Re-verify against the installed Strawberry when the stack grows — the property
+        # to check is that an error raised by the cost gate or the metrics extension still comes
+        # out masked.)
+        #
+        # ENTRIES ARE CLASSES OR ZERO-ARGUMENT FACTORIES, NEVER INSTANCES.
+        #
+        # `Schema.get_extensions()` resolves each entry with `ext if isinstance(ext,
+        # SchemaExtension) else ext()`, so a class is constructed fresh for every request while an
+        # instance is shared by all of them — extensions hold per-operation state
+        # (`execution_context`, and C9's resolved persisted-query document), so sharing one is a
+        # cross-request leak under concurrency. Strawberry deprecated the instance form for that
+        # reason (#4369) and warns at Schema construction. A parameterised extension therefore goes
+        # in as a factory: `lambda: QueryDepthLimiter(depth)`, not `QueryDepthLimiter(depth)`.
+        #
+        # The stack, with the two C9 entries still to land:
+        #
+        #   MaskInternalErrors                       (C4) OUTERMOST — nothing below can leak a
+        #                                                 stack trace past it.
+        #   MetricsExtension                         (C9) timings; wraps everything inside it.
+        #   PersistedQueries                         (C9) resolves a hash into a document, so it
+        #                                                 has to run before anything reads the
+        #                                                 document (its work is pre-yield, so any
+        #                                                 position ahead of parsing does; parsing
+        #                                                 happens inside every `on_operation`).
+        #   lambda: QueryCostLimiter(cost_config)    (C8) an AddValidationRules subclass. Rejects
+        #                                                 over-budget operations during
+        #                                                 VALIDATION, i.e. before a resolver runs.
+        #   lambda: QueryDepthLimiter(depth)         (C8) the stack bound, where the cost gate is
+        #   lambda: MaxTokensLimiter(tokens)         (C8) the row bound. See src/graphql/cost.py
+        #   lambda: MaxAliasesLimiter(aliases)       (C8) for why all four are needed.
+        #   PerOperationResources                    (C5) mints the loaders and the per-operation
+        #                                                 session in `on_operation` — see
+        #                                                 src/graphql/context.py for why they
+        #                                                 cannot be created in `context_getter`.
+        #
+        # C8 NOTE — the three stock limiters are position-INSENSITIVE and the ordering above is for
+        # readability rather than correctness: two of them only append a validation rule and the
+        # third only sets a parse option, all of it pre-yield, and parsing and validation both
+        # happen after every extension's pre-yield code has run. What their placement DOES matter
+        # for is that they sit inside `MaskInternalErrors` (so a rejection is still seen by it) and
+        # outside `PerOperationResources` (so nothing is allocated for an operation that is about
+        # to be refused).
+        #
+        # C7 NOTE — THE RESULT CACHE IS **NOT** AN EXTENSION, and the plan's sketch of one here was
+        # wrong. An extension sees the operation, not the resolved arguments: to key on the filter
+        # set it would have to re-derive `LogFilterInput` -> `LogQuery` from the AST and the
+        # variables, duplicating `to_log_query` (including its validation and its limit resolution)
+        # in a second place that could disagree with the first. Worse, a whole-operation cache keys
+        # on the DOCUMENT as well as the filters, so `{ logs { id } }` and `{ logs { id message } }`
+        # would be two entries holding the same rows, and any operation selecting a cached field
+        # beside an uncached one could not be cached at all. So the cache-aside sits in the two
+        # resolvers, around the repository call, keyed on the `LogQuery` they were about to run —
+        # one wrapper each. See src/cache.py.
+        #
+        # C5 NOTE — `PerOperationResources` is INNERMOST, and that is the position it wants: it
+        # sets up last, so nothing it allocates is held while an outer extension is still deciding
+        # whether to reject the operation, and it tears down FIRST, so the operation's database
+        # session is closed before `MaskInternalErrors` inspects the result. It also makes this
+        # schema **async-only** — its hook is an async generator, so `schema.execute_sync()` on it
+        # raises "failed to complete synchronously". That was already effectively true (every
+        # resolver is a coroutine, so `execute_sync` could only ever serve introspection); it is
+        # now enforced.
+        extensions=[
+            MaskInternalErrors,
+            lambda: QueryCostLimiter(CostConfig.from_settings(settings)),
+            lambda: QueryDepthLimiter(settings.max_query_depth),
+            lambda: MaxTokensLimiter(settings.max_query_tokens),
+            lambda: MaxAliasesLimiter(settings.max_query_aliases),
+            PerOperationResources,
+        ],
+    )
+
+
 #: The schema. Assembled once at import; every consumer imports this object rather than building
 #: its own, so the SDL test, the router and the E2E verifier can never be looking at three
 #: slightly different schemas.
-schema = LogQuerySchema(
-    query=Query,
-    mutation=Mutation,  # createLog
-    # C6: logStream. C12 adds orderStatusStream to the same type.
-    #
-    # Declaring a subscription root is what makes `GraphQLRouter`'s WebSocket half reachable — the
-    # mount and its `subscription_protocols` have been in place since C1 (see src/main.py), so this
-    # one keyword is the whole difference between a socket that negotiates and immediately has
-    # nothing to offer and a working `graphql-transport-ws` endpoint.
-    subscription=Subscription,
-    #
-    # ORDER IS SIGNIFICANT and the list is not a set.
-    #
-    # Strawberry drives these like nested context managers: each extension's `on_operation` code
-    # BEFORE its `yield` runs in list order, and the code AFTER its `yield` runs in REVERSE list
-    # order. So the FIRST entry is the OUTERMOST wrapper — it sets up first and observes the
-    # result last. That is why masking leads the list rather than trailing it: whatever a later
-    # extension adds to the result, MaskInternalErrors still sees it.
-    #
-    # (With a single extension this is moot. It is written down because it is the opposite of what
-    # "outermost goes last" intuition suggests, and C7-C9 add four more. Re-verify against the
-    # installed Strawberry when the stack grows — the property to check is that an error raised by
-    # the cost gate or the metrics extension still comes out masked.)
-    #
-    # ENTRIES ARE CLASSES OR ZERO-ARGUMENT FACTORIES, NEVER INSTANCES.
-    #
-    # `Schema.get_extensions()` resolves each entry with `ext if isinstance(ext, SchemaExtension)
-    # else ext()`, so a class is constructed fresh for every request while an instance is shared
-    # by all of them — extensions hold per-operation state (`execution_context`, and C9's resolved
-    # persisted-query document), so sharing one is a cross-request leak under concurrency.
-    # Strawberry deprecated the instance form for that reason (#4369) and warns at Schema
-    # construction. A parameterised
-    # extension therefore goes in as a factory: `lambda: QueryDepthLimiter(MAX_QUERY_DEPTH)`,
-    # not `QueryDepthLimiter(MAX_QUERY_DEPTH)`.
-    #
-    # The full stack, in the order it will be written as the remaining commits land:
-    #
-    #   MaskInternalErrors                       (C4) OUTERMOST — nothing below can leak a stack
-    #                                                 trace past it.
-    #   MetricsExtension                         (C9) timings; wraps everything inside it.
-    #   PersistedQueries                         (C9) resolves a hash into a document, so it has
-    #                                                 to run before anything reads the document
-    #                                                 (its work is pre-yield, so any position
-    #                                                 ahead of parsing does; parsing happens
-    #                                                 inside every `on_operation`).
-    #   lambda: AddValidationRules(cost rules)   (C8) rejects over-budget operations during
-    #                                                 VALIDATION, i.e. before a resolver runs.
-    #   lambda: QueryDepthLimiter(MAX_QUERY_DEPTH)      (C8)
-    #   lambda: MaxTokensLimiter(MAX_QUERY_TOKENS)      (C8)
-    #   lambda: MaxAliasesLimiter(MAX_QUERY_ALIASES)    (C8)
-    #   PerOperationResources                    (C5) mints the loaders and the per-operation
-    #                                                 session in `on_operation` — see
-    #                                                 src/graphql/context.py for why they cannot
-    #                                                 be created in `context_getter`.
-    #
-    # C7 NOTE — THE RESULT CACHE IS **NOT** AN EXTENSION, and the plan's sketch of one here was
-    # wrong. An extension sees the operation, not the resolved arguments: to key on the filter set
-    # it would have to re-derive `LogFilterInput` -> `LogQuery` from the AST and the variables,
-    # duplicating `to_log_query` (including its validation and its limit resolution) in a second
-    # place that could disagree with the first. Worse, a whole-operation cache keys on the DOCUMENT
-    # as well as the filters, so `{ logs { id } }` and `{ logs { id message } }` would be two
-    # entries holding the same rows, and any operation selecting a cached field beside an uncached
-    # one could not be cached at all. So the cache-aside sits in the two resolvers, around the
-    # repository call, keyed on the `LogQuery` they were about to run — one wrapper each. See
-    # src/cache.py.
-    #
-    # C5 NOTE — `PerOperationResources` is INNERMOST of the two installed so far, and that is the
-    # position it wants: it sets up last, so nothing it allocates is held while an outer extension
-    # is still deciding whether to reject the operation, and it tears down FIRST, so the operation's
-    # database session is closed before `MaskInternalErrors` inspects the result. It also makes
-    # this schema **async-only** — its hook is an async generator, so `schema.execute_sync()` on it
-    # raises "failed to complete synchronously". That was already effectively true (every resolver
-    # is a coroutine, so `execute_sync` could only ever serve introspection); it is now enforced.
-    extensions=[
-        MaskInternalErrors,
-        PerOperationResources,
-    ],
-)
+#:
+#: Built from the process-wide configuration, which is what `src.main.create_app` mounts. Note that
+#: an app built with injected settings (`create_app(settings=…)`, the hermetic test seam) still
+#: mounts THIS object: the depth/token/alias budgets it carries are the environment's, while the
+#: cost budget follows the injected settings through the request context. See `build_schema`.
+schema = build_schema(get_settings())
