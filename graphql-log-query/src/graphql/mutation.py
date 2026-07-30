@@ -48,14 +48,22 @@ import strawberry
 
 from src.db.repository import LogRepository
 from src.graphql.context import Context
-from src.graphql.inputs import CreateLogInput
+from src.graphql.ecommerce import OrderEvent
+from src.graphql.inputs import CreateLogInput, CreateOrderEventInput
 from src.graphql.types import LogEntry
-from src.graphql.validation import validate_create_log
+from src.graphql.validation import validate_create_log, validate_create_order_event
+
+CREATE_ORDER_EVENT_DESCRIPTION = (
+    "Append one status transition to an order's history and return it. This is the event source "
+    "for `orderStatusStream`: the row is committed FIRST and published to subscribers second, so "
+    "a streamed transition is always one that durably happened. `service` defaults to the order "
+    "service and `level` is derived from the status when they are omitted."
+)
 
 
 @strawberry.type
 class Mutation:
-    """The write surface. C4 gives it ``createLog``; C10/C11 add the e-commerce writes."""
+    """The write surface: ``createLog`` (C4) and ``createOrderEvent`` (C12)."""
 
     @strawberry.mutation
     async def create_log(
@@ -135,3 +143,94 @@ class Mutation:
             await broker.publish(entry)
 
         return entry
+
+    @strawberry.mutation(description=CREATE_ORDER_EVENT_DESCRIPTION)
+    async def create_order_event(
+        self,
+        info: strawberry.Info[Context, None],
+        order_data: CreateOrderEventInput,
+    ) -> OrderEvent:
+        """Append one order status transition and return it — C12, spec §3 Feature Area C.
+
+        .. rubric:: Why this mutation exists at all, rather than some other event source
+
+        Feature Area C requires a subscription that "streams order status transitions **as they
+        occur**". Transitions therefore have to be able to occur — and before this commit nothing
+        in the running system could produce one: ``order_events`` was written exactly once, by the
+        startup seeder, and never again. The three alternatives were considered and rejected:
+
+        * **A background task emitting synthetic transitions.** It would make the stream appear to
+          work while testing nothing a client can cause, and a subscription test would be grading a
+          timer. It also has no off switch that does not become a setting.
+        * **Polling the table for new rows.** That is a second delivery mechanism beside the broker,
+          with its own cursor, its own missed-row failure mode, and a floor on latency equal to the
+          poll interval — which spec §3 Feature Area C caps at 100 ms, so the poll would have to be
+          faster than the requirement it is trying to satisfy.
+        * **Reusing** ``createLog`` **with a magic metadata key.** An order event is not a log line
+          with a flag; it has ``orderId``, ``userId`` and a typed ``status``, none of which a
+          ``LogEntry`` can carry without becoming a bag.
+
+        So: a real mutation, symmetric with ``createLog`` in every respect that matters — same
+        validate/insert/commit/project/publish order, same session ownership, same
+        publish-after-commit rule, same "the broker's absence must not fail the write" asymmetry —
+        because the two are the same operation over two tables. It is also what C13's ``OrderBoard``
+        needs in order to demonstrate a live transition without a seeded fixture.
+
+        Args:
+            info: Carries the :class:`~src.graphql.context.Context` — settings, the session
+                factory, and the broker.
+            order_data: Published as ``orderData``. Validated by
+                :func:`src.graphql.validation.validate_create_order_event` before anything else
+                happens, which is also where ``service`` and ``level`` get their defaults.
+
+        Returns:
+            The stored event, projected through
+            :meth:`src.graphql.ecommerce.OrderEvent.from_orm` — the single mapping ``Query
+            .orderEvents`` and the subscription both use, so a created event, the same row fetched
+            back, and the frame a subscriber receives are guaranteed to serialise identically.
+
+        Raises:
+            src.graphql.errors.ValidationError: If the payload breaks a rule — a blank or over-long
+                ``orderId``/``userId``/``service``/``traceId``, a NUL byte, or ``metadata`` that is
+                not a bounded JSON object. Carries ``extensions.code = "VALIDATION_ERROR"`` and
+                reaches the client as a normal errors envelope, never a 500.
+        """
+        context = info.context
+        params = validate_create_order_event(order_data)
+
+        async with context.session() as session:
+            # Constructed over the session rather than taken from `context.repository()` for the
+            # reason `create_log` documents: this resolver needs the session itself, because the
+            # repository flushes and stops and the commit below is the transaction boundary it is
+            # deliberately leaving to us.
+            repository = LogRepository(session, context.settings)
+            row = await repository.insert_order_event(
+                order_id=params.order_id,
+                user_id=params.user_id,
+                status=params.status,
+                service=params.service,
+                level=params.level,
+                timestamp=params.timestamp,
+                metadata=params.metadata,
+                trace_id=params.trace_id,
+            )
+            await session.commit()
+            event = OrderEvent.from_orm(row)
+
+        # PUBLISH THE COMMITTED EVENT — OUTSIDE THE SESSION BLOCK, AFTER `await session.commit()`,
+        # AND THE ORDER IS NOT INTERCHANGEABLE. The argument is `create_log`'s, unchanged, and it is
+        # *sharper* here: an order dashboard renders state transitions, so announcing a SHIPPED
+        # whose transaction then failed would leave every board showing an order as shipped when the
+        # store's newest event still says PACKED — a wrong answer that no later event corrects and
+        # that a refetch does not explain, because the row simply is not there. The reverse mistake
+        # (committed, not published) costs one missed frame on a stream that is explicitly lossy
+        # under back-pressure. So: commit, then publish.
+        #
+        # No try/except, and adding one would be wrong for the reason `create_log` gives:
+        # `LogBroker.publish_order_event` has no await points and cannot raise by construction, so
+        # a stalled subscriber or a dead Redis can neither delay nor fail a write that committed.
+        broker = context.broker
+        if broker is not None:
+            await broker.publish_order_event(event)
+
+        return event

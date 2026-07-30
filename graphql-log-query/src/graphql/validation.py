@@ -60,6 +60,7 @@ from src.db.models import (
     USER_ID_MAX_LENGTH,
 )
 from src.db.repository import as_utc
+from src.generators import ORDER_EVENT_SERVICE, ORDER_STATUS_LEVELS
 from src.graphql.errors import ValidationError
 
 if TYPE_CHECKING:  # pragma: no cover - import-cycle break, evaluated by type checkers only
@@ -68,6 +69,7 @@ if TYPE_CHECKING:  # pragma: no cover - import-cycle break, evaluated by type ch
     # needs the real classes.
     from src.graphql.inputs import (
         CreateLogInput,
+        CreateOrderEventInput,
         LogFilterInput,
         OrderEventFilterInput,
         PaymentEventFilterInput,
@@ -120,6 +122,31 @@ MAX_METADATA_NODES = 200
 #: replicated and streamed to every C6 subscriber, so this is the number that decides how much a
 #: single ``createLog`` can cost everyone downstream.
 MAX_METADATA_BYTES = 8_192
+
+
+@dataclass(frozen=True, slots=True)
+class CreateOrderEventParams:
+    """A validated, normalised ``createOrderEvent`` payload, ready for the repository — C12.
+
+    The order-side twin of :class:`CreateLogParams`, and the same object for the same reason: what
+    survives validation, with every enum already reduced to the string its column holds and every
+    default already **resolved**. A resolver holding one of these cannot accidentally persist the
+    raw input, because the raw input is no longer in scope.
+
+    ``service`` and ``level`` are non-optional *here* even though they are optional on the input,
+    which is the whole point of the type: the defaulting decision is made once, in
+    :func:`validate_create_order_event`, rather than being an ``or`` in the repository and another
+    one in a test.
+    """
+
+    order_id: str
+    user_id: str
+    status: str
+    service: str
+    level: str
+    timestamp: datetime | None
+    metadata: dict[str, Any] | None
+    trace_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +500,129 @@ def validate_subscription_filter(service: str | None) -> None:
     _reject_nul("service", service)
     _require_non_blank("service", service)
     _require_max_length("service", service, MAX_SERVICE_LENGTH)
+
+
+def validate_order_subscription_filter(order_id: str | None, user_id: str | None) -> None:
+    """Check ``Subscription.orderStatusStream``'s two free-form arguments — C12.
+
+    ``status`` needs nothing here for the reason ``level`` needs nothing on ``logStream``: it is
+    the :class:`~src.graphql.enums.OrderStatus` enum, so an unknown value is rejected during
+    validation with a message naming the seven legal statuses, before the resolver runs and before
+    a queue is allocated.
+
+    The rules applied to the two identifiers are deliberately **the same three**
+    :func:`validate_order_event_filter` applies to the same two fields. A subscription filter and a
+    query filter that disagreed about what a legal ``orderId`` is would be a genuinely confusing
+    surface: the same string would be accepted by ``orderEvents`` and rejected by
+    ``orderStatusStream``, or worse, accepted by both and match on only one.
+
+    Blank in particular is refused rather than treated as "no filter". An empty ``orderId`` cannot
+    equal any stored one, so a subscription carrying it would open successfully, register a queue,
+    and then stay silent forever — indistinguishable, to the client, from an order that nothing is
+    happening to.
+
+    Raises:
+        src.graphql.errors.ValidationError: Either identifier is blank, over-long, or contains a
+            NUL byte.
+    """
+    _check_identifier("orderId", order_id, MAX_ORDER_ID_LENGTH)
+    _check_identifier("userId", user_id, MAX_USER_ID_LENGTH)
+
+
+def validate_create_order_event(order_data: CreateOrderEventInput) -> CreateOrderEventParams:
+    """Validate and normalise a ``createOrderEvent`` payload — C12's event source.
+
+    .. rubric:: What is trimmed, and what is defaulted
+
+    ``orderId``, ``userId``, ``service`` and ``traceId`` are **stripped**, exactly as
+    :func:`validate_create_log` strips ``service`` and ``traceId`` and for the identical reason:
+    every one of them is a grouping key. ``"ord-60000 "`` arriving from a copy-pasted id would
+    become a second, invisible order in ``orderStatusDistribution`` and in every subscriber's
+    filter, sitting next to the real one and impossible to spot.
+
+    ``service`` and ``level`` are **defaulted rather than required**, which ``createLog`` does not
+    do, and the asymmetry is the domain's:
+
+    * A log line's source is genuinely unknown to this server — only the emitter knows which
+      component wrote it — so ``createLog`` demands it.
+    * An order status transition has one obvious emitter (:data:`src.generators.ORDER_EVENT_SERVICE`,
+      the same name the seeded corpus uses, so a live event and a seeded one land in the same
+      ``logStats`` bucket instead of forking the service list), and its severity is a **property of
+      the status**: a cancellation is a WARNING whether or not the caller says so. Deriving it from
+      :data:`src.generators.ORDER_STATUS_LEVELS` is what keeps
+      ``orderEvents(filters: {level: WARNING})`` meaning "the unhappy transitions" for live rows as
+      well as seeded ones.
+
+    Both remain overridable — a partner feed with its own service name and its own severity policy
+    is a legitimate caller — so the defaults are a convenience, not a constraint.
+
+    Returns:
+        A :class:`CreateOrderEventParams` whose fields go straight to
+        :meth:`src.db.repository.LogRepository.insert_order_event`.
+
+    Raises:
+        src.graphql.errors.ValidationError: On the first rule that fails, naming the field and the
+            limit.
+    """
+    order_id = order_data.order_id
+    _reject_nul("orderId", order_id)
+    _require_non_blank("orderId", order_id)
+    order_id = order_id.strip()
+    _require_max_length("orderId", order_id, MAX_ORDER_ID_LENGTH)
+
+    user_id = order_data.user_id
+    _reject_nul("userId", user_id)
+    _require_non_blank("userId", user_id)
+    user_id = user_id.strip()
+    _require_max_length("userId", user_id, MAX_USER_ID_LENGTH)
+
+    # Strawberry hands the resolver an OrderStatus MEMBER; the column holds the member's value.
+    # The two are identical strings by construction (see
+    # `src.graphql.enums._assert_enum_matches_roster`), but passing the member through would bind
+    # an Enum against a VARCHAR and asyncpg would refuse it.
+    status = order_data.status.value
+
+    service = order_data.service
+    if service is None:
+        service = ORDER_EVENT_SERVICE
+    else:
+        _reject_nul("service", service)
+        _require_non_blank("service", service)
+        service = service.strip()
+        _require_max_length("service", service, MAX_SERVICE_LENGTH)
+
+    # `ORDER_STATUS_LEVELS` covers every member of ORDER_STATUSES — an import-time guard in
+    # `src.generators` pins that — so the lookup cannot miss for a status that reached here
+    # through the enum. `.get` with a fallback anyway, because a KeyError on a write path would be
+    # a masked 500 for a status the schema itself declared legal.
+    level = order_data.level.value if order_data.level is not None else None
+    if level is None:
+        level = ORDER_STATUS_LEVELS.get(status, "INFO")
+
+    trace_id = order_data.trace_id
+    if trace_id is not None:
+        _reject_nul("traceId", trace_id)
+        _require_non_blank("traceId", trace_id)
+        trace_id = trace_id.strip()
+        _require_max_length("traceId", trace_id, MAX_TRACE_ID_LENGTH)
+
+    metadata = validate_metadata(order_data.metadata)
+
+    # Same UTC normalisation every stored instant gets: a naive value bound against a `timestamptz`
+    # column is interpreted in the SERVER's TimeZone setting, so the row would land at an hour
+    # nobody chose — and `orderStatusStream`'s ordering is this column.
+    timestamp = as_utc(order_data.timestamp)
+
+    return CreateOrderEventParams(
+        order_id=order_id,
+        user_id=user_id,
+        status=status,
+        service=service,
+        level=level,
+        timestamp=timestamp,
+        metadata=metadata,
+        trace_id=trace_id,
+    )
 
 
 def validate_create_log(log_data: CreateLogInput) -> CreateLogParams:

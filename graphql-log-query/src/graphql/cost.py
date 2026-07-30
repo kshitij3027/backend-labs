@@ -346,8 +346,34 @@ DEFAULT_WEIGHTS: Mapping[str, FieldCost] = MappingProxyType(
         # --- Mutation ----------------------------------------------------------------------------
         #: One INSERT plus the broker publish and its Redis fan-out.
         "Mutation.createLog": FieldCost(weight=10),
+        #: C12. Exactly the same work against a table with the same shape — one INSERT, one commit,
+        #: one fan-out over the same bounded queues — so deliberately the same weight. Pricing them
+        #: differently would be a claim about relative cost that nothing has measured.
+        "Mutation.createOrderEvent": FieldCost(weight=10),
         # --- Subscription (priced PER EVENT — see the module docstring) --------------------------
         "Subscription.logStream": FieldCost(weight=10),
+        #: C12, spec §3 Feature Area C. Priced per DELIVERED EVENT exactly as `logStream` is, and at
+        #: the same weight, because one delivery is one dequeue and one serialisation either way.
+        #:
+        #: The unit matters more here than it does for `logStream`, so it is worth stating: this
+        #: field returns `OrderEvent!` — ONE event, not a list — so the root multiplier stays 1 and
+        #: what is being priced is genuinely "the work one arriving transition costs". The stream's
+        #: LENGTH is bounded elsewhere (SUBSCRIPTION_QUEUE_MAXSIZE and the drop policy in
+        #: `src.broker`); what this bounds is what a client can attach to each event, for as long as
+        #: the socket stays open.
+        #:
+        #: That is a real exposure, because `OrderEvent` carries THREE traversals where `LogEntry`
+        #: carries one. The arithmetic, pinned in `tests/unit/test_order_stream_cost.py` rather than
+        #: trusted here:
+        #:   ADMITTED  orderStatusStream { orderId status }                             12
+        #:   ADMITTED  ... { payments { id } }                                         120
+        #:   ADMITTED  ... { payments { id } userActivity { id } relatedLogs { id } }   340
+        #:   REJECTED  ... { payments { order { payments { order { payments { id }
+        #:                                                        } } } } }      1,151,520
+        #: The last one is the alternating list/single shape C11's `PaymentEvent.order` note calls
+        #: the most dangerous in the schema, reached through the subscription root instead of
+        #: through `orderEvents` — and the same multiplication refuses it here.
+        "Subscription.orderStatusStream": FieldCost(weight=10),
     }
 )
 

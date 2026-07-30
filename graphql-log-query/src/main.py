@@ -36,6 +36,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from strawberry.fastapi import GraphQLRouter
 from strawberry.subscriptions import GRAPHQL_TRANSPORT_WS_PROTOCOL, GRAPHQL_WS_PROTOCOL
 
+from src.api.debug import router as debug_router
 from src.api.health import router as health_router
 from src.api.metrics import router as metrics_router
 from src.broker import LogBroker, create_redis_client
@@ -62,7 +63,8 @@ creation, and real-time streaming over WebSocket — with DataLoader batching, R
 caching, automatic persisted queries, and a pre-execution depth/complexity gate in front of it.
 
 `/health` is the only other unversioned HTTP route that is part of the contract; `/metrics`
-carries Prometheus text exposition from C9.
+carries Prometheus text exposition from C9, and `/debug/memory` carries the server's own RSS
+reading for the C12/C14 memory gate.
 """
 
 
@@ -390,6 +392,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     #    everything else here, before the C13 SPA catch-all.
     if resolved.metrics_enabled:
         app.include_router(metrics_router)
+
+    # 4. GET /debug/memory — the SERVER's own psutil RSS reading, which is the only thing the
+    #    MAX_BACKEND_MEM_MB gate in scripts/verify_e2e.py (C12) and scripts/load_test.py (C14) can
+    #    honestly be computed from: both harnesses run in a separate container, so their own
+    #    process's memory says nothing about this one.
+    #
+    #    Registered UNCONDITIONALLY, unlike /metrics, and that is deliberate. Hanging it off
+    #    METRICS_ENABLED would turn an observability toggle into a switch that silently makes a
+    #    verification gate unenforceable — the harness would still print PASS, having read nothing.
+    #    See src/api/debug.py for what it does and does not expose (process facts only: a pid, an
+    #    RSS, and the subscriber count /metrics already publishes as a gauge).
+    app.include_router(debug_router)
 
     # === C13 ==  The React SPA, and it MUST BE REGISTERED LAST — after /graphql, /health and
     #             /metrics — because the SPA fallback is a catch-all:

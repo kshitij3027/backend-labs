@@ -162,6 +162,56 @@ class CreateLogInput:
     trace_id: Optional[str] = None
 
 
+@strawberry.input(
+    description=(
+        "The createOrderEvent payload — one transition in an order's lifecycle. `orderId`, "
+        "`userId` and `status` are the event; `service` defaults to the order service and `level` "
+        "is derived from the status (CANCELLED and REFUNDED are WARNING, the rest INFO) so a "
+        "caller states only what it actually knows."
+    )
+)
+class CreateOrderEventInput:
+    """The ``createOrderEvent`` payload — C12, published as ``orderData``.
+
+    Three required fields and five optional ones. The split is the domain's: an order status
+    transition without an order, an acting user or a status is not an event, while the emitting
+    service, the severity, the instant, a metadata object and a correlation id are all things a
+    real emitter legitimately leaves to the server.
+
+    ``status`` is the :class:`~src.graphql.enums.OrderStatus` **enum**, so ``status: "SHIPED"`` is
+    rejected during validation with a message naming the seven legal values — before a resolver
+    runs, before a session is opened, and before anything is published to a subscriber. That is the
+    same guarantee ``level`` gives ``CreateLogInput``, and it is why nothing in
+    :mod:`src.graphql.validation` checks ``status``.
+
+    ``service`` and ``level`` are ``Optional`` **with server-side defaults** rather than required —
+    see :func:`src.graphql.validation.validate_create_order_event` for the argument, which is that
+    an order event's emitter is known and its severity is a function of its status.
+
+    ``timestamp`` omitted means **now, server-side**, applied in
+    :meth:`src.db.repository.LogRepository.insert_order_event` — the one place in the project
+    allowed to read the wall clock for a stored row. Not "now, client-side": ``orderStatusStream``
+    orders by this column and a client's clock is not something this server can vouch for.
+
+    .. rubric:: There is deliberately no ``createPaymentEvent`` or ``createUserEvent`` beside it
+
+    Spec §3 Feature Area C asks for a stream of **order status transitions**, and this mutation
+    exists to be that stream's event source (the same role ``createLog`` plays for ``logStream``).
+    Two more write paths for two streams nothing subscribes to would be surface with no reader —
+    and payment and user events are already reachable, seeded and queryable, which is what the spec
+    asks of them.
+    """
+
+    order_id: str
+    user_id: str
+    status: OrderStatus
+    service: Optional[str] = None
+    level: Optional[LogLevel] = None
+    timestamp: Optional[datetime] = None
+    metadata: Optional[JSON] = None
+    trace_id: Optional[str] = None
+
+
 # =================================================================================================
 # C10 — the e-commerce event filters (spec §3 Feature Area A)
 #

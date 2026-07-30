@@ -58,8 +58,8 @@ spelling everywhere beats two that differ per field type.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import Optional
+from collections.abc import Mapping, Sequence
+from typing import Any, Optional
 
 import strawberry
 from strawberry.scalars import JSON
@@ -73,7 +73,12 @@ from src.graphql.enums import (
     PaymentOutcome,
     UserActivity,
 )
-from src.graphql.types import LogEntry, LogEvent
+from src.graphql.types import (
+    LogEntry,
+    LogEvent,
+    from_wire_timestamp,
+    to_wire_timestamp,
+)
 
 
 def _log_level(stored: str) -> LogLevel:
@@ -214,6 +219,81 @@ class OrderEvent(LogEvent):
             user_id=row.user_id,
             status=OrderStatus(row.status),
             metadata=row.metadata_,
+        )
+
+    # =============================================================================================
+    # C12 — the JSON representation, for the pub/sub bridge behind `orderStatusStream`.
+    #
+    # The exact counterpart of `LogEntry.to_wire()` / `from_wire()`, written the same way and for
+    # the same reason: `src.broker` needs ONE representation of a published order event, and a
+    # codec living in the broker would be a second mapping of this type sitting a module away from
+    # the `from_orm` it has to agree with. `metadata_` -> `metadata` and `int` -> `ID` are already
+    # spelled out above; putting them here too, in the module that owns the type, is what stops the
+    # two spellings from drifting.
+    #
+    # WHY THIS TYPE AND NOT `PaymentEvent` / `UserEvent`: only order events are published. Spec §3
+    # Feature Area C asks for a stream of *order status transitions*, and a `to_wire` on a type
+    # nothing publishes would be untested surface that looks maintained.
+    # =============================================================================================
+
+    def to_wire(self) -> dict[str, Any]:
+        """This event as a JSON-serialisable dict. Every published scalar field, no envelope.
+
+        All nine, rather than the ones a caller happens to need: a subscriber on another worker
+        reconstructs a complete :class:`OrderEvent` and never consults the database to fill a gap,
+        which is what makes ``orderStatusStream`` cost zero SQL statements on *every* worker rather
+        than only on the one that wrote the row.
+
+        The three traversal fields (``payments``, ``userActivity``, ``relatedLogs``) are absent and
+        must stay absent — they are resolvers, not state. A client that selects them inside a
+        subscription resolves them per delivered event through the per-operation DataLoader, on a
+        short-lived session, exactly as it would under a query. Serialising them here would put a
+        point-in-time snapshot of another table into an event payload.
+
+        Key order matches the declaration order of the type, for the same reason
+        :meth:`src.graphql.types.LogEntry.to_wire` fixes its own: nothing depends on it
+        semantically, and it keeps two encodings of one event byte-identical.
+        """
+        return {
+            "id": str(self.id),
+            "timestamp": to_wire_timestamp(self.timestamp),
+            "service": self.service,
+            "level": self.level.value,
+            "trace_id": self.trace_id,
+            "order_id": self.order_id,
+            "user_id": self.user_id,
+            "status": self.status.value,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_wire(cls, body: Mapping[str, Any]) -> OrderEvent:
+        """Rebuild an event from what :meth:`to_wire` produced. The inverse, and nothing else.
+
+        **Raises rather than tolerating**, exactly as ``LogEntry.from_wire`` does. The seven
+        required fields are read with ``[]`` and the two nullable ones with ``.get``, so a
+        truncated payload is a ``KeyError`` and a ``level``/``status`` outside its enum is a
+        ``ValueError``. :func:`src.broker.decode_event` turns any of them into "drop this message",
+        which is the only safe answer for a channel any process with the Redis credentials can
+        write to — and an event the published schema cannot express must never reach a subscriber,
+        because the failure would otherwise happen during serialisation, mid-stream, on a socket
+        that has already been told the subscription succeeded.
+
+        Note ``order_id`` and ``user_id`` are read as **required**. They are what the receiving
+        broker's :class:`~src.broker.OrderSubscriptionFilter` matches on, so a body missing one is
+        not a slightly-incomplete event — it is an unfilterable one, and delivering it would mean a
+        subscription scoped to a single order receiving somebody else's.
+        """
+        return cls(
+            id=strawberry.ID(str(body["id"])),
+            timestamp=from_wire_timestamp(body["timestamp"]),
+            service=body["service"],
+            level=LogLevel(body["level"]),
+            trace_id=body.get("trace_id"),
+            order_id=body["order_id"],
+            user_id=body["user_id"],
+            status=OrderStatus(body["status"]),
+            metadata=body.get("metadata"),
         )
 
 

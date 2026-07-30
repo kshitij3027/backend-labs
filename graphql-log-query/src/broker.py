@@ -22,13 +22,17 @@ terminal sentinel, the idempotent release, the shutdown sweep.
 
 .. rubric:: ``publish`` is ``async def`` and contains NO await points. Both halves are deliberate.
 
-It is ``async`` because the call site reads ``await broker.publish(entry)`` and because C12's order
-stream may one day need a real await there. It contains no suspension point *today*: the local
+It is ``async`` because the call site reads ``await broker.publish(entry)`` and because a future
+kind may one day need a real await there. It contains no suspension point *today*: the local
 fan-out is a loop of ``put_nowait``, and the Redis hop is handed to a background task rather than
 awaited. Awaiting a coroutine that never suspends does not yield to the event loop, so "publish
 never blocks" is a property of the code rather than a hope about how fast Redis is — which matters
 precisely when Redis is *not* fast, i.e. when it is down and every await would sit on a connect
 timeout inside a mutation resolver.
+
+C12 kept that exactly: :meth:`LogBroker.publish_order_event` is a second ``async`` wrapper over the
+same synchronous :meth:`LogBroker._publish` body, so both mutations inherit the property from one
+function rather than from two that happen to agree.
 
 .. rubric:: The event-loop constraint, stated plainly
 
@@ -48,6 +52,21 @@ reason it lives in the broker: a subscriber watching one quiet service must not 
 filled — and itself dropped — by a firehose on a different service it never asked for. With the
 filter in the resolver, back-pressure would be shared by every subscriber on the process; with the
 filter here, each subscriber's queue depth reflects only its own traffic.
+
+.. rubric:: TWO STREAMS, ONE BROKER — C12 (spec §3 Feature Area C)
+
+``orderStatusStream`` is the same machinery with a second event kind, not a second broker. One
+registry, one lock, one bounded-queue policy, one shutdown sweep, one per-connection cap, one
+pub/sub bridge — because every one of those is a property of *the process*, and a second copy of
+each would be a second set of edges to find. What distinguishes the two streams is exactly three
+things, each of them data rather than a branch:
+
+* the envelope's ``kind`` (:data:`EVENT_KIND_LOG` / :data:`EVENT_KIND_ORDER`) — the discriminator
+  C6 put in the payload before there was a second kind to discriminate;
+* the row it selects in :data:`_DECODERS`, which is what makes an *unknown* kind a drop rather than
+  a guess;
+* the ``kind`` tag on the subscriber's filter, which :meth:`LogBroker._fan_out` routes on so an
+  order subscriber is never handed a ``LogEntry`` and vice versa.
 
 .. rubric:: The Redis bridge — spec §4 bonus, cross-worker fan-out
 
@@ -78,18 +97,28 @@ import logging
 import os
 import threading
 import uuid
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Optional, Union
 
 from src.config import Settings
-from src.graphql.enums import LogLevel
+from src.graphql.ecommerce import OrderEvent
+from src.graphql.enums import LogLevel, OrderStatus
 from src.graphql.types import LogEntry
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
     from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
+
+#: Anything this broker can carry. A union rather than a base class: ``LogEntry`` and ``OrderEvent``
+#: are Strawberry types whose shared ancestor is the *published* ``LogEvent`` interface, and that
+#: interface deliberately carries only the four correlation fields (see
+#: :class:`src.graphql.types.LogEvent`) — not ``orderId``, not ``status``, not ``message``. A filter
+#: needs the concrete type, so the broker names both rather than narrowing to their common parent.
+PublishedEvent = Union[LogEntry, OrderEvent]
 
 # =================================================================================================
 # The wire format
@@ -110,16 +139,44 @@ logger = logging.getLogger(__name__)
 #: subscribed to the same channel, and a guess there means one worker fabricating entries.
 EVENT_FORMAT_VERSION = 1
 
-#: The only kind C6 publishes. C12's order-status events get their own.
+#: The kind C6 publishes: a ``LogEntry`` written by ``createLog``.
 EVENT_KIND_LOG = "log"
+
+#: The kind C12 adds: an ``OrderEvent`` written by ``createOrderEvent``. **A new kind rather than a
+#: new envelope** — the discriminator was put in the payload at C6 precisely so this commit could
+#: be one entry in :data:`_DECODERS` instead of a second wire format, and so a C6 binary meeting a
+#: C12 message during a rolling deploy *drops* it (see :func:`decode_event`) rather than trying to
+#: read an order event as a log line.
+EVENT_KIND_ORDER = "order"
 
 
 @dataclass(frozen=True, slots=True)
 class RemoteEvent:
-    """A decoded envelope: who published it, and the entry it carried."""
+    """A decoded envelope: who published it, what kind it is, and the event it carried.
+
+    ``kind`` is carried out of the decode rather than re-derived from ``type(entry)`` because it is
+    what :meth:`LogBroker._fan_out` routes on, and a router that switched on the Python type would
+    silently start guessing the moment two kinds ever shared one class.
+    """
 
     origin: str
-    entry: LogEntry
+    entry: PublishedEvent
+    #: Defaulted so every C6-era construction site (and every test that builds one by hand) still
+    #: reads as "a log envelope" without being edited.
+    kind: str = EVENT_KIND_LOG
+
+
+def _encode_envelope(kind: str, body: dict[str, Any], *, origin: str) -> str:
+    """Wrap one already-rendered event body in the versioned envelope. The only writer of it.
+
+    Split out of :func:`encode_event` when C12 added a second kind, so that ``v``, ``kind`` and
+    ``origin`` are assembled in exactly one place: two encoders agreeing today about what an
+    envelope looks like is how a version bump lands on half the payloads.
+    """
+    payload = {"v": EVENT_FORMAT_VERSION, "kind": kind, "origin": origin, "entry": body}
+    # `separators` because this is a hot path in aggregate (one document per ingested event) and
+    # the default separators add a space per key for a machine-only payload.
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def encode_event(entry: LogEntry, *, origin: str) -> str:
@@ -145,15 +202,40 @@ def encode_event(entry: LogEntry, *, origin: str) -> str:
         Compact JSON. See :meth:`~src.graphql.types.LogEntry.to_wire` for what the body guarantees
         — in particular that ``metadata`` absent and ``metadata`` present stay distinguishable.
     """
-    payload = {
-        "v": EVENT_FORMAT_VERSION,
-        "kind": EVENT_KIND_LOG,
-        "origin": origin,
-        "entry": entry.to_wire(),
+    return _encode_envelope(EVENT_KIND_LOG, entry.to_wire(), origin=origin)
+
+
+def encode_order_event(event: OrderEvent, *, origin: str) -> str:
+    """Serialise one order status transition into the same envelope, under the ``order`` kind.
+
+    The twin of :func:`encode_event`, and deliberately nothing more: the envelope is
+    :func:`_encode_envelope`'s and the body is
+    :meth:`src.graphql.ecommerce.OrderEvent.to_wire`'s, so this function holds no mapping of its own
+    and therefore has nothing that can drift from either.
+
+    Every published field travels, for the same reason a log entry's do: ``orderStatusStream``
+    issues **zero** database round trips, so a subscriber on another worker has to be able to
+    reconstruct the whole event from the payload alone. ``orderId``, ``userId`` and ``status`` in
+    particular are what the *receiving* broker's :class:`OrderSubscriptionFilter` matches on — a
+    body missing one of them would make a remote event unfilterable rather than merely incomplete,
+    and the symptom would be a narrowly-filtered subscription that quietly receives another
+    customer's orders.
+    """
+    return _encode_envelope(EVENT_KIND_ORDER, event.to_wire(), origin=origin)
+
+
+#: kind -> the constructor that rebuilds that kind's body. **The whole of C12's wire change.**
+#:
+#: A table rather than an ``if``/``elif`` chain inside :func:`decode_event`, for one reason: an
+#: unknown kind must be *dropped*, and a table makes that the structural default (``.get(kind)``
+#: is ``None``) instead of an else-branch somebody has to remember to write last. Adding a kind is
+#: one row here plus one encoder above; forgetting to add the row fails closed.
+_DECODERS: Mapping[str, Any] = MappingProxyType(
+    {
+        EVENT_KIND_LOG: LogEntry.from_wire,
+        EVENT_KIND_ORDER: OrderEvent.from_wire,
     }
-    # `separators` because this is a hot path in aggregate (one document per ingested log line) and
-    # the default separators add a space per key for a machine-only payload.
-    return json.dumps(payload, separators=(",", ":"))
+)
 
 
 def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[RemoteEvent]:
@@ -165,11 +247,15 @@ def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[R
 
     * not valid JSON, or not a JSON object;
     * an envelope version this build does not know (see :data:`EVENT_FORMAT_VERSION`);
-    * a kind this build does not handle (a C12 order event reaching a C6 binary during a rolling
-      deploy is exactly this case, and dropping it beats mis-decoding it);
-    * a missing required field, or a ``level`` outside :class:`~src.graphql.enums.LogLevel` —
-      both of which :meth:`src.graphql.types.LogEntry.from_wire` raises on, deliberately, so that
-      each caller can decide what a malformed body means. Here it means "drop the message".
+    * a kind absent from :data:`_DECODERS`. **The kind is DISPATCHED ON, never guessed.** A future
+      binary's third kind reaching this one during a rolling deploy is exactly this case, and so is
+      a C12 order event reaching a C6 binary — dropping beats decoding an order event's body as a
+      log line, which would raise on the missing ``message`` key and, if the two shapes ever
+      overlapped, would fabricate an entry instead;
+    * a missing required field, a ``level`` outside :class:`~src.graphql.enums.LogLevel`, or a
+      ``status`` outside :class:`~src.graphql.enums.OrderStatus` — all of which the ``from_wire``
+      constructors raise on, deliberately, so that each caller can decide what a malformed body
+      means. Here it means "drop the message".
     """
     if raw is None:
         return None
@@ -185,7 +271,12 @@ def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[R
         return None
     if payload.get("v") != EVENT_FORMAT_VERSION:
         return None
-    if payload.get("kind") != EVENT_KIND_LOG:
+
+    kind = payload.get("kind")
+    from_wire = _DECODERS.get(kind) if isinstance(kind, str) else None
+    if from_wire is None:
+        # An unknown kind is dropped rather than guessed — see the docstring. This is the branch a
+        # rolling deploy runs through in both directions.
         return None
 
     origin = payload.get("origin")
@@ -194,22 +285,35 @@ def decode_event(raw: str | bytes | bytearray | memoryview | None) -> Optional[R
         return None
 
     try:
-        entry = LogEntry.from_wire(body)
-    except Exception:  # noqa: BLE001 - a missing key, a bad level, an unparseable timestamp
+        entry = from_wire(body)
+    except Exception:  # noqa: BLE001 - a missing key, a bad enum member, an unparseable timestamp
         logger.debug("dropping a malformed subscription message", exc_info=True)
         return None
 
-    return RemoteEvent(origin=origin, entry=entry)
+    return RemoteEvent(origin=origin, entry=entry, kind=kind)
 
 
 # =================================================================================================
 # Filters
+#
+# TWO filter classes, one per event kind, and **the `kind` class attribute is what keeps them
+# apart**. It is not a label: `LogBroker._fan_out` skips every subscriber whose `kind` differs from
+# the kind being published, which is the only thing standing between an order subscriber and a
+# `LogEntry` its `matches()` would raise an AttributeError on. Without it, publishing a log line
+# would evaluate `OrderSubscriptionFilter.matches(LogEntry)`, that would raise, and the fan-out's
+# "a broken filter costs only its own subscriber" rule would DROP a perfectly healthy order
+# subscription — a bug whose symptom is "orderStatusStream dies whenever anybody writes a log".
+#
+# It is a plain class attribute rather than an annotated field, deliberately: annotating it would
+# make it a dataclass field, so it would join every constructor signature, every `repr`, and every
+# equality comparison — and a caller could then pass `SubscriptionFilter(kind="order")` and route a
+# log filter onto the order stream.
 # =================================================================================================
 
 
 @dataclass(frozen=True)
 class SubscriptionFilter:
-    """What one subscriber is watching. Both fields optional; supplied fields are AND-composed.
+    """What one ``logStream`` subscriber is watching. Both fields optional and AND-composed.
 
     Evaluated in :meth:`LogBroker.publish`, once per live subscriber per published entry, **before
     the enqueue** — see the module docstring for why that is stronger than filtering in the
@@ -219,6 +323,9 @@ class SubscriptionFilter:
     mode of not coercing is silent: ``LogLevel.ERROR != "ERROR"`` is ``True``, so a filter holding
     a raw string would match nothing at all and present as "the subscription is quiet".
     """
+
+    #: The event kind this filter subscribes to. See the section comment above.
+    kind = EVENT_KIND_LOG
 
     service: Optional[str] = None
     level: Optional[LogLevel] = None
@@ -238,6 +345,62 @@ class SubscriptionFilter:
         if self.service is not None and entry.service != self.service:
             return False
         if self.level is not None and entry.level != self.level:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class OrderSubscriptionFilter:
+    """What one ``orderStatusStream`` subscriber is watching — spec §3 Feature Area C.
+
+    "Filtering by order id, status, and/or user": three optional fields, AND-composed, evaluated
+    **at enqueue time** exactly like the log filter and for exactly the same reason. That reason is
+    sharper here than it is for logs. A dashboard watching one customer's single order is the
+    canonical use of this stream, and an order-status firehose (every order in the system moving
+    through seven statuses) is the canonical background traffic — so a filter applied in the
+    resolver would let that firehose fill, and then *drop*, a subscription that asked for one order.
+    The queue depth a subscriber pays for is its own traffic, not the system's.
+
+    ``status`` is coerced from a string in ``__post_init__`` for the reason ``SubscriptionFilter``
+    coerces ``level``: ``OrderStatus.SHIPPED != "SHIPPED"``, so an uncoerced filter matches nothing
+    at all and reads as a quiet stream rather than as a bug.
+
+    Note there is deliberately **no** ``service`` or ``level`` field. Every order event is emitted
+    by one service and its severity is a function of its status (see
+    :data:`src.generators.ORDER_STATUS_LEVELS`), so both would be filters that either match
+    everything or nothing — a surface that looks like a choice and is not.
+    """
+
+    #: The event kind this filter subscribes to. See the section comment above.
+    kind = EVENT_KIND_ORDER
+
+    order_id: Optional[str] = None
+    status: Optional[OrderStatus] = None
+    user_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.status is not None and not isinstance(self.status, OrderStatus):
+            # frozen dataclass: normalisation goes through object.__setattr__ or nowhere.
+            object.__setattr__(self, "status", OrderStatus(self.status))
+
+    @property
+    def matches_everything(self) -> bool:
+        """True when nothing is constrained — the unfiltered ``orderStatusStream`` subscription."""
+        return self.order_id is None and self.status is None and self.user_id is None
+
+    def matches(self, event: OrderEvent) -> bool:
+        """Does ``event`` satisfy every constraint this filter carries?
+
+        Exact equality on all three, never a prefix or a substring: ``orderId`` and ``userId`` are
+        opaque identifiers, and a filter that matched ``ord-6000`` against ``ord-60001`` would leak
+        one customer's orders into another's stream — the one failure mode a per-order subscription
+        must not have.
+        """
+        if self.order_id is not None and event.order_id != self.order_id:
+            return False
+        if self.status is not None and event.status != self.status:
+            return False
+        if self.user_id is not None and event.user_id != self.user_id:
             return False
         return True
 
@@ -296,10 +459,13 @@ class Subscriber:
     many exist.
 
     Attributes:
-        queue: Bounded ``asyncio.Queue``. Holds :class:`~src.graphql.types.LogEntry` values plus at
-            most one ``None`` **terminal sentinel** meaning "this subscription is over".
-        filter: Evaluated by the publisher, on the publisher's task — which is why a filter that
-            raises must cost only this subscriber.
+        queue: Bounded ``asyncio.Queue``. Holds events of **this subscriber's kind only** — see
+            :attr:`filter` — plus at most one ``None`` **terminal sentinel** meaning "this
+            subscription is over".
+        filter: What this subscriber watches, and (through its ``kind``) which of the two streams
+            it is on. Evaluated by the publisher, on the publisher's task — which is why a filter
+            that raises must cost only this subscriber. The ``kind`` check happens *before*
+            ``matches`` is called, so a filter is never handed an event of the wrong type.
         connection: The object identifying the WebSocket connection this subscription is
             multiplexed on (the GraphQL :class:`~src.graphql.context.Context`, which Strawberry
             creates exactly once per socket). ``None`` for a subscriber with no connection scope,
@@ -318,13 +484,13 @@ class Subscriber:
     def __init__(
         self,
         *,
-        flt: SubscriptionFilter,
+        flt: Union[SubscriptionFilter, OrderSubscriptionFilter],
         queue_size: int,
         connection: Optional[Any] = None,
     ) -> None:
         self.filter = flt
         self.connection = connection
-        self.queue: asyncio.Queue[Optional[LogEntry]] = asyncio.Queue(
+        self.queue: asyncio.Queue[Optional[PublishedEvent]] = asyncio.Queue(
             maxsize=_check_queue_size(queue_size)
         )
         self.released = False
@@ -513,7 +679,7 @@ class LogBroker:
 
     def subscribe(
         self,
-        flt: SubscriptionFilter,
+        flt: Union[SubscriptionFilter, OrderSubscriptionFilter],
         *,
         connection: Optional[Any] = None,
         queue_size: Optional[int] = None,
@@ -521,7 +687,11 @@ class LogBroker:
         """Register a subscriber and return its handle.
 
         Args:
-            flt: What this subscriber watches. Evaluated by the publisher before the enqueue.
+            flt: What this subscriber watches, and which stream it is on. Evaluated by the
+                publisher before the enqueue. The filter's ``kind`` is what routes it: an
+                :class:`OrderSubscriptionFilter` never sees a ``LogEntry`` and vice versa, so one
+                registry and one per-connection cap serve both streams without either being able to
+                deliver the other's events.
             connection: The WebSocket connection this subscription is multiplexed on — in practice
                 the :class:`~src.graphql.context.Context`, which Strawberry resolves once per
                 socket, so object identity *is* connection identity. Supplying it opts into
@@ -607,7 +777,7 @@ class LogBroker:
     # -- publishing -------------------------------------------------------------------------
 
     async def publish(self, entry: LogEntry) -> int:
-        """Fan ``entry`` out locally and hand it to the Redis bridge. **Never raises, never blocks.**
+        """Fan a **log entry** out locally and hand it to the Redis bridge. Never raises or blocks.
 
         Called from ``createLog`` **after the commit** — see :mod:`src.graphql.mutation` for why
         that ordering is not negotiable.
@@ -621,17 +791,50 @@ class LogBroker:
             How many local subscribers the entry was enqueued to. ``0`` is an ordinary answer — it
             means nobody is watching, or nobody's filter matched.
         """
+        return self._publish(entry, EVENT_KIND_LOG, encode_event)
+
+    async def publish_order_event(self, event: OrderEvent) -> int:
+        """Fan an **order status transition** out — C12's half of spec §3 Feature Area C.
+
+        The exact twin of :meth:`publish`, differing only in the kind tag and the encoder, and
+        carrying every one of that method's guarantees unchanged: no await point, no way to raise,
+        no way for a stalled ``orderStatusStream`` subscriber to add latency to the
+        ``createOrderEvent`` mutation that produced the event. It is called from that mutation
+        **after the commit**, for the reason :mod:`src.graphql.mutation` argues at length.
+
+        Returns:
+            How many local ``orderStatusStream`` subscribers it was enqueued to. Log subscribers
+            are not candidates and are not counted — they are on the other kind.
+        """
+        return self._publish(event, EVENT_KIND_ORDER, encode_order_event)
+
+    def _publish(self, event: PublishedEvent, kind: str, encoder: Any) -> int:
+        """The shared body of the two publish methods. **Never raises, never awaits.**
+
+        Not ``async``, and the two public methods are — which looks backwards until you read the
+        module docstring's note on ``publish``: the *public* coroutines exist so their call sites
+        read ``await broker.publish(...)`` and so a future kind may one day need a real await
+        there, while this contains no suspension point at all. Keeping the sync body separate is
+        what makes "publish never blocks" checkable by reading one function.
+        """
         self._published += 1
-        delivered = self._fan_out(entry)
-        self._schedule_remote(entry)
+        delivered = self._fan_out(event, kind)
+        self._schedule_remote(event, encoder)
         return delivered
 
-    def _fan_out(self, entry: LogEntry) -> int:
-        """Enqueue ``entry`` on every matching live subscriber. **Never raises.**
+    def _fan_out(self, event: PublishedEvent, kind: str) -> int:
+        """Enqueue ``event`` on every live subscriber **of this kind** whose filter matches.
 
         The method invariants 2 and 3 from the module docstring live in. Each subscriber is handled
         inside its own ``try`` so that a full queue or a misbehaving filter costs *that* subscriber
         and nothing else — not the publish, and certainly not the mutation that triggered it.
+
+        ``kind`` is checked before ``matches`` is called and is not part of the filter's own logic.
+        That ordering is load-bearing: an :class:`OrderSubscriptionFilter` handed a
+        :class:`~src.graphql.types.LogEntry` would raise ``AttributeError`` on ``order_id``, the
+        ``except Exception`` below would read that as a broken subscriber, and a healthy order
+        subscription would be dropped the first time anybody wrote a log line. See the section
+        comment above the filters.
         """
         subscribers = self._subscribers
         # Unlocked truthiness check: "nobody is streaming" is the common case by a wide margin, and
@@ -649,10 +852,14 @@ class LogBroker:
         for subscriber in current:
             if subscriber.released:
                 continue
+            if subscriber.filter.kind != kind:
+                # A subscriber on the other stream. Skipped before its filter is consulted — see
+                # the docstring.
+                continue
             try:
-                if not subscriber.filter.matches(entry):
+                if not subscriber.filter.matches(event):
                     continue
-                subscriber.queue.put_nowait(entry)
+                subscriber.queue.put_nowait(event)
                 delivered += 1
             except asyncio.QueueFull:
                 # The entire back-pressure policy, in one branch. This consumer is a full queue
@@ -716,7 +923,9 @@ class LogBroker:
         self.unsubscribe(subscriber)
 
     @staticmethod
-    def _drain(queue: "asyncio.Queue[Optional[LogEntry]]", *, limit: Optional[int] = None) -> int:
+    def _drain(
+        queue: "asyncio.Queue[Optional[PublishedEvent]]", *, limit: Optional[int] = None
+    ) -> int:
         """Discard up to ``limit`` (default: all) queued items; return how many went.
 
         ``get_nowait`` in a loop rather than replacing the queue object, so the identity a parked
@@ -733,8 +942,14 @@ class LogBroker:
 
     # -- the Redis bridge -------------------------------------------------------------------
 
-    def _schedule_remote(self, entry: LogEntry) -> None:
-        """Hand ``entry`` to a background task that PUBLISHes it. Never raises, never awaits."""
+    def _schedule_remote(self, event: PublishedEvent, encoder: Any) -> None:
+        """Hand ``event`` to a background task that PUBLISHes it. Never raises, never awaits.
+
+        ``encoder`` is the kind's envelope writer (:func:`encode_event` or
+        :func:`encode_order_event`), passed down from :meth:`_publish` rather than re-derived from
+        ``type(event)`` here — one decision about which kind this is, made once, at the call site
+        that knows.
+        """
         if self._redis is None or self._stopping:
             return
         try:
@@ -744,14 +959,14 @@ class LogBroker:
             # which is the half that has a live subscriber waiting on it.
             return
 
-        task = loop.create_task(self._publish_remote(entry))
+        task = loop.create_task(self._publish_remote(event, encoder))
         self._pending.add(task)
         task.add_done_callback(self._pending.discard)
 
-    async def _publish_remote(self, entry: LogEntry) -> None:
-        """PUBLISH one entry to the channel. Swallows every failure except cancellation."""
+    async def _publish_remote(self, event: PublishedEvent, encoder: Any) -> None:
+        """PUBLISH one event to the channel. Swallows every failure except cancellation."""
         try:
-            payload = encode_event(entry, origin=self._publisher_id)
+            payload = encoder(event, origin=self._publisher_id)
         except Exception:  # noqa: BLE001 - an unserialisable entry is not a transport failure
             # Counted as an envelope problem rather than a Redis one, and deliberately does NOT
             # flip the health flag: reporting a perfectly healthy bridge as degraded because one
@@ -783,7 +998,9 @@ class LogBroker:
             # publisher, so without this every local subscriber sees each entry twice.
             self._remote_suppressed += 1
             return
-        self._fan_out(decoded.entry)
+        # The kind travels with the decoded envelope rather than being inferred from the Python
+        # object, so a remote order event reaches order subscribers and only those.
+        self._fan_out(decoded.entry, decoded.kind)
 
     async def start(self) -> None:
         """Start the background reader. A no-op with no Redis client, and idempotent.
@@ -957,8 +1174,11 @@ def create_redis_client(settings: Settings) -> Optional["Redis"]:
 __all__ = [
     "EVENT_FORMAT_VERSION",
     "EVENT_KIND_LOG",
+    "EVENT_KIND_ORDER",
     "BrokerStats",
     "LogBroker",
+    "OrderSubscriptionFilter",
+    "PublishedEvent",
     "RemoteEvent",
     "SubscriptionFilter",
     "SubscriptionLimitExceeded",
@@ -966,4 +1186,5 @@ __all__ = [
     "create_redis_client",
     "decode_event",
     "encode_event",
+    "encode_order_event",
 ]

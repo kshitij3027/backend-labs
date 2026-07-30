@@ -1170,6 +1170,56 @@ class LogRepository:
         await self._session.flush()
         return entry
 
+    async def insert_order_event(
+        self,
+        *,
+        order_id: str,
+        user_id: str,
+        status: str,
+        service: str,
+        level: str,
+        timestamp: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+        trace_id: str | None = None,
+    ) -> OrderEventORM:
+        """Insert one order status transition and return it with its generated ``id`` populated.
+
+        C12's write path, and the exact shape of :meth:`insert_log` deliberately: keyword-only
+        (``order_id``, ``user_id``, ``status``, ``service``, ``level`` and ``trace_id`` are six
+        strings in a row, and a positional call site transposing two of them would be accepted by
+        the type checker, accepted by PostgreSQL, and wrong), defaulting ``timestamp`` to now, and
+        **flushing without committing** so the caller owns the transaction boundary.
+
+        That last point is what makes ``createOrderEvent`` able to publish only after the row is
+        durable — see :mod:`src.graphql.mutation`. It is also the seam that would let an order
+        event and the log line describing it land in **one** transaction, which is the reason the
+        commit was left to the caller in the first place.
+
+        No ordering or uniqueness is enforced against the order's existing history, and that is the
+        domain rather than an omission: ``order_events`` is an append-only stream, an out-of-order
+        arrival from a partner feed is data, and "the order's current status" is defined as the
+        status of its newest event rather than as a state machine this table polices.
+        """
+        resolved_timestamp = as_utc(timestamp)
+        if resolved_timestamp is None:
+            resolved_timestamp = datetime.now(timezone.utc)
+
+        event = OrderEventORM(
+            timestamp=resolved_timestamp,
+            service=service,
+            level=level,
+            trace_id=trace_id,
+            order_id=order_id,
+            user_id=user_id,
+            status=status,
+            metadata_=metadata,
+        )
+        self._session.add(event)
+        # Flush, not commit — see `insert_log`. This emits the INSERT so PostgreSQL assigns the
+        # BIGSERIAL id and RETURNING brings it back, while leaving the transaction open.
+        await self._session.flush()
+        return event
+
     # ---------------------------------------------------------------------------------------------
     # C10 — the e-commerce event reads.
     #

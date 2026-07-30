@@ -7,6 +7,20 @@ input CreateLogInput {
   traceId: String = null
 }
 
+"""
+The createOrderEvent payload — one transition in an order's lifecycle. `orderId`, `userId` and `status` are the event; `service` defaults to the order service and `level` is derived from the status (CANCELLED and REFUNDED are WARNING, the rest INFO) so a caller states only what it actually knows.
+"""
+input CreateOrderEventInput {
+  orderId: String!
+  userId: String!
+  status: OrderStatus!
+  service: String = null
+  level: LogLevel = null
+  timestamp: DateTime = null
+  metadata: JSON = null
+  traceId: String = null
+}
+
 """Date with time (isoformat)"""
 scalar DateTime
 
@@ -94,6 +108,11 @@ type LogStats {
 
 type Mutation {
   createLog(logData: CreateLogInput!): LogEntry!
+
+  """
+  Append one status transition to an order's history and return it. This is the event source for `orderStatusStream`: the row is committed FIRST and published to subscribers second, so a streamed transition is always one that durably happened. `service` defaults to the order service and `level` is derived from the status when they are omitted.
+  """
+  createOrderEvent(orderData: CreateOrderEventInput!): OrderEvent!
 }
 
 """
@@ -296,6 +315,11 @@ type Subscription {
   Live log entries, pushed over WebSocket as `createLog` commits them. `service` and `level` are applied SERVER-SIDE, before an entry is queued for this subscriber — so a narrow subscription costs neither bandwidth nor queue depth for traffic it did not ask for. Each subscriber gets its own bounded queue: a client that stops reading long enough to fill it is disconnected with a SLOW_CONSUMER error rather than being buffered without limit, so a gap is always reported and never silent.
   """
   logStream(service: String = null, level: LogLevel = null): LogEntry!
+
+  """
+  Live order status transitions, pushed over WebSocket as `createOrderEvent` commits them. `orderId`, `status` and `userId` are optional and AND-composed, and all three are applied SERVER-SIDE, before an event is queued for this subscriber — so a board watching one customer's order pays neither bandwidth nor queue depth for every other order in the system. Each subscriber gets its own bounded queue: a client that stops reading long enough to fill it is disconnected with a SLOW_CONSUMER error rather than being buffered without limit, so a gap is always reported and never silent.
+  """
+  orderStatusStream(orderId: String = null, status: OrderStatus = null, userId: String = null): OrderEvent!
 }
 
 enum UserActivity {

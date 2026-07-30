@@ -428,7 +428,10 @@ def test_error_count_counts_the_published_error_enum_member() -> None:
 
 def test_the_schema_publishes_a_mutation_root_with_create_log() -> None:
     """Spec §2 item 24. A schema with no ``Mutation`` type makes every write document invalid."""
-    assert set(_field_types("Mutation")) == {"createLog"}
+    # An exact set, not a superset check: a mutation appearing here that nobody meant to publish is
+    # a write path nobody meant to expose, so this assertion is supposed to break when the root
+    # grows. C12 grew it deliberately — `createOrderEvent` is `orderStatusStream`'s event source.
+    assert set(_field_types("Mutation")) == {"createLog", "createOrderEvent"}
     assert _field_types("Mutation")["createLog"] == "LogEntry!", (
         "the spec requires the created object back, and non-null because a successful mutation "
         "always has one — a nullable return would force every client to branch on a case that "
@@ -484,7 +487,9 @@ def test_the_schema_publishes_a_subscription_root_with_log_stream() -> None:
     a ``graphql-transport-ws`` client negotiates a socket successfully and then finds that no
     ``subscribe`` message can ever validate.
     """
-    assert set(_field_types("Subscription")) == {"logStream"}
+    # Exact for the same reason as the Mutation root above. C12 added the second stream (spec §3
+    # Feature Area C), which shares one broker with the first — see src/broker.py's kind routing.
+    assert set(_field_types("Subscription")) == {"logStream", "orderStatusStream"}
     assert _field_types("Subscription")["logStream"] == "LogEntry!", (
         "a streamed entry is never null — a null frame would be a payload a client has to branch "
         "on for a case the server cannot produce"
