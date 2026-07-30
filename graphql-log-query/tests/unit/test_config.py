@@ -54,7 +54,16 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     # Caching
     "cache_enabled": True,
     "cache_ttl_seconds": 30,
+    #: Shared by `logStats` and `paymentOutcomeBreakdown` — the two ADDITIVE aggregates, whose
+    #: counts a single write moves by one out of thousands.
     "agg_cache_ttl_seconds": 60,
+    #: C11's per-aggregation TTL policy (spec §3 Feature Area D). The two numbers below bracket the
+    #: shared one above, and the ordering IS the policy: `orderStatusDistribution` is
+    #: REDISTRIBUTIVE (one event moves an order between buckets, so a stale answer is wrong in two
+    #: places at once) and `orderFunnel` is MONOTONIC (a status once reached is never un-reached, so
+    #: a stale read can only undercount). `src.cache.TTL_POLICY` maps kind -> field.
+    "order_status_agg_ttl_seconds": 20,
+    "funnel_agg_ttl_seconds": 300,
     # Cost gating
     "max_query_depth": 10,
     #: Calibrated so ONE level of `relatedLogs` at DEFAULT_QUERY_LIMIT is admitted (11,110) and

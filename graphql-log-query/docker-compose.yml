@@ -125,7 +125,15 @@ services:
       # --- Caching (C7/C11) ---
       - CACHE_ENABLED=${CACHE_ENABLED:-true}
       - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-30}
+      # The per-aggregation TTL policy (C11). Three numbers rather than one because the three
+      # aggregates go stale differently: the distribution is REDISTRIBUTIVE (one event moves an
+      # order between buckets), logStats and the payment breakdown are ADDITIVE (one write, one
+      # count, +1 out of thousands), and the funnel is MONOTONIC (a stale read can only
+      # undercount). The reasoning table is in .env.example; the kind -> setting map is
+      # src.cache.TTL_POLICY.
       - AGG_CACHE_TTL_SECONDS=${AGG_CACHE_TTL_SECONDS:-60}
+      - ORDER_STATUS_AGG_TTL_SECONDS=${ORDER_STATUS_AGG_TTL_SECONDS:-20}
+      - FUNNEL_AGG_TTL_SECONDS=${FUNNEL_AGG_TTL_SECONDS:-300}
       # --- Cost gating (C8) ---
       - MAX_QUERY_DEPTH=${MAX_QUERY_DEPTH:-10}
       - MAX_QUERY_COMPLEXITY=${MAX_QUERY_COMPLEXITY:-25000}

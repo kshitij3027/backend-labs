@@ -97,8 +97,21 @@ class Settings(BaseSettings):
     #: point-in-time answer, and a long TTL would make "live" data visibly stale in the dashboard.
     cache_ttl_seconds: int = 30
     #: Aggregations get their own, longer TTL: they are far more expensive to compute (SQL GROUP
-    #: BY over the whole window) and far less sensitive to a single new row.
+    #: BY over the whole window) and far less sensitive to a single new row. Shared by
+    #: `Query.logStats` and `Query.paymentOutcomeBreakdown` — see `src.cache.TTL_POLICY`.
     agg_cache_ttl_seconds: int = 60
+    #: `Query.orderStatusDistribution` — the SHORTEST TTL in the system, and deliberately shorter
+    #: than the generic aggregate one. It answers "where does every order stand right now", so a
+    #: single new order event MOVES an order from one bucket to another: the number is not merely
+    #: incremented by a write, it is redistributed by one. That is the dashboard panel an operator
+    #: watches during an incident, so it gets the tightest staleness bound any cached read has.
+    order_status_agg_ttl_seconds: int = 20
+    #: `Query.orderFunnel` — the LONGEST, for the opposite reason. The funnel counts orders that
+    #: have EVER reached each status, so it is monotonic: a status once reached is never
+    #: un-reached, and a stale answer can only ever undercount by the orders that moved during the
+    #: window. It is also the most expensive of the three (a COUNT DISTINCT per group over the
+    #: whole window), so it is the one where a long TTL buys the most.
+    funnel_agg_ttl_seconds: int = 300
 
     # --- Cost gating (C8) -----------------------------------------------------------------
     #: Maximum operation nesting depth. GraphQL's cyclic type graph means a client can otherwise
@@ -226,7 +239,12 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("cache_ttl_seconds", "agg_cache_ttl_seconds")
+    @field_validator(
+        "cache_ttl_seconds",
+        "agg_cache_ttl_seconds",
+        "order_status_agg_ttl_seconds",
+        "funnel_agg_ttl_seconds",
+    )
     @classmethod
     def _check_cache_ttl(cls, value: int) -> int:
         """Refuse a negative TTL — Redis has no expiry that means "in the past"."""

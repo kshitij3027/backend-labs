@@ -88,6 +88,14 @@ from strawberry.dataloader import DataLoader
 from src.config import Settings
 from src.db.models import LogEntryORM
 from src.db.repository import LogRepository
+
+# C11. This module sits BELOW `src.graphql.ecommerce` in the import graph and above
+# `src.graphql.types`: the event types import the interface and the enums and nothing else, and in
+# particular they do NOT import this module (their resolvers reach the loaders through
+# `info.context.loaders`, resolved at call time). So `loaders -> ecommerce -> types` is acyclic, and
+# the projections below can be the same `from_orm` classmethods every other read path uses rather
+# than a second mapping written here.
+from src.graphql.ecommerce import OrderEvent, PaymentEvent, UserEvent
 from src.graphql.types import LogEntry
 
 #: How a registry gets a repository for one batch. Deliberately a *factory of context managers*
@@ -108,57 +116,104 @@ RepositoryProvider = Callable[[], AbstractAsyncContextManager[LogRepository]]
 # =================================================================================================
 
 
-def group_logs_by_trace_id(
-    rows: Sequence[LogEntryORM],
-    keys: Sequence[str],
+def group_rows_by_key(
+    rows: Sequence[Any],
+    keys: Sequence[Any],
+    key_of: Callable[[Any], Any],
+    project: Callable[[Any], Any],
     *,
     max_per_key: Optional[int] = None,
-) -> list[list[LogEntry]]:
-    """Bucket ``rows`` by ``trace_id`` and return one bucket per key, **in key order**.
+) -> list[list[Any]]:
+    """Bucket ``rows`` by ``key_of(row)`` and return one bucket per key, **in key order**.
+
+    THE list-shaped half of the ordering contract, written once. C5 had one of these; C11 has seven
+    edges (order -> payments, order -> user activity, user -> orders, and four correlation lookups)
+    and seven copies of this loop would be seven chances to write ``grouped[key]`` where
+    ``grouped.get(key)`` was meant — a mistake that raises on the *first* unexpected row rather than
+    quietly, but which in the other direction (dropping the ``is None`` guard) silently buckets
+    every uncorrelated row under one key.
 
     Args:
-        rows: What :meth:`~src.db.repository.LogRepository.list_logs_by_trace_ids` returned — a
-            flat list covering every key, newest first. Rows whose ``trace_id`` is not among the
-            keys are ignored rather than treated as an error; the query cannot produce them, and
-            silently dropping one is better than failing a whole operation if it ever does.
+        rows: What the batched repository read returned — a flat list covering every key, newest
+            first. Rows whose key is not among ``keys`` are ignored rather than treated as an
+            error; the query cannot produce them, and silently dropping one is better than failing
+            a whole operation if it ever does.
         keys: The batch, in the order the loader was called in. The result is aligned to **this**.
+        key_of: How to read the grouping key off a row. Returning ``None`` means "this row belongs
+            to no group" and the row is skipped — which is the ``trace_id IS NULL`` case, and the
+            reason this is not simply ``getattr``.
+        project: How to turn a row into the published type. Applied **inside** the batch, while the
+            rows are still attached to the session that loaded them.
         max_per_key: Optional per-bucket ceiling, applied to the newest entries because the rows
             arrive newest first. Passed ``MAX_QUERY_LIMIT`` by :class:`LoaderRegistry`, so the
-            "every list a client can select is capped" rule (spec §2 item 22) covers this field
-            too. ``None`` means uncapped, which is what the unit tests use.
+            "every list a client can select is capped" rule (spec §2 item 22) covers these nested
+            fields too. ``None`` means uncapped, which is what the unit tests use.
 
     Returns:
         ``len(keys)`` lists. A key with no rows gets ``[]`` — the empty list is the answer, not a
         missing entry. A key that appears twice gets the **same list object** at both positions, so
         callers must treat the result as read-only (``LogEntry.related_logs`` builds a new list).
     """
-    grouped: dict[str, list[LogEntry]] = {key: [] for key in keys}
+    grouped: dict[Any, list[Any]] = {key: [] for key in keys}
 
     for row in rows:
-        trace_id = row.trace_id
-        if trace_id is None:
+        key = key_of(row)
+        if key is None:
             continue
-        bucket = grouped.get(trace_id)
+        bucket = grouped.get(key)
         if bucket is None:
             continue
         if max_per_key is not None and len(bucket) >= max_per_key:
             continue
-        bucket.append(LogEntry.from_orm(row))
+        bucket.append(project(row))
 
     return [grouped[key] for key in keys]
+
+
+def align_rows_by_key(
+    rows: Sequence[Any],
+    keys: Sequence[Any],
+    key_of: Callable[[Any], Any],
+    project: Callable[[Any], Any],
+) -> list[Optional[Any]]:
+    """Index ``rows`` by ``key_of(row)`` and return one value per key, **in key order**.
+
+    The single-valued half of the contract. ``None`` at any position whose key had no row, which is
+    what lets a by-id field answer ``null`` for a miss with no ``errors`` entry — absence is an
+    ordinary answer to "is there a row with this id", not a failure.
+    """
+    by_key = {key_of(row): project(row) for row in rows}
+    return [by_key.get(key) for key in keys]
+
+
+def group_logs_by_trace_id(
+    rows: Sequence[LogEntryORM],
+    keys: Sequence[str],
+    *,
+    max_per_key: Optional[int] = None,
+) -> list[list[LogEntry]]:
+    """Bucket log rows by ``trace_id`` and return one bucket per key, **in key order**.
+
+    The named form of :func:`group_rows_by_key` for the field that started all this
+    (``LogEntry.relatedLogs``, spec §2 item 17). It stays a named function rather than becoming a
+    call site because the ``trace_id`` / :meth:`LogEntry.from_orm` pairing is a fact about this
+    schema, and because C5's unit tests are written against this name.
+    """
+    return group_rows_by_key(
+        rows, keys, lambda row: row.trace_id, LogEntry.from_orm, max_per_key=max_per_key
+    )
 
 
 def align_logs_by_id(
     rows: Sequence[LogEntryORM], keys: Sequence[int]
 ) -> list[Optional[LogEntry]]:
-    """Index ``rows`` by primary key and return one entry per key, **in key order**.
+    """Index log rows by primary key and return one entry per key, **in key order**.
 
     ``None`` at any position whose id had no row. That is what makes ``Query.log(id:)`` able to
     answer ``null`` for a miss with no ``errors`` entry, exactly as it did before the loader existed
     — see its resolver for why absence is an ordinary answer rather than a ``NOT_FOUND``.
     """
-    by_id = {row.id: LogEntry.from_orm(row) for row in rows}
-    return [by_id.get(key) for key in keys]
+    return align_rows_by_key(rows, keys, lambda row: row.id, LogEntry.from_orm)
 
 
 # =================================================================================================
@@ -342,6 +397,39 @@ class LoaderRegistry:
             different row.
         log_by_id: ``id -> LogEntry | None`` — behind ``Query.log(id:)``, so a document selecting
             several entries by id costs one statement rather than one per alias.
+
+    .. rubric:: C11 — twelve loaders, because the requirement is "all entity types, not just logs"
+
+    Spec §3 Feature Area D asks for the batching to cover every entity, and the surface below is
+    that requirement enumerated: a **by-id** loader per type (three), a **by-foreign-key** loader
+    per published edge (four), and a **by-trace-id** loader per type (four, counting the log one
+    C5 already had). Every nested field in :mod:`src.graphql.ecommerce` and every branch of
+    ``Query.correlatedEvents`` goes through exactly one of them, so there is no traversal in the
+    schema that reaches the database any other way.
+
+    They are all the same three lines, and that is the point: one repository call that dedupes its
+    keys into a single ``IN (...)``, and one pure re-alignment. Where a naive implementation of the
+    nested fields would issue one SELECT per parent, a page of N orders selecting payments, user
+    activity and correlated log lines costs **four** statements at any N — asserted at two values
+    of N in ``tests/integration/test_cross_entity_loaders.py``, because a number that grows with N
+    is an N+1 wearing a smaller constant.
+
+    Attributes:
+        order_event_by_id: ``id -> OrderEvent | None`` — behind ``Query.orderEvent(id:)``.
+        payment_event_by_id: ``id -> PaymentEvent | None`` — behind ``Query.paymentEvent(id:)``.
+        user_event_by_id: ``id -> UserEvent | None`` — behind ``Query.userEvent(id:)``.
+        order_events_by_order_id: ``order_id -> list[OrderEvent]`` — one order's whole history,
+            newest first. ``PaymentEvent.order`` reads the head of it, which is why there is no
+            separate "latest status" loader: a second loader over the same key would be a second
+            statement for a row this one already fetched.
+        order_events_by_user_id: ``user_id -> list[OrderEvent]`` — behind ``UserEvent.orders``.
+        order_events_by_trace_id: ``trace_id -> list[OrderEvent]`` — one branch of
+            ``Query.correlatedEvents``.
+        payment_events_by_order_id: ``order_id -> list[PaymentEvent]`` — behind
+            ``OrderEvent.payments``.
+        payment_events_by_trace_id: ``trace_id -> list[PaymentEvent]``.
+        user_events_by_user_id: ``user_id -> list[UserEvent]`` — behind ``OrderEvent.userActivity``.
+        user_events_by_trace_id: ``trace_id -> list[UserEvent]``.
     """
 
     def __init__(
@@ -380,6 +468,41 @@ class LoaderRegistry:
             load_fn=self.load_log_by_id,
             batch_window_ms=self._batch_window_ms,
         )
+
+        # C11 — the cross-entity loaders. Built here rather than lazily on first use because a
+        # DataLoader binds the running event loop when it is constructed (see the note on this
+        # method's docstring), and "the registry is built inside on_operation" is the one place that
+        # is guaranteed to be true.
+        self.order_event_by_id: DataLoader = self._build(self.load_order_event_by_id)
+        self.payment_event_by_id: DataLoader = self._build(self.load_payment_event_by_id)
+        self.user_event_by_id: DataLoader = self._build(self.load_user_event_by_id)
+
+        self.order_events_by_order_id: DataLoader = self._build(
+            self.load_order_events_by_order_id
+        )
+        self.order_events_by_user_id: DataLoader = self._build(self.load_order_events_by_user_id)
+        self.order_events_by_trace_id: DataLoader = self._build(
+            self.load_order_events_by_trace_id
+        )
+
+        self.payment_events_by_order_id: DataLoader = self._build(
+            self.load_payment_events_by_order_id
+        )
+        self.payment_events_by_trace_id: DataLoader = self._build(
+            self.load_payment_events_by_trace_id
+        )
+
+        self.user_events_by_user_id: DataLoader = self._build(self.load_user_events_by_user_id)
+        self.user_events_by_trace_id: DataLoader = self._build(self.load_user_events_by_trace_id)
+
+    def _build(self, load_fn: Any) -> DataLoader:  # noqa: ANN401 - any batch load function
+        """One :class:`WindowedDataLoader` over ``load_fn``, with this registry's batch window.
+
+        A one-line helper so the window cannot be attached to nine of the ten loaders — which is
+        the kind of omission that produces a field that is *nearly* batched and a test that still
+        passes because the default window is zero.
+        """
+        return WindowedDataLoader(load_fn=load_fn, batch_window_ms=self._batch_window_ms)
 
     @classmethod
     def from_session(
@@ -434,11 +557,130 @@ class LoaderRegistry:
             rows = await repository.get_logs_by_ids(keys)
             return align_logs_by_id(rows, keys)
 
+    # =============================================================================================
+    # C11 — the cross-entity batch load functions.
+    #
+    # Every one is the same four lines and every one honours the same contract: enter the
+    # repository provider (so "which session does this batch run on" is answered in ONE place, by
+    # `Context.repository`), issue ONE statement, project INSIDE the block while the rows are still
+    # attached, and re-align the flat result onto the keys with a pure function.
+    #
+    # `max_per_key=MAX_QUERY_LIMIT` on every grouped loader is not decoration: spec §2 item 22 says
+    # the cap applies on every query path, and a nested list is a path. Without it, `OrderEvent
+    # .userActivity` on a user with ten thousand events would put all of them on the wire for every
+    # order on the page — a list a client cannot bound, which is precisely the shape the cap exists
+    # for. The by-id loaders take no cap because their key IS the bound.
+    # =============================================================================================
+
+    async def load_order_event_by_id(self, keys: list[int]) -> list[Optional[OrderEvent]]:
+        """Load each order event named in ``keys`` — **one statement for the whole batch**."""
+        async with self._repository() as repository:
+            rows = await repository.get_order_events_by_ids(keys)
+            return align_rows_by_key(rows, keys, lambda row: row.id, OrderEvent.from_orm)
+
+    async def load_payment_event_by_id(self, keys: list[int]) -> list[Optional[PaymentEvent]]:
+        """Load each payment event named in ``keys`` — **one statement for the whole batch**."""
+        async with self._repository() as repository:
+            rows = await repository.get_payment_events_by_ids(keys)
+            return align_rows_by_key(rows, keys, lambda row: row.id, PaymentEvent.from_orm)
+
+    async def load_user_event_by_id(self, keys: list[int]) -> list[Optional[UserEvent]]:
+        """Load each user event named in ``keys`` — **one statement for the whole batch**."""
+        async with self._repository() as repository:
+            rows = await repository.get_user_events_by_ids(keys)
+            return align_rows_by_key(rows, keys, lambda row: row.id, UserEvent.from_orm)
+
+    async def load_order_events_by_order_id(self, keys: list[str]) -> list[list[OrderEvent]]:
+        """One order's history per key, newest first — **one statement for the whole batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_order_events_by_order_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.order_id,
+                OrderEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_order_events_by_user_id(self, keys: list[str]) -> list[list[OrderEvent]]:
+        """Every order event placed by each user in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_order_events_by_user_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.user_id,
+                OrderEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_order_events_by_trace_id(self, keys: list[str]) -> list[list[OrderEvent]]:
+        """Every order event carrying each trace in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_order_events_by_trace_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.trace_id,
+                OrderEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_payment_events_by_order_id(self, keys: list[str]) -> list[list[PaymentEvent]]:
+        """Every payment event for each order in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_payment_events_by_order_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.order_id,
+                PaymentEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_payment_events_by_trace_id(self, keys: list[str]) -> list[list[PaymentEvent]]:
+        """Every payment event carrying each trace in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_payment_events_by_trace_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.trace_id,
+                PaymentEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_user_events_by_user_id(self, keys: list[str]) -> list[list[UserEvent]]:
+        """Every activity event for each user in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_user_events_by_user_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.user_id,
+                UserEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
+    async def load_user_events_by_trace_id(self, keys: list[str]) -> list[list[UserEvent]]:
+        """Every activity event carrying each trace in ``keys`` — **one statement for the batch**."""
+        async with self._repository() as repository:
+            rows = await repository.list_user_events_by_trace_ids(keys)
+            return group_rows_by_key(
+                rows,
+                keys,
+                lambda row: row.trace_id,
+                UserEvent.from_orm,
+                max_per_key=self._settings.max_query_limit,
+            )
+
 
 __all__ = [
     "LoaderRegistry",
     "RepositoryProvider",
     "WindowedDataLoader",
     "align_logs_by_id",
+    "align_rows_by_key",
     "group_logs_by_trace_id",
+    "group_rows_by_key",
 ]

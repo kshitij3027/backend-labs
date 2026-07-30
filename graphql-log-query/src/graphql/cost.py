@@ -62,6 +62,21 @@ projection on *both* levels past 34 parents (``10 + N × 717 > 25,000`` at ``N =
 below are calibrated against that boundary; ``.env.example`` carries the same table for operators,
 and ``tests/unit/test_cost.py`` pins both of its sides so neither can move unnoticed.
 
+.. rubric:: C11: the same budget, unchanged, now also gating the e-commerce traversals
+
+Spec §3 Feature Area D asks for "complexity analysis tuned so deep nested e-commerce queries are
+rejected", and the tuning turned out to be **weights only** — ``MAX_QUERY_COMPLEXITY`` did not move
+and did not need to, which is worth stating because widening a budget to admit a query one has just
+made expensive is the failure C8 already met once. The nested traversals
+(``OrderEvent.payments`` / ``.userActivity`` / ``.relatedLogs``, ``UserEvent.orders``,
+``PaymentEvent.order``) are each one batched indexed read, so they are each priced at 10 — exactly
+what ``LogEntry.relatedLogs`` costs, because it is exactly the same work — and the multiplication
+does the rest. One traversal over a full page is 11,010 and runs; three of them over a full page is
+33,010 and does not; the flagship dossier declares ``limit: 10`` and prices at 10,360. The
+three cached aggregates carry an explicit ``size`` (7, 7 and 20 — their vocabularies) because a
+``GROUP BY`` returns one row per bucket rather than one per matching row, so the whole dashboard
+query prices at 220. Every one of those numbers is pinned in ``tests/unit/test_ecommerce_cost.py``.
+
 .. rubric:: THE MOST IMPORTANT LINE IN THIS FILE: an omitted bound is not a free query
 
 ``LogEntry.relatedLogs`` takes **no client-supplied size argument at all**, and ``logs`` may omit
@@ -237,11 +252,87 @@ DEFAULT_WEIGHTS: Mapping[str, FieldCost] = MappingProxyType(
         #: service } }` therefore prices at 40 + 2 x 100 = 240, comfortably inside the 25,000 budget
         #: and comfortably above a scalar.
         "Query.correlatedEvents": FieldCost(weight=40),
+        # --- Query roots: the C11 by-id entry points ----------------------------------------------
+        #
+        #: One row by primary key, batched with its siblings by the per-operation DataLoader —
+        #: deliberately the same weight as `Query.log`, which does exactly the same work against a
+        #: table with exactly the same primary key. Pricing them differently would be a claim about
+        #: relative cost that nothing has measured.
+        "Query.orderEvent": FieldCost(weight=5),
+        "Query.paymentEvent": FieldCost(weight=5),
+        "Query.userEvent": FieldCost(weight=5),
+        # --- Query roots: the C11 cached aggregates (spec §3 Feature Area D) -----------------------
+        #
+        # ALL THREE CARRY AN EXPLICIT `size`, and that is what makes them affordable. They are lists
+        # the SERVER sizes rather than the client: the row count of a GROUP BY over a controlled
+        # vocabulary is bounded by the VOCABULARY, never by the corpus. Without a `size` each would
+        # inherit the DEFAULT_QUERY_LIMIT assumption and the three-panel dashboard query would price
+        # at roughly fourteen times what it costs — a gate rejecting the dashboard it was built for,
+        # which is the exact miscalibration C8's budget of 1000 already made once. The sizes are
+        # pinned against `len(OrderStatus)` and `len(PaymentMethod) x len(PaymentOutcome)` by a unit
+        # test rather than trusted, because an enum gaining a member has to move them.
+        #
+        #: DISTINCT ON over the order stream and then a GROUP BY over the result — one pass with a
+        #: per-order seek, i.e. a shade more work than `logStats`' pair of scans. 7 OrderStatus
+        #: members, so at most 7 buckets whatever the corpus size.
+        "Query.orderStatusDistribution": FieldCost(weight=35, size=7),
+        #: A COUNT(DISTINCT order_id) per group — the most expensive of the three, because a
+        #: distinct count needs a sort or a hash per group where COUNT(*) needs a counter. Same 7
+        #: buckets.
+        "Query.orderFunnel": FieldCost(weight=40, size=7),
+        #: One GROUP BY with a plain and a distinct count in the same pass — the same shape as
+        #: `logStats`, hence the same weight. Bounded by 5 methods x 4 outcomes = 20 cells.
+        "Query.paymentOutcomeBreakdown": FieldCost(weight=30, size=20),
         # --- LogEntry ----------------------------------------------------------------------------
         #: The correlated lookup. C5's DataLoader collapses N of these into one statement, so the
         #: weight prices rows rather than round trips: batching bounds the number of queries, not
         #: the number of entries a trace group can contain.
         "LogEntry.relatedLogs": FieldCost(weight=10),
+        # --- C11: the nested e-commerce traversals (spec §3 Feature Areas B and D) -----------------
+        #
+        # THE GRADIENT SPEC §3 FEATURE AREA D ASKS FOR ("complexity analysis tuned so deep nested
+        # e-commerce queries are rejected") IS ALREADY IN THE MODEL — nesting MULTIPLIES — so what
+        # these weights have to do is make one level affordable and two levels not. They are all 10,
+        # the same as `LogEntry.relatedLogs`, and the sameness is the calibration rather than
+        # laziness: every one of them is one batched `WHERE <key> IN (…)` against an indexed column,
+        # which is the identical unit of work, and pricing identical work differently would put a
+        # number in the table that no measurement supports.
+        #
+        # None carries a `size`. Every one of these lists is unbounded from the client's side — an
+        # order can have any number of payment events, a user any number of activities — so they
+        # take THE default assumption (DEFAULT_QUERY_LIMIT rows), exactly as `relatedLogs` does and
+        # for the reason the module docstring calls the most important line in the file: an omitted
+        # bound is not a free query. Giving them a small `size` because the seeded corpus happens to
+        # produce three payments per order would price the corpus rather than the schema.
+        #
+        # WHAT THIS BUYS, at the shipped 25,000 with DEFAULT_QUERY_LIMIT = 100 (arithmetic pinned in
+        # `tests/unit/test_ecommerce_cost.py`, both sides of the boundary):
+        #   ADMITTED  { orderEvents { payments { id } } }                      11,010
+        #   ADMITTED  the flagship dossier at limit 10                         10,360
+        #   REJECTED  { orderEvents { payments { id } userActivity { id }
+        #                             relatedLogs { id } } }                   33,010
+        #   REJECTED  { orderEvents { payments { order { payments { id } } } } } 1,151,010
+        # The middle two are the interesting pair: three traversals over a hundred parents is
+        # refused, and the same three over ten is served. That is the gate doing its job rather than
+        # a wall — the fix a client is told to apply is `limit`, and it works.
+        #
+        #: The order -> payments edge. One batched read of an order's payment stream.
+        "OrderEvent.payments": FieldCost(weight=10),
+        #: The order -> user edge, traversed into that user's activity stream.
+        "OrderEvent.userActivity": FieldCost(weight=10),
+        #: The correlation edge into `log_entries` — the SAME loader `LogEntry.relatedLogs` uses, so
+        #: deliberately the same weight. A client selecting both must be charged the same for each.
+        "OrderEvent.relatedLogs": FieldCost(weight=10),
+        #: The payment -> order edge. NOT a list — it is the head of the order's history — so it
+        #: multiplies nothing further and is priced like the other single-row batched lookups.
+        #: That makes it the cheapest field in this block and the most dangerous one, because it is
+        #: what lets a document alternate `payments { order { payments { … } } }` and multiply
+        #: without ever selecting a list twice in a row. The budget catches that at 1,111,010.
+        "PaymentEvent.order": FieldCost(weight=5),
+        "PaymentEvent.relatedLogs": FieldCost(weight=10),
+        #: The order -> user edge read from the user's side.
+        "UserEvent.orders": FieldCost(weight=10),
+        "UserEvent.relatedLogs": FieldCost(weight=10),
         # --- LogStats: lists whose length the server, not the client, decides -------------------
         #: Bounded by the number of distinct services in the window (the generated corpus has a
         #: handful). Conservative rather than exact, because it is an assumption either way.

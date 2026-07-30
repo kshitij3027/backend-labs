@@ -255,6 +255,12 @@ def test_order_event_publishes_its_status_and_both_identifiers() -> None:
         "userId": "String!",
         "status": "OrderStatus!",
         "metadata": "JSON",
+        # C11 (spec §3 Feature Area B). Three traversals, each non-null and each a non-null list:
+        # "this order has no payment events" is `[]`, never `null`, because a nullable list would
+        # give a client two spellings of one fact.
+        "payments": "[PaymentEvent!]!",
+        "userActivity": "[UserEvent!]!",
+        "relatedLogs": "[LogEntry!]!",
     }
 
 
@@ -270,6 +276,11 @@ def test_payment_event_publishes_its_method_and_outcome() -> None:
         "method": "PaymentMethod!",
         "outcome": "PaymentOutcome!",
         "metadata": "JSON",
+        # C11. `order` is NULLABLE and singular, and both halves are deliberate: it is the newest
+        # transition of the order this payment names, and a payment ingested for an order this
+        # store has not seen yet is data rather than an error.
+        "order": "OrderEvent",
+        "relatedLogs": "[LogEntry!]!",
     }
 
 
@@ -284,23 +295,84 @@ def test_user_event_publishes_its_activity_type() -> None:
         "userId": "String!",
         "activityType": "UserActivity!",
         "metadata": "JSON",
+        # C11 — the order -> user edge read from the user's side.
+        "orders": "[OrderEvent!]!",
+        "relatedLogs": "[LogEntry!]!",
     }
 
 
 @pytest.mark.parametrize("type_name", ["OrderEvent", "PaymentEvent", "UserEvent"])
-def test_the_new_types_publish_no_list_field_yet(type_name: str) -> None:
-    """C11 owns nested traversal, and a nested list without a cost weight is a gate hole.
+def test_every_traversal_field_on_an_event_type_carries_an_explicit_cost_weight(
+    type_name: str,
+) -> None:
+    """The C10 tripwire, INVERTED by C11 rather than deleted — it still guards the same hole.
 
-    ``OrderEvent.payments`` and friends land in C11 **with** their DataLoaders and **with** rows in
-    ``DEFAULT_WEIGHTS``. This test is the tripwire: adding one here without the other two makes the
-    suite red rather than making the cost gate quietly cheaper.
+    Until C11 these types had no fields with a sub-selection at all, so the tripwire could be
+    spelled "assert there are no list fields": adding ``OrderEvent.payments`` without a
+    ``DEFAULT_WEIGHTS`` row would fail here rather than make the cost gate quietly cheaper. C11
+    added seven such fields, so the *spelling* had to change — but not the guarantee, which is what
+    a relaxation would have thrown away.
+
+    So the assertion is now the one the C10 version was standing in for: **every field on these
+    types that has a sub-selection is weighted**. A traversal with no entry is priced at
+    ``DEFAULT_FIELD_WEIGHT`` — 1 — which is a hole rather than a neutral default, because the
+    expensive part of ``payments`` is the batched read itself and a weight of 1 makes it
+    indistinguishable from selecting a scalar. The check walks the **schema**, so a field added in
+    C12 or C13 without a weight fails here rather than surviving until somebody prices a document
+    by hand.
+
+    Scalars are exempt on purpose: ``orderId`` costs its one unit per row and nothing else, and
+    weighting every leaf would be a table nobody could read.
     """
-    lists = [name for name, rendered in _field_types(type_name).items() if "[" in rendered]
+    record = _introspect(type_name)
+    traversals = [
+        field["name"]
+        for field in record["fields"]
+        # A field whose named type is one of ours (rather than a scalar or an enum) is a traversal:
+        # it reaches another table. Rendered types are strings like `[PaymentEvent!]!`.
+        if any(
+            owner in _render_type(field["type"])
+            for owner in ("OrderEvent", "PaymentEvent", "UserEvent", "LogEntry")
+        )
+    ]
 
-    assert lists == [], (
-        f"{type_name} gained the list field(s) {lists}; add a src.graphql.cost.DEFAULT_WEIGHTS "
-        "entry and a batching DataLoader before relaxing this test"
+    assert traversals, f"{type_name} publishes no traversal fields, so this test proves nothing"
+
+    unweighted = [
+        name
+        for name in traversals
+        if f"{type_name}.{name}" not in DEFAULT_WEIGHTS and name not in DEFAULT_WEIGHTS
+    ]
+
+    assert unweighted == [], (
+        f"these {type_name} traversals have no src.graphql.cost.DEFAULT_WEIGHTS entry and are "
+        f"priced at the default weight of 1: {unweighted}. Add a weight AND a batching DataLoader "
+        "before relaxing this test."
     )
+
+
+@pytest.mark.parametrize(
+    ("type_name", "field_name"),
+    [
+        ("OrderEvent", "payments"),
+        ("OrderEvent", "userActivity"),
+        ("OrderEvent", "relatedLogs"),
+        ("PaymentEvent", "order"),
+        ("PaymentEvent", "relatedLogs"),
+        ("UserEvent", "orders"),
+        ("UserEvent", "relatedLogs"),
+    ],
+)
+def test_every_nested_traversal_takes_no_arguments(type_name: str, field_name: str) -> None:
+    """A traversal is reached by the parent's own key, so there is nothing for a client to pass.
+
+    Worth pinning rather than assuming: the moment one of these grows a ``filters`` or ``limit``
+    argument it stops being batchable by a plain key — two parents asking for the same key with
+    different arguments would need two batches — and the DataLoader would start silently serving
+    the first caller's arguments to the second. If such an argument is ever wanted, the key has to
+    become ``(key, arguments)`` and this test is where that decision gets recorded.
+    """
+    assert _args(type_name, field_name) == {}
 
 
 # --- The enums ------------------------------------------------------------------------------------
@@ -547,6 +619,68 @@ def test_every_list_field_on_the_query_root_carries_an_explicit_cost_weight() ->
         f"these Query list fields have no src.graphql.cost.DEFAULT_WEIGHTS entry and are priced "
         f"at the default weight of 1: {unweighted}"
     )
+
+
+def test_the_c11_by_id_entry_points_are_published_and_nullable() -> None:
+    """One row by id per event type, ``null`` for a miss — mirroring ``Query.log(id:)`` exactly.
+
+    Nullable rather than non-null: absence is an ordinary answer to "is there a row with this id",
+    and a non-null field would force the resolver to raise a ``NOT_FOUND`` for a question a client
+    asked perfectly reasonably.
+    """
+    query_fields = _field_types("Query")
+
+    assert query_fields["orderEvent"] == "OrderEvent"
+    assert query_fields["paymentEvent"] == "PaymentEvent"
+    assert query_fields["userEvent"] == "UserEvent"
+    for field_name in ("orderEvent", "paymentEvent", "userEvent"):
+        assert _args("Query", field_name) == {"id": "ID!"}
+
+
+def test_the_c11_aggregates_are_published_as_non_null_lists_with_optional_filters() -> None:
+    """The three panels a C13 dashboard draws, selectable in ONE document.
+
+    Three root fields rather than one ``ecommerceStats`` object, because spec §3 Feature Area D
+    asks for a TTL policy defined *per aggregation* and a single object field is a single cache
+    entry with a single TTL. Three fields is not three round trips — a client selects all three in
+    one query and gets one ``data`` object, which is exactly Feature Area E's "multi-series
+    analytics from a single query result".
+
+    ``filters`` is optional on all three, so "omitted filters are ignored" starts at the argument;
+    and each takes the **same** input type as the flat list field over the same table, which is what
+    makes an aggregate and the rows beneath it unable to disagree about what a filter means.
+    """
+    query_fields = _field_types("Query")
+
+    assert query_fields["orderStatusDistribution"] == "[OrderStatusCount!]!"
+    assert query_fields["orderFunnel"] == "[FunnelStage!]!"
+    assert query_fields["paymentOutcomeBreakdown"] == "[PaymentOutcomeCount!]!"
+
+    assert _args("Query", "orderStatusDistribution") == {"filters": "OrderEventFilterInput"}
+    assert _args("Query", "orderFunnel") == {"filters": "OrderEventFilterInput"}
+    assert _args("Query", "paymentOutcomeBreakdown") == {"filters": "PaymentEventFilterInput"}
+
+
+def test_the_aggregate_types_publish_enums_rather_than_strings() -> None:
+    """A bucket's dimension is the same enum the filter takes, or the two cannot be joined.
+
+    If ``OrderStatusCount.status`` were a ``String`` a dashboard could render the distribution but
+    could not feed a bucket straight back into ``orderEvents(filters: {status: …})`` — the click
+    on a bar would need a client-side mapping between two vocabularies that are the same
+    vocabulary.
+    """
+    assert _field_types("OrderStatusCount") == {"status": "OrderStatus!", "orders": "Int!"}
+    assert _field_types("FunnelStage") == {
+        "status": "OrderStatus!",
+        "ordersReached": "Int!",
+        "share": "Float!",
+    }
+    assert _field_types("PaymentOutcomeCount") == {
+        "method": "PaymentMethod!",
+        "outcome": "PaymentOutcome!",
+        "events": "Int!",
+        "orders": "Int!",
+    }
 
 
 @pytest.mark.parametrize(

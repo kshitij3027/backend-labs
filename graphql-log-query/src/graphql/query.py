@@ -44,14 +44,28 @@ could notice.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import datetime
 from typing import Optional
 
 import strawberry
 
-from src.cache import cached_log_stats, cached_logs
-from src.db.repository import LogQuery, LogStatsResult, clamp_limit
+from src.cache import (
+    cached_log_stats,
+    cached_logs,
+    cached_order_funnel,
+    cached_order_status_distribution,
+    cached_payment_outcome_breakdown,
+)
+from src.db.repository import (
+    FunnelBucket,
+    LogQuery,
+    LogStatsResult,
+    OrderStatusBucket,
+    PaymentOutcomeBucket,
+    clamp_limit,
+)
 from src.graphql import errors
 from src.graphql.context import Context
 
@@ -61,7 +75,14 @@ from src.graphql.context import Context
 # `errors.` qualifier on the second is what makes the translation visible at the point it happens
 # rather than hidden behind two identical-looking names. See src/graphql/cursor.py.
 from src.graphql.cursor import InvalidCursorError, decode_cursor, encode_cursor
-from src.graphql.ecommerce import OrderEvent, PaymentEvent, UserEvent
+from src.graphql.ecommerce import (
+    FunnelStage,
+    OrderEvent,
+    OrderStatusCount,
+    PaymentEvent,
+    PaymentOutcomeCount,
+    UserEvent,
+)
 from src.graphql.inputs import (
     LogFilterInput,
     OrderEventFilterInput,
@@ -83,7 +104,7 @@ from src.graphql.types import (
 from src.graphql.validation import validate_time_range, validate_trace_id
 
 
-def _parse_log_id(raw: str) -> int:
+def _parse_entity_id(raw: str, type_name: str) -> int:
     """Turn a GraphQL ``ID`` into the ``BIGSERIAL`` primary key it names.
 
     ``ID`` is a string on the wire, and the ids this server issues are decimal integers. Anything
@@ -91,6 +112,11 @@ def _parse_log_id(raw: str) -> int:
     of being folded into "not found": returning ``null`` for ``log(id: "abc")`` would tell a client
     with a broken id-building bug that the row simply does not exist, and it would go on believing
     that forever.
+
+    ``type_name`` is in the message rather than inferred, because the four by-id fields read four
+    **different** BIGSERIAL sequences: ``LogEntry`` 42 and ``OrderEvent`` 42 are two rows in two
+    tables that happen to have reached the same number, and an error that did not say which type it
+    was talking about would be actively misleading to a client juggling both.
 
     Raises:
         src.graphql.errors.ValidationError: If ``raw`` is not a run of digits. C4 gave this the
@@ -101,9 +127,14 @@ def _parse_log_id(raw: str) -> int:
     """
     if not raw.isascii() or not raw.isdigit():
         raise errors.ValidationError(
-            f"invalid LogEntry id {raw!r}: ids issued by this server are decimal integers"
+            f"invalid {type_name} id {raw!r}: ids issued by this server are decimal integers"
         )
     return int(raw)
+
+
+def _parse_log_id(raw: str) -> int:
+    """``_parse_entity_id`` for ``LogEntry`` — the spelling C3's ``Query.log`` was written against."""
+    return _parse_entity_id(raw, "LogEntry")
 
 
 @strawberry.type
@@ -458,16 +489,31 @@ class Query:
         table's own ``trace_id`` index for as cleanly. Four indexed equality reads on four small
         result sets is the cheaper and far more legible shape.
 
-        ``limit`` is applied **per table** by the shared clamp, so the worst case is
-        ``4 x MAX_QUERY_LIMIT`` rows. That is stated rather than hidden: a single per-trace cap
-        would need the merge to happen in SQL, which is the union this deliberately is not. A trace
-        holding more than ``MAX_QUERY_LIMIT`` events of one kind is a retry storm, and truncating
-        the newest of each kind is the right answer for it.
+        ``limit`` is applied **per table**, so the worst case is ``4 x MAX_QUERY_LIMIT`` rows. That
+        is stated rather than hidden: a single per-trace cap would need the merge to happen in SQL,
+        which is the union this deliberately is not. A trace holding more than ``MAX_QUERY_LIMIT``
+        events of one kind is a retry storm, and truncating the newest of each kind is the right
+        answer for it.
 
-        C11 SEAM: the four loads are issued sequentially on one session, which is correct here (one
-        session is one connection, so concurrency would only queue) but is exactly where the
-        cross-entity DataLoaders go — at which point a batch of trace ids costs the same four
-        statements as one.
+        .. rubric:: C11 closed the seam: the four reads go through the four trace-id DataLoaders
+
+        Before C11 this issued four flat SELECTs directly on the operation's session. It still
+        issues four statements — but they are now **batched by trace id**, so a document naming
+        several traces under aliases (``a: correlatedEvents(traceId: "x") b: correlatedEvents(…)``)
+        costs four statements in total rather than four *per alias*. Nothing about the answer moved:
+        the loaders return the same rows in the same ``(timestamp DESC, id DESC)`` order and the
+        per-table cap is applied here instead of in the statement's ``LIMIT``, which is the same
+        truncation of the same newest-first list.
+
+        The four loads are gathered rather than awaited in sequence. They are four *different*
+        loaders, so they cannot merge into one batch whatever happens; gathering them just means
+        the four batches are dispatched in one tick instead of four, and each one takes the
+        operation's session in turn (one session is one connection, so they queue either way).
+
+        **No session is held across these awaits, and that is a hard requirement rather than a
+        style choice** — a loader dispatches its batch in its own task, and a resolver holding the
+        session while awaiting one would deadlock against itself. See
+        :class:`src.graphql.context.OperationResources`.
 
         Raises:
             src.graphql.errors.ValidationError: If ``traceId`` is blank, over-long or contains a
@@ -477,39 +523,28 @@ class Query:
         # Required, so it is validated here rather than inside a filter conversion. See
         # `validate_trace_id` for why the argument is required at all.
         trace = validate_trace_id(trace_id)
-        settings = context.settings
+        loaders = context.loaders
+        # Resolved once and applied to all four lists, so "per table" means one number rather than
+        # four clamps that could drift apart.
+        cap = clamp_limit(limit, context.settings)
 
-        order_query = to_order_event_query(
-            OrderEventFilterInput(trace_id=trace, limit=limit), settings
-        )
-        payment_query = to_payment_event_query(
-            PaymentEventFilterInput(trace_id=trace, limit=limit), settings
-        )
-        user_query = to_user_event_query(
-            UserEventFilterInput(trace_id=trace, limit=limit), settings
+        log_entries, order_events, payment_events, user_events = await asyncio.gather(
+            # The SAME loader `LogEntry.relatedLogs` uses, deliberately: the correlation read here
+            # and the one behind that field cannot disagree about what "sharing a trace" means,
+            # because there is one statement builder and one loader between them.
+            loaders.logs_by_trace_id.load(trace),
+            loaders.order_events_by_trace_id.load(trace),
+            loaders.payment_events_by_trace_id.load(trace),
+            loaders.user_events_by_trace_id.load(trace),
         )
 
         events: list[LogEvent] = []
-        async with context.repository() as repository:
-            # `list_logs_by_trace_ids` rather than a `LogQuery(trace_id=…)`: `LogQuery` has no
-            # trace filter (C2 built it for the spec's six filter fields), and the batch builder is
-            # the statement that already exists for exactly this lookup — it is what C5's
-            # DataLoader runs, so the correlation read here and the one behind `relatedLogs` cannot
-            # disagree about what "sharing a trace" means.
-            log_rows = await repository.list_logs_by_trace_ids([trace])
-            events.extend(LogEntry.from_orm(row) for row in log_rows[: clamp_limit(limit, settings)])
-            events.extend(
-                OrderEvent.from_orm(row)
-                for row in await repository.list_order_events(order_query)
-            )
-            events.extend(
-                PaymentEvent.from_orm(row)
-                for row in await repository.list_payment_events(payment_query)
-            )
-            events.extend(
-                UserEvent.from_orm(row)
-                for row in await repository.list_user_events(user_query)
-            )
+        # Sliced, never mutated: a loader hands the *same list object* to every caller of a key, so
+        # truncating in place would shorten it for the next reader of that trace in this operation.
+        events.extend(log_entries[:cap])
+        events.extend(order_events[:cap])
+        events.extend(payment_events[:cap])
+        events.extend(user_events[:cap])
 
         # Merged newest-first in Python, because the four statements each ordered their own table
         # and nothing has interleaved them yet. The `id` is NOT part of the sort key: it is unique
@@ -519,3 +554,173 @@ class Query:
         # needs.
         events.sort(key=lambda event: (event.timestamp, type(event).__name__), reverse=True)
         return events
+
+    # =============================================================================================
+    # C11 — the by-id entry points (spec §3 Feature Area D: "DataLoader batching extended across all
+    # entity types, not just logs").
+    #
+    # Three fields that mirror `Query.log(id:)` exactly, including the reason it goes through a
+    # loader at all: not because ONE lookup needs batching, but because a DOCUMENT is not one
+    # lookup. A client hydrating a list of ids writes `{ a: orderEvent(id:"1"){…} b: orderEvent(
+    # id:"2"){…} … }` and every alias is a separate resolver call, which without the loader is one
+    # statement per alias. Through it the whole selection set collapses into a single
+    # `WHERE id IN (…)`.
+    #
+    # `null` for a miss, with NO `errors` entry, on all three: absence is an ordinary answer to "is
+    # there a row with this id". C4 reserves `NOT_FOUND` for lookups where absence really is
+    # exceptional, and a single-entity fetch is not one of them.
+    # =============================================================================================
+
+    @strawberry.field(
+        description=(
+            "One order event by id, or null when there is no such row. Batched with its siblings "
+            "by a per-operation DataLoader, so a document naming several under aliases costs one "
+            "query."
+        )
+    )
+    async def order_event(
+        self,
+        info: strawberry.Info[Context, None],
+        id: strawberry.ID,  # noqa: A002 - matches `Query.log(id:)`, which the spec names this way
+    ) -> Optional[OrderEvent]:
+        """One order event by id — batched through ``loaders.order_event_by_id``."""
+        return await info.context.loaders.order_event_by_id.load(
+            _parse_entity_id(id, "OrderEvent")
+        )
+
+    @strawberry.field(
+        description="One payment event by id, or null when there is no such row. Batched by id."
+    )
+    async def payment_event(
+        self,
+        info: strawberry.Info[Context, None],
+        id: strawberry.ID,  # noqa: A002
+    ) -> Optional[PaymentEvent]:
+        """One payment event by id — batched through ``loaders.payment_event_by_id``."""
+        return await info.context.loaders.payment_event_by_id.load(
+            _parse_entity_id(id, "PaymentEvent")
+        )
+
+    @strawberry.field(
+        description="One user activity event by id, or null when there is no such row. Batched by id."
+    )
+    async def user_event(
+        self,
+        info: strawberry.Info[Context, None],
+        id: strawberry.ID,  # noqa: A002
+    ) -> Optional[UserEvent]:
+        """One user event by id — batched through ``loaders.user_event_by_id``."""
+        return await info.context.loaders.user_event_by_id.load(
+            _parse_entity_id(id, "UserEvent")
+        )
+
+    # =============================================================================================
+    # C11 — the cached aggregates (spec §3 Feature Area D: "Redis caching applied to aggregations,
+    # with an invalidation or TTL policy defined per aggregation").
+    #
+    # THREE root fields rather than one `ecommerceStats` object, and the choice is the requirement's
+    # rather than a preference. "A TTL policy defined PER AGGREGATION" needs the aggregations to be
+    # separately cacheable, and a single object field is a single cache entry with a single TTL —
+    # the policy would have exactly one row and would be a constant wearing a table's clothes. As
+    # three fields they get three keys, three TTLs (20s / 300s / 60s — see `src.cache.TTL_POLICY`
+    # for what property of each aggregate chose its number) and three independent expiries.
+    #
+    # Feature Area E's "dashboard renders multi-series analytics from a SINGLE query result" is
+    # unaffected, and this is worth being precise about because it looks like a tension: a GraphQL
+    # document selects all three in one request and receives one `data` object. Three root FIELDS is
+    # not three round trips — that conflation is the REST habit this project exists to demonstrate
+    # against.
+    #
+    # ALL THREE ARE COMPUTED IN SQL. There is no `SELECT *` behind any of them; see the section
+    # comment above `src.db.repository.OrderStatusBucket` for the three statements and for what
+    # counting rows in Python would cost (a silently capped total, the whole table on the wire, and
+    # all of it in memory in a process serving 100 concurrent requests).
+    #
+    # THEY REUSE THE EXISTING FILTER INPUTS AND THE EXISTING PREDICATE BUILDER. `filters` here is
+    # the same `OrderEventFilterInput` `Query.orderEvents` takes, converted by the same
+    # `to_order_event_query`, so an aggregate and the rows behind it can never disagree about what a
+    # filter means — a dashboard's summary panel and the table under it describe one set. The one
+    # field that means nothing here is `limit`, which every aggregate ignores (and which is
+    # therefore absent from the cache key, so two page sizes do not compute one answer twice).
+    # =============================================================================================
+
+    @strawberry.field(
+        description=(
+            "How many orders are sitting at each status right now — one bucket per status, in "
+            "lifecycle order, counted from each order's NEWEST event. Computed in SQL "
+            "(DISTINCT ON + GROUP BY) and cached in Redis under its own short TTL, because one new "
+            "order event moves an order between buckets rather than merely incrementing one. "
+            "`filters.limit` is ignored: an aggregate describes the whole matching set."
+        )
+    )
+    async def order_status_distribution(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[OrderEventFilterInput] = None,
+    ) -> list[OrderStatusCount]:
+        """Current-status distribution — spec §3 Feature Area D, cached at 20s.
+
+        The projection (:meth:`OrderStatusCount.from_buckets`, which applies the lifecycle
+        ordering) runs on the cache-hit path and the cache-miss path alike, because what is cached
+        is the repository's bucket tuple rather than the published objects. See the Values section
+        in :mod:`src.cache` for why that separation is not an accident.
+        """
+        context = info.context
+        query = to_order_event_query(filters, context.settings)
+
+        async def load() -> tuple[OrderStatusBucket, ...]:
+            async with context.repository() as repository:
+                return await repository.order_status_distribution(query)
+
+        return OrderStatusCount.from_buckets(
+            await cached_order_status_distribution(context.cache, query, load)
+        )
+
+    @strawberry.field(
+        description=(
+            "How many distinct orders have EVER reached each status, in lifecycle order, with each "
+            "stage's share of the widest one. Cumulative rather than current, so an order counts at "
+            "every stage it passed through — which is what makes this a conversion funnel. "
+            "Computed in SQL (COUNT DISTINCT + GROUP BY) and cached under the longest TTL in the "
+            "system, because the numbers are monotonic and a stale read can only undercount."
+        )
+    )
+    async def order_funnel(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[OrderEventFilterInput] = None,
+    ) -> list[FunnelStage]:
+        """The order conversion funnel — spec §3 Feature Area D, cached at 300s."""
+        context = info.context
+        query = to_order_event_query(filters, context.settings)
+
+        async def load() -> tuple[FunnelBucket, ...]:
+            async with context.repository() as repository:
+                return await repository.order_funnel(query)
+
+        return FunnelStage.from_buckets(await cached_order_funnel(context.cache, query, load))
+
+    @strawberry.field(
+        description=(
+            "The payment method x outcome cross-tabulation, busiest cell first. Each cell carries "
+            "both the number of payment ATTEMPTS and the number of distinct ORDERS behind them, so "
+            "retries are visible rather than folded into one number. Computed in SQL (GROUP BY + "
+            "COUNT DISTINCT) and cached under the shared aggregate TTL."
+        )
+    )
+    async def payment_outcome_breakdown(
+        self,
+        info: strawberry.Info[Context, None],
+        filters: Optional[PaymentEventFilterInput] = None,
+    ) -> list[PaymentOutcomeCount]:
+        """The payment cross-tabulation — spec §3 Feature Area D, cached at 60s."""
+        context = info.context
+        query = to_payment_event_query(filters, context.settings)
+
+        async def load() -> tuple[PaymentOutcomeBucket, ...]:
+            async with context.repository() as repository:
+                return await repository.payment_outcome_breakdown(query)
+
+        return PaymentOutcomeCount.from_buckets(
+            await cached_payment_outcome_breakdown(context.cache, query, load)
+        )

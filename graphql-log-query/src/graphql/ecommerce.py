@@ -14,12 +14,28 @@ the nested traversals (``OrderEvent.user``, ``OrderEvent.payments``) and C12 the
 subscription, both of which land here, and keeping them out of ``types.py`` is what stops the core
 type module from slowly becoming the module where everything is.
 
-.. rubric:: What is deliberately NOT here yet
+.. rubric:: C11 filled the seams: nested traversal, and the aggregates the dashboard renders
 
-**No nested field resolvers, no cross-entity DataLoaders, no aggregations.** Those are C11 (spec
-§3 Feature Areas B and D), and the seams are marked below. Building them now would mean building
-them without the batching that makes them correct — a naive ``OrderEvent.payments`` resolver is one
-SELECT per order, i.e. precisely the N+1 this project exists to demonstrate the absence of.
+Spec §3 **Feature Area B** ("nested resolution: an order query can traverse to its user and payment
+events in the same request") is the three field resolvers on ``OrderEvent`` plus their counterparts
+on the other two. **Feature Area D** ("Redis caching applied to aggregations") is the three
+aggregate types at the bottom of this module.
+
+**EVERY NESTED FIELD HERE GOES THROUGH A DATALOADER, WITHOUT EXCEPTION.** That is not a performance
+preference, it is the reason these fields were held back until C11: a naive ``OrderEvent.payments``
+is one ``SELECT ... WHERE order_id = :id`` per order, so a page of a hundred orders is a hundred
+statements — and it returns byte-identical JSON, so no test of the response can tell the two apart.
+The resolvers below therefore contain no SQL, no session and no repository call; each is a single
+``await info.context.loaders.<edge>.load(key)``, and the batching is proved by counting the
+statements PostgreSQL actually received at two different page sizes.
+
+.. rubric:: THE ONE RULE A RESOLVER HERE MUST NOT BREAK: never await a loader inside a session
+
+A DataLoader dispatches its batch in **its own asyncio task**, and that task queues for the
+operation's shared session. A resolver that held the session and then awaited a loader would be
+waiting on a task waiting on it — a deadlock that presents as a test suite which stops rather than
+fails. See :class:`src.graphql.context.OperationResources`. Nothing in this module opens a session
+at all, which is the structural way to keep that true.
 
 .. rubric:: ``from_orm`` is the only construction path, exactly as it is for ``LogEntry``
 
@@ -42,12 +58,14 @@ spelling everywhere beats two that differ per field type.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Optional
 
 import strawberry
 from strawberry.scalars import JSON
 
 from src.db.models import OrderEventORM, PaymentEventORM, UserEventORM
+from src.db.repository import FunnelBucket, OrderStatusBucket, PaymentOutcomeBucket
 from src.graphql.enums import (
     LogLevel,
     OrderStatus,
@@ -55,7 +73,7 @@ from src.graphql.enums import (
     PaymentOutcome,
     UserActivity,
 )
-from src.graphql.types import LogEvent
+from src.graphql.types import LogEntry, LogEvent
 
 
 def _log_level(stored: str) -> LogLevel:
@@ -98,10 +116,90 @@ class OrderEvent(LogEvent):
     status: OrderStatus
     metadata: Optional[JSON]
 
-    # C11 SEAM: `user: UserEvent`-style traversal and `payments: [PaymentEvent!]!` land here, both
-    # routed through cross-entity DataLoaders keyed on `user_id` / `order_id`. They are not written
-    # now because a resolver added without its loader is one SELECT per parent, and the cost gate
-    # would have to price a field whose weight nobody has calibrated yet.
+    # =============================================================================================
+    # C11 — the three traversals that make `orderEvents` a one-round-trip dossier (Feature Area B).
+    #
+    # THE `strawberry.Info` ANNOTATIONS BELOW ARE DELIBERATELY BARE — no type parameters. That is
+    # the same decision `LogEntry.related_logs` documents at length and for the same reason:
+    # `strawberry.Info[Context, None]` would require `Context` to be importable *here*, at
+    # schema-construction time, and this module sits UNDER `src.graphql.loaders`, which
+    # `src.graphql.context` imports. Parameterising these would close the cycle
+    # (ecommerce -> context -> loaders -> ecommerce) and the application would fail to import.
+    # Strawberry resolves the parameter annotation with or without arguments, so dropping them
+    # costs nothing at run time.
+    # =============================================================================================
+
+    @strawberry.field(
+        description=(
+            "Every payment event filed under this order, newest first — the order -> payments "
+            "relationship. Batched across the whole selection set by a per-operation DataLoader, "
+            "so a page of N orders costs one query rather than N. Empty when the order has no "
+            "payment events."
+        )
+    )
+    async def payments(self, info: strawberry.Info) -> list[PaymentEvent]:
+        """This order's payment stream — spec §3 Feature Area B, batched on ``order_id``.
+
+        One REST API would answer this with ``GET /orders/{id}/payments``, once per order on the
+        page. Here it is one ``WHERE order_id IN (...)`` for the entire page, and the client did not
+        have to know that.
+
+        Note this returns the whole stream rather than "the payment": a payment is authorized, then
+        captured, then possibly refunded, so an order has several payment *events* and collapsing
+        them to one would throw away the history that makes ``outcome`` meaningful.
+        """
+        return await info.context.loaders.payment_events_by_order_id.load(self.order_id)
+
+    @strawberry.field(
+        description=(
+            "Everything the user who placed this order did, newest first — the order -> user "
+            "relationship, traversed to that user's activity stream. There is no `users` table to "
+            "join to (this system stores events, not entities), so `userId` IS the edge and this "
+            "field is the batched read across it."
+        )
+    )
+    async def user_activity(self, info: strawberry.Info) -> list[UserEvent]:
+        """The acting user's activity — spec §3 Feature Area B, batched on ``user_id``.
+
+        Published as ``userActivity`` rather than ``user`` on purpose. ``user`` would promise a
+        *User entity*, and there is none: ``user_events`` is the user's history and nothing else in
+        this system knows a user's name, tier or email. Naming the field after what it returns is
+        the difference between a schema a client can reason about and one that invites a
+        ``user { email }`` selection that can never exist.
+
+        Note the scope: this is every activity that user has ever produced, **not** only the
+        activity around this order. That is the useful question ("who is this customer") and it is
+        why the key is ``user_id`` rather than ``trace_id`` — the session-scoped view is
+        ``relatedLogs``' neighbour, ``Query.correlatedEvents(traceId:)``.
+        """
+        return await info.context.loaders.user_events_by_user_id.load(self.user_id)
+
+    @strawberry.field(
+        description=(
+            "The log lines emitted under this event's traceId, newest first. Empty when traceId "
+            "is null. This is the fourth leg of the correlation: order status, payments, user "
+            "activity and the raw log output of the same unit of work, in one request."
+        )
+    )
+    async def related_logs(self, info: strawberry.Info) -> list[LogEntry]:
+        """Log lines sharing this event's trace — batched through **C5's own** loader.
+
+        Deliberately the same ``logs_by_trace_id`` loader ``LogEntry.relatedLogs`` uses, not a new
+        one: "sharing a trace" has to mean one thing across the schema, and two loaders over one
+        key would also mean two statements for a document that selected both.
+
+        Nothing is excluded here, unlike :meth:`src.graphql.types.LogEntry.related_logs`. That
+        field drops the entry it was resolved from because a log line correlated only with itself
+        is not "related"; an order event is not in ``log_entries`` at all, so there is nothing to
+        drop and every member of the group is a genuine answer.
+
+        The ``None`` guard is above every ``await``, so an untraced event costs **zero** round
+        trips rather than one that returns nothing — the same property C5 asserts with a statement
+        counter.
+        """
+        if self.trace_id is None:
+            return []
+        return await info.context.loaders.logs_by_trace_id.load(self.trace_id)
 
     @classmethod
     def from_orm(cls, row: OrderEventORM) -> OrderEvent:
@@ -135,8 +233,44 @@ class PaymentEvent(LogEvent):
     outcome: PaymentOutcome
     metadata: Optional[JSON]
 
-    # C11 SEAM: `order: OrderEvent` (the newest status of the order this payment belongs to),
-    # batched by `order_id`.
+    @strawberry.field(
+        description=(
+            "The current state of the order this payment belongs to — the newest OrderEvent "
+            "carrying the same orderId, or null when no order event exists for it. Batched by "
+            "orderId through a per-operation DataLoader."
+        )
+    )
+    async def order(self, info: strawberry.Info) -> Optional[OrderEvent]:
+        """This payment's order, as of its newest status transition — batched on ``order_id``.
+
+        .. rubric:: Why this reads the head of the history loader instead of having its own
+
+        "The newest order event for this id" could be a loader of its own with a ``DISTINCT ON``
+        behind it. It is not, because ``order_events_by_order_id`` already returns that order's
+        whole history **newest first**, so the answer is its first element — and a second loader
+        over the same key would issue a second statement for a row the first one already fetched.
+        A document selecting both ``order`` and (in a future commit) the full history would pay
+        twice for one read.
+
+        Returns ``None`` rather than raising when the order has no events. That is an ordinary
+        answer: a payment event ingested for an order this store has not seen (a partner feed
+        arriving out of order) is data, not a failure, and ``NOT_FOUND`` would turn a nullable
+        field into an errors envelope for something no client can act on.
+        """
+        history = await info.context.loaders.order_events_by_order_id.load(self.order_id)
+        return history[0] if history else None
+
+    @strawberry.field(
+        description=(
+            "The log lines emitted under this event's traceId, newest first. Empty when traceId "
+            "is null."
+        )
+    )
+    async def related_logs(self, info: strawberry.Info) -> list[LogEntry]:
+        """Log lines sharing this payment's trace — through C5's ``logs_by_trace_id`` loader."""
+        if self.trace_id is None:
+            return []
+        return await info.context.loaders.logs_by_trace_id.load(self.trace_id)
 
     @classmethod
     def from_orm(cls, row: PaymentEventORM) -> PaymentEvent:
@@ -169,7 +303,34 @@ class UserEvent(LogEvent):
     activity_type: UserActivity
     metadata: Optional[JSON]
 
-    # C11 SEAM: `orders: [OrderEvent!]!` for this user, batched by `user_id`.
+    @strawberry.field(
+        description=(
+            "Every order event this user produced, newest first — the order -> user relationship "
+            "traversed from the user's side. Batched by userId through a per-operation DataLoader."
+        )
+    )
+    async def orders(self, info: strawberry.Info) -> list[OrderEvent]:
+        """This user's order events — spec §3 Feature Area B, batched on ``user_id``.
+
+        The reverse of :meth:`OrderEvent.user_activity`, over the same denormalised ``user_id``
+        column and the same index (``ix_order_events_user_ts``). Order *events*, not orders: this
+        system has no ``orders`` table, so "this user's orders" is spelled as the transitions they
+        caused, and a client that wants one row per order groups by ``orderId`` (or asks
+        ``Query.orderStatusDistribution``, which does exactly that in SQL).
+        """
+        return await info.context.loaders.order_events_by_user_id.load(self.user_id)
+
+    @strawberry.field(
+        description=(
+            "The log lines emitted under this event's traceId, newest first. Empty when traceId "
+            "is null."
+        )
+    )
+    async def related_logs(self, info: strawberry.Info) -> list[LogEntry]:
+        """Log lines sharing this activity's trace — through C5's ``logs_by_trace_id`` loader."""
+        if self.trace_id is None:
+            return []
+        return await info.context.loaders.logs_by_trace_id.load(self.trace_id)
 
     @classmethod
     def from_orm(cls, row: UserEventORM) -> UserEvent:
@@ -186,4 +347,154 @@ class UserEvent(LogEvent):
         )
 
 
-__all__ = ["OrderEvent", "PaymentEvent", "UserEvent"]
+# =================================================================================================
+# C11 — the published aggregates (spec §3 Feature Area D, and what Feature Area E's dashboard draws)
+#
+# Three types, one per aggregate, because the three answer genuinely different questions and a
+# shared `{ status, count }` shape would invite a client to plot two of them on one axis. See the
+# section comment above `src.db.repository.OrderStatusBucket` for the SQL and for why the funnel and
+# the distribution are not the same number.
+#
+# EACH `from_buckets` IS WHERE THE PUBLISHED ORDERING IS APPLIED, and it runs on the cache-HIT path
+# and the cache-MISS path alike — because what is cached is the repository's bucket tuple, not the
+# published objects. That is the arrangement `logStats` established (see `src.cache`'s Values
+# section): caching the published object would make this projection skippable, and a skippable
+# projection is a second implementation of the ordering waiting to be written.
+#
+# The SQL orders by the status STRING, for determinism only. The order a client sees is the ORDER
+# LIFECYCLE — CREATED, PAID, PACKED, SHIPPED, DELIVERED, CANCELLED, REFUNDED — which is exactly
+# `OrderStatus`'s declaration order, so enumerating the enum IS the ordering and a status added to
+# the enum lands in the right place with no second list to update. Same trick, same reason, as
+# `LogStats.from_result` applying ascending severity to `levelBreakdown`.
+# =================================================================================================
+
+
+def _by_lifecycle(status: str) -> int:
+    """Position of ``status`` in the order lifecycle, for sorting. Unknown values sort last.
+
+    Unknown cannot happen through the schema (the column is validated into
+    :class:`~src.graphql.enums.OrderStatus` before it is published) — but this function runs over
+    strings that came out of a ``GROUP BY``, and a sort key that raised on an unexpected value would
+    turn one unrecognised row into a failed dashboard rather than a row at the end of the list.
+    """
+    order = {member.value: index for index, member in enumerate(OrderStatus)}
+    return order.get(status, len(order))
+
+
+@strawberry.type(
+    description=(
+        "How many orders are sitting at one status RIGHT NOW — i.e. how many orders have this as "
+        "the status of their newest event. Every order appears in exactly one bucket, so these "
+        "counts sum to the number of orders in the window."
+    )
+)
+class OrderStatusCount:
+    """One bucket of the current-status distribution."""
+
+    status: OrderStatus
+    orders: int
+
+    @classmethod
+    def from_buckets(cls, buckets: Sequence[OrderStatusBucket]) -> list[OrderStatusCount]:
+        """Project the repository's buckets onto the published shape, in lifecycle order."""
+        return [
+            cls(status=OrderStatus(bucket.status), orders=bucket.orders)
+            for bucket in sorted(buckets, key=lambda bucket: _by_lifecycle(bucket.status))
+        ]
+
+
+@strawberry.type(
+    description=(
+        "How many distinct orders have EVER reached one status. Cumulative rather than current, so "
+        "an order that was delivered is counted at every stage it passed through — which is what "
+        "makes this a funnel and makes `share` a conversion rate."
+    )
+)
+class FunnelStage:
+    """One stage of the order funnel."""
+
+    status: OrderStatus
+    orders_reached: int
+    #: ``ordersReached`` as a fraction of the widest stage, rounded to four places. Derived here
+    #: rather than in SQL because it is a ratio between rows of one result — a window function
+    #: could compute it, at the cost of a second pass over a result that is at most seven rows
+    #: long. Four places because a conversion rate is read as a percentage with two decimals, and
+    #: because an unrounded float would make the cached blob and the response differ in their last
+    #: bit depending on the platform.
+    share: float
+
+    @classmethod
+    def from_buckets(cls, buckets: Sequence[FunnelBucket]) -> list[FunnelStage]:
+        """Project the repository's buckets onto the published shape, in lifecycle order.
+
+        ``share`` is computed against the **widest** stage rather than against CREATED. They are
+        the same number for any corpus this project generates (every lifecycle starts at CREATED,
+        so CREATED is always the widest), and they stop being the same the moment a time-window
+        filter clips the beginning of an order's history off the result — at which point dividing
+        by a CREATED bucket that is missing or small would produce shares above 1.0. Dividing by
+        the maximum cannot.
+        """
+        widest = max((bucket.orders for bucket in buckets), default=0)
+        return [
+            cls(
+                status=OrderStatus(bucket.status),
+                orders_reached=bucket.orders,
+                share=round(bucket.orders / widest, 4) if widest else 0.0,
+            )
+            for bucket in sorted(buckets, key=lambda bucket: _by_lifecycle(bucket.status))
+        ]
+
+
+@strawberry.type(
+    description=(
+        "One (method, outcome) cell of the payment cross-tabulation. `events` counts payment "
+        "attempts and `orders` counts the distinct orders behind them, so `events > orders` in a "
+        "DECLINED cell is retries — which a single count could not express."
+    )
+)
+class PaymentOutcomeCount:
+    """One cell of the payment method x outcome breakdown."""
+
+    method: PaymentMethod
+    outcome: PaymentOutcome
+    events: int
+    orders: int
+
+    @classmethod
+    def from_buckets(cls, buckets: Sequence[PaymentOutcomeBucket]) -> list[PaymentOutcomeCount]:
+        """Project the repository's cells onto the published shape.
+
+        Ordered busiest cell first, ties broken by the enum declaration order of the method and
+        then the outcome — busiest first because that is what a stacked bar chart leads with, and
+        the tiebreak because two cells with equal counts must not swap places between two identical
+        requests.
+        """
+        methods = {member.value: index for index, member in enumerate(PaymentMethod)}
+        outcomes = {member.value: index for index, member in enumerate(PaymentOutcome)}
+        ordered = sorted(
+            buckets,
+            key=lambda bucket: (
+                -bucket.events,
+                methods.get(bucket.method, len(methods)),
+                outcomes.get(bucket.outcome, len(outcomes)),
+            ),
+        )
+        return [
+            cls(
+                method=PaymentMethod(bucket.method),
+                outcome=PaymentOutcome(bucket.outcome),
+                events=bucket.events,
+                orders=bucket.orders,
+            )
+            for bucket in ordered
+        ]
+
+
+__all__ = [
+    "FunnelStage",
+    "OrderEvent",
+    "OrderStatusCount",
+    "PaymentEvent",
+    "PaymentOutcomeCount",
+    "UserEvent",
+]

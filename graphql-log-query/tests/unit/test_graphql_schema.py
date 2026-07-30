@@ -231,7 +231,7 @@ def test_metadata_is_published_under_that_exact_name() -> None:
 
 
 def test_query_publishes_exactly_the_expected_read_entry_points() -> None:
-    """The four §2 log entry points, plus the four C10 e-commerce ones and nothing else.
+    """The four §2 log entry points, the four C10 e-commerce ones, C11's six, and nothing else.
 
     Camel-casing is on, so it is not ``logs_connection`` or ``log_stats`` — the spec's own
     acceptance commands are written in that casing and would not validate otherwise, and the same
@@ -243,14 +243,26 @@ def test_query_publishes_exactly_the_expected_read_entry_points() -> None:
     look at rather than something the suite absorbs.
     """
     assert set(_field_types("Query")) == {
+        # --- §2, the log surface ---
         "logs",
         "log",
         "logsConnection",
         "logStats",
+        # --- §3 Feature Area A (C10), the e-commerce streams ---
         "orderEvents",
         "userEvents",
         "paymentEvents",
         "correlatedEvents",
+        # --- §3 Feature Area D (C11), by-id hydration through the cross-entity DataLoaders ---
+        "orderEvent",
+        "paymentEvent",
+        "userEvent",
+        # --- §3 Feature Area D (C11), the cached aggregates. Three fields rather than one object,
+        #     because "a TTL policy defined PER AGGREGATION" needs them separately cacheable — and
+        #     three root fields is still ONE round trip, which is Feature Area E's requirement.
+        "orderStatusDistribution",
+        "orderFunnel",
+        "paymentOutcomeBreakdown",
     }
 
 

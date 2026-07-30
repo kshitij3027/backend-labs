@@ -11,6 +11,15 @@ input CreateLogInput {
 scalar DateTime
 
 """
+How many distinct orders have EVER reached one status. Cumulative rather than current, so an order that was delivered is counted at every stage it passed through — which is what makes this a funnel and makes `share` a conversion rate.
+"""
+type FunnelStage {
+  status: OrderStatus!
+  ordersReached: Int!
+  share: Float!
+}
+
+"""
 The `JSON` scalar type represents JSON values as specified by [ECMA-404](https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf).
 """
 scalar JSON @specifiedBy(url: "https://ecma-international.org/wp-content/uploads/ECMA-404_2nd_edition_december_2017.pdf")
@@ -100,6 +109,21 @@ type OrderEvent implements LogEvent {
   userId: String!
   status: OrderStatus!
   metadata: JSON
+
+  """
+  Every payment event filed under this order, newest first — the order -> payments relationship. Batched across the whole selection set by a per-operation DataLoader, so a page of N orders costs one query rather than N. Empty when the order has no payment events.
+  """
+  payments: [PaymentEvent!]!
+
+  """
+  Everything the user who placed this order did, newest first — the order -> user relationship, traversed to that user's activity stream. There is no `users` table to join to (this system stores events, not entities), so `userId` IS the edge and this field is the batched read across it.
+  """
+  userActivity: [UserEvent!]!
+
+  """
+  The log lines emitted under this event's traceId, newest first. Empty when traceId is null. This is the fourth leg of the correlation: order status, payments, user activity and the raw log output of the same unit of work, in one request.
+  """
+  relatedLogs: [LogEntry!]!
 }
 
 """Filters for Query.orderEvents. Every field is optional and ANDed."""
@@ -126,6 +150,14 @@ enum OrderStatus {
   REFUNDED
 }
 
+"""
+How many orders are sitting at one status RIGHT NOW — i.e. how many orders have this as the status of their newest event. Every order appears in exactly one bucket, so these counts sum to the number of orders in the window.
+"""
+type OrderStatusCount {
+  status: OrderStatus!
+  orders: Int!
+}
+
 type PageInfo {
   hasNextPage: Boolean!
   hasPreviousPage: Boolean!
@@ -146,6 +178,16 @@ type PaymentEvent implements LogEvent {
   method: PaymentMethod!
   outcome: PaymentOutcome!
   metadata: JSON
+
+  """
+  The current state of the order this payment belongs to — the newest OrderEvent carrying the same orderId, or null when no order event exists for it. Batched by orderId through a per-operation DataLoader.
+  """
+  order: OrderEvent
+
+  """
+  The log lines emitted under this event's traceId, newest first. Empty when traceId is null.
+  """
+  relatedLogs: [LogEntry!]!
 }
 
 """Filters for Query.paymentEvents. Every field is optional and ANDed."""
@@ -177,6 +219,16 @@ enum PaymentOutcome {
   REFUNDED
 }
 
+"""
+One (method, outcome) cell of the payment cross-tabulation. `events` counts payment attempts and `orders` counts the distinct orders behind them, so `events > orders` in a DECLINED cell is retries — which a single count could not express.
+"""
+type PaymentOutcomeCount {
+  method: PaymentMethod!
+  outcome: PaymentOutcome!
+  events: Int!
+  orders: Int!
+}
+
 type Query {
   logs(filters: LogFilterInput = null): [LogEntry!]!
   log(id: ID!): LogEntry
@@ -202,6 +254,36 @@ type Query {
   Every event of every kind carrying this trace id, newest first — log lines, order status transitions, payment outcomes and user actions in one heterogeneous list. Returns the LogEvent interface, so a client selects per-type fields with inline fragments (`... on OrderEvent { orderId status }`). This is the question a correlation id exists to answer, and answering it in one round trip is what would otherwise take four REST calls.
   """
   correlatedEvents(traceId: String!, limit: Int = null): [LogEvent!]!
+
+  """
+  One order event by id, or null when there is no such row. Batched with its siblings by a per-operation DataLoader, so a document naming several under aliases costs one query.
+  """
+  orderEvent(id: ID!): OrderEvent
+
+  """
+  One payment event by id, or null when there is no such row. Batched by id.
+  """
+  paymentEvent(id: ID!): PaymentEvent
+
+  """
+  One user activity event by id, or null when there is no such row. Batched by id.
+  """
+  userEvent(id: ID!): UserEvent
+
+  """
+  How many orders are sitting at each status right now — one bucket per status, in lifecycle order, counted from each order's NEWEST event. Computed in SQL (DISTINCT ON + GROUP BY) and cached in Redis under its own short TTL, because one new order event moves an order between buckets rather than merely incrementing one. `filters.limit` is ignored: an aggregate describes the whole matching set.
+  """
+  orderStatusDistribution(filters: OrderEventFilterInput = null): [OrderStatusCount!]!
+
+  """
+  How many distinct orders have EVER reached each status, in lifecycle order, with each stage's share of the widest one. Cumulative rather than current, so an order counts at every stage it passed through — which is what makes this a conversion funnel. Computed in SQL (COUNT DISTINCT + GROUP BY) and cached under the longest TTL in the system, because the numbers are monotonic and a stale read can only undercount.
+  """
+  orderFunnel(filters: OrderEventFilterInput = null): [FunnelStage!]!
+
+  """
+  The payment method x outcome cross-tabulation, busiest cell first. Each cell carries both the number of payment ATTEMPTS and the number of distinct ORDERS behind them, so retries are visible rather than folded into one number. Computed in SQL (GROUP BY + COUNT DISTINCT) and cached under the shared aggregate TTL.
+  """
+  paymentOutcomeBreakdown(filters: PaymentEventFilterInput = null): [PaymentOutcomeCount!]!
 }
 
 type ServiceCount {
@@ -238,6 +320,16 @@ type UserEvent implements LogEvent {
   userId: String!
   activityType: UserActivity!
   metadata: JSON
+
+  """
+  Every order event this user produced, newest first — the order -> user relationship traversed from the user's side. Batched by userId through a per-operation DataLoader.
+  """
+  orders: [OrderEvent!]!
+
+  """
+  The log lines emitted under this event's traceId, newest first. Empty when traceId is null.
+  """
+  relatedLogs: [LogEntry!]!
 }
 
 """Filters for Query.userEvents. Every field is optional and ANDed."""

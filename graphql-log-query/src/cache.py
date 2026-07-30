@@ -70,7 +70,18 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Generic, Optional, TypeVar
 
 from src.config import Settings
-from src.db.repository import LogQuery, LogStatsResult, ServiceLevelCount, as_utc, clamp_limit
+from src.db.repository import (
+    FunnelBucket,
+    LogQuery,
+    LogStatsResult,
+    OrderEventQuery,
+    OrderStatusBucket,
+    PaymentEventQuery,
+    PaymentOutcomeBucket,
+    ServiceLevelCount,
+    as_utc,
+    clamp_limit,
+)
 from src.graphql.types import LogEntry, from_wire_timestamp, to_wire_timestamp
 
 if TYPE_CHECKING:  # pragma: no cover - annotations only
@@ -99,13 +110,47 @@ DEFAULT_CACHE_NAMESPACE = "graphql-log-query:cache"
 KIND_LOGS = "logs"
 KIND_LOG_STATS = "logStats"
 
+#: C11's three e-commerce aggregates. Named after the published field so a human running ``KEYS``
+#: against Redis can see which resolver a key belongs to without decoding anything.
+KIND_ORDER_STATUS_AGG = "orderStatusDistribution"
+KIND_ORDER_FUNNEL_AGG = "orderFunnel"
+KIND_PAYMENT_OUTCOME_AGG = "paymentOutcomeBreakdown"
+
 #: Which setting supplies the TTL for each kind — spec §3 Feature Area D asks for a TTL policy
-#: defined *per aggregation*, so the policy is a table rather than a constant. C11 adds its
-#: cross-entity aggregates by adding rows here; nothing else changes, and every TTL in the system
-#: stays visible in one place next to the kind it governs.
+#: defined *per aggregation*, so the policy is a table rather than a constant. Every TTL in the
+#: system is visible here, in one place, next to the kind it governs.
+#:
+#: .. rubric:: THE POLICY, and the property of each aggregate that chose its number
+#:
+#: The numbers are not a scale from "important" to "unimportant". Each one is the answer to *how
+#: wrong can this be after N seconds*, which is a different question per aggregate:
+#:
+#: ``logs`` — 30s (``CACHE_TTL_SECONDS``)
+#:     Rows, not an aggregate. The spec's own §7 value. A new log line is simply absent.
+#: ``orderStatusDistribution`` — 20s (``ORDER_STATUS_AGG_TTL_SECONDS``), the shortest
+#:     REDISTRIBUTIVE. One new order event does not increment a bucket, it MOVES an order from one
+#:     bucket to another, so a stale answer is wrong in two places at once. It is also the panel an
+#:     operator stares at during an incident.
+#: ``logStats`` / ``paymentOutcomeBreakdown`` — 60s (``AGG_CACHE_TTL_SECONDS``)
+#:     ADDITIVE and expensive. A write moves one count by one out of thousands, and the read is a
+#:     ``GROUP BY``-class scan over the whole window. The two share a setting because they share
+#:     that shape exactly; a second knob with the same value would be two things to keep equal.
+#: ``orderFunnel`` — 300s (``FUNNEL_AGG_TTL_SECONDS``), the longest
+#:     MONOTONIC. A status once reached is never un-reached, so this can only grow and a stale read
+#:     can only *undercount* — never contradict itself. It is also the most expensive of the three
+#:     (a ``COUNT(DISTINCT ...)`` per group), so it is where a long TTL buys the most.
+#:
+#: **There is no invalidation, for any of them.** Spec §3 Feature Area D asks for "an invalidation
+#: **or** TTL policy"; this is the TTL half, argued in full in this module's docstring. The short
+#: version: keys are opaque hashes of arbitrary filter sets, so invalidating "every key this write
+#: affects" needs a reverse index or a keyspace scan per write — machinery that costs more than the
+#: query it saves, guarding a window that is already bounded and uniform.
 TTL_POLICY: Mapping[str, str] = {
     KIND_LOGS: "cache_ttl_seconds",
     KIND_LOG_STATS: "agg_cache_ttl_seconds",
+    KIND_ORDER_STATUS_AGG: "order_status_agg_ttl_seconds",
+    KIND_ORDER_FUNNEL_AGG: "funnel_agg_ttl_seconds",
+    KIND_PAYMENT_OUTCOME_AGG: "agg_cache_ttl_seconds",
 }
 
 #: The TTL an unknown kind gets. The short one, deliberately: a kind that reached
@@ -199,6 +244,50 @@ def log_stats_key_payload(query: LogQuery) -> dict[str, Any]:
     instead of on one an unfiltered result is already sitting in.
     """
     return _query_payload(query, limit=None)
+
+
+def order_event_key_payload(query: OrderEventQuery) -> dict[str, Any]:
+    """The key payload for the two order aggregates: every filter, **no limit**.
+
+    Enumerated field by field rather than ``dataclasses.asdict``-ed, for the reason this section's
+    header gives: a payload that silently gains whatever field a later commit adds moves every key
+    in the system the first time somebody adds one that does not change the answer.
+
+    ``limit`` is absent because an aggregate ignores it — see
+    :func:`~src.db.repository.build_order_funnel_select`. Including it would put a field in the hash
+    that can never change the value, so two clients asking the same question with different page
+    sizes would compute the same numbers twice and store them under two keys.
+
+    The **kind** is what separates ``orderStatusDistribution`` from ``orderFunnel``: the two are
+    driven by byte-identical filters and return different numbers, so a payload alone would collide
+    them. :func:`make_cache_key` hashes the kind *inside* the document for exactly this case.
+    """
+    return {
+        "service": query.service,
+        "level": query.level,
+        "start_time": _wire_instant(query.start_time),
+        "end_time": _wire_instant(query.end_time),
+        "trace_id": query.trace_id,
+        "order_id": query.order_id,
+        "user_id": query.user_id,
+        "status": query.status,
+        "search_text": query.search_text,
+    }
+
+
+def payment_event_key_payload(query: PaymentEventQuery) -> dict[str, Any]:
+    """The key payload for ``paymentOutcomeBreakdown``: every filter, **no limit**."""
+    return {
+        "service": query.service,
+        "level": query.level,
+        "start_time": _wire_instant(query.start_time),
+        "end_time": _wire_instant(query.end_time),
+        "trace_id": query.trace_id,
+        "order_id": query.order_id,
+        "method": query.method,
+        "outcome": query.outcome,
+        "search_text": query.search_text,
+    }
 
 
 def make_cache_key(
@@ -352,6 +441,80 @@ def decode_log_stats(payload: Any) -> LogStatsResult:
     )
 
 
+def _encode_buckets(rows: Sequence[Any], fields: Sequence[str]) -> dict[str, Any]:
+    """Render a tuple of frozen bucket dataclasses as a versioned object of positional rows.
+
+    Positional rows rather than objects for the reason :func:`encode_log_stats` gives: the bucket
+    list is the part of an aggregate payload whose size grows with the vocabulary, and repeating
+    two to four key names per bucket is bytes spent on nothing. The field order is passed in and
+    consumed by :func:`_decode_buckets` four lines away, which is the entire distance over which
+    the pairing has to be remembered.
+    """
+    return {
+        "v": CACHE_FORMAT_VERSION,
+        "buckets": [[getattr(row, field) for field in fields] for row in rows],
+    }
+
+
+def _decode_buckets(payload: Any, kind: str) -> list[list[Any]]:  # noqa: ANN401 - any JSON value
+    """Validate a versioned bucket object and return its raw rows.
+
+    Raises:
+        ValueError: If the blob is not a versioned bucket object this build understands. The caller
+            treats that as a miss and recomputes, which is what makes a format change survivable
+            without a flush.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"cached {kind} payload is {type(payload).__name__}, expected an object")
+    if payload.get("v") != CACHE_FORMAT_VERSION:
+        raise ValueError(f"cached {kind} payload has format version {payload.get('v')!r}")
+    buckets = payload.get("buckets")
+    if not isinstance(buckets, list):
+        raise ValueError(f"cached {kind} payload has no `buckets` array")
+    return buckets
+
+
+def encode_order_status_distribution(rows: Sequence[OrderStatusBucket]) -> dict[str, Any]:
+    """Render the current-status distribution for storage."""
+    return _encode_buckets(rows, ("status", "orders"))
+
+
+def decode_order_status_distribution(payload: Any) -> tuple[OrderStatusBucket, ...]:
+    """Rebuild the current-status distribution. Raises on anything unexpected."""
+    return tuple(
+        OrderStatusBucket(status=status, orders=int(orders))
+        for status, orders in _decode_buckets(payload, KIND_ORDER_STATUS_AGG)
+    )
+
+
+def encode_order_funnel(rows: Sequence[FunnelBucket]) -> dict[str, Any]:
+    """Render the order funnel for storage."""
+    return _encode_buckets(rows, ("status", "orders"))
+
+
+def decode_order_funnel(payload: Any) -> tuple[FunnelBucket, ...]:
+    """Rebuild the order funnel. Raises on anything unexpected."""
+    return tuple(
+        FunnelBucket(status=status, orders=int(orders))
+        for status, orders in _decode_buckets(payload, KIND_ORDER_FUNNEL_AGG)
+    )
+
+
+def encode_payment_outcome_breakdown(rows: Sequence[PaymentOutcomeBucket]) -> dict[str, Any]:
+    """Render the payment cross-tabulation for storage."""
+    return _encode_buckets(rows, ("method", "outcome", "events", "orders"))
+
+
+def decode_payment_outcome_breakdown(payload: Any) -> tuple[PaymentOutcomeBucket, ...]:
+    """Rebuild the payment cross-tabulation. Raises on anything unexpected."""
+    return tuple(
+        PaymentOutcomeBucket(
+            method=method, outcome=outcome, events=int(events), orders=int(orders)
+        )
+        for method, outcome, events, orders in _decode_buckets(payload, KIND_PAYMENT_OUTCOME_AGG)
+    )
+
+
 #: The codec for ``Query.logs``.
 LOG_ENTRIES_CODEC: ValueCodec[list[LogEntry]] = ValueCodec(
     kind=KIND_LOGS, encode=encode_log_entries, decode=decode_log_entries
@@ -360,6 +523,25 @@ LOG_ENTRIES_CODEC: ValueCodec[list[LogEntry]] = ValueCodec(
 #: The codec for ``Query.logStats``.
 LOG_STATS_CODEC: ValueCodec[LogStatsResult] = ValueCodec(
     kind=KIND_LOG_STATS, encode=encode_log_stats, decode=decode_log_stats
+)
+
+#: The codec for ``Query.orderStatusDistribution``.
+ORDER_STATUS_AGG_CODEC: ValueCodec[tuple[OrderStatusBucket, ...]] = ValueCodec(
+    kind=KIND_ORDER_STATUS_AGG,
+    encode=encode_order_status_distribution,
+    decode=decode_order_status_distribution,
+)
+
+#: The codec for ``Query.orderFunnel``.
+ORDER_FUNNEL_AGG_CODEC: ValueCodec[tuple[FunnelBucket, ...]] = ValueCodec(
+    kind=KIND_ORDER_FUNNEL_AGG, encode=encode_order_funnel, decode=decode_order_funnel
+)
+
+#: The codec for ``Query.paymentOutcomeBreakdown``.
+PAYMENT_OUTCOME_AGG_CODEC: ValueCodec[tuple[PaymentOutcomeBucket, ...]] = ValueCodec(
+    kind=KIND_PAYMENT_OUTCOME_AGG,
+    encode=encode_payment_outcome_breakdown,
+    decode=decode_payment_outcome_breakdown,
 )
 
 
@@ -943,27 +1125,97 @@ async def cached_log_stats(
     )
 
 
+async def cached_order_status_distribution(
+    cache: Optional[ResultCache],
+    query: OrderEventQuery,
+    compute: Callable[[], Awaitable[tuple[OrderStatusBucket, ...]]],
+) -> tuple[OrderStatusBucket, ...]:
+    """``Query.orderStatusDistribution`` through the cache, under its own 20-second TTL.
+
+    Returns the **repository's** buckets, not the published objects, exactly as
+    :func:`cached_log_stats` does — so ``OrderStatusCount.from_buckets`` (which applies the
+    lifecycle ordering) runs identically on a hit and on a miss.
+    """
+    if cache is None:
+        return await compute()
+    return await cache.fetch(
+        KIND_ORDER_STATUS_AGG,
+        order_event_key_payload(query),
+        compute,
+        ORDER_STATUS_AGG_CODEC,
+    )
+
+
+async def cached_order_funnel(
+    cache: Optional[ResultCache],
+    query: OrderEventQuery,
+    compute: Callable[[], Awaitable[tuple[FunnelBucket, ...]]],
+) -> tuple[FunnelBucket, ...]:
+    """``Query.orderFunnel`` through the cache, under its own 300-second TTL."""
+    if cache is None:
+        return await compute()
+    return await cache.fetch(
+        KIND_ORDER_FUNNEL_AGG,
+        order_event_key_payload(query),
+        compute,
+        ORDER_FUNNEL_AGG_CODEC,
+    )
+
+
+async def cached_payment_outcome_breakdown(
+    cache: Optional[ResultCache],
+    query: PaymentEventQuery,
+    compute: Callable[[], Awaitable[tuple[PaymentOutcomeBucket, ...]]],
+) -> tuple[PaymentOutcomeBucket, ...]:
+    """``Query.paymentOutcomeBreakdown`` through the cache, under the shared aggregate TTL."""
+    if cache is None:
+        return await compute()
+    return await cache.fetch(
+        KIND_PAYMENT_OUTCOME_AGG,
+        payment_event_key_payload(query),
+        compute,
+        PAYMENT_OUTCOME_AGG_CODEC,
+    )
+
+
 __all__ = [
     "CACHE_FORMAT_VERSION",
     "DEFAULT_CACHE_NAMESPACE",
     "KIND_LOGS",
     "KIND_LOG_STATS",
+    "KIND_ORDER_FUNNEL_AGG",
+    "KIND_ORDER_STATUS_AGG",
+    "KIND_PAYMENT_OUTCOME_AGG",
     "LOG_ENTRIES_CODEC",
     "LOG_STATS_CODEC",
+    "ORDER_FUNNEL_AGG_CODEC",
+    "ORDER_STATUS_AGG_CODEC",
+    "PAYMENT_OUTCOME_AGG_CODEC",
     "TTL_POLICY",
     "CacheStats",
     "ResultCache",
     "ValueCodec",
     "cached_log_stats",
     "cached_logs",
+    "cached_order_funnel",
+    "cached_order_status_distribution",
+    "cached_payment_outcome_breakdown",
     "create_cache_redis_client",
     "create_request_redis_client",
     "create_result_cache",
     "decode_log_entries",
     "decode_log_stats",
+    "decode_order_funnel",
+    "decode_order_status_distribution",
+    "decode_payment_outcome_breakdown",
     "encode_log_entries",
     "encode_log_stats",
+    "encode_order_funnel",
+    "encode_order_status_distribution",
+    "encode_payment_outcome_breakdown",
     "log_stats_key_payload",
     "logs_key_payload",
     "make_cache_key",
+    "order_event_key_payload",
+    "payment_event_key_payload",
 ]

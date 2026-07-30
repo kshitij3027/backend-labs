@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, select, tuple_
+from sqlalchemy import Select, distinct, func, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.expression import ColumnElement
 
@@ -712,6 +712,264 @@ def build_user_event_select(
     ).limit(clamp_limit(query.limit, settings))
 
 
+# =================================================================================================
+# C11 — the cross-entity batch loads (spec §3 Feature Area D: "DataLoader batching extended across
+# all entity types, not just logs")
+#
+# Two generic builders rather than ten near-identical ones. They take the model and the column
+# because the SHAPE is genuinely identical across every edge this schema publishes — order -> its
+# payments, order -> its user's activity, user -> their orders, anything -> its trace — and ten
+# copies of `select(X).where(X.c.in_(keys)).order_by(...).limit(...)` would be ten places for the
+# `dict.fromkeys` dedup or the `max(1, ...)` on the limit to be forgotten in exactly one of them.
+#
+# EVERY CONTRACT THE C5 BUILDERS ESTABLISHED HOLDS HERE UNCHANGED, because the loaders above them
+# depend on all three:
+#
+#   * ONE statement per batch, never one per key. That is the whole requirement.
+#   * A FLAT list in `(timestamp DESC, id DESC)` order — NOT one bucket per key and NOT in key
+#     order. Re-aligning rows onto keys is `src.graphql.loaders`'s job, because it is a pure
+#     function worth unit testing against a shuffled batch with misses and duplicates in it.
+#   * Keys DEDUPLICATED order-preservingly. A DataLoader batch legitimately contains the same key
+#     twice (two payment events for one order ask for the same order), and PostgreSQL's extended
+#     protocol caps a statement at 32767 bound parameters.
+#
+# INDEX COVERAGE. Every batched predicate below is served by an index C10 already declared, and the
+# claim is checkable rather than asserted — `tests/integration/test_cross_entity_loaders.py` reads
+# `pg_indexes` and pins the pairing:
+#
+#   order_events.order_id   -> ix_order_events_order_ts     (order_id, timestamp, id)
+#   order_events.user_id    -> ix_order_events_user_ts      (user_id, timestamp, id)
+#   order_events.trace_id   -> ix_order_events_trace_id     (trace_id)
+#   payment_events.order_id -> ix_payment_events_order_ts   (order_id, timestamp, id)
+#   payment_events.trace_id -> ix_payment_events_trace_id   (trace_id)
+#   user_events.user_id     -> ix_user_events_user_ts       (user_id, timestamp, id)
+#   user_events.trace_id    -> ix_user_events_trace_id      (trace_id)
+#   every `id`              -> the primary key
+#
+# So C11 adds no index. That is not luck — C10 declared each of these for the traversal it knew was
+# coming, and the trailing-`id` tiebreak on the composite three is what lets the ordered read come
+# out of the index instead of out of a Sort node. The one thing to check when adding a new edge is
+# that its column leads an index; if it does not, add one in the same shape rather than shipping a
+# batched sequential scan (batched, and still O(table) per operation).
+# =================================================================================================
+
+
+def build_events_by_keys_select(
+    model: EventModel,
+    column: Any,  # noqa: ANN401 - an InstrumentedAttribute on `model`
+    keys: Sequence[str],
+    settings: Settings,
+) -> Select[Any]:
+    """The ONE SELECT that fetches every ``model`` row whose ``column`` is any of ``keys``.
+
+    .. rubric:: The LIMIT is a transfer bound and it is deliberately NOT a per-group one
+
+    ``MAX_QUERY_LIMIT * len(keys)`` — exactly the ceiling
+    :func:`build_logs_by_trace_ids_select` applies, for exactly the same reason: one pathological
+    key (an order retried ten thousand times, a user_id shared by a load-test fixture) must not be
+    able to pull a whole table through one field selection.
+
+    Its cost, stated rather than hidden: the ordering is global, so a hot key *could* in principle
+    consume the whole allowance and leave another key in the same batch wrongly empty. That needs
+    one key with more rows than the entire allowance, which cannot happen at any corpus this
+    project builds (an order has at most 14 events, a user a few dozen). The clean fix, if it ever
+    does, is the same one named on the log builder — a
+    ``ROW_NUMBER() OVER (PARTITION BY <column> ORDER BY timestamp DESC, id DESC) <= cap`` filter,
+    which caps each group independently inside the same single statement.
+
+    Args:
+        model: One of the three C10 event models.
+        column: The mapped column to match on — ``OrderEventORM.user_id`` and friends. Passed in
+            rather than named by string so a typo is an ``AttributeError`` at import rather than a
+            statement that compiles against the wrong table.
+        keys: The batch, in the order the loader was called in. Duplicates are collapsed.
+        settings: Supplies ``MAX_QUERY_LIMIT``.
+    """
+    unique = list(dict.fromkeys(keys))
+    return (
+        select(model)
+        .where(column.in_(unique))
+        .order_by(model.timestamp.desc(), model.id.desc())
+        .limit(settings.max_query_limit * max(1, len(unique)))
+    )
+
+
+def build_events_by_ids_select(model: EventModel, event_ids: Sequence[int]) -> Select[Any]:
+    """The ONE SELECT that fetches every ``model`` row named by ``event_ids``.
+
+    No ``LIMIT``, and that is not an oversight — it is :func:`build_logs_by_ids_select`'s argument
+    applied to the event tables: ``id`` is the primary key, so the result can never exceed the
+    number of distinct keys asked for. The batch size *is* the cap, and a ``LIMIT`` on top could
+    only ever silently drop a row a caller explicitly named.
+    """
+    unique = list(dict.fromkeys(event_ids))
+    return (
+        select(model)
+        .where(model.id.in_(unique))
+        .order_by(model.timestamp.desc(), model.id.desc())
+    )
+
+
+# =================================================================================================
+# C11 — the e-commerce aggregates (spec §3 Feature Area D: "Redis caching applied to aggregations")
+#
+# THE RULE FROM THE `logStats` SECTION ABOVE APPLIES HERE WORD FOR WORD: every number below is
+# computed BY POSTGRESQL. There is no `SELECT *` in this section and there must never be one. The
+# tempting implementation — pull the order events and count them in Python — is silently CAPPED by
+# `clamp_limit`, transfers the whole table to count it, and holds it in memory in a process serving
+# 100 concurrent requests. Only the first of those three changes an assertion, which is why the
+# tests grade these against a corpus larger than the default limit.
+#
+# THREE aggregates, and the three are genuinely different questions rather than one question with
+# three renderings. That distinction is what makes a per-aggregation TTL policy meaningful instead
+# of decorative (see `src.cache.TTL_POLICY`):
+#
+#   * DISTRIBUTION — "where does every order stand RIGHT NOW". One row per order (its newest event's
+#     status), then grouped. VOLATILE: one new event moves an order between buckets.
+#   * FUNNEL — "how many orders EVER reached each status". MONOTONIC: a status once reached is never
+#     un-reached, so this can only grow and a stale read can only undercount.
+#   * PAYMENT BREAKDOWN — the (method x outcome) cross-tabulation. Bounded by the VOCABULARY
+#     (5 x 4 = 20 buckets), never by the row count, exactly as `build_stats_breakdown_select` is.
+#
+# All three share `build_order_event_predicates` / `build_payment_event_predicates` with the flat
+# list reads, so a filter means precisely the same thing on an aggregate as on the rows behind it —
+# a dashboard's summary can never describe a different set from the table beneath it. None applies a
+# LIMIT, for the same reason `build_count_select` ignores one.
+#
+# ORDERING IS BY NAME HERE AND BY LIFECYCLE IN THE PROJECTION. The SQL orders by the status string
+# purely for determinism (an unordered GROUP BY may return groups in a different order between two
+# identical calls, which makes a response diff-unstable for no reason). The *published* order —
+# CREATED, PAID, PACKED, … — is applied in `src.graphql.ecommerce`, exactly as `LogStats.from_result`
+# applies ascending severity to `levelBreakdown`. Keeping it there is what lets the store stay
+# ignorant of the API's enum declaration order.
+# =================================================================================================
+
+
+@dataclass(frozen=True, slots=True)
+class OrderStatusBucket:
+    """How many orders are **currently** sitting at one status."""
+
+    status: str
+    orders: int
+
+
+@dataclass(frozen=True, slots=True)
+class FunnelBucket:
+    """How many distinct orders have **ever** reached one status."""
+
+    status: str
+    orders: int
+
+
+@dataclass(frozen=True, slots=True)
+class PaymentOutcomeBucket:
+    """One ``(method, outcome)`` cell: how many events, and how many distinct orders."""
+
+    method: str
+    outcome: str
+    events: int
+    orders: int
+
+
+def build_order_status_distribution_select(query: OrderEventQuery) -> Select[Any]:
+    """``DISTINCT ON (order_id)`` newest event per order, then ``GROUP BY status``.
+
+    .. rubric:: Why the subquery is not optional
+
+    ``order_events`` is an append-only stream: an order that reached DELIVERED has a CREATED row, a
+    PAID row and a PACKED row still sitting in the table. A plain ``GROUP BY status`` therefore
+    counts *transitions*, not orders — every fulfilled order would be counted once in every bucket
+    it passed through, and the "where do orders stand" panel would show a monotonically rising
+    count in every state at once. (That number is a real and useful one; it is the **funnel**, and
+    it has its own builder below.)
+
+    ``DISTINCT ON`` is PostgreSQL's own primitive for "the first row of each group under this
+    ORDER BY", and the ORDER BY has to lead with the distinct column — which is why the sort is
+    ``(order_id, timestamp DESC, id DESC)`` rather than the store's usual pair. The ``id`` tiebreak
+    is doing real work here rather than decorating: two events of one order can share an instant
+    under a bulk write, and without it "the newest status" would be whichever row the executor
+    happened to reach first, i.e. a count that changes between two identical calls.
+
+    The alternative shapes were considered and are worse at this size: a correlated
+    ``MAX(timestamp)`` subquery re-scans per order, and a ``ROW_NUMBER()`` window sorts every row of
+    every group rather than seeking one per group. ``ix_order_events_order_ts`` is
+    ``(order_id, timestamp, id)``, which is exactly the ordering this asks for.
+
+    ``query.limit`` is ignored, as it is on every aggregate in this module.
+    """
+    newest = select(OrderEventORM.order_id, OrderEventORM.status).distinct(
+        OrderEventORM.order_id
+    )
+    for predicate in build_order_event_predicates(query):
+        newest = newest.where(predicate)
+    newest = newest.order_by(
+        OrderEventORM.order_id.asc(),
+        OrderEventORM.timestamp.desc(),
+        OrderEventORM.id.desc(),
+    )
+
+    current = newest.subquery("current_order_status")
+    return (
+        select(current.c.status, func.count().label("orders"))
+        .group_by(current.c.status)
+        .order_by(current.c.status.asc())
+    )
+
+
+def build_order_funnel_select(query: OrderEventQuery) -> Select[Any]:
+    """``count(DISTINCT order_id)`` per status: how many orders ever reached each stage.
+
+    ``DISTINCT`` rather than ``count(*)`` is the whole difference between a funnel and an event
+    histogram, and it is not a distinction the seeded corpus can expose on its own — a generated
+    order emits each status at most once, so the two agree there and a test written against this
+    corpus alone cannot tell them apart. They diverge the moment anything retries: a payment
+    processor that re-notifies PAID writes a second PAID row, and ``count(*)`` would report an
+    order that converted twice. Counting orders is what the field claims to do, so it counts
+    orders.
+
+    One flat ``GROUP BY`` over an indexed column, no subquery: unlike the distribution above, this
+    question genuinely is about every row rather than about the newest one per order.
+    """
+    statement = select(
+        OrderEventORM.status,
+        func.count(distinct(OrderEventORM.order_id)).label("orders"),
+    ).select_from(OrderEventORM)
+    for predicate in build_order_event_predicates(query):
+        statement = statement.where(predicate)
+    return statement.group_by(OrderEventORM.status).order_by(OrderEventORM.status.asc())
+
+
+def build_payment_outcome_breakdown_select(query: PaymentEventQuery) -> Select[Any]:
+    """The ``(method, outcome)`` cross-tabulation, with both an event count and an order count.
+
+    Grouped on both columns at once rather than run twice, for the reason
+    :func:`build_stats_breakdown_select` gives: the per-method and per-outcome views a dashboard
+    draws are two marginals of one cross-tabulation, and folding them from a single scan is what
+    makes them unable to disagree about which rows they counted.
+
+    **Two counts, because they answer different questions and their difference is the signal.** A
+    payment is a stream — AUTHORIZED, then CAPTURED, then possibly REFUNDED — so ``events`` counts
+    attempts and ``orders`` counts the orders those attempts belong to. ``events > orders`` in a
+    DECLINED bucket means orders are being retried, which is precisely what a payments dashboard
+    exists to show; a single count could not express it.
+
+    Result size is bounded by the vocabulary (5 methods x 4 outcomes = 20 cells), never by the row
+    count — which is what lets the cost gate price this field at a fixed size rather than at the
+    page-size assumption.
+    """
+    statement = select(
+        PaymentEventORM.method,
+        PaymentEventORM.outcome,
+        func.count().label("events"),
+        func.count(distinct(PaymentEventORM.order_id)).label("orders"),
+    ).select_from(PaymentEventORM)
+    for predicate in build_payment_event_predicates(query):
+        statement = statement.where(predicate)
+    return statement.group_by(PaymentEventORM.method, PaymentEventORM.outcome).order_by(
+        PaymentEventORM.method.asc(), PaymentEventORM.outcome.asc()
+    )
+
+
 class LogRepository:
     """Executes the builders above against one :class:`~sqlalchemy.ext.asyncio.AsyncSession`.
 
@@ -939,3 +1197,181 @@ class LogRepository:
         """Matching user activity events, newest first, capped at the clamped limit."""
         result = await self._session.execute(build_user_event_select(query, self._settings))
         return list(result.scalars().all())
+
+    # ---------------------------------------------------------------------------------------------
+    # C11 — the batched cross-entity reads (spec §3 Feature Area D).
+    #
+    # Ten methods, three lines each, all of them the same sentence: dedupe, one statement, flat
+    # result. They are the store half of `src.graphql.loaders`'s cross-entity DataLoaders, and the
+    # ONLY thing each one adds over the two generic builders above is naming the (model, column)
+    # pair — which is worth a method rather than a call-site argument, because "which column is the
+    # order -> user edge" is a fact about this schema and should be written down once.
+    #
+    # EVERY ONE SHORT-CIRCUITS AN EMPTY BATCH WITHOUT EXECUTING ANYTHING. That is load-bearing
+    # rather than tidy: `WHERE order_id IN ()` is a statement that cannot match, and issuing it
+    # would put a round trip on the wire for a question whose answer is already known — which is
+    # exactly what the statement-counting tests exist to catch. It is also what makes
+    # `OrderEvent.relatedLogs` free (not merely cheap) on a page of untraced events.
+    # ---------------------------------------------------------------------------------------------
+
+    async def get_order_events_by_ids(self, event_ids: Sequence[int]) -> list[OrderEventORM]:
+        """Fetch every order event named by ``event_ids`` in **one** statement."""
+        if not event_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_ids_select(OrderEventORM, event_ids)
+        )
+        return list(result.scalars().all())
+
+    async def get_payment_events_by_ids(self, event_ids: Sequence[int]) -> list[PaymentEventORM]:
+        """Fetch every payment event named by ``event_ids`` in **one** statement."""
+        if not event_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_ids_select(PaymentEventORM, event_ids)
+        )
+        return list(result.scalars().all())
+
+    async def get_user_events_by_ids(self, event_ids: Sequence[int]) -> list[UserEventORM]:
+        """Fetch every user event named by ``event_ids`` in **one** statement."""
+        if not event_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_ids_select(UserEventORM, event_ids)
+        )
+        return list(result.scalars().all())
+
+    async def list_order_events_by_order_ids(
+        self, order_ids: Sequence[str]
+    ) -> list[OrderEventORM]:
+        """Every order event belonging to any of ``order_ids`` — one statement, newest first.
+
+        The order's own history, which is also how ``PaymentEvent.order`` answers "what is this
+        payment's order doing": the newest row of the group is the current status.
+        """
+        if not order_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                OrderEventORM, OrderEventORM.order_id, order_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_order_events_by_user_ids(self, user_ids: Sequence[str]) -> list[OrderEventORM]:
+        """Every order event placed by any of ``user_ids`` — the order -> user edge, read backwards."""
+        if not user_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                OrderEventORM, OrderEventORM.user_id, user_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_order_events_by_trace_ids(
+        self, trace_ids: Sequence[str]
+    ) -> list[OrderEventORM]:
+        """Every order event carrying any of ``trace_ids`` — the correlation edge."""
+        if not trace_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                OrderEventORM, OrderEventORM.trace_id, trace_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_payment_events_by_order_ids(
+        self, order_ids: Sequence[str]
+    ) -> list[PaymentEventORM]:
+        """Every payment event filed under any of ``order_ids`` — the order -> payments edge."""
+        if not order_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                PaymentEventORM, PaymentEventORM.order_id, order_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_payment_events_by_trace_ids(
+        self, trace_ids: Sequence[str]
+    ) -> list[PaymentEventORM]:
+        """Every payment event carrying any of ``trace_ids``."""
+        if not trace_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                PaymentEventORM, PaymentEventORM.trace_id, trace_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_user_events_by_user_ids(self, user_ids: Sequence[str]) -> list[UserEventORM]:
+        """Every activity event belonging to any of ``user_ids`` — the order -> user traversal."""
+        if not user_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                UserEventORM, UserEventORM.user_id, user_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    async def list_user_events_by_trace_ids(self, trace_ids: Sequence[str]) -> list[UserEventORM]:
+        """Every activity event carrying any of ``trace_ids``."""
+        if not trace_ids:
+            return []
+        result = await self._session.execute(
+            build_events_by_keys_select(
+                UserEventORM, UserEventORM.trace_id, trace_ids, self._settings
+            )
+        )
+        return list(result.scalars().all())
+
+    # ---------------------------------------------------------------------------------------------
+    # C11 — the e-commerce aggregates. Every number computed by PostgreSQL; see the section comment
+    # above `OrderStatusBucket` for the three questions and why they are three.
+    #
+    # `query.limit` is ignored by all three, exactly as `log_stats` and `count_logs` ignore it: these
+    # numbers describe the whole matching set, and an aggregate that silently stopped at
+    # MAX_QUERY_LIMIT would report a plausible, wrong total with nothing to say it had truncated.
+    #
+    # An empty result is a normal answer rather than an error. A GROUP BY over no rows returns no
+    # rows, so the caller gets an empty tuple and the dashboard renders zeros — a filter narrowed to
+    # a quiet window must not look like a failure.
+    # ---------------------------------------------------------------------------------------------
+
+    async def order_status_distribution(
+        self, query: OrderEventQuery
+    ) -> tuple[OrderStatusBucket, ...]:
+        """How many orders currently sit at each status — **one** statement, computed in SQL."""
+        rows = (
+            await self._session.execute(build_order_status_distribution_select(query))
+        ).all()
+        return tuple(
+            OrderStatusBucket(status=row.status, orders=int(row.orders)) for row in rows
+        )
+
+    async def order_funnel(self, query: OrderEventQuery) -> tuple[FunnelBucket, ...]:
+        """How many distinct orders ever reached each status — **one** statement, computed in SQL."""
+        rows = (await self._session.execute(build_order_funnel_select(query))).all()
+        return tuple(FunnelBucket(status=row.status, orders=int(row.orders)) for row in rows)
+
+    async def payment_outcome_breakdown(
+        self, query: PaymentEventQuery
+    ) -> tuple[PaymentOutcomeBucket, ...]:
+        """The ``(method, outcome)`` cross-tabulation — **one** statement, computed in SQL."""
+        rows = (
+            await self._session.execute(build_payment_outcome_breakdown_select(query))
+        ).all()
+        return tuple(
+            PaymentOutcomeBucket(
+                method=row.method,
+                outcome=row.outcome,
+                events=int(row.events),
+                orders=int(row.orders),
+            )
+            for row in rows
+        )
