@@ -79,14 +79,12 @@ test-unit:
 # service over the compose network (still hermetic in the sense that no published host port is
 # involved, which is what separates this from `make e2e`). Same no-coverage rule as test-unit.
 #
-# The `if [ -d ... ]` guard exists because tests/integration/ arrives in C2: a target that `make
-# help` advertises must not exit 4 with "file or directory not found" just because the suite it
-# names lands in the next commit. The guard removes itself the moment the directory exists.
+# tests/integration/ exists as of C2, so the `if [ -d ... ]` guard C1 carried has removed itself
+# exactly as its comment said it would, and this is back to the plain house form.
 test-int:
 	docker compose build test
 	@status=0; \
-	docker compose --profile test run --rm test \
-	  sh -c 'if [ -d tests/integration ]; then pytest tests/integration; else echo "no integration tests yet — they arrive in C2"; fi' || status=$$?; \
+	docker compose --profile test run --rm test pytest tests/integration || status=$$?; \
 	docker compose down; \
 	exit $$status
 

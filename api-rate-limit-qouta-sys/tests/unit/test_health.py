@@ -16,12 +16,45 @@ import socket
 import pytest
 from fastapi.testclient import TestClient
 
-from src.api.health import RATE_LIMITER_ACTIVE, SERVED_BY, STATUS_HEALTHY
+from src.api.health import (
+    RATE_LIMITER_ACTIVE,
+    REDIS_OK,
+    REDIS_UNREACHABLE,
+    SERVED_BY,
+    STATUS_HEALTHY,
+)
 from src.main import API_VERSION, Runtime, create_app
+from src.redis_client import BackingStoreUnavailable
 
 #: The complete body. Asserted as a set so an accidentally added field is caught here rather than
 #: by a dashboard that silently starts rendering something nobody meant to publish.
-EXPECTED_KEYS = {"status", "rate_limiter", "version", "uptime_sec", "served_by"}
+EXPECTED_KEYS = {"status", "rate_limiter", "version", "uptime_sec", "served_by", "redis"}
+
+
+class StubGateway:
+    """A gateway stand-in that answers ``ping()`` however the test needs it to.
+
+    The three Redis outcomes ``/health`` has to distinguish — answered, answered falsy, refused —
+    are not all reachable against a real server (a healthy Redis never returns a falsy PONG), so
+    the probe's branches are pinned here and the real-server behaviour is covered in
+    ``tests/integration/test_redis_gateway.py``.
+    """
+
+    def __init__(self, *, answer: object = True, error: Exception | None = None) -> None:
+        self._answer = answer
+        self._error = error
+        self.pings = 0
+
+    async def ping(self) -> object:
+        self.pings += 1
+        if self._error is not None:
+            raise self._error
+        return self._answer
+
+
+def _client_with_gateway(settings, gateway: object) -> TestClient:
+    """An app whose Runtime carries ``gateway`` instead of a real one."""
+    return TestClient(create_app(runtime=Runtime(settings=settings, redis=gateway)))  # type: ignore[arg-type]
 
 
 def test_health_returns_the_spec_contract(client):
@@ -53,6 +86,62 @@ def test_health_reports_version_uptime_and_replica(client):
 
 def test_health_body_has_exactly_the_documented_keys(client):
     assert set(client.get("/health").json()) == EXPECTED_KEYS
+
+
+def test_health_reports_redis_ok_when_the_gateway_answers(settings):
+    stub = StubGateway(answer=True)
+
+    body = _client_with_gateway(settings, stub).get("/health").json()
+
+    assert body["redis"] == REDIS_OK
+    assert stub.pings == 1
+
+
+@pytest.mark.parametrize(
+    "stub",
+    [
+        StubGateway(answer=False),
+        StubGateway(answer=None),
+        StubGateway(error=BackingStoreUnavailable("redis is down", op="ping")),
+    ],
+    ids=["falsy-pong", "no-pong", "classified-failure"],
+)
+def test_health_reports_redis_unreachable_on_anything_but_a_pong(settings, stub):
+    """A refusal and a non-answer are the same fact to an operator: the store is not reachable."""
+    body = _client_with_gateway(settings, stub).get("/health").json()
+
+    assert body["redis"] == REDIS_UNREACHABLE
+
+
+def test_a_redis_outage_does_not_turn_the_probe_red(settings):
+    """**The decision, asserted at the unit level too.**
+
+    `status` stays "healthy", `rate_limiter` stays "active", the HTTP status stays 200. `/health`
+    is what the container HEALTHCHECK, compose's `condition: service_healthy` and (C12) nginx's
+    upstream check read, and every one of them treats a non-200 as "restart this replica". A
+    replica that cannot reach Redis is still alive and — per C8's `FAIL_MODE=open` — still serving
+    correctly through the bounded local fallback, so failing the probe would restart a healthy
+    process. Worse, it would restart every replica simultaneously, because they all share the one
+    Redis that is down: a dependency failure the system was built to survive would become a total
+    outage. Liveness and dependency health are therefore two separate fields.
+    """
+    response = _client_with_gateway(
+        settings, StubGateway(error=BackingStoreUnavailable("down", op="ping"))
+    ).get("/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["redis"] == REDIS_UNREACHABLE
+    assert body["status"] == STATUS_HEALTHY
+    assert body["rate_limiter"] == RATE_LIMITER_ACTIVE
+
+
+def test_an_unstarted_runtime_reports_redis_unreachable(client):
+    """The default test seam injects a Runtime and never starts it, so the gateway is unconnected.
+
+    That must read as "unreachable" — never as an AttributeError, and never as a fabricated "ok".
+    """
+    assert client.get("/health").json()["redis"] == REDIS_UNREACHABLE
 
 
 def test_served_by_is_this_containers_hostname(client):
@@ -106,6 +195,8 @@ def test_health_survives_a_missing_runtime(settings):
     assert body["rate_limiter"] == "active"
     assert body["uptime_sec"] == 0.0
     assert body["served_by"]
+    # No runtime means no gateway to probe — reported honestly rather than guessed at.
+    assert body["redis"] == REDIS_UNREACHABLE
 
 
 def test_health_through_the_production_lifespan_path():
@@ -114,21 +205,32 @@ def test_health_through_the_production_lifespan_path():
     Every other test here uses the hermetic ``create_app(runtime=...)`` seam, which skips the
     lifespan entirely. That is the right default, but it would leave the startup path that
     actually ships as the one path nothing exercises: the Runtime construction, the settings read,
-    and (from C2) the Redis pool open/close. Entering the TestClient as a context manager is what
-    runs startup and shutdown.
+    and the Redis gateway's open/close. Entering the TestClient as a context manager is what runs
+    startup and shutdown.
+
+    Note what is NOT asserted: the value of ``redis``. This is a unit test, and whether a Redis
+    happens to be reachable from wherever it runs is not its subject —
+    ``tests/integration/test_redis_gateway.py`` asserts ``"ok"`` against a real server. What IS
+    asserted is that the lifespan started the gateway and, on the way out, stopped it: a shutdown
+    that leaks the pool turns a restart loop into a connection leak against a server whose
+    connection count is a finite, shared resource.
     """
     app = create_app()
 
     with TestClient(app) as lifespan_client:
         response = lifespan_client.get("/health")
+        assert app.state.runtime.redis.is_connected is True
 
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "healthy"
     assert body["rate_limiter"] == "active"
     assert body["version"] == API_VERSION
+    assert body["redis"] in {"ok", "unreachable"}
     # A runtime built by the lifespan, not injected by a fixture.
     assert isinstance(app.state.runtime, Runtime)
+    # ...and torn down by it.
+    assert app.state.runtime.redis.is_connected is False
 
 
 def test_rate_limit_headers_are_readable_cross_origin(client):

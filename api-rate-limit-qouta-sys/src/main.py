@@ -2,12 +2,13 @@
 
 Three things live here, and they are the three seams the rest of the project hangs off:
 
-* :class:`Runtime` — the single container for per-process collaborators (settings now; C2's
-  Redis gateway, C3's tier registry, C4's limiter and C9's analytics collector as they land).
+* :class:`Runtime` — the single container for per-process collaborators (settings and the Redis
+  gateway now; C3's tier registry, C4's limiter and C9's analytics collector as they land).
   Handlers read it defensively off ``request.app.state.runtime`` and degrade to a safe fallback
   rather than raising, so a half-wired runtime is never a 500.
-* :func:`lifespan` — the production startup path. It builds a Runtime and attaches it to
-  ``app.state`` before the app serves a single request, and tears it down on the way out.
+* :func:`lifespan` — the production startup path. It builds a Runtime, **starts** it (opening the
+  Redis client) and attaches it to ``app.state`` before the app serves a single request, then
+  stops it on the way out.
 * :func:`create_app` — the construction site. Passing a pre-built ``runtime`` skips the lifespan
   entirely, which is the hermetic test seam: no env, no Redis connection, no I/O.
 
@@ -15,6 +16,21 @@ That last seam matters more here than in a typical service. C12's decisive test 
 apps in one process, each with its own Redis client and its own pool, and drives both through
 ``httpx.ASGITransport`` against one real Redis — which is only possible because ``create_app``
 takes a Runtime instead of constructing one from global state.
+
+.. rubric:: Construction, start and stop are three separate steps
+
+:meth:`Runtime.build` is synchronous and performs **no I/O** — it constructs the
+:class:`~src.redis_client.RedisGateway` without connecting it. Opening the client is
+:meth:`Runtime.start`, closing it is :meth:`Runtime.stop`, and :func:`lifespan` is what calls them
+in production.
+
+The split exists because ``create_app(runtime=...)`` skips the lifespan by design, so nothing would
+call them on the injected path. **A test that injects a Runtime and needs Redis must therefore
+await ``runtime.start()`` itself, and await ``runtime.stop()`` in teardown.** A test that does not
+need Redis simply skips both: the gateway is inert until connected, and every read of it degrades
+to a documented fallback (``/health`` reports ``redis: "unreachable"``), so the hermetic unit tests
+that make up most of the suite still need no server at all.
+
 
 The module-level ``app`` is what uvicorn serves (``python -m uvicorn src.main:app``). Building it
 calls :func:`~src.config.get_settings`, so a missing or placeholder ``JWT_SECRET`` /
@@ -36,6 +52,7 @@ from fastapi.responses import ORJSONResponse
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
+from src.redis_client import RedisGateway, redact_redis_url
 
 logger = logging.getLogger(__name__)
 
@@ -102,12 +119,13 @@ class Runtime:
     clock, so reported uptime cannot go backwards when NTP steps the system clock — the same
     reasoning that puts the limiter's clock inside Redis rather than on each replica.
 
-    C2 adds ``redis`` (the gateway) here, C3 ``tiers``, C4 ``limiter``, C9 ``analytics``. Read
-    sites use ``getattr(runtime, "...", None)`` so a half-wired runtime degrades to a documented
-    fallback rather than a 500.
+    C3 adds ``tiers``, C4 ``limiter``, C9 ``analytics``. Read sites use
+    ``getattr(runtime, "...", None)`` so a half-wired runtime degrades to a documented fallback
+    rather than a 500.
     """
 
     settings: Settings
+    redis: RedisGateway
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -117,18 +135,34 @@ class Runtime:
 
     @classmethod
     def build(cls, settings: Settings) -> Runtime:
-        """Construct a Runtime from configuration.
+        """Construct a Runtime from configuration. **Synchronous, and performs no I/O.**
 
         One constructor for both paths — the lifespan and the injected-runtime test seam — on
         purpose. The moment production and test wiring diverge, the suite starts proving things
         about a system that is not the one being shipped, and for an enforcement layer that means
         a green test run over limits nobody is actually applying.
 
-        C1 has nothing to construct beyond the settings themselves; C2 opens the Redis pool here
-        (and :func:`lifespan` closes it), which is why this is a classmethod rather than a bare
-        ``Runtime(settings)`` call at every site.
+        The gateway is *constructed* here and *connected* in :meth:`start`. Keeping construction
+        I/O-free is what lets ``create_app(runtime=Runtime.build(settings))`` stay a hermetic test
+        seam: building a Runtime never dials anything, so a unit test does not need a Redis and an
+        unreachable one is not an import-time failure.
         """
-        return cls(settings=settings)
+        return cls(settings=settings, redis=RedisGateway(settings))
+
+    async def start(self) -> None:
+        """Open every connection this Runtime owns. Called by :func:`lifespan`, never by ``build``.
+
+        Idempotent, because the gateway's ``connect`` is. Note that ``redis.asyncio.from_url`` is
+        lazy — no socket is opened until the first command — so an unreachable Redis does not fail
+        startup here. That is the intended behaviour: the service is designed to serve (degraded)
+        while Redis is down, so refusing to boot without it would trade a documented fail-open for
+        an outage.
+        """
+        await self.redis.connect()
+
+    async def stop(self) -> None:
+        """Release every connection this Runtime owns. Never raises."""
+        await self.redis.aclose()
 
 
 def _configure_logging(settings: Settings) -> None:
@@ -156,13 +190,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings = get_settings()
     runtime = Runtime.build(settings)
+    await runtime.start()
     app.state.runtime = runtime
 
+    # `redact_redis_url` and NOT `settings.redis_url`: a Redis URL may legitimately carry
+    # `user:password@`, and a startup line is the single most-copied piece of text in an incident —
+    # it gets pasted into issues, chat and whatever aggregator ingests container stdout. Host, port
+    # and database index are what an operator needs; the credentials are not.
     logger.info(
-        "runtime initialised (log_level=%s, redis_url=%s, fail_mode=%s, "
+        "runtime initialised (log_level=%s, redis=%s, fail_mode=%s, "
         "rate_limit_enabled=%s, default_tier=%s, tiers=%s)",
         settings.log_level,
-        settings.redis_url,
+        redact_redis_url(settings.redis_url),
         settings.fail_mode,
         settings.rate_limit_enabled,
         settings.default_tier,
@@ -172,10 +211,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # C2 closes the Redis gateway here (`await runtime.redis.aclose()`), which is the reason
-        # this is a try/finally rather than a bare `yield`: the pool must be released even when
-        # shutdown is triggered by an exception, or a restart loop leaks a connection per cycle
-        # against a server whose connection count is a finite, shared resource.
+        # try/finally rather than a bare `yield`: the pool must be released even when shutdown is
+        # triggered by an exception, or a restart loop leaks a connection per cycle against a
+        # server whose connection count is a finite, shared resource.
+        await runtime.stop()
         logger.info("runtime shutdown complete (uptime %.1fs)", runtime.uptime_sec)
 
 
@@ -186,8 +225,14 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         runtime: Tests inject a pre-built :class:`Runtime` here; the app is then constructed
             **without** a lifespan and the runtime is attached to ``app.state`` directly, so there
             is no startup work, no Redis connection and no environment dependency. When omitted
-            (production: the module-level ``app``), :func:`lifespan` builds and attaches one on
-            startup.
+            (production: the module-level ``app``), :func:`lifespan` builds, starts and attaches
+            one on startup and stops it on shutdown.
+
+    .. warning::
+       Injecting a ``runtime`` skips the lifespan, and therefore skips :meth:`Runtime.start` and
+       :meth:`Runtime.stop` too. A test that needs the Redis gateway connected must ``await
+       runtime.start()`` before driving the app and ``await runtime.stop()`` afterwards; one that
+       does not need Redis skips both and gets the documented degraded behaviour instead.
     """
     common = {
         "title": API_TITLE,

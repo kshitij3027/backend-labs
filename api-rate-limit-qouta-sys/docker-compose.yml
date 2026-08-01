@@ -158,10 +158,15 @@ services:
   # requirements as `api`, plus tests/ and the two config files) and runs pytest. Profile-gated
   # so it never starts on a bare `docker compose up`. Run via `make test`.
   #
-  # It waits on Redis because from C2 the integration suite asserts Lua behaviour against a REAL
-  # redis:7-alpine rather than against fakeredis. fakeredis is a reimplementation — its TIME,
-  # float coercion and Lua->RESP rules are approximations, which is precisely the wrong oracle
-  # for a script whose entire job is exactness.
+  # It waits on Redis because from C2 the integration suite asserts gateway and (from C4) Lua
+  # behaviour against a REAL redis:7-alpine rather than against fakeredis. fakeredis is a
+  # reimplementation — its TIME, float coercion and Lua->RESP rules are approximations, which is
+  # precisely the wrong oracle for a script whose entire job is exactness. The NOSCRIPT-recovery
+  # test in tests/integration/test_redis_gateway.py is the concrete example: it issues a real
+  # `SCRIPT FLUSH` and re-runs, which only means anything against a real script cache.
+  #
+  # REDIS_URL is the ONE variable the suite needs from compose: tests/integration/conftest.py
+  # reads it (defaulting to this same value) to point its gateway fixture at this service.
   #
   # Note what is NOT set here: JWT_SECRET / API_KEY_PEPPER / ADMIN_TOKEN. tests/conftest.py sets
   # them with os.environ.setdefault before `src` is imported, so the suite carries its own
