@@ -1,0 +1,188 @@
+# API Rate Limiter & Quota Manager — service topology (Commit C1).
+#
+# Two services today: `redis` (the shared store) and `api` (one uvicorn/FastAPI process on
+# :8000). C12 splits `api` into `api1` + `api2` behind an nginx `lb`; nothing else about the
+# topology changes, because the reason there are two services rather than one is already true
+# here.
+#
+# .. rubric:: Why Redis is its own service, and not a dict in the app
+#
+# The limiter's state MUST live outside the API process. A token bucket held in Python memory is
+# not a rate limit once there are two replicas behind a load balancer — it is TWO rate limits,
+# and the caller gets double the allowance they paid for. The same applies, worse, to quota
+# counters: a per-process daily counter means N replicas each hand out the full daily allowance.
+# So buckets, sliding-window counters and quota counters all live in this one Redis, every
+# read-modify-write against them is a single server-side Lua script (atomic on Redis's single
+# thread), and the clock they refill against is `redis.call('TIME')` — ONE clock, so a replica
+# with a fast system clock cannot refill its own bucket early. Redis being a separate container
+# is what makes that property visible and testable rather than merely intended.
+#
+# The profile-gated `test` service runs the pytest suite from Dockerfile.test; C13/C14 add `e2e`
+# and `loadtest` services from the same image. None of them starts on a bare `docker compose up`.
+# The harnesses reach the API by SERVICE NAME over the compose network (http://api:8000), never
+# via a published host port, so they are immune to an API_PORT collision on the host.
+#
+# Every one of the 29 Settings fields is passed to `api` as ${VAR:-default}, including the ones
+# no code reads until C4-C14. That is deliberate: the whole config surface is host-overridable
+# from day one and this file never has to change again as later commits start reading those keys.
+
+services:
+  # Shared state. ONE bucket, ONE quota counter, ONE clock, for however many API replicas exist.
+  redis:
+    image: redis:7-alpine
+    # appendonly=yes, and this is a correctness choice rather than a default worth inheriting.
+    # A Redis restart without AOF resets every daily and monthly QUOTA counter to zero — a
+    # customer who has burned 90% of a paid monthly allowance gets it back for free, which is a
+    # billing-shaped hole rather than a cache miss. Losing token BUCKETS on restart is fine and
+    # expected: buckets are ephemeral by design (they refill continuously, carry a ~1 h TTL, and
+    # an empty bucket recovers within a minute), so the worst case there is one brief window of
+    # extra burst headroom. Persistence is bought for the counters that represent money.
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      # `redis-cli ping` rather than a TCP port probe: the port is listening well before the
+      # server is ready to answer commands, and `api`'s depends_on below waits on THIS.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Named volume, so the AOF survives `docker compose down` (only `down -v` — i.e. `make
+    # clean` and the test targets — discards it). Tests deliberately start from a clean store.
+    volumes:
+      - redis-data:/data
+
+  # Live production API — built from the production Dockerfile and the only service exposed on
+  # the host. No container_name (sibling convention: leaves compose free to name/scale it, which
+  # C12 relies on).
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # An operator-supplied .env is optional: `required: false` keeps a clean clone runnable.
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # --- Server / logging ---
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+      # --- Shared state (C2) ---
+      - "REDIS_URL=${REDIS_URL:-redis://redis:6379/0}"
+      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-32}
+      # 250 ms, on BOTH connect and socket read. The rate-limit check has a 5 ms budget, so a
+      # Redis that has stopped answering must be classified as failed in milliseconds, not
+      # seconds — a limiter that hangs is worse for the caller than one that fails open.
+      - REDIS_TIMEOUT_MS=${REDIS_TIMEOUT_MS:-250}
+
+      # --- Secrets (C5, C10) ---
+      # Dev-only values — NOT secrets, and deliberately not any of the placeholder strings
+      # Settings rejects, so `make up` works on a clean clone with no .env at all. Override via
+      # .env or the shell (`JWT_SECRET=$(openssl rand -hex 32)`) for anything not a laptop.
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-signing-key-0123456789abcdef}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - ACCESS_TOKEN_TTL_MIN=${ACCESS_TOKEN_TTL_MIN:-30}
+      # The pepper for the HMAC-SHA256 API-key digests. It lives HERE, in the app's environment,
+      # and never in Redis — so a stolen Redis dump on its own yields digests an attacker cannot
+      # invert into usable keys. Rotating it invalidates every stored key by construction.
+      - API_KEY_PEPPER=${API_KEY_PEPPER:-dev-only-insecure-pepper-0123456789abcdef}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-dev-only-insecure-admin-token-0123456789abcdef}
+
+      # --- Limits and quotas (C3, C4) ---
+      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+      # Quoted: the value is `tier:rpm:burst:daily:monthly,...` and YAML would otherwise have to
+      # be trusted with a string full of colons.
+      - "TIER_LIMITS=${TIER_LIMITS:-free:60:60:1000:25000,premium:300:300:50000:1250000,enterprise:1000:1000:500000:12500000}"
+      - DEFAULT_TIER=${DEFAULT_TIER:-free}
+      # Weighted per-request cost by endpoint category (the in-scope bonus). Quoted for the
+      # same reason as TIER_LIMITS.
+      - "ENDPOINT_COSTS=${ENDPOINT_COSTS:-logs_query:5,logs_ingest:2,default:1}"
+      - BUCKET_TTL_SEC=${BUCKET_TTL_SEC:-3600}
+      - SLIDING_WINDOW_SEC=${SLIDING_WINDOW_SEC:-60}
+      - SLIDING_WINDOW_ENABLED=${SLIDING_WINDOW_ENABLED:-true}
+      - QUOTA_DAILY_ENABLED=${QUOTA_DAILY_ENABLED:-true}
+      - QUOTA_MONTHLY_ENABLED=${QUOTA_MONTHLY_ENABLED:-true}
+      - TIER_CACHE_TTL_SEC=${TIER_CACHE_TTL_SEC:-5}
+
+      # --- Analytics (C9, C11) ---
+      - ANALYTICS_MINUTE_TTL_SEC=${ANALYTICS_MINUTE_TTL_SEC:-3600}
+      - ANALYTICS_HOUR_TTL_SEC=${ANALYTICS_HOUR_TTL_SEC:-604800}
+      - ANALYTICS_MAX_BUCKETS=${ANALYTICS_MAX_BUCKETS:-120}
+
+      # --- Degradation (C8) ---
+      - FAIL_MODE=${FAIL_MODE:-open}
+      # Sizes the degraded fallback bucket at ceil(tier_capacity / API_REPLICAS). It must track
+      # the number of `api*` services below: N replicas each holding a FULL local bucket is the
+      # N-times overspend this project exists to prevent, so a wrong value here is not cosmetic.
+      - API_REPLICAS=${API_REPLICAS:-2}
+      - BREAKER_FAILURES=${BREAKER_FAILURES:-5}
+      - BREAKER_COOLDOWN_SEC=${BREAKER_COOLDOWN_SEC:-5}
+
+      # --- Test-only seam, inert in production (C4) ---
+      # Gates the Lua script's `now_ms_override` ARGV. Default false, and it stays false here:
+      # a caller-supplied clock is precisely the skew vulnerability the design removed, so it
+      # must be inert by construction outside the tests that need a frozen clock.
+      - ALLOW_CLOCK_OVERRIDE=${ALLOW_CLOCK_OVERRIDE:-false}
+
+      # --- Dashboard (C15) ---
+      - DASHBOARD_POLL_MS=${DASHBOARD_POLL_MS:-5000}
+
+      # --- CORS ---
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+    depends_on:
+      # Wait for `redis-cli ping`, not merely for the container to exist. Starting the API
+      # against a Redis that is not answering yet would make the first seconds of every `make up`
+      # run in the degraded fail-open path — i.e. unmetered — which is exactly the state this
+      # project is built to make visible rather than accidental.
+      redis:
+        condition: service_healthy
+    # The container always binds :8000; only the host side is tunable. 8020 because sibling
+    # projects in this repo already hold 8000/8001/8010/8080.
+    ports:
+      - "${API_PORT:-8020}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # /health is dependency-free, unauthenticated and never metered, so the app is healthy as
+      # soon as uvicorn binds; 20s covers pool construction without flapping the container.
+      start_period: 20s
+    # Trade-off, accepted deliberately: a FATAL config error (e.g. a placeholder JWT_SECRET,
+    # which Settings rejects at import) restart-loops here rather than stopping once — compose
+    # cannot distinguish "crashed transiently" from "will never start". The refusal contract
+    # still holds (the container never serves a request with a bad key, and `docker compose up`
+    # surfaces `exited with code 1` on every cycle), and auto-recovery from transient crashes is
+    # worth more day to day than a clean exit on a misconfiguration you see immediately anyway.
+    restart: unless-stopped
+
+  # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code and
+  # requirements as `api`, plus tests/ and the two config files) and runs pytest. Profile-gated
+  # so it never starts on a bare `docker compose up`. Run via `make test`.
+  #
+  # It waits on Redis because from C2 the integration suite asserts Lua behaviour against a REAL
+  # redis:7-alpine rather than against fakeredis. fakeredis is a reimplementation — its TIME,
+  # float coercion and Lua->RESP rules are approximations, which is precisely the wrong oracle
+  # for a script whose entire job is exactness.
+  #
+  # Note what is NOT set here: JWT_SECRET / API_KEY_PEPPER / ADMIN_TOKEN. tests/conftest.py sets
+  # them with os.environ.setdefault before `src` is imported, so the suite carries its own
+  # credentials and behaves identically inside this container and in a bare `pytest` run. One
+  # declaration, in the file the tests actually read.
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [test]
+    environment:
+      - "REDIS_URL=redis://redis:6379/0"
+    depends_on:
+      redis:
+        condition: service_healthy
+    # No -q: verbosity is centralized in pytest.ini (`addopts = -q --tb=short`). A second -q here
+    # would stack to -qq and suppress the "N passed in Xs" summary line.
+    command: ["pytest"]
+
+volumes:
+  # Named rather than a bind mount: the AOF is Redis's own on-disk format and has no business in
+  # the source tree (it would land in the build context and in git status). `make clean` and the
+  # test targets drop it with `down -v`.
+  redis-data:

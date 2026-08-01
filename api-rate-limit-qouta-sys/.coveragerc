@@ -1,0 +1,38 @@
+# Coverage measurement rules. The GATE itself (--cov-fail-under) is supplied by `make test` as
+# $${COV_MIN:-90}, never here: keeping it on the command line is what lets `COV_MIN=99 make test`
+# prove the gate bites instead of merely existing.
+#
+# Coverage flags are likewise absent from pytest.ini's `addopts`. In addopts they would attach to
+# `make test-unit` too, and a percentage measured over the unit subset alone is a coverage-shaped
+# lie — it would look like a tighter gate while covering strictly less.
+
+[run]
+# `source = src` and not `.`, for two specific exclusions rather than tidiness:
+#
+#   * scripts/ — verify_e2e.py and load_test.py are black-box harnesses that only ever execute
+#     inside the e2e/loadtest containers, driving the app over HTTP. `pytest` never imports them,
+#     so they would report as several hundred uncovered statements and drag the project number
+#     down for measuring exactly the thing they are not: they are the verification, not the
+#     subject of it.
+#   * tests/ — a suite that counts itself always looks well covered. The number would move only
+#     when tests were added, which is the opposite of a signal.
+#
+# What is left is exactly the code that ships in the production image.
+source = src
+# Branch coverage, because statement coverage cannot see the failure this project is about. The
+# degraded fail-open path, the "denial writes nothing" path and the quota-vs-rate branch are all
+# reached by lines that a statement-only run already counts as covered via their happy path.
+branch = True
+# Package marker, no statements worth measuring.
+omit = src/__init__.py
+
+[report]
+show_missing = True
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if typing.TYPE_CHECKING:
+    def __repr__
+    raise NotImplementedError
+    @(abc\.)?abstractmethod
+    if __name__ == .__main__.:

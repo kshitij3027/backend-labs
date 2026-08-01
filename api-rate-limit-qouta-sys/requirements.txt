@@ -1,0 +1,65 @@
+# api-rate-limit-qouta-sys — Python dependencies (pinned FastAPI + Redis stack).
+#
+# Pins are EXACT so image builds are reproducible and offline-friendly. This layer is
+# installed before the app source is copied, so it caches once and code changes only
+# rebuild the thin source layer on top of it. Everything here resolves to a prebuilt
+# manylinux wheel on python:3.11-slim — no C toolchain required.
+#
+# The defining dependency of this project is Redis. Rate-limit buckets and cumulative
+# quota counters MUST live outside the process: two API replicas each holding their own
+# in-memory bucket would let a caller spend the limit twice, which is exactly the bug
+# this project exists to not have. State is shared, and every read-modify-write against
+# it is a server-side Lua script so the check-and-decrement is atomic under concurrency.
+
+# --- Web / API ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# --- Shared state: token buckets + quota counters across replicas ---
+redis==5.2.1               # asyncio client; Lua EVALSHA for atomic bucket/quota updates
+
+# --- Auth: API-key hashing + JWT verification (two accepted credential forms) ---
+#
+# NO bcrypt here, deliberately. API keys are hashed with HMAC-SHA256 + a server-side pepper —
+# stdlib `hmac` and `hashlib`, so there is nothing to pin — and that is a correctness decision
+# rather than a convenience one:
+#
+#   * bcrypt at its default cost is ~250 ms per hash. This project's ENTIRE latency budget for a
+#     rate-limit check is 5 ms, and identity resolution runs on every metered request, so bcrypt
+#     alone would be 50x the budget before the limiter had done anything.
+#   * bcrypt salts every hash individually, which means you cannot LOOK A KEY UP by its digest.
+#     Answering "who is this?" would mean bcrypt-comparing the presented key against every stored
+#     key in turn — O(n) 250 ms hashes per request. The whole storage design here is a single
+#     `apikey:v1:<hmac_sha256_hex>` HASH lookup, which a per-hash salt makes impossible.
+#   * A password KDF exists to slow dictionary and offline-search attacks against low-entropy
+#     human-chosen secrets. These API keys are 256-bit CSPRNG output: there is no dictionary to
+#     try and no search that terminates, so the KDF buys nothing for what it costs.
+#
+# The pepper lives in the app's environment (API_KEY_PEPPER), never in Redis, so a stolen Redis
+# dump on its own yields digests an attacker cannot invert or replay. Rotating the pepper
+# invalidates every stored key by construction.
+PyJWT==2.9.0
+python-multipart==0.0.12   # OAuth2 password-form body parsing for the token endpoint
+
+# --- Serialization / runtime helpers ---
+orjson==3.10.7
+psutil==6.0.0              # backend RSS probe used by the load/E2E memory gates
+
+# --- Testing ---
+pytest==8.3.3
+pytest-asyncio==0.24.0
+httpx==0.27.2
+# The [lua] extra pulls `lupa`, and it is what makes EVAL/EVALSHA work in the double at all —
+# without it fakeredis raises on the very first script call, and the decision script IS the code
+# under test. Every other Redis sibling in this repo pins the [lua] extra for the same reason.
+# Load-bearing Lua assertions still run against a real redis:7-alpine in tests/integration/:
+# fakeredis is a reimplementation whose TIME, float coercion and Lua->RESP rules are
+# approximations, which is the wrong oracle for a script whose entire job is exactness.
+fakeredis[lua]==2.26.1     # unit-level Redis double (incl. Lua) so unit tests need no server
+# The spec requires >90% coverage; until now there was no runner to produce or enforce the
+# number. Flags live on `make test` only (see .coveragerc for why never in pytest.ini addopts).
+pytest-cov==5.0.0          # pytest integration: --cov / --cov-branch / --cov-fail-under
+coverage[toml]==7.6.1      # the measurement engine underneath it

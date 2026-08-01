@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Environment / secrets (never commit real JWT signing keys or API keys)
+.env
+.env.*
+*.env
+!.env.example
+
+# Testing / tooling caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local data (Redis dumps, seeded quota snapshots, exports, scratch results)
+data/
+dump.rdb
+appendonly.aof
+appendonlydir/
+*.db
+*.sqlite3
+*.log
+*.ndjson
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Planning docs (per root CLAUDE.md rule 6)
+plan.md
+project_requirements.md

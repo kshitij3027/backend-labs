@@ -1,0 +1,59 @@
+# Keep junk and bulky artifacts out of the build context / image. The production Dockerfile
+# copies only src/ (+ requirements.txt) and Dockerfile.test additionally copies tests/ +
+# scripts/ + pytest.ini + .coveragerc, so most of this is belt-and-braces.
+#
+# Three things are deliberately NOT ignored, and each has bitten a build somewhere:
+#   * tests/ and scripts/  — the tester image needs them in its build context.
+#   * .coveragerc          — it is COPYed into the tester image; ignoring it would silently
+#                            fall back to coverage.py's defaults and measure the wrong tree.
+#   * nginx/               — C12's load-balancer config is bind-mounted from the build context.
+# Patterns below are listed by name rather than as `*.md` so adding a doc never accidentally
+# knocks one of the above out of the context.
+
+# VCS / planning docs
+.git
+.gitignore
+README.md
+plan.md
+project_requirements.md
+
+# Python caches / build artifacts
+__pycache__
+*.pyc
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov/
+build
+dist
+*.egg-info
+
+# Virtual environments
+.venv
+venv
+env
+ENV
+
+# Secrets / env — a real .env must never be baked into an image layer. Compose reads it at run
+# time via `env_file`, which is the correct seam. The template is exempted explicitly: it holds
+# only placeholder values (which Settings rejects on purpose) and is useful documentation inside
+# the image.
+.env
+.env.*
+!.env.example
+
+# Local data (Redis dumps, exported counters, scratch results). Redis persistence lives in a
+# named volume, never in the build context.
+data/
+dump.rdb
+appendonly.aof
+appendonlydir/
+
+# OS / logs
+.DS_Store
+*.log
