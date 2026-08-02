@@ -28,7 +28,15 @@ from src.redis_client import BackingStoreUnavailable
 
 #: The complete body. Asserted as a set so an accidentally added field is caught here rather than
 #: by a dashboard that silently starts rendering something nobody meant to publish.
-EXPECTED_KEYS = {"status", "rate_limiter", "version", "uptime_sec", "served_by", "redis"}
+EXPECTED_KEYS = {
+    "status",
+    "rate_limiter",
+    "version",
+    "uptime_sec",
+    "served_by",
+    "redis",
+    "config_version",
+}
 
 
 class StubGateway:
@@ -53,8 +61,16 @@ class StubGateway:
 
 
 def _client_with_gateway(settings, gateway: object) -> TestClient:
-    """An app whose Runtime carries ``gateway`` instead of a real one."""
-    return TestClient(create_app(runtime=Runtime(settings=settings, redis=gateway)))  # type: ignore[arg-type]
+    """An app whose Runtime carries ``gateway`` instead of a real one.
+
+    Built with ``dataclasses.replace`` off a real ``Runtime.build`` rather than by calling
+    ``Runtime(...)`` field by field: the Runtime grows a collaborator every other commit (C3's tier
+    registry, C4's limiter, C9's analytics), and a hand-listed constructor call here would have to
+    be updated each time — which is a test helper failing to compile, not a test failing to pass.
+    Everything except the gateway stays exactly as production builds it.
+    """
+    runtime = dataclasses.replace(Runtime.build(settings), redis=gateway)
+    return TestClient(create_app(runtime=runtime))
 
 
 def test_health_returns_the_spec_contract(client):
@@ -82,6 +98,10 @@ def test_health_reports_version_uptime_and_replica(client):
     assert body["uptime_sec"] >= 0.0
     assert body["served_by"]
     assert isinstance(body["served_by"], str)
+    # The injected-runtime seam never starts the runtime, so the tier registry has never read
+    # `config:version` and is still serving `settings.tier_limits`. Reported as 0 — an honest
+    # "no snapshot from Redis yet", which is what C10 needs this field to mean.
+    assert body["config_version"] == 0
 
 
 def test_health_body_has_exactly_the_documented_keys(client):
@@ -195,8 +215,10 @@ def test_health_survives_a_missing_runtime(settings):
     assert body["rate_limiter"] == "active"
     assert body["uptime_sec"] == 0.0
     assert body["served_by"]
-    # No runtime means no gateway to probe — reported honestly rather than guessed at.
+    # No runtime means no gateway to probe and no tier registry to read — both reported honestly
+    # rather than guessed at.
     assert body["redis"] == REDIS_UNREACHABLE
+    assert body["config_version"] == 0
 
 
 def test_health_through_the_production_lifespan_path():

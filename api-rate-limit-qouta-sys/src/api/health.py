@@ -36,6 +36,13 @@ top level, not nested. Everything else is additive:
   whole project exists to catch would go undetected.
 * ``redis`` — ``"ok"`` or ``"unreachable"``, from a real ``PING`` through the gateway (so the probe
   also feeds the circuit breaker rather than being a second, unobserved path to the server).
+* ``config_version`` — the ``config:version`` this replica's tier snapshot was built from. This is
+  how C10 watches a runtime tier change propagate: after a ``PUT /admin/tiers/{tier}`` the number
+  climbs on the replica that served the write immediately and on every other replica within
+  ``TIER_CACHE_TTL_SEC``. Without it, "did the change reach replica 2 yet?" is only answerable by
+  firing traffic at it and inferring the answer from a 429. ``0`` means no snapshot has ever been
+  read from Redis — a legitimate degraded state (the configured defaults are being enforced), not
+  an error.
 
 ``rate_limiter`` is the constant ``"active"`` for now; C8 makes it report ``"degraded"`` (still
 with a 200) when Redis is unreachable and the fallback bucket is carrying the load. A silent
@@ -125,6 +132,29 @@ class HealthResponse(BaseModel):
         "on purpose: this process stays healthy (and keeps serving, fail-open) when the shared "
         "store is down."
     )
+    config_version: int = Field(
+        description="`config:version` behind this replica's tier snapshot. C10 watches this "
+        "number climb to prove a runtime tier change propagated; 0 means no snapshot has been "
+        "read from Redis yet and the configured defaults are in force."
+    )
+
+
+def _config_version(runtime: object) -> int:
+    """Read the tier snapshot's version off the runtime, degrading to ``0`` rather than raising.
+
+    The same ``getattr`` discipline as :func:`_probe_redis`, applied one level deeper: a runtime
+    with no registry (a half-wired process, or a test that injected a bare object) must produce a
+    200 with an honest ``0``, not an ``AttributeError`` on the one endpoint an orchestrator uses to
+    decide whether to restart this replica.
+
+    :meth:`~src.tiers.TierRegistry.snapshot` is synchronous and touches no I/O, so calling it here
+    costs an attribute read — and, as a side effect worth having, the container's 10-second
+    ``/health`` poll keeps the 5-second snapshot warm on a replica that is otherwise idle.
+    """
+    snapshot = getattr(getattr(runtime, "tiers", None), "snapshot", None)
+    if snapshot is None:
+        return 0
+    return int(getattr(snapshot(), "version", 0) or 0)
 
 
 async def _probe_redis(runtime: object) -> str:
@@ -187,4 +217,5 @@ async def health(request: Request) -> HealthResponse:
         uptime_sec=round(uptime_sec, 3),
         served_by=SERVED_BY,
         redis=await _probe_redis(runtime),
+        config_version=_config_version(runtime),
     )

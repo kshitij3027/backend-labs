@@ -2,8 +2,8 @@
 
 Three things live here, and they are the three seams the rest of the project hangs off:
 
-* :class:`Runtime` — the single container for per-process collaborators (settings and the Redis
-  gateway now; C3's tier registry, C4's limiter and C9's analytics collector as they land).
+* :class:`Runtime` — the single container for per-process collaborators (settings, the Redis
+  gateway and the tier registry now; C4's limiter and C9's analytics collector as they land).
   Handlers read it defensively off ``request.app.state.runtime`` and degrade to a safe fallback
   rather than raising, so a half-wired runtime is never a 500.
 * :func:`lifespan` — the production startup path. It builds a Runtime, **starts** it (opening the
@@ -53,6 +53,7 @@ from fastapi.responses import ORJSONResponse
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
 from src.redis_client import RedisGateway, redact_redis_url
+from src.tiers import TierRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +120,13 @@ class Runtime:
     clock, so reported uptime cannot go backwards when NTP steps the system clock — the same
     reasoning that puts the limiter's clock inside Redis rather than on each replica.
 
-    C3 adds ``tiers``, C4 ``limiter``, C9 ``analytics``. Read sites use
-    ``getattr(runtime, "...", None)`` so a half-wired runtime degrades to a documented fallback
-    rather than a 500.
+    C4 adds ``limiter``, C9 ``analytics``. Read sites use ``getattr(runtime, "...", None)`` so a
+    half-wired runtime degrades to a documented fallback rather than a 500.
     """
 
     settings: Settings
     redis: RedisGateway
+    tiers: TierRegistry
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -146,8 +147,16 @@ class Runtime:
         I/O-free is what lets ``create_app(runtime=Runtime.build(settings))`` stay a hermetic test
         seam: building a Runtime never dials anything, so a unit test does not need a Redis and an
         unreachable one is not an import-time failure.
+
+        The tier registry is handed the **same** gateway object rather than building its own. One
+        ``Redis`` client per process, sharing one pool, is a rule redis-py itself states: two
+        clients over one pool means closing either leaves the other holding dead connections, and
+        two clients with two pools doubles this process's connection footprint against a
+        single-threaded server for no gain. Constructing the registry is likewise pure — it starts
+        life serving ``settings.tier_limits`` and does not touch Redis until :meth:`start`.
         """
-        return cls(settings=settings, redis=RedisGateway(settings))
+        gateway = RedisGateway(settings)
+        return cls(settings=settings, redis=gateway, tiers=TierRegistry(settings, gateway))
 
     async def start(self) -> None:
         """Open every connection this Runtime owns. Called by :func:`lifespan`, never by ``build``.
@@ -157,11 +166,26 @@ class Runtime:
         startup here. That is the intended behaviour: the service is designed to serve (degraded)
         while Redis is down, so refusing to boot without it would trade a documented fail-open for
         an outage.
+
+        **Order matters:** the gateway is connected before the registry is started, because
+        :meth:`~src.tiers.TierRegistry.start` seeds ``config:tiers`` and takes its first snapshot —
+        i.e. it is the first thing in the process to issue a command. Starting it against an
+        unconnected gateway would classify every seed write as an outage and boot the replica on
+        the fallback table for no reason. The registry's own start never raises, so an unreachable
+        Redis still leaves a serving process.
         """
         await self.redis.connect()
+        await self.tiers.start()
 
     async def stop(self) -> None:
-        """Release every connection this Runtime owns. Never raises."""
+        """Release every connection this Runtime owns. Never raises.
+
+        **Order matters here too, and it is the reverse.** The registry is stopped *first*: it may
+        have a background refresh in flight holding a pooled connection, and closing the pool
+        underneath that task turns an orderly shutdown into a traceback (and, under compose, into
+        a restart loop that looks like a crash). Cancel the borrower, then close the pool.
+        """
+        await self.tiers.stop()
         await self.redis.aclose()
 
 
