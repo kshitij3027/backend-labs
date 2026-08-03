@@ -157,6 +157,10 @@ def test_the_enums_carry_their_wire_strings():
     assert QuotaPeriodState.RESET == "reset"
     assert QuotaPeriodState.ACTIVE == "active"
     assert QuotaPeriodState.EXHAUSTED == "exhausted"
+    # C4. A period with no ceiling has no other state that is TRUE: `reset` is a claim that a
+    # boundary just rolled over, and for an unlimited or switched-off period there is no boundary
+    # to have rolled. It is the same condition that makes `daily_remaining` report UNLIMITED.
+    assert QuotaPeriodState.UNENFORCED == "unenforced"
     assert CredentialKind.API_KEY == "api_key"
     assert CredentialKind.JWT == "jwt"
 
@@ -289,7 +293,56 @@ def test_remaining_is_never_negative_and_is_an_integer_string(
 
 
 def test_reset_headers_are_never_negative():
-    assert decision(window_reset_sec=-9).headers()[RATELIMIT_RESET_HEADER] == "0"
+    """Both gates' resets are nonsense, so there is nothing to fall back to and the floor holds.
+
+    Reachable only from a hand-built decision (C8's fallback constructs one by hand); the script's
+    own quantities are clamped at the source.
+    """
+    verdict = decision(window_reset_sec=-9, bucket_reset_sec=-4)
+
+    assert verdict.headers()[RATELIMIT_RESET_HEADER] == "0"
+
+
+def test_a_window_with_no_reset_falls_back_to_the_buckets_recovery():
+    """**With ``SLIDING_WINDOW_ENABLED=false`` the script has no window reset to report.**
+
+    It still reports the tier's per-minute number as ``window_limit`` — that is what the caller's
+    plan says — so a naive ``str(max(0, window_reset_sec))`` emits ``Limit: 60, Remaining: 0,
+    Reset: 0`` on a drained bucket. A client pacing off that pair retries immediately, is refused
+    by the bucket whose real recovery was seconds away, and loops: the same retry storm
+    ``Retry-After: 0`` would cause, arriving through a different header.
+
+    It matters specifically because ``SLIDING_WINDOW_ENABLED`` is an *operability* switch, so it
+    gets flipped during an incident — exactly when a client-side retry storm is least affordable.
+    """
+    verdict = decision(
+        allowed=False,
+        reason=DenyReason.RATE_LIMIT,
+        retry_after_sec=5,
+        bucket_remaining=0,
+        bucket_reset_sec=5,
+        # What the script emits when the account-wide gate is switched off.
+        window_limit=60,
+        window_used=0,
+        window_reset_sec=0,
+    )
+
+    headers = verdict.headers()
+
+    assert headers[RATELIMIT_RESET_HEADER] == "5"
+    assert int(headers[RATELIMIT_RESET_HEADER]) >= 1
+    assert headers[RATELIMIT_LIMIT_HEADER] == "60"
+
+
+def test_a_live_window_reset_is_never_displaced_by_the_bucket():
+    """The fallback must not become the rule: while the window is running, it is the answer.
+
+    ``X-RateLimit-Limit`` is the window's ceiling, so a ``Limit``/``Reset`` pair drawn from two
+    different gates would tell a client to sleep for the wrong gate's recovery.
+    """
+    verdict = decision(window_reset_sec=37, bucket_reset_sec=2)
+
+    assert verdict.headers()[RATELIMIT_RESET_HEADER] == "37"
 
 
 def test_every_emitted_header_is_exposed_to_browser_javascript():

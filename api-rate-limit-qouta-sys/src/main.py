@@ -52,6 +52,7 @@ from fastapi.responses import ORJSONResponse
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
+from src.limiter import Limiter
 from src.redis_client import RedisGateway, redact_redis_url
 from src.tiers import TierRegistry
 
@@ -120,13 +121,14 @@ class Runtime:
     clock, so reported uptime cannot go backwards when NTP steps the system clock — the same
     reasoning that puts the limiter's clock inside Redis rather than on each replica.
 
-    C4 adds ``limiter``, C9 ``analytics``. Read sites use ``getattr(runtime, "...", None)`` so a
-    half-wired runtime degrades to a documented fallback rather than a 500.
+    C9 adds ``analytics``. Read sites use ``getattr(runtime, "...", None)`` so a half-wired runtime
+    degrades to a documented fallback rather than a 500.
     """
 
     settings: Settings
     redis: RedisGateway
     tiers: TierRegistry
+    limiter: Limiter
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -154,9 +156,20 @@ class Runtime:
         two clients with two pools doubles this process's connection footprint against a
         single-threaded server for no gain. Constructing the registry is likewise pure — it starts
         life serving ``settings.tier_limits`` and does not touch Redis until :meth:`start`.
+
+        The limiter is built **after** the registry because it holds a reference to it: the tier
+        table it sends to the decision script is the registry's pre-rendered snapshot, read
+        synchronously per request. Its constructor is pure too — it tries to register the decision
+        script and tolerates the gateway not being connected yet, which is always the case here.
         """
         gateway = RedisGateway(settings)
-        return cls(settings=settings, redis=gateway, tiers=TierRegistry(settings, gateway))
+        registry = TierRegistry(settings, gateway)
+        return cls(
+            settings=settings,
+            redis=gateway,
+            tiers=registry,
+            limiter=Limiter(gateway, registry, settings),
+        )
 
     async def start(self) -> None:
         """Open every connection this Runtime owns. Called by :func:`lifespan`, never by ``build``.

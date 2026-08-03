@@ -154,11 +154,25 @@ class QuotaPeriodState(StrEnum):
     ``exhausted``
         The counter has reached or passed its limit. A request denied for
         :attr:`DenyReason.QUOTA_DAILY` always carries ``exhausted`` for the daily period.
+    ``unenforced``
+        There is **no ceiling on this period at all** — either the tier declares one of the
+        :data:`UNLIMITED` limits (``limit <= 0``) or the period is switched off entirely
+        (``QUOTA_DAILY_ENABLED=false``, which reaches the decision script as an ``EXPIREAT`` of 0
+        and stops the counter being read or written).
+
+        This member exists because the alternative was reporting ``reset``, and ``reset`` is a
+        *claim*: it says a period boundary has just rolled over. For a period that has no boundary
+        that is simply false, and it is false in the direction that invites a client to build a
+        "your quota just refreshed" display on top of a quota nobody is counting. The condition is
+        exactly the one under which :attr:`LimitDecision.daily_remaining` reports
+        :data:`UNLIMITED` and :meth:`LimitDecision.headers` omits the ``X-Quota-*`` headers, so all
+        three now agree rather than two of them agreeing and the third saying something else.
     """
 
     RESET = "reset"
     ACTIVE = "active"
     EXHAUSTED = "exhausted"
+    UNENFORCED = "unenforced"
 
 
 class CredentialKind(StrEnum):
@@ -557,6 +571,46 @@ class LimitDecision:
             return max(0, self.retry_after_sec)
         return max(1, self.retry_after_sec)
 
+    def _rate_limit_reset(self) -> int:
+        """``X-RateLimit-Reset`` in delay-seconds: the window's recovery, or the bucket's.
+
+        .. rubric:: Why there is a fallback at all
+
+        The account-wide window is an **operability switch** (``SLIDING_WINDOW_ENABLED``), which
+        means it gets flipped during an incident — precisely when a client-side retry storm is
+        least affordable. With the gate off, the decision script reports the tier's per-minute
+        number as ``window_limit`` (that is still what the caller's plan says) but has no window to
+        report a recovery for, so ``window_reset_sec`` is 0.
+
+        Emitting ``X-RateLimit-Reset: 0`` there is the same bug ``Retry-After: 0`` would be,
+        arriving through a different header: a caller looking at ``Limit: 60, Remaining: 0,
+        Reset: 0`` retries immediately, is refused by the *bucket* — whose real recovery was five
+        seconds away — and loops. A limiter that manufactures its own retry storm is worse than one
+        that advertises nothing.
+
+        So when the window has no recovery to report, the bucket's own recovery is reported
+        instead. It is the gate that is actually refusing the request at that point, so it is the
+        honest number, and it is never zero while the bucket is short of capacity.
+
+        .. rubric:: Why the guard lives here and not in the script
+
+        The script's job is to report **raw per-gate facts**: gate 2 was not consulted, therefore
+        gate 2 has no reset. Which of those facts becomes which header is presentation, and
+        presentation belongs to the layer that emits headers. Folding the fallback into Lua would
+        make ``window_reset_ms`` mean "the window's reset, except sometimes the bucket's", which is
+        the kind of field nobody can reason about six months later.
+
+        :attr:`effective_remaining` already carries the mirror-image guard for
+        ``window_limit <= 0``; this is the same idea applied to the other half of the pair.
+
+        A non-positive value from *both* gates floors at 0 — that path is reachable only from a
+        hand-built decision (C8's fallback), and a negative delay is not a number any HTTP client
+        knows what to do with.
+        """
+        if self.window_reset_sec > 0:
+            return self.window_reset_sec
+        return max(0, self.bucket_reset_sec)
+
     # ------------------------------------------------------------------ #
     # Wire shapes
     # ------------------------------------------------------------------ #
@@ -577,15 +631,19 @@ class LimitDecision:
             future configuration where burst != rpm.
         ``X-RateLimit-Remaining`` = :attr:`effective_remaining`
             The binding number across both gates. See that property.
-        ``X-RateLimit-Reset`` = ``window_reset_sec``
+        ``X-RateLimit-Reset`` = ``window_reset_sec``, falling back to ``bucket_reset_sec``
             The **account-wide sliding window's** reset, in **delay-seconds** — deliberately *not*
-            ``bucket_reset_sec``. ``X-RateLimit-Limit`` is the tier's per-minute number, which is
-            the window's ceiling, so the matching ``Reset`` has to be the window's too: a
-            ``Limit``/``Reset`` pair describing two different gates is worse than either one alone,
-            because the obvious client behaviour — "I am at my limit, so sleep until Reset" —
-            would then sleep for the wrong gate's recovery and wake into another 429. The bucket's
-            own recovery is on the decision as ``bucket_reset_sec`` for anyone who needs it. See
-            the module docstring for the unit asymmetry with ``X-Quota-Reset``.
+            ``bucket_reset_sec`` while that window is running. ``X-RateLimit-Limit`` is the tier's
+            per-minute number, which is the window's ceiling, so the matching ``Reset`` has to be
+            the window's too: a ``Limit``/``Reset`` pair describing two different gates is worse
+            than either one alone, because the obvious client behaviour — "I am at my limit, so
+            sleep until Reset" — would then sleep for the wrong gate's recovery and wake into
+            another 429. The bucket's own recovery is on the decision as ``bucket_reset_sec`` for
+            anyone who needs it.
+
+            When the window gate is switched off there is no window recovery to report, and the
+            bucket's is emitted instead rather than a zero — see :meth:`_rate_limit_reset`. See the
+            module docstring for the unit asymmetry with ``X-Quota-Reset``.
         ``X-Quota-Limit`` / ``X-Quota-Remaining`` / ``X-Quota-Reset``
             The **daily** period. Daily is the one that binds in practice (monthly is daily x 25),
             it is the one that rolls over within a client's session, and three more headers for the
@@ -612,7 +670,7 @@ class LimitDecision:
         out: dict[str, str] = {
             RATELIMIT_LIMIT_HEADER: str(max(0, self.window_limit)),
             RATELIMIT_REMAINING_HEADER: str(self.effective_remaining),
-            RATELIMIT_RESET_HEADER: str(max(0, self.window_reset_sec)),
+            RATELIMIT_RESET_HEADER: str(self._rate_limit_reset()),
         }
 
         if self.degraded:

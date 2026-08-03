@@ -84,6 +84,52 @@ SECRET_FIELDS: dict[str, str] = {
 }
 
 
+#: Duration settings that must be **strictly positive**, and what a non-positive value would
+#: silently do if it were accepted. Both are passed straight through to the decision script as
+#: ARGV, and the script reads a non-positive value as "this thing is not in force".
+#:
+#: That is the failure this guard exists to prevent, and it is invisible without it. Measured:
+#: ``SLIDING_WINDOW_SEC=0`` with ``SLIDING_WINDOW_ENABLED=true`` writes **zero** ``sw:*`` keys, the
+#: account-wide gate never fires, and there is no error and no log line anywhere — a one-character
+#: config typo removing one of the two enforcement mechanisms this project is built out of. ``-30``
+#: behaves identically. ``BUCKET_TTL_SEC`` is currently neutralised downstream by the level-aware
+#: TTL floor, so a negative value there is harmless *today*; it is bounded anyway because "harmless
+#: because something further down happens to clamp it" is a property that changes without notice.
+#:
+#: Grouped in a mapping rather than written as three separate validators for the same reason
+#: :data:`SECRET_FIELDS` is: a fourth duration added later inherits the rule by being listed here,
+#: not by someone remembering to copy a method.
+#:
+#: ``TIER_CACHE_TTL_SEC`` is deliberately **not** here. Zero means "never cache", which is a
+#: legitimate (if expensive) operational choice, and ``src.tiers`` already floors the retry backoff
+#: so that choice cannot turn an outage into a hot loop.
+POSITIVE_DURATION_FIELDS: dict[str, str] = {
+    "sliding_window_sec": (
+        "the width of the account-wide sliding window; a non-positive value disables that gate "
+        "silently, leaving only the per-endpoint token bucket in force"
+    ),
+    "bucket_ttl_sec": (
+        "the floor under a token bucket's TTL; a non-positive value means the only thing keeping "
+        "a drained bucket alive is the refill deficit"
+    ),
+}
+
+
+def positive_duration_error(field_name: str, value: int) -> str:
+    """Build the rejection message for one duration field.
+
+    Names the setting, the value, and — the part that matters — *what it would have done*. A
+    message that says only "must be >= 1" tells an operator how to make the error go away; this one
+    tells them what they nearly shipped, which is the difference between a fix and a workaround.
+    """
+    purpose = POSITIVE_DURATION_FIELDS.get(field_name, "a duration in seconds")
+    return (
+        f"{field_name.upper()} must be at least 1 second (got {value}) — it is {purpose}. "
+        "Use the dedicated on/off switch if you meant to disable the feature, so the decision is "
+        "visible in the configuration rather than implied by a zero."
+    )
+
+
 def secret_error(field_name: str) -> str:
     """Build the rejection message for one secret field.
 
@@ -514,6 +560,25 @@ class Settings(BaseSettings):
         """Accept ``ENDPOINT_COSTS`` as the compact ``category:cost,...`` string or a mapping."""
         if isinstance(value, str):
             return parse_endpoint_costs(value)
+        return value
+
+    @field_validator(*POSITIVE_DURATION_FIELDS)
+    @classmethod
+    def _check_positive_duration(cls, value: int, info: ValidationInfo) -> int:
+        """Refuse a zero or negative duration for any field in :data:`POSITIVE_DURATION_FIELDS`.
+
+        A startup failure, not a runtime surprise — the same rule the rest of this module applies
+        to ``TIER_LIMITS`` and ``ENDPOINT_COSTS``, and for the identical reason: every one of these
+        values ends up as ARGV in the decision script, where "non-positive" already has a meaning
+        ("this gate is not enforcing anything"). An operator who types ``SLIDING_WINDOW_SEC=0``
+        expecting "no windowing overhead" would get exactly that plus no account-wide rate limit,
+        with nothing on ``/health`` and nothing in the logs to say so.
+
+        ``validate_default=True`` on the model means this also fires on the declared defaults, so
+        the shipped 60 and 3600 are checked by the same code path the environment goes through.
+        """
+        if value < 1:
+            raise ValueError(positive_duration_error(info.field_name or "duration", value))
         return value
 
     @field_validator(*SECRET_FIELDS)

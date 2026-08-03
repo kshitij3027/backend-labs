@@ -23,6 +23,7 @@ from src.config import (
     DEFAULT_TIER_LIMITS_SPEC,
     MIN_SECRET_LEN,
     PLACEHOLDER_SECRETS,
+    POSITIVE_DURATION_FIELDS,
     SECRET_FIELDS,
     Settings,
     TierConfig,
@@ -289,6 +290,64 @@ def test_cors_origins_accepts_a_list():
         "http://b",
     ]
     assert build(cors_origins="*").cors_origins == ["*"]
+
+
+# --------------------------------------------------------------------------------------------
+# Positive durations: SLIDING_WINDOW_SEC, BUCKET_TTL_SEC
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field_name", sorted(POSITIVE_DURATION_FIELDS))
+@pytest.mark.parametrize("value", [0, -1, -30])
+def test_a_non_positive_duration_is_a_startup_failure(field_name, value):
+    """**A config typo must not be able to switch an enforcement mechanism off silently.**
+
+    Both of these are passed straight through to the decision script as ARGV, where a non-positive
+    value already means "this thing is not in force". Measured before this validator existed:
+    ``SLIDING_WINDOW_SEC=0`` with ``SLIDING_WINDOW_ENABLED=true`` wrote **zero** ``sw:*`` keys, the
+    account-wide gate never fired, and there was no error and no log line — one character removing
+    one of the two mechanisms this project is built out of.
+
+    The house rule in ``src.config`` is that a bad value is a startup message, not a runtime
+    surprise, and a runtime surprise you cannot even observe is the worst version of it.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        build(**{field_name: value})
+
+    message = str(excinfo.value)
+    assert field_name.upper() in message
+    # The message has to say what the value would have DONE, not merely that it was out of range —
+    # otherwise the obvious fix is "put any number there" rather than "use the on/off switch".
+    assert str(value) in message
+
+
+@pytest.mark.parametrize("field_name", sorted(POSITIVE_DURATION_FIELDS))
+def test_one_second_is_the_boundary_and_is_accepted(field_name):
+    """The bound is ``>= 1``, not ``> 1``: a one-second window is legal, if aggressive."""
+    assert getattr(build(**{field_name: 1}), field_name) == 1
+
+
+def test_the_shipped_defaults_pass_their_own_validator():
+    """``validate_default=True`` means the declared defaults go through the same code path.
+
+    A bound that the shipped configuration itself would fail is a bound that gets deleted rather
+    than fixed, so it is worth asserting that the default and the rule agree.
+    """
+    settings = build()
+
+    assert settings.sliding_window_sec == 60
+    assert settings.bucket_ttl_sec == 3600
+
+
+def test_the_tier_cache_ttl_is_deliberately_allowed_to_be_zero():
+    """Not every duration is bounded, and the exception is a decision rather than an oversight.
+
+    ``TIER_CACHE_TTL_SEC=0`` means "never cache the tier table" — expensive, but a legitimate
+    operational choice — and ``src.tiers`` already floors its post-failure retry backoff so that
+    choice cannot turn a Redis outage into a hot loop.
+    """
+    assert "tier_cache_ttl_sec" not in POSITIVE_DURATION_FIELDS
+    assert build(tier_cache_ttl_sec=0).tier_cache_ttl_sec == 0
 
 
 # --------------------------------------------------------------------------------------------
