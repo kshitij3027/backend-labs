@@ -513,21 +513,26 @@ async def test_production_sends_the_inert_override(settings: Settings):
 # ---------------------------------------------------------------------------------------------
 
 
-async def test_a_store_outage_propagates_because_C8_owns_the_fail_open_decision(
-    settings: Settings,
-):
-    """**C8's job, not the limiter's**, and this test is here so C8 does not add a second handler.
+async def test_a_store_outage_is_absorbed_here_and_nowhere_else(settings: Settings):
+    """**Changed at C8, and the change is the commit.** This used to assert propagation.
 
-    "Redis is down" has no obvious default for a rate limiter: serve through a bounded local bucket
-    (``FAIL_MODE=open``) or refuse with a 503 (``FAIL_MODE=closed``). Only C8 knows which, and only
-    C8 can set ``X-RateLimit-Degraded`` so the fail-open is visible rather than silent. A ``try``
-    here would make that choice in the wrong module for every caller at once.
+    Until C7 this test read ``pytest.raises(BackingStoreUnavailable)`` and existed so that no
+    commit before C8 would quietly choose a fail-open policy in the wrong module. C8 is the module
+    that owns ``FAIL_MODE``, so the handler lands here — and the assertion inverts: ``check()`` now
+    **never** raises that type, and the middleware adds no second handler.
+
+    What is asserted is deliberately the *shape* of the answer (a degraded decision came back
+    instead of an exception). The policy itself — the fallback bucket's capacity, the fail-closed
+    denial, the ``X-Quota-*`` suppression — is `tests/unit/test_degradation.py`'s subject, where it
+    is stated once rather than half-stated in two files.
     """
     limiter, gateway, _ = build(settings)
     gateway.raises = BackingStoreUnavailable("script:rlq failed", op="script:rlq")
 
-    with pytest.raises(BackingStoreUnavailable):
-        await limiter.check(USER, ENDPOINT, 1, now=MOMENT)
+    verdict = await limiter.check(USER, ENDPOINT, 1, now=MOMENT)
+
+    assert verdict.degraded is True
+    assert limiter.degraded is True
 
 
 async def test_a_malformed_reply_surfaces_as_a_ValueError(settings: Settings):

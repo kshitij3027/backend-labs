@@ -154,10 +154,36 @@ justified in writing. Related and separate: C8's own plan note already requires 
 "the store is unreachable" from "this process ran out of connections to reach it" — the vector
 above is precisely how a caller manufactures the second condition, so the pool-exhaustion case and
 the identity case are the same incident seen from two modules.
+
+.. rubric:: WHAT C8 DECIDED — the answers to the rubric above
+
+**A failure to resolve identity is a 503.** :class:`~src.redis_client.BackingStoreUnavailable`
+still propagates out of :meth:`IdentityResolver.resolve` exactly as described above;
+:class:`~src.middleware.RateLimitMiddleware` catches it in a branch of its own and refuses the
+request. Never a principal, never a pass-through, and ``FAIL_MODE`` deliberately gets no vote:
+that setting configures what happens when *limits* cannot be checked, and there is no deployment
+for which "we could not establish who you are, so come in" is the right answer.
+
+**The JWT path keeps working while the API-key path is refused.** This falls out of the shape this
+module already had — :meth:`_resolve_jwt` verifies one HMAC over bytes in memory and touches no
+Redis at all — and it is strictly better than 503-ing everyone, so it is now a property with a test
+on it rather than an accident. A Bearer caller authenticates normally through a total Redis outage
+and is then metered by the limiter's local fallback bucket; only ``X-API-Key`` callers get the 503.
+
+**The pre-auth pool exhaustion measured above is bounded here**, by
+:data:`IDENTITY_POOL_SHARE`: the API-key lookup runs under a semaphore admitting at most
+``REDIS_MAX_CONNECTIONS // 4`` concurrent lookups, so unauthenticated traffic can occupy a quarter
+of the pool and no more — the limiter always has connections left for the callers that *are*
+authenticated. The bound lives here, wrapped around the lookup itself, rather than in the
+middleware around ``resolve``: at that level it would also throttle the JWT branch, making the
+credential form that needs no Redis queue behind the one that does, which would undo the carve-out
+in the paragraph above. Derived from ``REDIS_MAX_CONNECTIONS`` rather than configured separately,
+so the two cannot be tuned into disagreement.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -193,7 +219,9 @@ __all__ = [
     "HTTP_OWS",
     "IDENTITY_CACHE_MAX_ENTRIES",
     "IDENTITY_CACHE_TTL_SEC",
+    "IDENTITY_POOL_SHARE",
     "IdentityResolver",
+    "identity_concurrency",
     "SCHEME_KINDS",
     "STATUS_ACTIVE",
     "WWW_AUTHENTICATE",
@@ -334,6 +362,32 @@ IDENTITY_CACHE_MAX_ENTRIES: Final = 10_000
 #: Seconds an entry stays usable. Also the worst-case revocation latency on a replica that did not
 #: serve the revocation — see the module docstring for why that trade is the right one.
 IDENTITY_CACHE_TTL_SEC: Final = 5.0
+
+#: Reciprocal of the share of ``REDIS_MAX_CONNECTIONS`` the **pre-auth** identity lookup may hold
+#: at once. ``4`` means one quarter — 8 concurrent lookups against the shipped pool of 32.
+#:
+#: This number is the fix for the vector measured in the module docstring: identity resolution runs
+#: before the limiter, so it is reachable by a caller holding no credential, and without a bound a
+#: flood of distinct unknown keys takes the entire pool — leaving the *limiter*, which every
+#: authenticated caller needs, with nothing. Capping the unauthenticated path at a quarter means
+#: the worst an anonymous flood can do is make itself slow.
+#:
+#: Derived from ``REDIS_MAX_CONNECTIONS`` rather than declared as its own setting, deliberately.
+#: The invariant that matters is *relative* ("well under the pool"), and two independent numbers is
+#: how an operator raising the pool ends up with an identity bound that no longer bounds anything —
+#: or lowering it ends up with a bound larger than the pool, which is no bound at all.
+IDENTITY_POOL_SHARE: Final = 4
+
+
+def identity_concurrency(settings: Settings) -> int:
+    """How many API-key lookups may be in flight at once. See :data:`IDENTITY_POOL_SHARE`.
+
+    Floored at 1, so a tiny or mis-set ``REDIS_MAX_CONNECTIONS`` produces a serialised identity
+    path rather than a semaphore of zero permits, which would deadlock every authenticated request
+    in the process — a config typo turning into a total outage on the one path that has to work
+    before anything else can.
+    """
+    return max(1, settings.redis_max_connections // IDENTITY_POOL_SHARE)
 
 #: Raw ASGI headers: the ``scope["headers"]`` list of ``(name, value)`` byte pairs.
 RawHeaders = Sequence[tuple[bytes, bytes]]
@@ -746,6 +800,7 @@ class IdentityResolver:
         clock: Callable[[], float] = time.monotonic,
         max_entries: int = IDENTITY_CACHE_MAX_ENTRIES,
         ttl_sec: float = IDENTITY_CACHE_TTL_SEC,
+        max_concurrency: int | None = None,
     ) -> None:
         self._gateway = gateway
         self._settings = settings
@@ -756,6 +811,22 @@ class IdentityResolver:
         self._ttl_sec = max(0.0, float(ttl_sec))
 
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
+
+        # The pre-auth concurrency bound. See `IDENTITY_POOL_SHARE`.
+        #
+        # The semaphore is built lazily, on first use, and rebuilt if the running event loop
+        # changes. `Runtime.build` is synchronous and may run with no loop at all, and
+        # `asyncio.Semaphore` binds to the loop that first awaits it and refuses every other one
+        # — a failure that surfaces as "attached to a different loop" hundreds of lines from its
+        # cause. Rebuilding on a loop change costs one identity comparison per lookup and removes
+        # the whole class of failure; the same reasoning that makes the integration fixtures
+        # function-scoped.
+        self._max_concurrency = max(
+            1, identity_concurrency(settings) if max_concurrency is None else max_concurrency
+        )
+        self._gate: asyncio.Semaphore | None = None
+        self._gate_loop: asyncio.AbstractEventLoop | None = None
+        self._in_flight = 0
 
         #: Cache lookups served without touching Redis, **including** cached negatives.
         self.hits = 0
@@ -770,6 +841,14 @@ class IdentityResolver:
         #: aged out did its job, while an eviction means the working set is larger than the cap and
         #: is the number that says so.
         self.evictions = 0
+        #: Lookups that had to wait for a permit because the concurrency bound was already full.
+        #: The signature of the pre-auth flood the bound exists for: a large number here means
+        #: unauthenticated traffic is being made to queue instead of being allowed to take the
+        #: pool the limiter needs.
+        self.gate_waits = 0
+        #: High-water mark of concurrent lookups. Must never exceed
+        #: :attr:`_max_concurrency`; ``tests/unit/test_overload.py`` asserts exactly that.
+        self.peak_in_flight = 0
 
     # ------------------------------------------------------------------ #
     # The hot path
@@ -878,21 +957,61 @@ class IdentityResolver:
     # API keys
     # ------------------------------------------------------------------ #
     async def _resolve_api_key(self, raw_key: str) -> Principal | None:
-        """Look ``raw_key`` up by its peppered digest, through the LRU+TTL cache."""
+        """Look ``raw_key`` up by its peppered digest, through the LRU+TTL cache.
+
+        The Redis lookup — and **only** the Redis lookup — runs under the concurrency bound. The
+        digest, the cache read and the cache write are microseconds of local work with no await in
+        them, so holding a permit across them would shrink the effective bound for no reason; and
+        a cache *hit*, which is the overwhelming majority of real traffic, never takes a permit at
+        all. What is bounded is exactly the thing that consumes a pooled connection.
+        """
         digest = self.digest(raw_key)
 
         hit, cached = self._cache_get(digest)
         if hit:
             return cached
 
-        record = await self._gateway.run(
-            lambda: self._gateway.client.hgetall(apikey_key(digest)), op="identity:apikey"
-        )
+        gate = self._acquire_gate()
+        if gate.locked():
+            # Sampled before the acquire: `locked()` is true precisely when every permit is out, so
+            # this call is about to wait. Checked rather than timed because the number that matters
+            # operationally is "how often is the pre-auth path being made to queue", not how long
+            # any individual queue was.
+            self.gate_waits += 1
+        async with gate:
+            self._in_flight += 1
+            if self._in_flight > self.peak_in_flight:
+                self.peak_in_flight = self._in_flight
+            try:
+                record = await self._gateway.run(
+                    lambda: self._gateway.client.hgetall(apikey_key(digest)),
+                    op="identity:apikey",
+                )
+            finally:
+                # `finally`, so a `BackingStoreUnavailable` (which propagates to the middleware's
+                # 503 branch) cannot leak a permit. A leaked permit is permanent: the bound would
+                # shrink by one on every outage until the identity path serialised itself and then
+                # deadlocked, long after the outage that caused it.
+                self._in_flight -= 1
+
         principal = self._principal_from_record(record)
         # Cached whatever the answer was. A negative is a real answer and it is the one an attacker
         # generates in volume; see the module docstring.
         self._cache_put(digest, principal)
         return principal
+
+    def _acquire_gate(self) -> asyncio.Semaphore:
+        """Return the semaphore bound to the running loop, building it on first use.
+
+        See ``__init__`` for why this is lazy and loop-aware rather than a field built in the
+        constructor.
+        """
+        loop = asyncio.get_running_loop()
+        if self._gate is None or self._gate_loop is not loop:
+            self._gate = asyncio.Semaphore(self._max_concurrency)
+            self._gate_loop = loop
+            self._in_flight = 0
+        return self._gate
 
     def _principal_from_record(self, raw: Mapping[Any, Any]) -> Principal | None:
         """Turn an ``apikey:v1:<digest>`` HASH into a principal, or ``None``. Never raises.
@@ -1033,6 +1152,13 @@ class IdentityResolver:
             "negative_hits": self.negative_hits,
             "evictions": self.evictions,
             "hit_rate": round(self.hits / lookups, 4) if lookups else 0.0,
+            # The pre-auth concurrency bound and how hard it is being leaned on. Published beside
+            # the cache counters because they are two halves of one story: `negative_hits` is the
+            # part of a key-guessing flood absorbed in-process, and `gate_waits` is the part that
+            # reached Redis and was made to queue for it.
+            "max_concurrency": self._max_concurrency,
+            "gate_waits": self.gate_waits,
+            "peak_in_flight": self.peak_in_flight,
         }
 
     # ------------------------------------------------------------------ #

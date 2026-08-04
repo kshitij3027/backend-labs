@@ -760,8 +760,16 @@ class LimitDecision:
         A reply of the wrong length means this decoder and the script disagree about the contract.
         Building a decision out of whatever happened to land in the right slots would produce a
         confident, wrong answer — a caller allowed because a quota field landed in the ``allowed``
-        position. C4 and C8 classify the raised :class:`ValueError` as a failure and take the
-        configured fail-open / fail-closed path, which is a *known* state with a header on it.
+        position.
+
+        **C8 lets the raised :class:`ValueError` propagate** rather than routing it through
+        ``FAIL_MODE``, and that is the same call :mod:`src.redis_client` makes for a
+        ``ResponseError``: an arity or enum mismatch is a *bug in this service*, it fails on every
+        single request rather than transiently, and dressing it up as a degradation would mean a
+        one-element edit to the script silently disabled rate limiting everywhere while
+        ``/health`` reported it identically to an unplugged Redis. It becomes a 500 — visible and
+        attributable — which is the correct answer when the service is the broken thing.
+        ``tests/unit/test_limiter.py`` pins both directions.
 
         Raises:
             ValueError: on a reply that is not a sequence, is not exactly

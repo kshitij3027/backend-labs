@@ -28,6 +28,12 @@ from src.redis_client import BackingStoreUnavailable
 
 #: The complete body. Asserted as a set so an accidentally added field is caught here rather than
 #: by a dashboard that silently starts rendering something nobody meant to publish.
+#:
+#: ``pool`` was added at C8 — a **deliberate** edit to a pinned contract, which is exactly the
+#: friction this assertion exists to impose. It carries the connection-pool saturation signal,
+#: which cannot be folded into ``redis`` (a saturated pool says nothing about the store's health)
+#: or into ``rate_limiter`` (saturation is not degradation; it is refused, not served). See the
+#: rubrics in ``src/api/health.py``.
 EXPECTED_KEYS = {
     "status",
     "rate_limiter",
@@ -35,6 +41,7 @@ EXPECTED_KEYS = {
     "uptime_sec",
     "served_by",
     "redis",
+    "pool",
     "config_version",
 }
 

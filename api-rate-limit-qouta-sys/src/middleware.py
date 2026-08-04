@@ -120,14 +120,45 @@ suspended inside ``__call__`` simultaneously, each asserting it got its own numb
   :meth:`~src.models.LimitDecision.headers` and
   :meth:`~src.models.LimitDecision.error_body`. A second place that formatted
   ``X-RateLimit-Remaining`` would be a second definition of what the number means.
-* **It does not catch** :class:`~src.redis_client.BackingStoreUnavailable`. Neither the identity
-  resolver nor the limiter catches it either, and that is C8's decision to make — **once**, in the
-  module that owns ``FAIL_MODE``. Read the "READ THIS BEFORE WRITING C8" rubric in
-  :mod:`src.identity` before adding a handler here: the two failures reachable from this file
-  ("limits could not be checked" and "identity could not be resolved") are *different events* with
-  different safe answers, and collapsing them into one ``except`` is an authentication bypass.
+* **It does not decide the fail-open policy.** :meth:`src.limiter.Limiter.check` does, once, in
+  the module that owns ``FAIL_MODE``, and it returns a decision rather than raising — so this file
+  has **no** ``except`` around the limiter call. What it does own is the *rendering*: which status
+  code a refusal gets. See the next rubric.
 * **It does not record analytics.** C9 does, at the marked seam at the bottom of
   :meth:`RateLimitMiddleware.__call__`, where the response body has already been sent.
+
+.. rubric:: Two failures, two branches — the C8 decision this file DOES own
+
+Read the "READ THIS BEFORE WRITING C8" rubric in :mod:`src.identity` alongside this. The two
+awaits on this path fail for different reasons and get different answers, and collapsing them into
+one ``except`` would be an authentication bypass:
+
+**Identity could not be resolved -> 503, never a principal, never a pass-through.** Nothing is
+known about the caller. Serving them would be serving an unauthenticated request to anyone holding
+any string, for as long as the store is down — and identity resolution is a *pre-auth, unmetered*
+path sharing the limiter's pool, so an attacker with no credential can manufacture the condition
+on demand and then walk in. That is not degradation; it is an authentication bypass whose timing
+the attacker chooses. Failing closed on identity while the limiter fails open is a coherent policy
+and it is the one this service ships.
+
+**The JWT path is unaffected, and that is worth stating because it is easy to break.** A Bearer
+token is verified with one HMAC over bytes already in memory: :meth:`src.identity.IdentityResolver.resolve`
+touches Redis **only** on the API-key branch, so a JWT-authenticated caller keeps being
+authenticated — and then metered through the fallback bucket — for the whole outage, while API-key
+callers get a 503. That is strictly better than 503-ing everyone, and it is why the identity
+concurrency bound lives inside the resolver, wrapped around the *lookup*, rather than around the
+``resolve`` call here: a semaphore at this level would make the credential form that needs no Redis
+queue behind the one that does.
+
+**Limits could not be checked -> the limiter's own decision flows through normally.** Under
+``FAIL_MODE=open`` that is a degraded 200 (or a degraded 429) carrying ``X-RateLimit-Degraded: 1``
+via the existing :meth:`~src.models.LimitDecision.headers`. Under ``FAIL_MODE=closed``, and for a
+saturated connection pool in *either* mode, it is a refusal carrying
+:attr:`~src.models.DenyReason.BACKING_STORE`, which this file renders as a **503 with
+``Retry-After`` — not a 429**. The distinction is not pedantry: 429 means "you are over your
+limit", and a client library will treat it as a signal about *its own* behaviour. This caller is
+not over any limit; we were unable to find out. A 503 says that, and it says it in the one status
+code every HTTP client already understands as "the server, not you".
 """
 
 from __future__ import annotations
@@ -145,18 +176,29 @@ from src.config import DEFAULT_COST_CATEGORY, Settings
 from src.identity import ACCEPTED_SCHEMES, WWW_AUTHENTICATE, IdentityResolver
 from src.keys import classify
 from src.limiter import Limiter
-from src.models import LimitDecision
+from src.models import (
+    DEGRADED_HEADER,
+    DEGRADED_HEADER_VALUE,
+    RETRY_AFTER_HEADER,
+    DenyReason,
+    LimitDecision,
+)
+from src.redis_client import BackingStoreUnavailable
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "EXEMPT_EXACT_PATHS",
     "EXEMPT_PATH_PREFIXES",
+    "IDENTITY_UNAVAILABLE_DETAIL",
     "JSON_CONTENT_TYPE",
+    "LIMITER_UNAVAILABLE_DETAIL",
     "LimiterRuntime",
     "RateLimitMiddleware",
     "SCOPE_DECISION_KEY",
     "SCOPE_ENDPOINT_KEY",
+    "SERVICE_UNAVAILABLE_ERROR",
+    "STATUS_SERVICE_UNAVAILABLE",
     "STATUS_TOO_MANY_REQUESTS",
     "STATUS_UNAUTHORIZED",
     "UNAUTHORIZED_DETAIL",
@@ -330,6 +372,11 @@ def is_exempt(path: str) -> bool:
 STATUS_UNAUTHORIZED: Final = 401
 STATUS_TOO_MANY_REQUESTS: Final = 429
 
+#: Emitted when the enforcement layer could not reach a verdict: identity was unresolvable, the
+#: store was unreachable under ``FAIL_MODE=closed``, or this process's connection pool was
+#: saturated. **Never 429** — see the "two failures, two branches" rubric in the module docstring.
+STATUS_SERVICE_UNAVAILABLE: Final = 503
+
 JSON_CONTENT_TYPE: Final = "application/json"
 
 #: RFC 9110 §11.6.1. The challenge itself is :data:`src.identity.WWW_AUTHENTICATE`, generated from
@@ -362,6 +409,33 @@ UNAUTHORIZED_DETAIL: Final = (
 #: on the one path an unauthenticated flood consists entirely of.
 _UNAUTHORIZED_BODY: Final[bytes] = orjson.dumps(
     {"error": UNAUTHORIZED_ERROR, "detail": UNAUTHORIZED_DETAIL}
+)
+
+#: The 503 body's ``error``. Deliberately **not** one of the two spec literals
+#: (:data:`~src.models.ERROR_RATE_LIMIT` / :data:`~src.models.ERROR_QUOTA`), for the same reason
+#: :data:`UNAUTHORIZED_ERROR` is not: a client that pattern-matches those strings must never be
+#: told that an unavailable enforcement layer was a limit it exceeded. It is also why the 503 body
+#: is built here rather than from :meth:`~src.models.LimitDecision.error_body`, which renders
+#: ``"Rate limit exceeded"`` for any non-quota reason and would say exactly that.
+SERVICE_UNAVAILABLE_ERROR: Final = "Service Unavailable"
+
+#: Why an identity failure is a 503 and not a pass-through, in one sentence a caller can act on.
+#: It names no credential, no digest and no store detail — the caller's remedy is identical
+#: whatever the cause, and enumerating causes on the wire is what turns an error body into an
+#: oracle.
+IDENTITY_UNAVAILABLE_DETAIL: Final = (
+    "The credential store could not be reached, so this request could not be authenticated. "
+    "This is refused rather than served: serving it would mean admitting a caller whose identity "
+    "was never established. Retry after the interval below."
+)
+
+#: Why a limiter failure is a 503 and not a 429. Says explicitly that the caller is *not* over
+#: their limit, because that is the exact wrong conclusion for them to draw and the one a 429 would
+#: have invited.
+LIMITER_UNAVAILABLE_DETAIL: Final = (
+    "The rate limiter could not reach a verdict for this request, so it was refused rather than "
+    "admitted unmetered. This does not mean you are over your limit — it means the limit could "
+    "not be checked. Retry after the interval below."
 )
 
 # Lower-case bytes, as ASGI requires header names to be. Pre-encoded because these three never
@@ -511,6 +585,39 @@ async def _send_unauthorized(send: Send) -> None:
     )
 
 
+async def _send_unavailable(
+    send: Send, *, detail: str, retry_after: int, degraded: bool
+) -> None:
+    """Emit the 503 for a request the enforcement layer could not decide.
+
+    .. rubric:: No ``X-RateLimit-*`` and no ``X-Quota-*``, on purpose
+
+    The same rule as the 401, for the same reason: **no gate was evaluated**, so every number those
+    headers could carry would be invented. A client cannot detect a wrong header and will pace
+    itself off it; it can detect a missing one. The only numbers on this response are ones we
+    actually know — the retry interval, and (when the fallback policy is what refused) the fact
+    that this replica is degraded.
+
+    ``Retry-After`` is floored at 1 second at the call sites and again here. A ``Retry-After: 0``
+    handed to a client that is already being refused is a retry storm the service manufactured for
+    itself, and a 503 is precisely the response type clients retry hardest against.
+
+    ``X-RateLimit-Degraded`` appears only when the refusal *came from* the degraded policy
+    (``FAIL_MODE=closed`` with the store down). A pool-exhaustion 503 does not carry it: nothing
+    was degraded, the store is healthy, and this replica simply ran out of connections — reporting
+    it as degradation would be the misdiagnosis the whole overload/outage split exists to prevent.
+    """
+    headers = {RETRY_AFTER_HEADER: str(max(1, retry_after))}
+    if degraded:
+        headers[DEGRADED_HEADER] = DEGRADED_HEADER_VALUE
+    await _send_json(
+        send,
+        status=STATUS_SERVICE_UNAVAILABLE,
+        body=orjson.dumps({"error": SERVICE_UNAVAILABLE_ERROR, "detail": detail}),
+        headers=headers,
+    )
+
+
 async def _send_denied(send: Send, decision: LimitDecision) -> None:
     """Emit the 429 for ``decision``. Both the body and every header come from the decision.
 
@@ -559,6 +666,13 @@ class RateLimitMiddleware:
         # the guarantee is checked when the app is built rather than on the first request to an
         # unclassified path, which is where a missing default would otherwise surface.
         self._default_cost: int = settings.endpoint_costs[DEFAULT_COST_CATEGORY]
+
+        # `Retry-After` for the identity 503. The breaker's cooldown, because that is exactly how
+        # long this process will wait before it next discovers whether the credential store is
+        # back — advising a caller to return sooner is advising them to be refused again. Floored
+        # at 1: `Retry-After: 0` on a 503 is a retry storm, and 503 is the status clients retry
+        # against hardest.
+        self._identity_retry_after: int = max(1, int(settings.breaker_cooldown_sec))
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """Run the ordered flow for one request. Every value below is a local. See the docstring."""
@@ -657,15 +771,42 @@ class RateLimitMiddleware:
         # Raw `scope["headers"]` — no Starlette `Request` is built anywhere in this file. See
         # `src.identity.header_value` for the measurement behind that.
         #
-        # `BackingStoreUnavailable` from here PROPAGATES, deliberately and for now. C8 owns the
-        # decision, and before making it, read the "READ THIS BEFORE WRITING C8" rubric in
-        # `src.identity`: identity resolution is a pre-auth, unmetered path sharing the limiter's
-        # connection pool and circuit breaker, so failing open on *this* exception is an
-        # authentication bypass an unauthenticated attacker can trigger on demand — not the
-        # bounded degradation `FAIL_MODE=open` describes.
+        # `BackingStoreUnavailable` here is a **503, never a pass-through and never a principal**.
+        # This is the first half of the C8 decision (the module docstring argues it in full): the
+        # limiter failing open serves an unmetered request to a KNOWN customer, which is the
+        # documented degradation; identity failing open would serve an unauthenticated request to
+        # anyone holding any string — an authentication bypass, on a pre-auth path an attacker with
+        # no credential can saturate on demand and then walk through.
+        #
+        # `FAIL_MODE` deliberately gets no vote here. It configures what happens when *limits*
+        # cannot be checked; there is no deployment for which "we could not establish who you are,
+        # so come in" is the right answer, and making it configurable would be offering it.
+        #
+        # Note what is NOT refused: a Bearer token never reaches Redis (see
+        # `IdentityResolver._resolve_jwt`), so JWT callers keep authenticating straight through the
+        # outage and are then metered by the fallback bucket. Only the API-key branch 503s.
         # ----------------------------------------------------------------------------------- #
         runtime = _runtime_of(scope)
-        principal = await runtime.identity.resolve(scope["headers"])
+        try:
+            principal = await runtime.identity.resolve(scope["headers"])
+        except BackingStoreUnavailable as exc:
+            # WARNING, not ERROR: this is a dependency failure being handled exactly as designed,
+            # and it can arrive at request rate. The op name distinguishes the store outage from
+            # the saturated pool (`BackingStoreOverloaded` carries the same `op` shape), and the
+            # gateway has already logged the underlying cause once at its own site.
+            logger.warning(
+                "identity could not be resolved (%s); refusing with %d rather than admitting an "
+                "unauthenticated request",
+                exc.op or "identity",
+                STATUS_SERVICE_UNAVAILABLE,
+            )
+            await _send_unavailable(
+                send,
+                detail=IDENTITY_UNAVAILABLE_DETAIL,
+                retry_after=self._identity_retry_after,
+                degraded=False,
+            )
+            return
         if principal is None:
             await _send_unauthorized(send)
             return
@@ -703,15 +844,34 @@ class RateLimitMiddleware:
         state[SCOPE_DECISION_KEY] = decision
 
         # ----------------------------------------------------------------------------------- #
-        # 9. Denied -> emit the 429 here and return. The wrapped app is NEVER invoked.
+        # 9. Denied -> emit the refusal here and return. The wrapped app is NEVER invoked.
         #
         # That is the property, not a side effect: a rejected request costs zero downstream work.
         # No routing, no dependency resolution, no handler, no database. It matters most under
         # exactly the load that produces 429s — if a refused request still cost a trip through the
         # router and a handler, a caller could saturate the service *with requests it is refusing*,
         # and the rate limiter would be a queue rather than a gate.
+        #
+        # **Which** refusal is the second half of the C8 decision. `BACKING_STORE` is the one
+        # reason the decision script cannot produce: the limiter builds it by hand when it could
+        # not reach a verdict at all — `FAIL_MODE=closed` with the store down, or a saturated
+        # connection pool in either mode. Those get a 503, because 429 is a statement about the
+        # CALLER ("you are going too fast") and this caller has done nothing measurable. Every
+        # other reason is a real gate refusing a real overage, and keeps the spec's 429.
         # ----------------------------------------------------------------------------------- #
         if not decision.allowed:
+            if decision.reason is DenyReason.BACKING_STORE:
+                await _send_unavailable(
+                    send,
+                    detail=LIMITER_UNAVAILABLE_DETAIL,
+                    # From the decision, not re-derived: the fail-closed path advertises the
+                    # breaker's cooldown (when we next learn anything) while the pool-exhaustion
+                    # path advertises 1 second (contention clears in milliseconds). One number,
+                    # decided where the cause is known.
+                    retry_after=decision.retry_after_sec,
+                    degraded=decision.degraded,
+                )
+                return
             await _send_denied(send, decision)
             return
 

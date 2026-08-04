@@ -569,6 +569,20 @@ class TierRegistry:
                     lambda: self._gateway.client.get(CONFIG_VERSION_KEY), op="tiers:version"
                 )
             except BackingStoreUnavailable as exc:
+                # Deliberately NOT split on `BackingStoreOverloaded`, unlike `Limiter.check`.
+                #
+                # A momentary saturated pool therefore arms the full outage backoff, so a ~50 ms
+                # burst can suppress tier-config propagation for a whole backoff window against a
+                # store that never stopped answering. That is the known cost and it is accepted
+                # here, where it is not accepted one module over, because this refresh is nothing
+                # like the request path: it is off the hot path entirely (the snapshot is served
+                # synchronously and stays *stale but correct* throughout), the only consequence is
+                # that a runtime tier change reaches this replica a backoff later — bounded, and
+                # already the documented convergence story for every replica that did not serve the
+                # write — and treating it as a fast-retryable event would mean hammering a pool that
+                # is signalling backpressure with the one call on this path that nobody is waiting
+                # for. The distinction is load-bearing in `Limiter.check` because there it decides
+                # whether a request is *metered*; here it decides only how soon we ask again.
                 self.refresh_failures += 1
                 self._refresh_backoff_until = self._clock() + self._refresh_backoff_sec
                 # ONE line per backoff window, not one per request. The snapshot stays stale for

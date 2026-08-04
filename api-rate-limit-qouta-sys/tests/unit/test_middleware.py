@@ -39,6 +39,7 @@ from src.middleware import (
     JSON_CONTENT_TYPE,
     SCOPE_DECISION_KEY,
     SCOPE_ENDPOINT_KEY,
+    SERVICE_UNAVAILABLE_ERROR,
     UNAUTHORIZED_ERROR,
     WWW_AUTHENTICATE_HEADER,
     RateLimitMiddleware,
@@ -53,7 +54,7 @@ from src.models import (
     Principal,
     QuotaPeriodState,
 )
-from src.redis_client import BackingStoreUnavailable
+from src.redis_client import BackingStoreOverloaded, BackingStoreUnavailable
 
 #: Every rate/quota header a metered response can carry. Used to assert **absence** on the paths
 #: that must not advertise a limit they never evaluated.
@@ -1176,41 +1177,267 @@ async def test_the_middleware_instance_holds_no_per_request_attributes(settings)
     await drive(middleware, http_scope(path="/api/v1/logs/query", app=asgi_app))
 
     assert set(vars(middleware)) == before
-    assert before == {"app", "_settings", "_default_cost"}
+    assert before == {"app", "_settings", "_default_cost", "_identity_retry_after"}
 
 
 # =============================================================================================
-# 10. Failure propagation — C8's territory, not C6's
+# 10. Failure handling — C8's two branches
+#
+# **This section changed at C8, and the change is the commit.** Until C7 both awaits on this path
+# let `BackingStoreUnavailable` propagate unhandled, and the test here asserted exactly that,
+# parametrized over both stages, because C6 had no business choosing a policy on C8's behalf.
+#
+# C8 chose, and the two stages now diverge — which is the whole point of the C5 verification note
+# that demanded they be separate branches:
+#
+#   * identity  -> a 503 emitted HERE. Never a principal, never a pass-through, `FAIL_MODE`
+#                  deliberately not consulted. The tests below are strictly stronger than the
+#                  propagation assertion they replace: propagation only proved nobody had decided,
+#                  while these prove no request is admitted, no downstream work happens, and no
+#                  limit header is fabricated.
+#   * limiter   -> handled inside `Limiter.check`, which returns a decision rather than raising, so
+#                  there is NO handler here at all. The rendering split (429 for a real overage,
+#                  503 for `BACKING_STORE`) is asserted below; the policy itself lives in
+#                  `tests/unit/test_degradation.py`.
 # =============================================================================================
 
 
-@pytest.mark.parametrize("stage", ["identity", "limiter"])
-async def test_backing_store_unavailable_propagates(settings, stage):
-    """C6 does **not** implement fail-open. C8 does, and it must make two decisions, not one.
+async def test_an_identity_store_failure_is_a_503_and_never_a_principal(settings):
+    """**The authentication-bypass guard**, and the most important assertion in this file.
 
-    "We could not check your limits" and "we could not establish who you are" are different
-    failures with different safe answers: serving an unmetered request to a known customer is the
-    documented degradation, while serving an unauthenticated request to anyone holding any string
-    is an authentication bypass — one an unauthenticated attacker can *cause on demand*, because
-    identity resolution runs pre-auth on the shared pool and breaker (see the C8 rubric in
-    `src.identity`).
+    Failing open when *limits* could not be checked serves an unmetered request to a caller we
+    identified — the documented degradation. Failing open when *identity* could not be resolved
+    would serve an unauthenticated request to anyone holding any string, for as long as the store
+    is down. That is not a degradation, it is an authentication bypass, and `src.identity`'s C8
+    rubric measured how cheaply an attacker manufactures the outage that triggers it: 200 distinct
+    unknown API keys were enough to take the shared pool and breaker out, pre-auth.
 
-    So both exceptions propagate here, unhandled and distinguishable, rather than being collapsed
-    into a default this commit would be choosing on C8's behalf.
+    So the request is refused, and the assertions below are the three ways a "refusal" could still
+    have leaked something: the app must not run, the response must not be a 2xx/4xx that reads as
+    a verdict, and it must carry no rate-limit numbers, because none were measured.
     """
-    error = BackingStoreUnavailable("redis is down", op=f"{stage}:probe")
-    kwargs: dict[str, Any] = (
-        {"identity": StubIdentity(error=error)}
-        if stage == "identity"
-        else {"limiter": StubLimiter(error=error)}
+    error = BackingStoreUnavailable("redis is down", op="identity:apikey")
+    middleware, downstream, identity, limiter, asgi_app = build(
+        settings, identity=StubIdentity(error=error)
     )
-    middleware, downstream, _identity, _limiter, asgi_app = build(settings, **kwargs)
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 503
+    # The wrapped app was never invoked: the request was refused, not served.
+    assert downstream.calls == 0
+    # ...and it was never metered either. Metering an unidentified caller would mean charging
+    # somebody's bucket for a request whose owner was never established.
+    assert identity.calls == 1
+    assert limiter.calls == []
+    # Retry-After is present and >= 1. A `Retry-After: 0` on a 503 is a retry storm, and 503 is the
+    # status clients retry hardest against.
+    assert int(captured.headers["retry-after"]) >= 1
+    # No fabricated allowance, exactly as on the 401 path: no gate was evaluated, so any
+    # X-RateLimit-* number would be invented — and a client cannot detect a wrong header.
+    assert not [
+        name for name in captured.names() if name.startswith(RATE_LIMIT_HEADER_PREFIXES[:2])
+    ]
+    assert "x-ratelimit-degraded" not in captured.headers
+    body = captured.json()
+    # NOT one of the two spec literals: a client pattern-matching "Rate limit exceeded" must never
+    # be told that an unavailable credential store was a limit it exceeded.
+    assert body["error"] not in {ERROR_RATE_LIMIT, ERROR_QUOTA}
+    assert body["error"] == SERVICE_UNAVAILABLE_ERROR
+
+
+@pytest.mark.parametrize("fail_mode", ["open", "closed"])
+async def test_the_identity_503_is_not_configurable_by_fail_mode(settings, fail_mode):
+    """`FAIL_MODE` governs what happens when *limits* cannot be checked, and nothing else.
+
+    There is no deployment for which "we could not establish who you are, so come in" is the right
+    answer, so making it configurable would be offering it.
+
+    Parametrized over **both** settings rather than only the interesting one. `open` is the value
+    under which a shared handler would have let the request through, so it is the one that would
+    catch the bypass — but asserting only there leaves "identity does not consult FAIL_MODE" as a
+    claim about a single value rather than about the setting, and a future handler keyed on
+    `closed` would slip past. Two cases, one property, no reading between the lines.
+    """
+    middleware, downstream, _identity, limiter, asgi_app = build(
+        settings.model_copy(update={"fail_mode": fail_mode}),
+        identity=StubIdentity(error=BackingStoreUnavailable("down", op="identity:apikey")),
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 503
+    assert downstream.calls == 0
+    # Never metered either: there is no principal to meter, in either mode.
+    assert limiter.calls == []
+
+
+async def test_a_saturated_pool_on_the_identity_path_is_also_a_503(settings):
+    """`BackingStoreOverloaded` is a `BackingStoreUnavailable`, so the identity branch covers it.
+
+    The distinction between the two matters enormously to the *limiter* (one degrades, the other
+    refuses) and not at all here: whether the store was unreachable or this process had no
+    connection to reach it with, nothing was learned about the caller and the answer is the same.
+    Inheriting the branch rather than adding a second one is the reason the exception is a
+    subclass — see the third rubric in `src.redis_client`.
+    """
+    middleware, downstream, _identity, _limiter, asgi_app = build(
+        settings,
+        identity=StubIdentity(
+            error=BackingStoreOverloaded("no connection available", op="identity:apikey")
+        ),
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 503
+    assert downstream.calls == 0
+
+
+async def test_a_backing_store_denial_is_a_503_and_not_a_429(settings):
+    """**429 means "you are over your limit". This caller is not — we could not find out.**
+
+    `DenyReason.BACKING_STORE` is the one reason the decision script cannot produce: the limiter
+    builds it by hand when it reached no verdict at all (`FAIL_MODE=closed` with the store down, or
+    a saturated connection pool). Rendering it as 429 would tell a client library to back off
+    against a limit it never hit, and would make an operator reading a 429 graph believe callers
+    were being throttled when the enforcement layer was simply unavailable.
+    """
+    decision = denied(reason=DenyReason.BACKING_STORE, retry_after_sec=5, degraded=True)
+    middleware, downstream, _identity, _limiter, asgi_app = build(
+        settings, limiter=StubLimiter(decision)
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 503
+    assert downstream.calls == 0
+    assert captured.headers["retry-after"] == "5"
+    # The degraded marker rides along, because THIS refusal came from the degraded policy — it is
+    # what tells a caller the difference between "you were refused by a limit" and "you were
+    # refused because the limiter could not run".
+    assert captured.headers["x-ratelimit-degraded"] == "1"
+    assert captured.json()["error"] == SERVICE_UNAVAILABLE_ERROR
+
+
+async def test_a_non_degraded_backing_store_denial_omits_the_degraded_header(settings):
+    """The pool-exhaustion 503: refused, but nothing was degraded.
+
+    The store is healthy and this replica ran out of connections to it. Marking that as degradation
+    would blame Redis for local backpressure — the misdiagnosis C4's verification named — and would
+    make `X-RateLimit-Degraded` mean two different things on the wire.
+    """
+    decision = denied(reason=DenyReason.BACKING_STORE, retry_after_sec=1, degraded=False)
+    middleware, _downstream, _identity, _limiter, asgi_app = build(
+        settings, limiter=StubLimiter(decision)
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 503
+    assert "x-ratelimit-degraded" not in captured.headers
+    assert captured.headers["retry-after"] == "1"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        DenyReason.RATE_LIMIT,
+        DenyReason.SLIDING_WINDOW,
+        DenyReason.QUOTA_DAILY,
+        DenyReason.QUOTA_MONTHLY,
+    ],
+)
+async def test_every_real_gate_still_refuses_with_the_spec_429(settings, reason):
+    """The 503 branch must not have widened into "any denial the middleware finds confusing".
+
+    Four real gates, four 429s with the spec's literal body. This is the guard that keeps the
+    `BACKING_STORE` special case from becoming the general case.
+    """
+    middleware, _downstream, _identity, _limiter, asgi_app = build(
+        settings, limiter=StubLimiter(denied(reason=reason))
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 429
+    assert captured.json()["error"] in {ERROR_RATE_LIMIT, ERROR_QUOTA}
+
+
+async def test_a_degraded_allowed_decision_flows_through_with_its_header(settings):
+    """The fail-open path is a **normal 200**, decorated — not a special response.
+
+    The middleware does not know or care that the decision came from a local bucket: it wraps
+    `send` and appends `decision.headers()` exactly as it does for a Redis-backed decision, so the
+    degraded marker and the omission of every `X-Quota-*` both arrive through the one definition of
+    what a decision's headers are.
+    """
+    middleware, downstream, _identity, _limiter, asgi_app = build(
+        settings,
+        limiter=StubLimiter(
+            make_decision(degraded=True, daily_limit=0, monthly_limit=0, window_limit=30)
+        ),
+    )
+
+    captured = await drive(middleware, http_scope(app=asgi_app))
+
+    assert captured.status == 200
+    assert downstream.calls == 1
+    assert captured.headers["x-ratelimit-degraded"] == "1"
+    assert captured.headers["x-ratelimit-limit"] == "30"
+    assert not [name for name in captured.names() if name.startswith("x-quota-")]
+
+
+async def test_the_middleware_wraps_no_handler_at_all_around_the_limiter(settings):
+    """**The structural guard**, restored deliberately after C8 inverted the propagation tests.
+
+    Until C7 a parametrized test asserted that `BackingStoreUnavailable` propagated from *both*
+    awaits, and the limiter half of it was the only thing pinning that this file adds no `except`
+    of its own around `runtime.limiter.check`. C8 moved that policy inside `Limiter.check` — which
+    now returns a decision rather than raising — so the old assertion had nothing left to say and
+    was removed with it. That left the guard itself unwitnessed.
+
+    It is worth witnessing. The entire C8 structure rests on the fail-open policy being decided
+    **once**, in the module that owns `FAIL_MODE`; a second `except BackingStoreUnavailable` added
+    here later would be a divergent policy in the wrong module, silently overriding the first for
+    every caller — and, because `Limiter.check` no longer raises that type, such a handler would be
+    dead code that looked load-bearing until somebody "fixed" the limiter to raise again.
+
+    Asserted with a type the middleware has no reason to know about: if `check` raises anything at
+    all, it must reach the caller unchanged. A blanket handler here would swallow it and turn a bug
+    into a fabricated verdict.
+    """
+    sentinel = RuntimeError("the limiter blew up in a way nobody anticipated")
+    middleware, downstream, _identity, limiter, asgi_app = build(
+        settings, limiter=StubLimiter(error=sentinel)
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        await drive(middleware, http_scope(app=asgi_app))
+
+    assert raised.value is sentinel
+    # It really did reach the limiter, so this is not passing because the request stopped earlier.
+    assert len(limiter.calls) == 1
+    assert downstream.calls == 0
+
+
+async def test_a_backing_store_failure_from_the_limiter_would_also_propagate(settings):
+    """The same guard, aimed at the one type it would be most tempting to catch here.
+
+    `Limiter.check` does not raise `BackingStoreUnavailable` — that is C8's whole point, and
+    `tests/unit/test_degradation.py` proves it in every fail mode. So this drives a stub that does,
+    and asserts the middleware still has nothing to say about it: the absence of a handler is the
+    property, and this is the shape a re-added one would be caught by.
+    """
+    middleware, _downstream, _identity, _limiter, asgi_app = build(
+        settings,
+        limiter=StubLimiter(error=BackingStoreUnavailable("down", op="script:rlq")),
+    )
 
     with pytest.raises(BackingStoreUnavailable) as raised:
         await drive(middleware, http_scope(app=asgi_app))
 
-    assert raised.value.op == f"{stage}:probe"
-    assert downstream.calls == 0
+    assert raised.value.op == "script:rlq"
 
 
 async def test_a_missing_runtime_raises_rather_than_serving_unmetered(settings):

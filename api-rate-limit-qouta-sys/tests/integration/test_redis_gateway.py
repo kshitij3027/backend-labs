@@ -522,6 +522,41 @@ async def test_aclose_never_raises_from_teardown(redis_settings: Settings):
     assert instance.is_connected is False
 
 
+async def test_aclose_disconnects_the_pool_and_survives_a_pool_that_refuses(
+    redis_settings: Settings,
+):
+    """The pool is closed **separately**, and its failure is absorbed like the client's.
+
+    Handing redis-py an explicit ``connection_pool`` — which C8's ``BlockingConnectionPool``
+    requires — sets ``auto_close_connection_pool`` to ``False``, so ``client.aclose()`` alone
+    returns the borrowed connection and leaves every other pooled socket open. That is a connection
+    leak per restart cycle against a server whose connection count is a finite shared resource, and
+    it is invisible from inside the process that caused it.
+
+    The exploding half is the same best-effort rule the client close already follows: a shutdown
+    must not become a crash, because under compose a crash on the way out is a restart loop.
+    """
+    instance = RedisGateway(redis_settings)
+    await instance.connect()
+    real_pool = instance._pool
+    assert real_pool is not None
+    disconnected: list[bool] = []
+
+    class _ExplodingPool:
+        async def disconnect(self) -> None:
+            disconnected.append(True)
+            raise redis.exceptions.ConnectionError("pool disconnect failed")
+
+    instance._pool = _ExplodingPool()  # type: ignore[assignment]
+
+    await instance.aclose()
+
+    assert disconnected == [True]
+    assert instance.is_connected is False
+    # The real pool is released too, so the test leaves no sockets behind of its own.
+    await real_pool.disconnect()
+
+
 # --------------------------------------------------------------------------------------------
 # URL redaction
 # --------------------------------------------------------------------------------------------

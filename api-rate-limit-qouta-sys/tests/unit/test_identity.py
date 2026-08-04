@@ -54,6 +54,7 @@ from src.identity import (
     IdentityResolver,
     apikey_digest,
     header_value,
+    identity_concurrency,
     issue_token,
     parse_credential,
     seed_demo_credentials,
@@ -962,8 +963,16 @@ def test_the_cap_is_floored_at_one(settings: Settings, gateway: FakeGateway):
     assert IdentityResolver(gateway, settings, max_entries=0).cache_stats()["max_entries"] == 1
 
 
-def test_cache_stats_on_a_process_that_has_authenticated_nobody(resolver: IdentityResolver):
-    """No lookups means no hit rate. 0.0, not a ZeroDivisionError on the stats endpoint."""
+def test_cache_stats_on_a_process_that_has_authenticated_nobody(
+    resolver: IdentityResolver, settings: Settings
+):
+    """No lookups means no hit rate. 0.0, not a ZeroDivisionError on the stats endpoint.
+
+    The three concurrency counters joined this payload at C8, when the pre-auth path acquired a
+    bound; they are asserted here rather than only in ``tests/unit/test_overload.py`` because this
+    is the test that pins the payload's exact shape, and a counter nobody publishes is a counter
+    nobody reads.
+    """
     assert resolver.cache_stats() == {
         "size": 0,
         "max_entries": IDENTITY_CACHE_MAX_ENTRIES,
@@ -973,6 +982,9 @@ def test_cache_stats_on_a_process_that_has_authenticated_nobody(resolver: Identi
         "negative_hits": 0,
         "evictions": 0,
         "hit_rate": 0.0,
+        "max_concurrency": identity_concurrency(settings),
+        "gate_waits": 0,
+        "peak_in_flight": 0,
     }
 
 

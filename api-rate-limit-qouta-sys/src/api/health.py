@@ -34,8 +34,11 @@ top level, not nested. Everything else is additive:
   this field is how the E2E verifier proves that *both* of them answered: without it, the
   distributed double-spend check would pass trivially against a single replica and the bug the
   whole project exists to catch would go undetected.
-* ``redis`` — ``"ok"`` or ``"unreachable"``, from a real ``PING`` through the gateway (so the probe
-  also feeds the circuit breaker rather than being a second, unobserved path to the server).
+* ``redis`` — ``"ok"``, ``"unreachable"`` or ``"saturated"``, from a real ``PING`` through the
+  gateway (so the probe also feeds the circuit breaker rather than being a second, unobserved path
+  to the server). See the rubric below for why the third value exists.
+* ``pool`` — ``"ok"`` or ``"saturated"``: whether **this replica** has been failing to get
+  connections out of its own bounded pool. Its own field, deliberately; see below.
 * ``config_version`` — the ``config:version`` this replica's tier snapshot was built from. This is
   how C10 watches a runtime tier change propagate: after a ``PUT /admin/tiers/{tier}`` the number
   climbs on the replica that served the write immediately and on every other replica within
@@ -44,10 +47,35 @@ top level, not nested. Everything else is additive:
   read from Redis — a legitimate degraded state (the configured defaults are being enforced), not
   an error.
 
-``rate_limiter`` is the constant ``"active"`` for now; C8 makes it report ``"degraded"`` (still
-with a 200) when Redis is unreachable and the fallback bucket is carrying the load. A silent
-fail-open is indistinguishable from having no rate limiter at all, which is why the degraded state
-has to be visible on the one endpoint everything already polls.
+.. rubric:: ``rate_limiter: "degraded"`` — and the response is still 200 with ``status: "healthy"``
+
+``rate_limiter`` reports ``"degraded"`` while :class:`~src.limiter.Limiter`'s local fallback bucket
+is carrying this replica's traffic, and returns to ``"active"`` on the first decision Redis
+actually makes. A silent fail-open is indistinguishable from having no rate limiter at all, which
+is why the degraded state has to be visible on the one endpoint everything already polls.
+
+**The HTTP status stays 200 and ``status`` stays ``"healthy"`` while it says that**, which is the
+whole reason the two fields are separate. A degraded replica is serving every request correctly,
+through a bounded bucket, exactly as designed; turning the probe red would have the orchestrator
+restart it *for working as intended* — and restart every other replica at the same instant, because
+they share the one Redis that is down. See the last rubric in this docstring: liveness and
+dependency health are different questions and are answered in different fields.
+
+.. rubric:: A saturated connection pool is NOT a Redis outage, and does not say it is
+
+``redis: "saturated"`` and ``pool: "saturated"`` exist because the alternative was actively
+misleading. When this process runs out of pooled connections, the probe's own ``PING`` cannot get
+one either — and reporting that as ``redis: "unreachable"`` would blame a Redis that is answering
+every other client perfectly, sending an operator to debug the wrong machine during an incident.
+So :class:`~src.redis_client.BackingStoreOverloaded` is caught ahead of its parent and reported as
+what it is: we could not ask, so we do not know.
+
+``pool`` is a separate field rather than a fourth value of ``rate_limiter`` for the same reason.
+Saturation and degradation are different incidents with different remedies (add connections or shed
+load, versus wait for the store), they can occur independently, and a single field could only ever
+report one of them. It is driven by :attr:`~src.redis_client.RedisGateway.is_overloaded` — the
+gateway's own recent history — rather than by this probe's ping, so a ping that happened to win a
+connection does not erase a replica that is shedding requests.
 
 .. rubric:: What is deliberately NOT reported here: the C5 identity-cache counters
 
@@ -88,11 +116,12 @@ share the one Redis that is down. The outcome is a total outage triggered by a d
 the system was explicitly built to survive: a liveness probe that reports a *dependency's* health
 converts partial degradation into a full restart loop.
 
-So liveness and dependency health are reported as two separate fields. ``status`` answers "is this
-process alive?" (a liveness question). ``redis`` answers "can it reach the shared store?" (a
-readiness/observability question) and is what the dashboard, the E2E verifier and an operator read.
-``rate_limiter`` likewise stays ``"active"`` here; C8 is what turns it ``"degraded"``, driven by the
-limiter's own fallback state rather than by this ping.
+So liveness and dependency health are reported as separate fields. ``status`` answers "is this
+process alive?" (a liveness question). ``redis`` answers "can it reach the shared store?" and
+``pool`` answers "does it have connections to reach it with?" (readiness/observability questions),
+and those are what the dashboard, the E2E verifier and an operator read. ``rate_limiter`` answers
+"is enforcement authoritative right now?", driven by the limiter's own fallback state rather than
+by this ping — a store that is answering does not mean a request has been metered against it since.
 """
 
 from __future__ import annotations
@@ -102,7 +131,7 @@ import socket
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from src.redis_client import BackingStoreUnavailable
+from src.redis_client import BackingStoreOverloaded, BackingStoreUnavailable
 
 router = APIRouter(tags=["health"])
 
@@ -112,11 +141,25 @@ router = APIRouter(tags=["health"])
 STATUS_HEALTHY = "healthy"
 RATE_LIMITER_ACTIVE = "active"
 
-#: The two values of the additive ``redis`` field. Deliberately not ``true``/``false``: a boolean
-#: named ``redis`` reads as "is Redis configured?" in a payload, and this is a live reachability
-#: answer with a 250 ms timeout behind it.
+#: The C8 fail-open state: enforcement is running on the bounded local fallback bucket rather than
+#: on the shared store. Reported **with a 200 and ``status: "healthy"``** — see the docstring.
+RATE_LIMITER_DEGRADED = "degraded"
+
+#: The values of the additive ``redis`` field. Deliberately not ``true``/``false``: a boolean named
+#: ``redis`` reads as "is Redis configured?" in a payload, and this is a live reachability answer
+#: with a 250 ms timeout behind it — and one that now has three outcomes, which no boolean has.
 REDIS_OK = "ok"
 REDIS_UNREACHABLE = "unreachable"
+
+#: The store's reachability is **unknown**: this process could not get a connection out of its own
+#: pool, so no packet was ever sent. Reporting ``unreachable`` here would blame a healthy Redis for
+#: local backpressure, which is the misdiagnosis C4's verification called out by name.
+REDIS_SATURATED = "saturated"
+
+#: The values of the additive ``pool`` field — this replica's own connection capacity, independent
+#: of both ``redis`` and ``rate_limiter``.
+POOL_OK = "ok"
+POOL_SATURATED = "saturated"
 
 
 def _hostname() -> str:
@@ -140,10 +183,14 @@ SERVED_BY: str = _hostname()
 class HealthResponse(BaseModel):
     """The ``GET /health`` body. Small, stable, and safe to expose unauthenticated."""
 
-    status: str = Field(description="Always 'healthy' while the process is serving.")
+    status: str = Field(
+        description="Always 'healthy' while the process is serving — including while "
+        "`rate_limiter` is 'degraded', which is a replica working exactly as designed."
+    )
     rate_limiter: str = Field(
-        description="'active' while enforcement is backed by Redis; 'degraded' on the C8 "
-        "fail-open fallback path. Never absent — a missing field would read as 'no limiter'."
+        description="'active' while enforcement is backed by Redis; 'degraded' while the C8 "
+        "local fallback bucket is carrying this replica's traffic. Never absent — a missing "
+        "field would read as 'no limiter'."
     )
     version: str = Field(description="API version reported by the FastAPI app.")
     uptime_sec: float = Field(description="Seconds since the runtime was constructed.")
@@ -152,9 +199,15 @@ class HealthResponse(BaseModel):
         "fanning out across replicas rather than pinning to one."
     )
     redis: str = Field(
-        description="'ok' or 'unreachable', from a live PING. Reported separately from `status` "
-        "on purpose: this process stays healthy (and keeps serving, fail-open) when the shared "
-        "store is down."
+        description="'ok', 'unreachable', or 'saturated' when this replica had no connection to "
+        "ask with. Reported separately from `status` on purpose: this process stays healthy (and "
+        "keeps serving, fail-open) when the shared store is down."
+    )
+    pool: str = Field(
+        description="'ok' or 'saturated' — whether this replica is running out of pooled "
+        "connections. Distinct from `redis` and from `rate_limiter` because it is a different "
+        "incident with a different remedy: the store is healthy and this process is the "
+        "bottleneck, so requests are refused with 503 rather than served unmetered."
     )
     config_version: int = Field(
         description="`config:version` behind this replica's tier snapshot. C10 watches this "
@@ -181,8 +234,38 @@ def _config_version(runtime: object) -> int:
     return int(getattr(snapshot(), "version", 0) or 0)
 
 
+def _rate_limiter_state(runtime: object) -> str:
+    """``"degraded"`` while the fallback bucket is carrying traffic, else ``"active"``.
+
+    Read off the limiter through ``getattr`` for the same reason everything else here is: a
+    half-wired runtime must answer honestly with a 200, not raise an ``AttributeError`` on the
+    endpoint an orchestrator uses to decide whether to restart this replica. A runtime with no
+    limiter reports ``"active"`` — the same thing it reported before any enforcement existed, and
+    the value that does not invent a degradation nobody is in.
+
+    Note the source: the **limiter's** state, not this probe's ping. A successful ping proves the
+    store is answering; it does not prove a request has been metered against it since, and the
+    field is about enforcement rather than about reachability (which ``redis`` already carries).
+    """
+    if getattr(getattr(runtime, "limiter", None), "degraded", False):
+        return RATE_LIMITER_DEGRADED
+    return RATE_LIMITER_ACTIVE
+
+
+def _pool_state(runtime: object) -> str:
+    """``"saturated"`` while this process is failing to get pooled connections, else ``"ok"``.
+
+    Driven by :attr:`~src.redis_client.RedisGateway.is_overloaded`, which the gateway clears on its
+    next successful call — so this reports the replica's live capacity rather than a latch that
+    would stay lit for the process's lifetime after one burst.
+    """
+    if getattr(getattr(runtime, "redis", None), "is_overloaded", False):
+        return POOL_SATURATED
+    return POOL_OK
+
+
 async def _probe_redis(runtime: object) -> str:
-    """Return ``"ok"`` or ``"unreachable"`` for the runtime's Redis gateway.
+    """Return ``"ok"``, ``"unreachable"`` or ``"saturated"`` for the runtime's Redis gateway.
 
     Read through ``getattr`` for the same reason everything else in this module is: a half-wired or
     pre-startup runtime must produce a 200 with an honest field, not an ``AttributeError`` and a
@@ -204,6 +287,11 @@ async def _probe_redis(runtime: object) -> str:
         return REDIS_UNREACHABLE
     try:
         answered = await gateway.ping()
+    except BackingStoreOverloaded:
+        # FIRST, ahead of its parent. The probe could not get a connection out of *our* pool, so no
+        # packet reached Redis and its reachability is genuinely unknown. Answering "unreachable"
+        # would be a guess, and a guess that points an operator at the wrong machine.
+        return REDIS_SATURATED
     except BackingStoreUnavailable:
         return REDIS_UNREACHABLE
     return REDIS_OK if answered else REDIS_UNREACHABLE
@@ -235,11 +323,15 @@ async def health(request: Request) -> HealthResponse:
     runtime = getattr(request.app.state, "runtime", None)
     uptime_sec = float(getattr(runtime, "uptime_sec", 0.0) or 0.0)
     return HealthResponse(
+        # A CONSTANT, next to a `rate_limiter` that is not. That asymmetry is the design: this
+        # process is alive and serving whatever the store is doing, and the fields that vary are
+        # the ones describing dependencies rather than liveness.
         status=STATUS_HEALTHY,
-        rate_limiter=RATE_LIMITER_ACTIVE,
+        rate_limiter=_rate_limiter_state(runtime),
         version=str(getattr(request.app, "version", "")),
         uptime_sec=round(uptime_sec, 3),
         served_by=SERVED_BY,
         redis=await _probe_redis(runtime),
+        pool=_pool_state(runtime),
         config_version=_config_version(runtime),
     )
