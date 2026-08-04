@@ -190,9 +190,19 @@ def test_health_needs_no_authentication(client):
 
 
 def test_health_is_unversioned(client):
-    """It must not drift under /api/v1 — a probe that moves with the API version breaks rollouts."""
+    """It must not drift under /api/v1 — a probe that moves with the API version breaks rollouts.
+
+    `/api/v1/health` answered 404 until C6 and answers **401** from C6 on, which is a deliberate
+    consequence of the limiter middleware rather than a regression: it runs above the router, so a
+    request to a path that does not exist is classified and authenticated *before* anything asks
+    whether a handler exists. Routing first would make the 404-vs-401 difference a free
+    path-enumeration oracle for a caller holding no credential at all.
+
+    What this test is actually about is unchanged and still asserted: `/health` is served here and
+    is not served there.
+    """
     assert client.get("/health").status_code == 200
-    assert client.get("/api/v1/health").status_code == 404
+    assert client.get("/api/v1/health").status_code == 401
 
 
 def test_health_survives_a_missing_runtime(settings):
@@ -264,7 +274,7 @@ def test_rate_limit_headers_are_readable_cross_origin(client):
     the browser, and only ``response.headers.get(...)`` in the dashboard's JavaScript comes back
     null. No Python anywhere notices, which is what makes this untestable by every other means.
 
-    The nine names are written out literally rather than imported from ``src.main``: asserting the
+    The ten names are written out literally rather than imported from ``src.main``: asserting the
     response against the same list that produced it would pass just as happily if a header were
     deleted from both sides at once. This is the contract; ``EXPOSE_HEADERS`` implements it.
 
@@ -289,6 +299,11 @@ def test_rate_limit_headers_are_readable_cross_origin(client):
         "retry-after",
         "x-ratelimit-degraded",
         "x-served-by",
+        # Added at C6, when RateLimitMiddleware became the first thing to emit it. It is not
+        # CORS-safelisted, so without it a browser client that got a 401 could read the status
+        # and not the challenge — i.e. could not discover that this API accepts an `ApiKey`
+        # scheme at all. Changing this set is meant to take a deliberate edit; this is one.
+        "www-authenticate",
     }
 
 

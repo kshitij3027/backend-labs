@@ -55,6 +55,7 @@ from src.api.health import router as health_router
 from src.config import Settings, get_settings
 from src.identity import IdentityResolver
 from src.limiter import Limiter
+from src.middleware import RateLimitMiddleware
 from src.redis_client import RedisGateway, redact_redis_url
 from src.tiers import TierRegistry
 
@@ -97,6 +98,13 @@ pace itself instead of discovering the ceiling by hitting it. Note the deliberat
 #: Declared in full at C1 even though the middleware that emits them arrives in C6/C8: the list is
 #: the contract, and a header added to the contract later but forgotten here fails silently in the
 #: browser and nowhere else.
+#:
+#: ``WWW-Authenticate`` joined the list at C6, when something finally emitted it. It is the one
+#: header :class:`~src.middleware.RateLimitMiddleware` produces that does not come from
+#: :meth:`~src.models.LimitDecision.headers`, and it is not CORS-safelisted, so without it a
+#: browser client that got a 401 could see the status and not the challenge — i.e. could not
+#: discover that this API accepts an ``ApiKey`` scheme at all. ``tests/unit/test_middleware.py``
+#: pins the correspondence in the same way ``tests/unit/test_models.py`` pins the other eight.
 EXPOSE_HEADERS = [
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
@@ -107,6 +115,7 @@ EXPOSE_HEADERS = [
     "Retry-After",
     "X-RateLimit-Degraded",
     "X-Served-By",
+    "WWW-Authenticate",
 ]
 
 
@@ -316,6 +325,49 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     _configure_logging(settings)
 
+    # =========================================================================================
+    # MIDDLEWARE ORDER. Read this before adding one.
+    #
+    # Starlette's `add_middleware` does `user_middleware.insert(0, ...)`, and the stack is built
+    # by wrapping the router in that list REVERSED. The consequence is the opposite of what the
+    # reading order suggests: **the LAST middleware registered is the OUTERMOST one.**
+    #
+    # So the limiter is registered FIRST and CORS SECOND, which puts the limiter *inside* CORS and
+    # *outside* the router. Both halves of that sandwich are load-bearing:
+    #
+    #   * INSIDE CORS, because the limiter short-circuits its 429 without calling anything below
+    #     it. Outside CORS, that 429 would carry no `Access-Control-Allow-Origin` and no
+    #     `Access-Control-Expose-Headers` — so a browser client would be unable to read the
+    #     rejection *or* the `Retry-After` telling it when to come back, and the fetch would
+    #     surface as an opaque network error. The rate limiter would be invisible to precisely the
+    #     client the dashboard is written in. It also means a preflight `OPTIONS` is answered by
+    #     CORS and never reaches the limiter, so a browser's own protocol overhead is not charged
+    #     to the caller's quota.
+    #   * OUTSIDE the router, because an unrouted path must still be metered. A limiter that only
+    #     sees requests the router recognised is one an attacker bypasses by sending `GET /x`.
+    #
+    # `tests/integration/test_middleware_flow.py` asserts the CORS half against a real 429 rather
+    # than trusting this comment, because the failure mode is invisible from Python.
+    #
+    # ---------------------------------------------------------------------------------------
+    # Registered UNCONDITIONALLY, including when RATE_LIMIT_ENABLED is false. The middleware
+    # self-disables at step 3 of its own flow instead.
+    #
+    # The alternative — `if settings.rate_limit_enabled: app.add_middleware(...)` — reads tidier
+    # and is a trap. A config toggle that changes the middleware *stack* changes the shape of the
+    # request path itself: which callable owns `send`, whether `scope["state"]` exists, how many
+    # frames deep an exception is raised. So a bug reproduces in one mode and not the other, and
+    # the switch that was added to isolate the limiter's cost becomes a second code path nobody
+    # tested. Worse for C14 specifically: the overhead measurement is supposed to compare
+    # "limiter on" against "limiter off" through *the same stack*, and a conditional registration
+    # would have it comparing two different applications and attributing the difference to the
+    # limiter.
+    #
+    # With the middleware always installed, "off" costs a type check, a set lookup and a memoised
+    # classify — which is the honest baseline, and the one the disabled path actually pays.
+    # ---------------------------------------------------------------------------------------
+    app.add_middleware(RateLimitMiddleware, settings=settings)
+
     origins = list(settings.cors_origins)
     app.add_middleware(
         CORSMiddleware,
@@ -327,11 +379,6 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         allow_headers=["*"],
         expose_headers=EXPOSE_HEADERS,
     )
-
-    # C6 registers the pure-ASGI RateLimitMiddleware here, deliberately INSIDE CORS: Starlette
-    # applies middleware in reverse registration order, so CORS (added above, hence outermost)
-    # can still decorate a 429 the limiter short-circuits, and a preflight OPTIONS is answered
-    # without ever reaching — or being charged by — the limiter.
 
     # Unversioned liveness. A future v2 adds a router beside v1 here; /health never moves.
     app.include_router(health_router)

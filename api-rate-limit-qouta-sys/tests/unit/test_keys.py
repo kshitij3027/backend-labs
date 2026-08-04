@@ -492,6 +492,82 @@ def test_the_method_is_case_insensitive():
     assert classify("get", "/api/v1/whoami") == classify("GET", "/api/v1/whoami")
 
 
+# --------------------------------------------------------------------------------------------
+# HEAD is GET — the method-side half of the classifier/router agreement
+# --------------------------------------------------------------------------------------------
+
+
+#: One concrete path per route-table row, because a compiled regex is not a URL. A row with no
+#: sample here fails :func:`test_every_route_table_row_has_a_sample_path` rather than being
+#: silently skipped by the tests below — which is what keeps them covering rows added later.
+SAMPLE_PATHS = {
+    "GET:/api/v1/logs/query": "/api/v1/logs/query",
+    "POST:/api/v1/logs/ingest": "/api/v1/logs/ingest",
+    "GET:/api/v1/whoami": "/api/v1/whoami",
+    "GET:/api/v1/logs/{id}": "/api/v1/logs/42",
+}
+
+
+def test_every_route_table_row_has_a_sample_path():
+    """The bookkeeping that makes the parametrised tests below honest as the table grows."""
+    assert {route.label for route in ROUTE_TABLE} == set(SAMPLE_PATHS)
+    for route in ROUTE_TABLE:
+        assert classify(route.method, SAMPLE_PATHS[route.label]) == (route.label, route.category)
+
+
+@pytest.mark.parametrize(
+    "route", [route for route in ROUTE_TABLE if route.method == "GET"], ids=lambda r: r.label
+)
+def test_head_classifies_exactly_as_get_for_every_get_route(route):
+    """**A pricing bypass reachable through the method rather than the path.**
+
+    Starlette's `Route(methods=["GET"])` auto-adds HEAD (`self.methods.add("HEAD")`), so a plain
+    route on a priced path serves `HEAD /api/v1/logs/query` from the same 5-token handler as the
+    GET. Keyed on the exact method, the classifier would call that `("other", "default")` — 1
+    token, and on a *different bucket key* than the endpoint actually served, so the overspend does
+    not even show up in the metering for the endpoint it came from.
+
+    Asserted over every GET row rather than over the one expensive route, so a row added later
+    inherits the property instead of needing someone to remember this test exists.
+    """
+    sample = SAMPLE_PATHS[route.label]
+
+    assert classify("HEAD", sample) == classify("GET", sample)
+    assert classify("HEAD", sample) == (route.label, route.category)
+    # Same label means the same bucket key, which is the thing that actually has to match: a
+    # different key is a second, full allowance the caller can alternate onto.
+    assert bucket_key("alice", classify("HEAD", sample)[0]) == bucket_key(
+        "alice", classify("GET", sample)[0]
+    )
+
+
+def test_head_is_aliased_before_the_route_table_not_by_extra_rows():
+    """The alias is applied to the method, so it holds for rows this test has never seen.
+
+    `METHOD_ALIASES` is the whole list of methods that are classified as another method; pinning it
+    here means adding a second alias is a deliberate edit rather than a side effect.
+    """
+    assert dict(keys.METHOD_ALIASES) == {"HEAD": "GET"}
+    assert "HEAD" not in {route.method for route in ROUTE_TABLE}
+    # Lower case, and padded, still land on the alias.
+    assert classify("head", "/api/v1/logs/query") == ("GET:/api/v1/logs/query", "logs_query")
+    assert classify("HEAD", "/api/v1/logs/query\n") == ("GET:/api/v1/logs/query", "logs_query")
+
+
+def test_a_method_the_table_does_not_enumerate_is_still_not_free():
+    """The alias must not become a general "any method gets the GET price" rule.
+
+    A POST to a GET route is genuinely a different endpoint — the router 405s or dispatches
+    elsewhere — so it must keep collapsing onto `other`. HEAD is aliased because the router
+    dispatches it to the GET handler; nothing else clears that bar.
+    """
+    for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE"):
+        assert classify(method, "/api/v1/logs/query") == (
+            UNKNOWN_ENDPOINT_LABEL,
+            DEFAULT_ENDPOINT_CATEGORY,
+        )
+
+
 def test_a_trailing_slash_does_not_create_a_second_endpoint():
     """Starlette redirects `/x/` -> `/x`, but the limiter runs ABOVE the router and sees the raw
     path — so without normalisation the same endpoint would carry two buckets and two allowances a

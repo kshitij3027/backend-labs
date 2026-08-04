@@ -47,9 +47,11 @@ produces (the limiter's clock is ``redis.call('TIME')``, which is UTC epoch seco
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
+from types import MappingProxyType
 
 # --------------------------------------------------------------------------------------------
 # Global (untagged) keys
@@ -89,6 +91,18 @@ DEFAULT_ENDPOINT_CATEGORY = "default"
 #: Bound on :func:`classify`'s memo table. See the function docstring: this bound protects *process
 #: memory*, and is a different bound from the one protecting *Redis memory*.
 CLASSIFY_CACHE_SIZE = 1024
+
+#: Methods that are classified **as another method**, applied before :data:`ROUTE_TABLE` is
+#: consulted. Exactly one entry today, and it is a pricing rule rather than a convenience — see the
+#: "HEAD is classified as GET" rubric on :func:`classify` for the bypass it closes.
+#:
+#: A mapping rather than an ``if`` so that the set of aliases is one readable list. Nothing else
+#: belongs here on current evidence: ``OPTIONS`` never reaches the classifier (CORS answers a
+#: preflight above the limiter, and an unlisted ``OPTIONS`` 405s), and ``TRACE`` / ``CONNECT`` are
+#: not served at all. A future alias must clear the same bar this one does: *the router dispatches
+#: it to the aliased method's handler*, so charging it the aliased method's price is what makes the
+#: classifier and the router agree.
+METHOD_ALIASES: Mapping[str, str] = MappingProxyType({"HEAD": "GET"})
 
 #: Length and alphabet of an ``apikey:v1:`` digest — SHA-256 hex, lower case. Enforced by
 #: :func:`apikey_key`; see there for why this validation is a security control and not a nicety.
@@ -546,6 +560,30 @@ def classify(method: str, path: str) -> tuple[str, str]:
     of that boundary has to be checked against the other side, and the test that pins it asserts the
     invariant directly: ``classify(m, padded) == classify(m, clean)``.
 
+    .. rubric:: HEAD is classified as GET, because the ROUTER dispatches it as GET
+
+    The same divergence, reached through the **method** instead of the path, and it is worth
+    spelling out separately because the route table looks like it already handles the method.
+
+    Starlette's ``Route(methods=["GET"])`` **auto-adds HEAD** — literally
+    ``self.methods.add("HEAD")`` in its constructor — so a plain route on a priced path serves
+    ``HEAD /api/v1/logs/query`` from the very same 5-token handler as the ``GET``. A table keyed on
+    the exact method would call that request ``("other", "default")``: **1 token, on a different
+    bucket key than the endpoint it was actually served from.** The caller gets the expensive
+    endpoint at the cheap price, and the accounting lands somewhere else entirely, so the
+    overspend is invisible in the metering for the endpoint that was served.
+
+    It is latent rather than live in this repository today — every current route is a FastAPI
+    ``APIRoute``, which 405s an unlisted method, and the only ``StaticFiles`` mount sits under an
+    exempt prefix — and it goes live the moment anyone adds a plain ``Route`` or a ``Mount`` on a
+    priced path (C15's dashboard is the obvious candidate). Applying the alias here rather than
+    adding ``HEAD`` rows to :data:`ROUTE_TABLE` means the rule holds for **every** row, including
+    the ones a later commit adds without having read this docstring.
+
+    It is also simply correct on HTTP's own terms: RFC 9110 §9.3.2 defines HEAD as GET with the
+    response body omitted, and the server does the identical work to produce it. Charging it the
+    same is the honest price, not a concession.
+
     .. rubric:: Two different bounds, for two different resources
 
     ``lru_cache(maxsize=1024)`` bounds the **memo table in this process**. It has to be bounded for
@@ -559,7 +597,10 @@ def classify(method: str, path: str) -> tuple[str, str]:
     immutable tuple — so a hit is a dict lookup on the hot path, and a flood of novel paths costs at
     most 1024 entries before it starts evicting itself.
     """
+    # Upper-cased first, so the alias table is consulted with the one canonical spelling rather
+    # than needing an entry per casing a client might send.
     normalised_method = method.upper()
+    normalised_method = METHOD_ALIASES.get(normalised_method, normalised_method)
     normalised_path = _normalise_path(path)
     for route in ROUTE_TABLE:
         # `fullmatch`, not `match`. The patterns are already `$`-anchored, but `$` in Python also
