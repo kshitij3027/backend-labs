@@ -3,7 +3,8 @@
 Three things live here, and they are the three seams the rest of the project hangs off:
 
 * :class:`Runtime` — the single container for per-process collaborators (settings, the Redis
-  gateway and the tier registry now; C4's limiter and C9's analytics collector as they land).
+  gateway, the tier registry, the limiter and the identity resolver now; C9's analytics collector
+  as it lands).
   Handlers read it defensively off ``request.app.state.runtime`` and degrade to a safe fallback
   rather than raising, so a half-wired runtime is never a 500.
 * :func:`lifespan` — the production startup path. It builds a Runtime, **starts** it (opening the
@@ -52,6 +53,7 @@ from fastapi.responses import ORJSONResponse
 
 from src.api.health import router as health_router
 from src.config import Settings, get_settings
+from src.identity import IdentityResolver
 from src.limiter import Limiter
 from src.redis_client import RedisGateway, redact_redis_url
 from src.tiers import TierRegistry
@@ -113,9 +115,10 @@ class Runtime:
     """Per-process runtime state shared by every handler.
 
     Frozen: a Runtime is a container of already-constructed collaborators, not a scratchpad. The
-    limiter, the tier registry and the Redis gateway all own mutable state internally; what must
-    never happen is one request rebinding *which* limiter the next request uses. Freezing the
-    container makes that structural rather than conventional.
+    limiter, the tier registry, the identity resolver and the Redis gateway all own mutable state
+    internally; what must never happen is one request rebinding *which* limiter — or *which
+    identity resolver* — the next request uses. Freezing the container makes that structural rather
+    than conventional.
 
     ``started_at`` is captured from :func:`time.monotonic` despite the name, not from the wall
     clock, so reported uptime cannot go backwards when NTP steps the system clock — the same
@@ -129,6 +132,7 @@ class Runtime:
     redis: RedisGateway
     tiers: TierRegistry
     limiter: Limiter
+    identity: IdentityResolver
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -161,6 +165,12 @@ class Runtime:
         table it sends to the decision script is the registry's pre-rendered snapshot, read
         synchronously per request. Its constructor is pure too — it tries to register the decision
         script and tolerates the gateway not being connected yet, which is always the case here.
+
+        The identity resolver is built last, and it depends on neither of them. That is the design
+        rather than an accident of ordering: a principal is resolved from headers and one
+        ``apikey:v1:*`` lookup, and **what tier that principal is on is never read here** — it is
+        read from ``user:{uid}`` inside the decision script, on every request. Wiring the resolver
+        to the registry would create exactly the per-user tier cache the whole design avoids.
         """
         gateway = RedisGateway(settings)
         registry = TierRegistry(settings, gateway)
@@ -169,6 +179,7 @@ class Runtime:
             redis=gateway,
             tiers=registry,
             limiter=Limiter(gateway, registry, settings),
+            identity=IdentityResolver(gateway, settings),
         )
 
     async def start(self) -> None:
@@ -186,9 +197,23 @@ class Runtime:
         unconnected gateway would classify every seed write as an outage and boot the replica on
         the fallback table for no reason. The registry's own start never raises, so an unreachable
         Redis still leaves a serving process.
+
+        The identity seed runs alongside the tier seed and under the identical rule: it writes the
+        demo ``apikey:v1:*`` and ``user:{id}`` records with ``HSETNX``, and
+        :meth:`~src.identity.IdentityResolver.start` never raises. A replica that cannot seed still
+        authenticates against whatever another replica (or an operator) already wrote — so failing
+        the boot here would trade "the demo keys 401 until Redis returns" for "nothing serves at
+        all", which is the worse half of that trade in every deployment.
+
+        It runs **after** the tier seed on purpose: the demo ``user:{id}`` records name tiers, and
+        seeding a principal onto a tier before ``config:tiers`` exists would leave a window in which
+        that principal resolves to a tier the decision script cannot find and falls back to
+        ``DEFAULT_TIER`` for. Both are ``HSETNX`` and both are idempotent, so the ordering costs
+        nothing and removes the window.
         """
         await self.redis.connect()
         await self.tiers.start()
+        await self.identity.start()
 
     async def stop(self) -> None:
         """Release every connection this Runtime owns. Never raises.

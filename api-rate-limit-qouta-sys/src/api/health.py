@@ -49,6 +49,30 @@ with a 200) when Redis is unreachable and the fallback bucket is carrying the lo
 fail-open is indistinguishable from having no rate limiter at all, which is why the degraded state
 has to be visible on the one endpoint everything already polls.
 
+.. rubric:: What is deliberately NOT reported here: the C5 identity-cache counters
+
+:meth:`~src.identity.IdentityResolver.cache_stats` is a pure counter read — no I/O, no lock — so
+adding ``identity_cache`` to this body would be cheap in CPU. It is not added, for three reasons
+that are not about cost:
+
+* **This body is a pinned contract, not a dashboard.** ``tests/unit/test_health.py`` asserts the
+  exact key set and the C13 verifier asserts the spec's two keys character-for-character across a
+  container boundary. The value of that pinning comes from the payload being small and stable;
+  every field added "because it is cheap" is one more thing a probe consumer can start depending on
+  and one more reason a later commit cannot change it.
+* **There is already a surface for counters.** C11's ``GET /dashboard/api/stats`` is where the
+  limiter's, the registry's and the gateway's counters are published together, which is also the
+  only place they can be *compared* — an identity hit rate is meaningless next to a Redis ping and
+  informative next to the request rate that produced it.
+* **``/health`` is unauthenticated and public.** Cache size and hit rate are a (weak, but free)
+  side channel about credential traffic: a jump in the negative-hit share is exactly the signature
+  of a key-guessing flood, and that is operator information rather than caller information.
+
+So the counters exist, are exposed on the resolver, and C11 publishes them. If a future operator
+genuinely needs them on the liveness probe, adding the field is a one-line change *and* a
+deliberate edit to the key-set test — which is the right amount of friction for changing a probe's
+contract.
+
 .. rubric:: A Redis outage does NOT make this endpoint red
 
 ``status`` stays ``"healthy"`` and the HTTP status stays 200 when ``redis`` is ``"unreachable"``.
