@@ -7,18 +7,24 @@ proves the thing those stubs stand in for: a real
 CORS middleware wrapped around the whole thing — driven through ``httpx.ASGITransport``, which is
 the same in-process transport C12's distributed double-spend test uses.
 
-.. rubric:: The routes here are mounted BY THE TEST, on purpose
+.. rubric:: One route here is still mounted BY THE TEST, and only one
 
-C7 owns ``src/api/protected.py``. Until it lands, this suite mounts two throwaway handlers on the
-app it just built — at the two paths :data:`src.keys.ROUTE_TABLE` already prices differently
-(``GET /api/v1/whoami`` at cost 1, ``GET /api/v1/logs/query`` at cost 5) — so the weighted-cost
-bonus can be observed decrementing a real bucket by 5 rather than 1.
+Until C7 this suite mounted its own throwaway handlers at ``GET /api/v1/whoami`` and
+``GET /api/v1/logs/query`` so the weighted-cost bonus could be observed against paths
+:data:`src.keys.ROUTE_TABLE` prices differently. ``src/api/protected.py`` now serves both for
+real, so the throwaways are gone and every assertion below runs against the shipped surface —
+which is strictly better, because a stub route can only prove that the *middleware* charges 5
+tokens, while the real one also proves the router and the classifier agree about which endpoint
+that is.
 
-They are local to this module for a reason beyond commit scope: the classifier and the router are
-*independent* in this project by design (see the "agreeing with the router is a SECURITY property"
-rubric in :mod:`src.keys`), so a route existing or not existing changes nothing about what a
-request is labelled or charged. Mounting them here therefore proves exactly what C7 will prove,
-with no ``src/`` change to unpick afterwards.
+**The plain-Starlette route is kept, and it cannot be replaced by a real one.** Its whole subject
+is a divergence that only a non-``APIRoute`` can produce: ``Route(methods=["GET"])`` auto-adds
+``HEAD`` (literally ``self.methods.add("HEAD")`` in Starlette's constructor) while FastAPI's
+``APIRoute`` 405s it. So a plain route on a priced path is served by the expensive handler under
+``HEAD`` — the exact input that, before ``METHOD_ALIASES``, the classifier called
+``("other", "default")`` and charged 1 token for on an unrelated bucket key. Nothing in
+``src/api/protected.py`` is that shape (by design), and C15's dashboard mount will be, so the
+probe stays here as the standing reproduction of the method-side bypass.
 
 .. rubric:: Why some assertions land on a 404
 
@@ -30,8 +36,6 @@ appended to whatever the app produced rather than to a response the middleware w
 
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 import pytest
 from fastapi import FastAPI, Request
@@ -42,7 +46,7 @@ from src.config import Settings
 from src.identity import DEMO_KEY_BY_TIER, WWW_AUTHENTICATE
 from src.main import EXPOSE_HEADERS, Runtime, create_app
 from src.middleware import JSON_CONTENT_TYPE, SCOPE_DECISION_KEY
-from src.models import ERROR_RATE_LIMIT, LimitDecision, Tier
+from src.models import ERROR_RATE_LIMIT, Tier
 
 #: An origin that is not this app's, so CORS has something to answer about. The shipped
 #: ``CORS_ORIGINS`` default is ``*``, so any value works; a literal one makes the intent obvious.
@@ -55,39 +59,26 @@ BROWSER_ORIGIN = "http://localhost:5173"
 FREE_TIER_RPM = 60
 
 
-def _mount_probe_routes(app: FastAPI) -> None:
-    """Add the two cost-differentiated probes this suite drives. See the module docstring.
+def _mount_plain_head_probe(app: FastAPI) -> None:
+    """Add the one probe the shipped router cannot be. See the module docstring.
 
-    ``request.state.rlq_decision`` is echoed back because it is the one way to observe, from
-    outside the process, that the "transparent to route handlers" stash actually arrived — and
-    that a handler reading it needs no dependency, no decorator and no import.
+    A **plain Starlette** route, not a FastAPI ``APIRoute``, and that is the whole point of it:
+    ``Route(methods=["GET"])`` auto-adds HEAD while an ``APIRoute`` 405s it. It is mounted on a
+    path priced at 5 tokens so ``HEAD`` can be shown being served by the expensive handler *and*
+    charged the expensive price — the divergence ``METHOD_ALIASES`` closes. C15's dashboard and
+    any future ``Mount`` are this same shape.
     """
 
-    @app.get("/api/v1/whoami")
-    async def whoami(request: Request) -> dict[str, Any]:  # pragma: no cover - driven over HTTP
-        decision: LimitDecision = request.state.rlq_decision
-        return {
-            "user_id": decision.user_id,
-            "tier": decision.tier,
-            "endpoint": decision.endpoint,
-            "cost": decision.cost,
-        }
-
-    @app.get("/api/v1/logs/query")
-    async def logs_query() -> dict[str, str]:  # pragma: no cover - driven over HTTP
-        return {"rows": "stub"}
-
-    # A **plain Starlette** route, not a FastAPI `APIRoute`, and that is the whole point of it:
-    # `Route(methods=["GET"])` auto-adds HEAD (`self.methods.add("HEAD")`) while an `APIRoute`
-    # 405s it. It is mounted on a path priced at 5 tokens so `HEAD` can be shown being served by
-    # the expensive handler *and* charged the expensive price — the divergence Fix 1 closes. C15's
-    # dashboard and any future `Mount` are this same shape.
     async def plain_priced(request: Request) -> PlainTextResponse:  # pragma: no cover - over HTTP
         return PlainTextResponse("ok")
 
-    # Mounted on the *same* path as the FastAPI route above, which is how this actually shows up:
-    # GET matches the `APIRoute` FULL and is dispatched there, while HEAD only PARTIAL-matches it
-    # (path yes, method no) and Starlette keeps looking — landing on this one.
+    # Mounted on the *same* path as the real `GET /api/v1/logs/query`, which is how this actually
+    # shows up: GET matches the `APIRoute` FULL and is dispatched there, while HEAD only
+    # PARTIAL-matches it (path yes, method no) and Starlette keeps looking — landing on this one.
+    #
+    # Appended to `app.router.routes` directly rather than declared with `@app.get`, so it is
+    # invisible to `src.api.protected.verify_route_pricing` (which runs during `create_app`,
+    # before this) and cannot be mistaken for a route the project ships.
     app.router.routes.append(Route("/api/v1/logs/query", plain_priced, methods=["GET"]))
 
 
@@ -109,7 +100,7 @@ async def limited_app(redis_settings: Settings):
     await runtime.start()
 
     app = create_app(runtime=runtime)
-    _mount_probe_routes(app)
+    _mount_plain_head_probe(app)
     try:
         yield app
     finally:
@@ -540,7 +531,7 @@ async def test_the_switch_off_serves_unmetered_and_advertises_nothing(
     await runtime.redis.client.flushdb()
     await runtime.start()
     app = create_app(runtime=runtime)
-    _mount_probe_routes(app)
+    _mount_plain_head_probe(app)
 
     try:
         transport = httpx.ASGITransport(app=app)

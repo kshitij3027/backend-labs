@@ -45,6 +45,40 @@ going to be there — the identity lookup and the decision script.
 Each step is commented at its own site with why it sits where it does; the ordering is a contract,
 not an accident, and three of the four "why is this before that?" answers are security properties.
 
+.. rubric:: The path this file reasons about is ``get_route_path(scope)``, never ``scope["path"]``
+
+Both the exemption check and :func:`src.keys.classify` are given
+:func:`starlette.routing.get_route_path`, which is ``scope["path"]`` with ``scope["root_path"]``
+removed. That is not a stylistic preference — it is **the same function Starlette's own
+``Route.matches`` calls**, so what this middleware thinks a request is and what the router
+dispatches it to are the same string by construction rather than by two files happening to agree.
+
+The two strings diverge the moment the application is mounted under a prefix, which is a
+deployment decision made outside this repository (an ASGI server started with ``--root-path``, a
+proxy that forwards one, a sub-app mount). With ``root_path="/gw"``, ``scope["path"]`` is
+``/gw/api/v1/logs/query`` while the router sees ``/api/v1/logs/query``, and reading the raw path
+produces two live bugs at once:
+
+* **A 5x pricing bypass.** ``GET /gw/api/v1/logs/query`` is served by the real, expensive handler
+  and classified as ``("other", "default")`` — 1 token instead of 5, charged to
+  ``rate_limit:{user}:other``, a bucket that has nothing to do with the endpoint being used. The
+  overspend is invisible in that endpoint's own metering. This is the identical failure
+  :func:`src.keys.classify` documents for a trailing ``%0A`` and for ``HEAD``, reached through a
+  third door.
+* **A healthcheck that 401s.** ``/gw/health`` misses :func:`is_exempt`, so the container
+  ``HEALTHCHECK`` starts getting 401s and compose restarts a replica that is serving perfectly —
+  the same restart loop C12's "nginx must not add a path prefix" note is about, except triggered
+  from inside the app instead of from the proxy.
+
+Note what does **not** catch this: ``src.api.protected.verify_route_pricing`` compares path
+*templates*, and a template is root_path-independent, so every one of its checks passes while the
+bypass is live. A cross-check cannot cover a divergence in the input both sides are given. Only
+taking the path from the router's own accessor can.
+
+Nothing in this repository sets a ``root_path`` today (the Dockerfile's ``CMD`` is a bare
+``uvicorn src.main:app``), which is exactly why this is worth pinning: the bug is not reachable
+now, is one deployment flag away, and would be silent when it arrived.
+
 .. rubric:: The 429 is emitted as raw ASGI messages, and it HAS to be
 
 The obvious implementation is ``raise HTTPException(429, ...)``. It does not work here, and it does
@@ -104,6 +138,7 @@ from typing import Any, Final, Protocol
 
 import orjson
 from starlette.datastructures import MutableHeaders
+from starlette.routing import get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.config import DEFAULT_COST_CATEGORY, Settings
@@ -546,7 +581,16 @@ class RateLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        path: str = scope["path"]
+        # ----------------------------------------------------------------------------------- #
+        # 1b. THE path this middleware reasons about is `get_route_path(scope)`, NOT
+        #     `scope["path"]`. Read the rubric in the module docstring before changing this line.
+        #
+        # `get_route_path` is `scope["path"]` with `scope["root_path"]` stripped, and it is
+        # literally the function `starlette.routing.Route.matches` calls to decide what a request
+        # is. Using it here is what makes classifier/router agreement STRUCTURAL rather than a
+        # coincidence that holds only while nothing sets a root_path.
+        # ----------------------------------------------------------------------------------- #
+        path: str = get_route_path(scope)
 
         # ----------------------------------------------------------------------------------- #
         # 2. Exempt paths -> straight through, unmetered and unauthenticated.

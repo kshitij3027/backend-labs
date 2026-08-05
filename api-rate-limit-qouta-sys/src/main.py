@@ -52,6 +52,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
 from src.api.health import router as health_router
+from src.api.protected import router as protected_router
+from src.api.protected import verify_route_pricing
 from src.config import Settings, get_settings
 from src.identity import IdentityResolver
 from src.limiter import Limiter
@@ -382,6 +384,38 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
 
     # Unversioned liveness. A future v2 adds a router beside v1 here; /health never moves.
     app.include_router(health_router)
+
+    # The metered stub downstream — the four routes `src.keys.ROUTE_TABLE` prices. Included
+    # AFTER /health so the exempt liveness probe is matched first; the two paths cannot collide,
+    # but a reader should not have to prove that to themselves.
+    app.include_router(protected_router)
+
+    # =========================================================================================
+    # THE PRICING CROSS-CHECK. Read this before deleting the line below.
+    #
+    # `src.keys.classify` decides what a request COSTS, from the raw path, above the router.
+    # Starlette decides what a request DOES, from the mounted routes. Two pieces of code reading
+    # the same string to answer different questions — and any input they disagree about is a
+    # pricing bypass: the caller is served endpoint X and charged for endpoint Y. `src/keys.py`
+    # carries two rubrics on exactly this, because the difference between the categories is 5x.
+    #
+    # The failure mode this call closes is mundane and therefore likely: someone renames
+    # `/api/v1/logs/query` in `src/api/protected.py` and does not touch `ROUTE_TABLE`. Nothing
+    # about routing breaks — the endpoint serves perfectly — and the classifier silently drops it
+    # to ("other", "default"), so the project's most expensive endpoint is charged 1 token
+    # instead of 5, on a different bucket key, invisibly. No routing test notices, because
+    # routing is fine.
+    #
+    # So the correspondence is asserted at construction time and fails LOUDLY: a mismatch kills
+    # the process at startup with a message naming both sides, rather than showing up as a
+    # billing discrepancy nobody reads. It walks the app's real routes, so it cannot be satisfied
+    # by a declaration that has drifted from what is actually mounted.
+    #
+    # Cost is four regex matches against an lru_cached classifier, once per app construction.
+    # Deliberately NOT an `assert`: assertions are stripped under `python -O`, and a safety check
+    # that a runtime flag can remove is not a safety check.
+    # =========================================================================================
+    logger.debug("route pricing verified:\n%s", "\n".join(verify_route_pricing(app)))
 
     return app
 
