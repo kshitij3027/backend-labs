@@ -293,12 +293,31 @@ async def test_a_traversal_spelling_never_buys_a_free_pass(api: httpx.AsyncClien
     a 2xx, and a credentialed request is always metered. The raw, un-normalised path — the one no
     HTTP client will send — is driven straight into the ASGI scope in
     `tests/unit/test_middleware.py`, which is the only place it can be presented at all.
+
+    .. rubric:: C10 CHANGED ONE OUTCOME HERE, and narrowed the assertion rather than relaxing it
+
+    ``/api/v1/admin/%2e%2e/logs/query`` is the one spelling httpx does *not* collapse, so it reaches
+    the app as ``/api/v1/admin/../logs/query``. Before C10 nothing was mounted under the admin
+    prefix's wildcard and the router answered **404**; C10 added an authenticated catch-all there
+    (so an anonymous caller cannot enumerate the control plane by status code), and that route now
+    claims this path and answers **401**.
+
+    That is a *stricter* refusal, not a looser one: the request is still refused exemption, still
+    metered, still never served — and it now additionally requires ``ADMIN_TOKEN``. The status set
+    below is widened by one value and simultaneously constrained, so a 401 is only ever acceptable
+    for a path that literally begins with the admin prefix; any other path answering 401 here would
+    still fail.
     """
     anonymous = await api.get(path)
     assert anonymous.status_code == 401
 
     metered = await api.get(path, headers=key_headers(Tier.FREE))
-    assert metered.status_code in {200, 404}
+    assert metered.status_code in {200, 404, 401}
+    if metered.status_code == 401:
+        assert path.startswith("/api/v1/admin"), (
+            f"{path} was refused by the admin router's catch-all, but it is not an admin path — "
+            "a 401 from anywhere else here would mean the credential stopped being accepted"
+        )
     # Metered means metered: the headers are there and the allowance really moved.
     assert int(metered.headers["X-RateLimit-Remaining"]) < FREE_TIER_RPM
 

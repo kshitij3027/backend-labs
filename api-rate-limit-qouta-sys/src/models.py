@@ -1091,9 +1091,17 @@ class TierUpdate(BaseModel):
     ``extra="forbid"`` so ``{"rate_limit": 10}`` (a plausible misspelling of
     ``rate_limit_per_min``) is a 422 rather than a 200 that changed nothing — the worst possible
     outcome for an operator who believes they have just lowered a limit.
+
+    ``strict=True`` for the same reason, one type down. Pydantic's lax mode accepts
+    ``{"rate_limit_per_min": "10"}`` and applies it as ``10``, which is harmless in effect and
+    inconsistent in principle: a body whose *shape* is wrong should be refused rather than guessed
+    at, and this model already refuses a misspelled field name on exactly that argument. It also
+    keeps the four numbers integers at the boundary rather than after a coercion — every quantity
+    in the decision path is deliberately an integer at the source, because Lua 5.1 numbers are
+    doubles whose RESP encoding truncates. ``true`` (an ``int`` subclass in Python) is refused too.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", strict=True)
 
     rate_limit_per_min: int | None = Field(
         default=None, gt=0, description="New sustained requests-per-minute ceiling for this tier."
@@ -1128,10 +1136,24 @@ class TierUpdate(BaseModel):
     def apply_to(self, base: TierConfig) -> TierConfig:
         """Return ``base`` with this update's supplied fields replaced.
 
-        The merge rule lives here rather than in the admin handler so that "a PUT is a partial
-        update" has exactly one implementation. ``base`` is frozen, so this is a new object; the
-        tier the rest of the process is currently enforcing is untouched until the caller stores
-        the result.
+        ``base`` is frozen, so this is a new object; the tier the rest of the process is currently
+        enforcing is untouched.
+
+        .. rubric:: This is the RULE, and it is deliberately not the WRITE
+
+        The admin ``PUT`` does not call this. Its merge runs inside
+        :data:`src.lua.RLQ_MERGE_TIER`, because a partial update rewrites all four fields and
+        therefore needs a base for the three it is not changing — and the only base that cannot
+        silently revert another replica's committed change is the row in Redis at the instant of the
+        merge, never a :class:`~src.tiers.TierRegistry` snapshot (which is by design up to
+        ``TIER_CACHE_TTL_SEC`` stale). :meth:`src.tiers.TierRegistry.merge_tier` documents the
+        measured data loss that argument comes from.
+
+        What lives here is the *statement* of the rule in Python — "supplied fields replace, absent
+        fields keep" — for callers that already hold a base and simply want it applied: tests, and
+        anything that needs to predict what a ``PUT`` will produce without issuing one.
+        ``tests/integration/test_admin_api.py`` asserts this function and the script agree across a
+        matrix of field combinations, so the two cannot drift into being two different rules.
         """
         return TierConfig(
             name=base.name,
@@ -1197,7 +1219,14 @@ class QuotaUsage(BaseModel):
     used: int = Field(description="Requests consumed in the period so far.")
     remaining: int = Field(description="limit - used, floored at 0; -1 when unenforced.")
     reset_at: int = Field(description="Unix seconds at which this period's counter expires.")
-    state: QuotaPeriodState = Field(description="reset | active | exhausted.")
+    state: QuotaPeriodState = Field(
+        description=(
+            "unenforced | exhausted | reset | active, checked in that order — the same ladder "
+            "the decision script walks. `unenforced` covers both an unlimited tier and a period "
+            "switched off in configuration; see `QuotaPeriodState` and `src.api.admin."
+            "period_state` for why `reset` must not stand in for it."
+        )
+    )
 
 
 class UserUsage(BaseModel):

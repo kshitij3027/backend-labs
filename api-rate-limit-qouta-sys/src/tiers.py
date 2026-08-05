@@ -54,6 +54,14 @@ from types import MappingProxyType
 
 from src.config import Settings
 from src.keys import CONFIG_TIERS_KEY, CONFIG_VERSION_KEY
+from src.lua import (
+    MERGE_TIER_REPLY_ARITY,
+    MERGE_TIER_STATUS_ABSENT,
+    MERGE_TIER_STATUS_MERGED,
+    MERGE_TIER_UNCHANGED,
+    RLQ_MERGE_TIER,
+    RLQ_MERGE_TIER_NAME,
+)
 from src.models import TierConfig
 from src.redis_client import BackingStoreUnavailable, RedisGateway
 
@@ -259,6 +267,35 @@ class _Snapshot:
     argv_tail: tuple[str, ...]
     version: int
     fetched_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class TierWrite:
+    """The outcome of one :meth:`TierRegistry.merge_tier`, as reported by the script itself.
+
+    ``previous`` is the row the merge was actually applied to, read inside Redis at the instant of
+    the merge — **not** what this replica believed was stored. That distinction is the whole point
+    of the server-side merge, and it is what makes C10's ``TierUpdated.previous`` an audit record
+    rather than a guess: on a write that lands after another replica's, the guess is wrong exactly
+    when someone would want to look it up.
+
+    ``version`` is the ``config:version`` **this write produced**, not whatever the subsequent
+    refresh happened to read. Under concurrent writes the two differ, and "the version my change
+    created" is the number an audit trail wants; ``snapshot.version`` is the one describing what
+    this replica now serves, and both are available for that reason.
+
+    ``previous`` and ``config`` are ``None`` **exactly** when ``status`` is
+    :data:`~src.lua.MERGE_TIER_STATUS_ABSENT` — the tier does not exist, the script returned before
+    its ``HSET``, and nothing was written. Encoding "nothing happened" as a pair of ``None``s rather
+    than as a separate flag is what lets the caller narrow both values with one check instead of
+    asserting a relationship between a boolean and two optionals.
+    """
+
+    status: str
+    previous: TierConfig | None
+    config: TierConfig | None
+    version: int
+    snapshot: _Snapshot
 
 
 def _build_snapshot(
@@ -519,11 +556,191 @@ class TierRegistry:
                 lambda: self._gateway.client.setnx(CONFIG_VERSION_KEY, 1), op="tiers:version"
             )
 
-    async def refresh(self) -> _Snapshot:
+    def _ensure_merge_script(self) -> None:
+        """Attach :data:`~src.lua.RLQ_MERGE_TIER`'s handle to the gateway if it is not attached.
+
+        The same idempotent, called-per-use pattern as
+        :meth:`src.analytics.AnalyticsCollector._ensure_registered`, and for the same reason: the
+        handle can legitimately disappear underneath us, because
+        :meth:`~src.redis_client.RedisGateway.aclose` drops every registered script precisely so a
+        reconnect cannot dispatch onto a dead client.
+
+        Deliberately **not** registered in ``__init__``: :meth:`register` reads
+        :attr:`~src.redis_client.RedisGateway.client`, which raises until ``connect()`` has been
+        awaited, and ``Runtime.build`` constructs this registry before the gateway is connected —
+        by contract, so ``create_app(runtime=...)`` never opens a socket. Registering on first use
+        keeps that contract without a separate wiring step for a later reconnect to invalidate.
+        """
+        try:
+            self._gateway.script(RLQ_MERGE_TIER_NAME)
+        except KeyError:
+            self._gateway.register(RLQ_MERGE_TIER_NAME, RLQ_MERGE_TIER)
+
+    async def merge_tier(
+        self,
+        name: str,
+        *,
+        rate_limit_per_min: int | None = None,
+        burst: int | None = None,
+        daily_quota: int | None = None,
+        monthly_quota: int | None = None,
+    ) -> TierWrite:
+        """Apply a **partial** tier update, merging inside Redis, then re-read. **C10's write.**
+
+        Only the fields that are not ``None`` are changed; the rest keep whatever is *committed* at
+        the instant of the merge.
+
+        .. rubric:: The merge base is the committed row, and it CANNOT be this replica's snapshot
+
+        This is the whole reason the write is a Lua script (:data:`~src.lua.RLQ_MERGE_TIER`) rather
+        than ``apply_to`` plus an ``HSET``. A partial update rewrites all four fields, so it needs a
+        base for the three it is not changing — and :meth:`snapshot` is by design up to
+        ``TIER_CACHE_TTL_SEC`` old on any replica that did not serve the previous write. Merging
+        from it *deterministically reverts* whatever another replica committed inside that window:
+
+        .. code-block:: text
+
+           A: PUT premium {"daily_quota": 99999}      -> 300|300|99999|1250000
+           B: PUT premium {"rate_limit_per_min": 77}  ->  77|300|50000|1250000   <- A's change gone
+
+        With two replicas behind the C12 load balancer that is not a race, it is the default path
+        for two operator ``PUT``s seconds apart. The same shape loses updates between concurrent
+        ``PUT``s on one replica, and returns ``200`` for each of them. Merging server-side removes
+        the window entirely, because Redis runs the script body without interleaving another client.
+
+        Parameter names match :class:`~src.models.TierUpdate`'s fields but the model is deliberately
+        **not** imported here: this registry has no business knowing the shape of an HTTP body, and
+        four keyword arguments express the contract without the coupling. The Python-side statement
+        of the same merge rule is :meth:`~src.models.TierUpdate.apply_to`, and the integration suite
+        pins the two to agree rather than letting one drift into being a second implementation.
+
+        .. rubric:: ``HSET``, and why that is not a contradiction of :meth:`seed`'s ``HSETNX``
+
+        :meth:`seed` uses ``HSETNX`` because *startup* must never overwrite an operator's runtime
+        change. This is that runtime change. The two are the same rule read from both ends: a
+        replica booting has no opinion about limits and must defer to what is stored, while an
+        operator issuing a ``PUT`` is stating the new opinion. Nothing about ``seed``'s semantics is
+        weakened — it still cannot undo what this writes, on any later boot.
+
+        .. rubric:: Invalidate, then refresh — in that order, and both of them
+
+        :meth:`invalidate` is called *before* the read so its counter is already incremented when
+        :meth:`refresh` samples it. That is what makes the two compose: ``refresh`` clears the stale
+        flag only if the counter has not moved *during* its read, so an invalidation raised
+        beforehand is satisfied by this very read rather than leaving the snapshot permanently
+        stale. Calling ``invalidate`` after would mark the fresh snapshot stale for no reason and
+        cost the next request a scheduled refresh.
+
+        Awaiting :meth:`refresh` rather than relying on ``invalidate`` alone is what makes the
+        write's visibility **synchronous**. With only ``invalidate``, the next ``snapshot()`` on
+        this replica returns the *stale* value and schedules a background read — correct, and a
+        millisecond later the new numbers are in force, but the request that immediately follows the
+        ``PUT`` still sees the old ones. For an admin API that is a race an operator can lose, and
+        for a test it is one that cannot be asserted without sleeping.
+
+        Neither happens when the tier does not exist: :attr:`TierWrite.written` is ``False``, the
+        store is untouched, and there is nothing to become stale.
+
+        Returns:
+            A :class:`TierWrite` carrying the outcome, the **true** committed prior row, the row now
+            stored, the version this write produced, and this replica's refreshed snapshot.
+
+        Raises:
+            BackingStoreUnavailable: the write did not land. Deliberately propagated: C10 answers it
+                with a 503, because an admin write that silently no-ops is worse than an error.
+        """
+        self._ensure_merge_script()
+
+        # `settings.tier_limits` and NOT the snapshot: this is the process's shipped configuration,
+        # a constant read from the environment at startup with no staleness window, and it is used
+        # only when there is no committed row to merge onto. See `MERGE_TIER_ARGV_FALLBACK`.
+        fallback = self._settings.tier_limits.get(name)
+        args = [
+            name,
+            *(
+                MERGE_TIER_UNCHANGED if value is None else str(value)
+                for value in (rate_limit_per_min, burst, daily_quota, monthly_quota)
+            ),
+            *(
+                (MERGE_TIER_UNCHANGED,) * TIER_FIELD_COUNT
+                if fallback is None
+                else (
+                    str(fallback.rate_limit_per_min),
+                    str(fallback.burst),
+                    str(fallback.daily_quota),
+                    str(fallback.monthly_quota),
+                )
+            ),
+        ]
+
+        reply = await self._gateway.run_script(
+            RLQ_MERGE_TIER_NAME,
+            keys=[CONFIG_TIERS_KEY, CONFIG_VERSION_KEY],
+            args=args,
+        )
+        if len(reply) != MERGE_TIER_REPLY_ARITY:
+            # A contract mismatch between the script and this decoder, not an outage. Raised rather
+            # than papered over for the same reason `LimitDecision.from_lua` checks its arity: a
+            # decision built out of whatever happened to be in the right slots is a plausible-looking
+            # wrong answer, which is the failure mode this project exists to make impossible.
+            raise ValueError(
+                f"{RLQ_MERGE_TIER_NAME} returned {len(reply)} elements, expected "
+                f"{MERGE_TIER_REPLY_ARITY}"
+            )
+
+        status = _as_text(reply[0])
+        if status == MERGE_TIER_STATUS_ABSENT:
+            # Nothing was written — the script returns before its HSET — so there is nothing to
+            # invalidate and nothing to re-read. C10 turns this into a 404.
+            return TierWrite(
+                status=status,
+                previous=None,
+                config=None,
+                version=self._snapshot.version,
+                snapshot=self._snapshot,
+            )
+
+        previous = decode_tier(name, _as_text(reply[1]))
+        current = decode_tier(name, _as_text(reply[2]))
+        version = int(_as_text(reply[3]))
+
+        if status != MERGE_TIER_STATUS_MERGED:
+            logger.warning(
+                "tier %r had no usable stored row (%s); the update was merged onto the configured "
+                "default (%s) rather than onto a value nobody wrote",
+                name,
+                status,
+                encode_tier(previous),
+            )
+
+        self.invalidate()
+        snapshot = await self.refresh()
+        return TierWrite(
+            status=status,
+            previous=previous,
+            config=current,
+            version=version,
+            snapshot=snapshot,
+        )
+
+    async def refresh(self, *, strict: bool = False) -> _Snapshot:
         """Read ``config:tiers`` + ``config:version`` and swap in a new snapshot atomically.
 
         Returns the snapshot now in force — the new one on success, the **previous** one when Redis
         could not answer.
+
+        Args:
+            strict: Re-raise :class:`~src.redis_client.BackingStoreUnavailable` instead of
+                swallowing it. **Default ``False``, and every internal caller keeps that default**
+                — the background refresh, the startup refresh and :meth:`store_tier` all want an
+                outage to leave the last good table serving rather than to become an exception.
+
+                It exists for exactly one caller: C10's ``POST /admin/config/reload``. Swallowing
+                there would answer a "reload now" with a ``200`` and a version number that had not
+                moved, which is a reload button that lies — the one place where "keep serving the
+                old table" is still correct behaviour but reporting success for it is not. The
+                failure bookkeeping below (the counter, the backoff window, the log line) is
+                identical either way; ``strict`` changes only who is told.
 
         .. rubric:: An outage keeps the last good table rather than clearing it
 
@@ -532,7 +749,8 @@ class TierRegistry:
         already had: the numbers in the current snapshot were correct five seconds ago and are
         almost certainly still correct, whereas an empty table would leave every principal with no
         ceiling to look up — and "no limit found" is indistinguishable from "unlimited" at the point
-        where the decision is made.
+        where the decision is made. That stays true under ``strict``: the raised exception reports
+        the failure, it does not discard the table.
 
         Correctness errors (a ``WRONGTYPE`` because something else was written to ``config:tiers``)
         are deliberately **not** caught here. They are bugs in this service, they do not get better
@@ -596,6 +814,12 @@ class TierRegistry:
                     ",".join(sorted(self._snapshot.tiers)),
                     self._refresh_backoff_sec,
                 )
+                if strict:
+                    # Re-raised AFTER the bookkeeping above, never instead of it: an operator's
+                    # reload that fails must still arm the backoff, or a dashboard polling reload
+                    # during an outage would restore the per-request retry storm the backoff exists
+                    # to prevent.
+                    raise
                 return self._snapshot
 
             tiers = self._parse_tiers(raw_tiers)

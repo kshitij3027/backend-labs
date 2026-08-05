@@ -1,4 +1,4 @@
-"""The two Lua scripts, and the KEYS/ARGV contracts that let Python build a call to each.
+"""The three Lua scripts, and the KEYS/ARGV contracts that let Python build a call to each.
 
 .. rubric:: This module is PURE
 
@@ -60,10 +60,37 @@ registrations, and no execution path in which one can abort the other. That sepa
 argument of the paragraph above, so expressing it as two module constants rather than one is the
 point rather than a duplication.
 
-The ``int_arg`` helper is therefore written out twice, once per script. Factoring it into a shared
-prelude that both bodies interpolate would rewrite :data:`RLQ_CHECK_AND_CONSUME`'s text — and
-therefore its SHA, and therefore every replica's script cache — to save nine lines in a file whose
-whole purpose is that the two scripts cannot affect each other.
+The ``int_arg`` helper is therefore written out once per script. Factoring it into a shared prelude
+that every body interpolates would rewrite :data:`RLQ_CHECK_AND_CONSUME`'s text — and therefore its
+SHA, and therefore every replica's script cache — to save nine lines in a file whose whole purpose
+is that the scripts cannot affect each other.
+
+.. rubric:: The third script: :data:`RLQ_MERGE_TIER` (C10)
+
+Same argument, one more time, for the admin API's partial tier update. It is here for a reason that
+is *not* atomicity in the usual sense — ``HSET`` is already atomic — but because the operation is a
+**read-modify-write over a value the writer must not have cached**.
+
+The bug it exists to prevent was measured rather than imagined. With the merge done in Python from
+the replica's ``TierRegistry`` snapshot, two partial ``PUT``s seconds apart against two replicas
+behind the C12 load balancer produce:
+
+.. code-block:: text
+
+   A: PUT premium {"daily_quota": 99999}      -> store 300|300|99999|1250000
+   B: PUT premium {"rate_limit_per_min": 77}  -> store 77|300|50000|1250000
+                                                        ^^^^^ A's change silently reverted
+
+B's snapshot is by design up to ``TIER_CACHE_TTL_SEC`` old, and the write rewrites the whole
+four-field row — so a *stale merge base* deterministically reverts a committed change, inside a
+five-second window that two replicas make the default rather than the exception. The same shape
+loses updates between concurrent ``PUT``s on a single replica, and it makes the response's
+``previous`` field — documented as an audit record — factually wrong on the losing write.
+
+Doing the read, the merge and the write inside one script removes the window entirely: the merge
+base is whatever ``config:tiers`` holds at the instant of the merge, because Redis runs the whole
+body without interleaving another client. The script also returns the true prior row, which is what
+makes the audit record honest.
 """
 
 from __future__ import annotations
@@ -88,6 +115,24 @@ __all__ = [
     "KEY_QUOTA_DAILY",
     "KEY_QUOTA_MONTHLY",
     "KEY_USER",
+    "MERGE_TIER_ARGV_ARITY",
+    "MERGE_TIER_ARGV_BURST",
+    "MERGE_TIER_ARGV_DAILY",
+    "MERGE_TIER_ARGV_FALLBACK",
+    "MERGE_TIER_ARGV_MONTHLY",
+    "MERGE_TIER_ARGV_NAME",
+    "MERGE_TIER_ARGV_RPM",
+    "MERGE_TIER_FIELD_COUNT",
+    "MERGE_TIER_KEYS_ARITY",
+    "MERGE_TIER_KEY_CONFIG",
+    "MERGE_TIER_KEY_VERSION",
+    "MERGE_TIER_REPLY_ARITY",
+    "MERGE_TIER_SEPARATOR",
+    "MERGE_TIER_STATUS_ABSENT",
+    "MERGE_TIER_STATUS_MERGED",
+    "MERGE_TIER_STATUS_REPAIRED",
+    "MERGE_TIER_STATUS_SEEDED",
+    "MERGE_TIER_UNCHANGED",
     "MICRO_TOKENS",
     "NO_CLOCK_OVERRIDE",
     "RECORD_ARGV_ARITY",
@@ -111,6 +156,8 @@ __all__ = [
     "RECORD_KEY_TOP",
     "RLQ_CHECK_AND_CONSUME",
     "RLQ_CHECK_AND_CONSUME_NAME",
+    "RLQ_MERGE_TIER",
+    "RLQ_MERGE_TIER_NAME",
     "RLQ_RECORD_REQUEST",
     "RLQ_RECORD_REQUEST_NAME",
     "SW_DISABLED",
@@ -945,4 +992,244 @@ end
 -- scalar it has none of the nil-truncation hazard the decision script's 19-element reply has to
 -- reason about.
 return minute_requests
+"""
+
+
+# =============================================================================================
+# C10 — rlq_merge_tier: the admin API's partial tier update, merged SERVER-SIDE
+#
+# See the module docstring's third rubric for the measured bug this exists to prevent. In one
+# sentence: the merge base for a partial PUT must be the row that is committed *now*, and no
+# replica knows that without asking — its snapshot is deliberately up to TIER_CACHE_TTL_SEC old.
+# =============================================================================================
+
+# ---------------------------------------------------------------------------------------------
+# KEYS contract
+#
+# Both keys are UNTAGGED and global. That is deliberate and is stated here because every other
+# script in this file is careful about the `{user}` hash tag: `config:*` is one table shared by
+# every principal, so tagging it would pin the whole service's configuration to one slot for no
+# benefit. Two untagged keys in one script would be a CROSSSLOT the day this shards — which is
+# survivable here in a way it is not on the request path, because this runs on an operator's
+# PUT rather than on every request, and a sharded deployment would move `config:*` behind its own
+# connection rather than trying to co-locate it with a user's counters.
+# ---------------------------------------------------------------------------------------------
+
+#: ``config:tiers`` — HASH, field = tier name, value = ``rpm|burst|daily|monthly``.
+MERGE_TIER_KEY_CONFIG = 1
+
+#: ``config:version`` — STRING integer, ``INCR``-ed by exactly one on an accepted write.
+MERGE_TIER_KEY_VERSION = 2
+
+#: How many KEYS the merge script expects.
+MERGE_TIER_KEYS_ARITY = 2
+
+# ---------------------------------------------------------------------------------------------
+# ARGV contract
+# ---------------------------------------------------------------------------------------------
+
+#: The tier being re-sized.
+MERGE_TIER_ARGV_NAME = 1
+
+#: The four fields, in ``rpm|burst|daily|monthly`` order. Each is either a positive integer as a
+#: decimal string, or :data:`MERGE_TIER_UNCHANGED` meaning "the caller did not supply this one".
+MERGE_TIER_ARGV_RPM = 2
+MERGE_TIER_ARGV_BURST = 3
+MERGE_TIER_ARGV_DAILY = 4
+MERGE_TIER_ARGV_MONTHLY = 5
+
+#: First of four slots carrying **this process's configured default** for the tier
+#: (``settings.tier_limits``), or :data:`MERGE_TIER_UNCHANGED` in all four when the process has no
+#: default for that name.
+#:
+#: This is NOT a second merge base sneaking the cache back in. It is used only when the stored row
+#: is absent or unreadable, i.e. when there is no committed row to merge onto — and it is a
+#: per-process constant read from the environment at startup, not a value with a staleness window.
+#: It exists because `TierRegistry.seed`'s ``HSETNX`` would recreate exactly this row on the next
+#: replica boot anyway, so refusing the write instead would 404 a tier the snapshot legitimately
+#: lists and that any restart would bring back.
+MERGE_TIER_ARGV_FALLBACK = 6
+
+#: How many ARGV elements the merge script expects: name + 4 supplied + 4 fallback.
+MERGE_TIER_ARGV_ARITY = 9
+
+#: The "leave this field alone" / "no configured default" sentinel. A non-numeric byte, so the Lua
+#: side tests it with ``tonumber`` rather than a string compare, and legible in a ``MONITOR`` trace.
+MERGE_TIER_UNCHANGED = "-"
+
+#: Separator inside a ``config:tiers`` value. Written out here rather than imported from
+#: :data:`src.tiers.TIER_FIELD_SEPARATOR`, because this module is PURE and imports nothing but
+#: ``src.keys`` — the same rule that has ``src.keys.DEFAULT_ENDPOINT_CATEGORY`` and
+#: ``src.config.DEFAULT_COST_CATEGORY`` restated rather than cross-imported. The integration suite
+#: asserts the two are equal, so the duplication cannot drift silently.
+MERGE_TIER_SEPARATOR = "|"
+
+#: How many numbers a well-formed value carries. Same pin as
+#: :data:`src.tiers.TIER_FIELD_COUNT`.
+MERGE_TIER_FIELD_COUNT = 4
+
+# ---------------------------------------------------------------------------------------------
+# Reply contract — 4 positional elements, every one a string or an integer, never nil
+#
+# The same rule the decision script's 19-element reply follows: Lua->RESP stops at the first nil,
+# so a reply designed with a nullable slot silently truncates into a shorter list.
+# ---------------------------------------------------------------------------------------------
+
+#: The stored row was well-formed and the update was merged onto it. The normal outcome.
+MERGE_TIER_STATUS_MERGED = "merged"
+
+#: There was no row for this tier, so the update was merged onto the process's configured default
+#: and the row now exists. Reachable when an operator ``HDEL``s a row, or on a store that was
+#: flushed under a running replica.
+MERGE_TIER_STATUS_SEEDED = "seeded"
+
+#: There was a row and it was unreadable — wrong field count, a non-numeric field, or a
+#: non-positive one. Merged onto the configured default instead, which is the identical policy
+#: :func:`src.tiers.decode_tier` applies on the read side: a malformed row must never be allowed to
+#: become the base of a write, because a non-positive limit reads as "unenforced" in the decision
+#: script.
+MERGE_TIER_STATUS_REPAIRED = "repaired"
+
+#: No stored row AND no configured default: the tier does not exist. **Nothing is written** — not
+#: the row, not the version — and C10 answers 404. Creating a tier through the admin API is a
+#: deliberate non-feature; see :func:`src.api.admin._unknown_tier`.
+MERGE_TIER_STATUS_ABSENT = "absent"
+
+#: ``{status, previous_row, current_row, config_version}``.
+MERGE_TIER_REPLY_ARITY = 4
+
+#: The name the merge script is registered under on :class:`~src.redis_client.RedisGateway`.
+RLQ_MERGE_TIER_NAME = "rlq_merge_tier"
+
+
+RLQ_MERGE_TIER = f"""
+-- rlq_merge_tier: apply a PARTIAL tier update to the row that is committed RIGHT NOW.
+--
+-- KEYS[1] config:tiers    HASH   field = tier name, value = 'rpm|burst|daily|monthly'
+-- KEYS[2] config:version  STRING integer, INCR-ed by one on an accepted write
+--
+-- ARGV[1] tier name
+-- ARGV[2..5] rpm, burst, daily, monthly -- each a positive integer or '{MERGE_TIER_UNCHANGED}'
+-- ARGV[6..9] the caller's configured default for this tier, same order, or '{MERGE_TIER_UNCHANGED}'
+--
+-- Returns exactly {MERGE_TIER_REPLY_ARITY} elements:
+--   [1] status   '{MERGE_TIER_STATUS_MERGED}' | '{MERGE_TIER_STATUS_SEEDED}'
+--                | '{MERGE_TIER_STATUS_REPAIRED}' | '{MERGE_TIER_STATUS_ABSENT}'
+--   [2] previous the row the merge was applied to ('' when absent)
+--   [3] current  the row now stored ('' when absent)
+--   [4] version  config:version after the INCR (0 when nothing was written)
+--
+-- THE WHOLE POINT: read, merge and write happen inside one script, so no other client can commit
+-- between the read and the write. Doing the merge in Python from the replica's cached snapshot --
+-- which is by design up to TIER_CACHE_TTL_SEC stale -- deterministically reverts whatever another
+-- replica committed inside that window, because the write rewrites all four fields.
+
+local tiers_key   = KEYS[1]
+local version_key = KEYS[2]
+local name        = ARGV[1]
+
+-- The same invariant both other scripts state: every number handed BACK to redis.call goes
+-- through here, so the wire format does not depend on which Redis build is answering (<= 6.2
+-- renders an integral Lua number through fpconv_dtoa, i.e. 1250000 as '1.25e+06' -- which would
+-- write a tier value that this service's own parser then rejects as malformed).
+local function int_arg(value)
+  return string.format('%d', value)
+end
+
+-- Parse a stored row into {MERGE_TIER_FIELD_COUNT} positive integers, or nil.
+--
+-- Every rejection here mirrors `src.tiers.decode_tier`, and for the identical reason: a row that
+-- does not mean what it says must never become the base of a write. The pattern is deliberately
+-- STRICTER than Python's int() -- it refuses a sign, whitespace, a decimal point and Lua 5.1's
+-- '0x' hex form -- which is the safe direction: nothing in this service writes those shapes
+-- (`src.tiers.encode_tier` is the only writer), and a shape we cannot read identically on both
+-- sides falls back to the shipped default rather than to a number one side guessed at.
+local function decode(raw)
+  if type(raw) ~= 'string' then
+    return nil
+  end
+  local numbers = {{}}
+  local count = 0
+  for piece in string.gmatch(raw, '[^{MERGE_TIER_SEPARATOR}]+') do
+    count = count + 1
+    if count > {MERGE_TIER_FIELD_COUNT} then
+      return nil
+    end
+    if not string.match(piece, '^%d+$') then
+      return nil
+    end
+    local value = tonumber(piece)
+    if value <= 0 then
+      return nil
+    end
+    numbers[count] = value
+  end
+  if count ~= {MERGE_TIER_FIELD_COUNT} then
+    return nil
+  end
+  return numbers
+end
+
+local function encode(numbers)
+  local pieces = {{}}
+  for index = 1, {MERGE_TIER_FIELD_COUNT} do
+    pieces[index] = int_arg(numbers[index])
+  end
+  return table.concat(pieces, '{MERGE_TIER_SEPARATOR}')
+end
+
+-- HGET answers `false` (not nil) for a missing field, which is why `decode` type-checks rather
+-- than nil-checks: 'the field is absent' and 'the field is garbage' are different outcomes and
+-- the caller is told which.
+local stored = redis.call('HGET', tiers_key, name)
+local base   = decode(stored)
+local status = '{MERGE_TIER_STATUS_MERGED}'
+
+if base == nil then
+  local fallback = {{}}
+  local usable = true
+  for index = 1, {MERGE_TIER_FIELD_COUNT} do
+    fallback[index] = tonumber(ARGV[{MERGE_TIER_ARGV_FALLBACK} + index - 1])
+    if fallback[index] == nil then
+      usable = false
+    end
+  end
+  if not usable then
+    -- No committed row and no configured default: this tier does not exist. Return BEFORE any
+    -- write, so a 404 leaves `config:tiers` and `config:version` byte-identical -- the property
+    -- C10's "a rejected write writes nothing" test asserts against the whole hash.
+    return {{'{MERGE_TIER_STATUS_ABSENT}', '', '', 0}}
+  end
+  base = fallback
+  if stored == false then
+    status = '{MERGE_TIER_STATUS_SEEDED}'
+  else
+    status = '{MERGE_TIER_STATUS_REPAIRED}'
+  end
+end
+
+local merged = {{}}
+for index = 1, {MERGE_TIER_FIELD_COUNT} do
+  local supplied = tonumber(ARGV[{MERGE_TIER_ARGV_RPM} + index - 1])
+  if supplied == nil then
+    merged[index] = base[index]
+  else
+    merged[index] = supplied
+  end
+end
+
+local previous = encode(base)
+local current  = encode(merged)
+
+redis.call('HSET', tiers_key, name, current)
+
+-- INCR-ed in the SAME script as the HSET, so the pair cannot be half-applied. Issued as two
+-- separate commands from Python, a connection drop between them leaves the tier changed and the
+-- version unmoved -- and `config:version` is what every other replica's freshness check,
+-- /health's `config_version` and C13's propagation assertion all read to decide whether anything
+-- happened. "The limit changed but the version says it did not" is the worst available outcome
+-- for a feature whose entire claim is that a runtime change is observable.
+local version = redis.call('INCR', version_key)
+
+return {{status, previous, current, version}}
 """

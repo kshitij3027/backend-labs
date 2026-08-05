@@ -51,6 +51,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
 from src.analytics import AnalyticsCollector
+from src.api.admin import router as admin_router
 from src.api.health import router as health_router
 from src.api.protected import router as protected_router
 from src.api.protected import verify_route_pricing
@@ -401,6 +402,30 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     # AFTER /health so the exempt liveness probe is matched first; the two paths cannot collide,
     # but a reader should not have to prove that to themselves.
     app.include_router(protected_router)
+
+    # =========================================================================================
+    # THE CONTROL PLANE — mounted at /api/v1/admin, which is INSIDE the versioned prefix and
+    # nonetheless exempt from metering.
+    #
+    # That combination is deliberate and both halves matter:
+    #
+    #   * `/api/v1/admin` is listed in `src.middleware.EXEMPT_PATH_PREFIXES`, so these routes are
+    #     never rate limited. The admin API is how an operator *raises* a limit; metering it would
+    #     lock the control plane behind the incident it controls, and during the outage where
+    #     everything 429s the call that fixes it would 429 too.
+    #   * Exempt from METERING is not exempt from AUTHENTICATION. Every route on that router
+    #     carries `Depends(require_admin_token)`, attached to the router rather than to each path
+    #     so a route added later inherits it. The check is `hmac.compare_digest` against
+    #     ADMIN_TOKEN, in-process, and touches Redis on precisely no code path — because an
+    #     unmetered, anonymous surface whose rejection cost a store round trip would be an
+    #     amplifier against the shared connection pool the limiter depends on.
+    #
+    # It sits under the versioned prefix but is invisible to `verify_route_pricing` below, and by
+    # construction rather than by a second exclusion list: `mounted_v1_routes` filters through the
+    # ONE definition of exemption, `src.middleware.is_exempt`. Demanding a ROUTE_TABLE price for a
+    # route nothing charges would be asking the classifier to price the control plane.
+    # =========================================================================================
+    app.include_router(admin_router)
 
     # =========================================================================================
     # THE PRICING CROSS-CHECK. Read this before deleting the line below.
