@@ -455,9 +455,18 @@ class Settings(BaseSettings):
     # --- Analytics (C9, C11) ---
     analytics_minute_ttl_sec: int = Field(
         default=3600,
-        description="Minute-bucket retention. Set with `EXPIRE ... NX` so the TTL is anchored to "
-        "bucket creation — without NX a continuously hot bucket lives an hour past its last "
-        "write, and '1 h retention' quietly becomes '1 h after traffic stops'.",
+        description=(
+            "Minute-bucket retention. Set with `EXPIRE ... NX` so the TTL is anchored to bucket "
+            "creation — without NX a continuously hot bucket lives an hour past its last write, "
+            "and '1 h retention' quietly becomes '1 h after traffic stops'. It ALSO governs the "
+            "`stats:top:min:*` ZSET, which is a view of the same minute. 0 means 'never expire', "
+            "and the two families cost very different amounts of memory to keep: a bucket HASH is "
+            "~6 fields whatever the traffic, while the ZSET holds one member per DISTINCT "
+            "PRINCIPAL per minute (~127 B each), so it is the only analytics key sized by caller "
+            "cardinality. Zeroing this is therefore bounded for the hashes and unbounded for the "
+            "ZSETs — with an anonymous-heavy or high-cardinality workload it is the setting that "
+            "fills the store."
+        ),
     )
     analytics_hour_ttl_sec: int = Field(
         default=604800, description="Hour-bucket retention (7 days), same EXPIRE NX rule."

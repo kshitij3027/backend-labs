@@ -41,6 +41,7 @@ going to be there — the identity lookup and the decision script.
 7. Stash the decision on ``scope["state"]`` so a handler *may* read it.
 8. Denied -> emit the 429 directly. **The wrapped app is never invoked.**
 9. Allowed -> wrap ``send`` and append the headers to whatever the app produces.
+10. Record the finished request for C9's analytics — including when the handler *raised*.
 
 Each step is commented at its own site with why it sits where it does; the ordering is a contract,
 not an accident, and three of the four "why is this before that?" answers are security properties.
@@ -124,8 +125,32 @@ suspended inside ``__call__`` simultaneously, each asserting it got its own numb
   the module that owns ``FAIL_MODE``, and it returns a decision rather than raising — so this file
   has **no** ``except`` around the limiter call. What it does own is the *rendering*: which status
   code a refusal gets. See the next rubric.
-* **It does not record analytics.** C9 does, at the marked seam at the bottom of
-  :meth:`RateLimitMiddleware.__call__`, where the response body has already been sent.
+* **It does not decide what analytics means.** :class:`src.analytics.AnalyticsCollector` owns the
+  bucket arithmetic, the outcome taxonomy and the swallowing of every failure. This file owns
+  exactly one thing about it: *when* the call happens, which is after the response is on the wire,
+  on every terminal path.
+
+.. rubric:: Analytics fires on EVERY terminal path, and always after the response is sent (C9)
+
+Six paths end a metered request here — an allowed 2xx (or whatever the app produced), a 429, a
+401, the identity 503, the limiter 503, and a handler that raised (which becomes a 500 written by
+``ServerErrorMiddleware`` *outside* this file, and is therefore the one that is easiest to miss) —
+and every one of them records. A collector wired only
+to the happy path produces a dashboard whose request count is the count of *successful* requests,
+which is the number least worth watching: the traffic an operator opens this page to understand is
+the traffic that failed.
+
+The 401 has no principal, so it is recorded under :data:`~src.analytics.ANONYMOUS_USER_ID` rather
+than dropped. That is much better than not recording it: an authentication-failure flood is
+precisely the pattern worth seeing, it is invisible in every other counter this service keeps (an
+unauthenticated request never touches a bucket, a quota or a tier), and a dashboard whose totals
+silently disagree with the load balancer's is worse than one with an ``anonymous`` row in it.
+
+Each call sits **after** the response has been written, which takes its cost off the client's
+perceived latency — and the honest version of that claim is in
+:meth:`RateLimitMiddleware._record`, because on an HTTP/1.1 keep-alive connection it is not free.
+
+The one path that does **not** record is ``RATE_LIMIT_ENABLED=false``. See step 3 of the flow.
 
 .. rubric:: Two failures, two branches — the C8 decision this file DOES own
 
@@ -172,6 +197,7 @@ from starlette.datastructures import MutableHeaders
 from starlette.routing import get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from src.analytics import ANONYMOUS_USER_ID, UNKNOWN_TIER, AnalyticsCollector
 from src.config import DEFAULT_COST_CATEGORY, Settings
 from src.identity import ACCEPTED_SCHEMES, WWW_AUTHENTICATE, IdentityResolver
 from src.keys import classify
@@ -198,6 +224,7 @@ __all__ = [
     "SCOPE_DECISION_KEY",
     "SCOPE_ENDPOINT_KEY",
     "SERVICE_UNAVAILABLE_ERROR",
+    "STATUS_INTERNAL_SERVER_ERROR",
     "STATUS_SERVICE_UNAVAILABLE",
     "STATUS_TOO_MANY_REQUESTS",
     "STATUS_UNAUTHORIZED",
@@ -377,6 +404,11 @@ STATUS_TOO_MANY_REQUESTS: Final = 429
 #: saturated. **Never 429** — see the "two failures, two branches" rubric in the module docstring.
 STATUS_SERVICE_UNAVAILABLE: Final = 503
 
+#: Never *emitted* by this middleware — ``ServerErrorMiddleware``, which sits outside it, writes
+#: the actual 500. It is the status this file **records** for a request whose handler raised, so
+#: that 5xx traffic appears on the dashboard at all. See step 11 of the flow.
+STATUS_INTERNAL_SERVER_ERROR: Final = 500
+
 JSON_CONTENT_TYPE: Final = "application/json"
 
 #: RFC 9110 §11.6.1. The challenge itself is :data:`src.identity.WWW_AUTHENTICATE`, generated from
@@ -468,12 +500,16 @@ class LimiterRuntime(Protocol):
     A :class:`~typing.Protocol` rather than an import of ``Runtime``, for two reasons. The
     structural one: ``src.main`` imports this module, so importing ``Runtime`` back would be a
     circular import. The useful one: it states in the type system that this middleware needs
-    exactly two collaborators, so a reader does not have to grep to find out whether it also
+    exactly three collaborators, so a reader does not have to grep to find out whether it also
     reaches for the gateway or the tier registry behind their backs.
+
+    ``analytics`` is declared here and nonetheless read with ``getattr`` at the call site — see
+    :meth:`RateLimitMiddleware._record` for why that is not a hedge against this declaration.
     """
 
     identity: IdentityResolver
     limiter: Limiter
+    analytics: AnalyticsCollector
 
 
 def _runtime_of(scope: Scope) -> LimiterRuntime:
@@ -729,9 +765,25 @@ class RateLimitMiddleware:
         # nothing and duplicating the call below would cost a reader.
         #
         # Everything the switch actually gates is still gated: no cost is looked up, no principal is
-        # resolved, no script runs, and — the part worth stating — **no rate-limit headers are
-        # emitted**. A header describing a limit that was never evaluated is a lie, and it is the
-        # kind of lie a client builds pacing logic on top of.
+        # resolved, no script runs, no analytics record is written, and — the part worth stating —
+        # **no rate-limit headers are emitted**. A header describing a limit that was never
+        # evaluated is a lie, and it is the kind of lie a client builds pacing logic on top of.
+        #
+        # C9 NOTE — analytics does NOT fire on this branch, and C6's forward-looking comment here
+        # said it would. Two reasons overturned that, both about what the switch is FOR:
+        #
+        #   * `src.main` defines the disabled path as costing "a type check, a set lookup and a
+        #     memoised classify — which is the honest baseline". Recording would add a `send`
+        #     wrapper (the status code is not known otherwise) plus an awaited Redis round trip to
+        #     the branch whose whole purpose is having neither. C14's Phase C baselines the
+        #     limiter's overhead against this configuration; a baseline that already paid for the
+        #     analytics write would report the enforcement layer as cheaper than it is.
+        #   * No principal is resolved here — identity is never consulted — so every request would
+        #     be attributed to the anonymous sentinel. A graph reporting 100% anonymous traffic is
+        #     not a smaller version of the truth, it is a different claim.
+        #
+        # What C6's comment was actually right about survives untouched: classification still runs
+        # ABOVE the switch, because `SCOPE_ENDPOINT_KEY` is stashed for handlers on both branches.
         #
         # Classifying before identity is also deliberate, and it is not just ordering hygiene: the
         # label is a component of the bucket key, so it has to exist regardless of who is calling,
@@ -806,9 +858,33 @@ class RateLimitMiddleware:
                 retry_after=self._identity_retry_after,
                 degraded=False,
             )
+            # No decision, no principal and no tier: this request was refused before anything
+            # could be established about it. Recorded anyway, under the sentinels, because a
+            # credential store outage that is invisible on the dashboard is an outage nobody
+            # correlates with the 503s their clients are reporting.
+            await self._record(
+                runtime,
+                None,
+                status_code=STATUS_SERVICE_UNAVAILABLE,
+                user_id=ANONYMOUS_USER_ID,
+                endpoint=label,
+                tier=UNKNOWN_TIER,
+                cost=cost,
+            )
             return
         if principal is None:
             await _send_unauthorized(send)
+            # The anonymous sentinel, and see the analytics rubric in the module docstring: an
+            # auth-failure flood is exactly what you want visible, and it is visible nowhere else.
+            await self._record(
+                runtime,
+                None,
+                status_code=STATUS_UNAUTHORIZED,
+                user_id=ANONYMOUS_USER_ID,
+                endpoint=label,
+                tier=UNKNOWN_TIER,
+                cost=cost,
+            )
             return
 
         # ----------------------------------------------------------------------------------- #
@@ -871,8 +947,35 @@ class RateLimitMiddleware:
                     retry_after=decision.retry_after_sec,
                     degraded=decision.degraded,
                 )
+                # Recorded even though the store is what failed. The write goes to different keys
+                # through the same gateway, so it may well fail too — and `record` swallowing that
+                # is the point: when it succeeds (a fail-CLOSED refusal, or a saturated pool on a
+                # perfectly healthy store) the 503s are on the graph, and when it does not, the
+                # request is unaffected.
+                await self._record(
+                    runtime,
+                    decision,
+                    status_code=STATUS_SERVICE_UNAVAILABLE,
+                    user_id=principal.user_id,
+                    endpoint=label,
+                    tier=decision.tier,
+                    cost=cost,
+                )
                 return
             await _send_denied(send, decision)
+            # The 429s. `outcome:denied` unless the fallback bucket refused them, in which case
+            # `outcome:degraded` — see `src.analytics.OUTCOME_DEGRADED` for why "was this
+            # authoritative?" outranks "was it refused?" while the store is down. `status:429`
+            # carries the refusal either way.
+            await self._record(
+                runtime,
+                decision,
+                status_code=STATUS_TOO_MANY_REQUESTS,
+                user_id=principal.user_id,
+                endpoint=label,
+                tier=decision.tier,
+                cost=cost,
+            )
             return
 
         # ----------------------------------------------------------------------------------- #
@@ -916,23 +1019,62 @@ class RateLimitMiddleware:
                 MutableHeaders(raw=raw).update(decision.headers())
             await send(message)
 
-        await self.app(scope, receive, send_wrapper)
+        # ----------------------------------------------------------------------------------- #
+        # 11. Run the app, and record the result WHATEVER it turns out to be.
+        #
+        # The `except` is not defensive tidying — without it, 5xx traffic is invisible on the
+        # dashboard, which is the single failure class most worth seeing there.
+        #
+        # An unhandled handler exception does not come back as a status code. `ExceptionMiddleware`
+        # (which turns an `HTTPException` into a response) sits BELOW this middleware, around the
+        # router, and only handles what it was registered for; anything else propagates up through
+        # here to `ServerErrorMiddleware`, which is registered OUTSIDE us and is what actually
+        # writes the 500. So on that path `send_wrapper` was never called, `status_code` is still
+        # 0, and a record placed only after a normal return never happens at all — while the
+        # request was metered, the quota counter was charged, and the client got a 500. Verified:
+        # `totals.requests` silently under-reported and no `status:500` family ever appeared.
+        #
+        # `except Exception`, not `BaseException`: a `CancelledError` means the client went away
+        # mid-request, which is not a served request and must not become a data point — and
+        # awaiting a Redis write while unwinding a cancellation is how a shutdown hangs.
+        #
+        # The exception is re-raised untouched. `ServerErrorMiddleware` still produces the 500,
+        # still logs the traceback, and a debug-mode deployment still renders it — recording is
+        # additive here and owns nothing about the response.
+        # ----------------------------------------------------------------------------------- #
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            # `status_code or STATUS_INTERNAL_SERVER_ERROR`, rather than a flat 500: an app that
+            # raised *after* streaming a `http.response.start` has already committed a status to
+            # the wire, and that is the one the client saw. A flat 500 would put a code in the
+            # graph that nothing ever sent.
+            await self._record(
+                runtime,
+                decision,
+                status_code=status_code or STATUS_INTERNAL_SERVER_ERROR,
+                user_id=principal.user_id,
+                endpoint=label,
+                tier=decision.tier,
+                cost=cost,
+            )
+            raise
 
         # =================================== C9 SEAM ======================================= #
         # The response body has been sent. `status_code` above is captured here and nowhere else,
-        # and it is the one dimension of C9's analytics record that only the response knows.
-        #
-        # C9 adds one awaited call at this exact point:
-        #
-        #     await runtime.analytics.record(decision, status_code=status_code)
-        #
-        # Here, rather than before `await self.app(...)`, because the status is not known until
-        # afterwards and because the write takes ~220 us off perceived latency when it happens
-        # after the body is on the wire. **Awaited**, not fire-and-forget: a bare `create_task`
-        # would drop backpressure and leak tasks under load, which is a memory leak that only
-        # appears in production. Every exception it raises must be swallowed and counted —
-        # analytics may never fail a request that was already served.
+        # and it is the one dimension of the analytics record that only the response knows — which
+        # is the entire reason this call is below `await self.app(...)` rather than above it.
         # =================================================================================== #
+        await self._record(
+            runtime,
+            decision,
+            status_code=status_code,
+            user_id=principal.user_id,
+            endpoint=label,
+            tier=decision.tier,
+            cost=cost,
+        )
+
         logger.debug(
             "metered %s -> %d (endpoint=%s, tier=%s, cost=%d)",
             scope["method"],
@@ -940,4 +1082,67 @@ class RateLimitMiddleware:
             label,
             decision.tier,
             cost,
+        )
+
+    # ------------------------------------------------------------------ #
+    # C9 — analytics
+    # ------------------------------------------------------------------ #
+    async def _record(
+        self,
+        runtime: LimiterRuntime,
+        decision: LimitDecision | None,
+        *,
+        status_code: int,
+        user_id: str,
+        endpoint: str,
+        tier: str,
+        cost: int,
+    ) -> None:
+        """Fold one finished request into C9's analytics. Called from all five terminal paths.
+
+        .. rubric:: Awaited, not ``create_task``
+
+        A bare ``asyncio.create_task`` looks free and is not. It drops backpressure — under load
+        the records queue up behind a store that is already the bottleneck, and the queue is the
+        event loop's task list, which nothing bounds — and it leaks: a task nobody holds a
+        reference to can be garbage collected mid-flight, and one that outlives the request keeps
+        the decision, the scope and the closure alive with it. That is a memory leak whose only
+        symptom is an RSS graph, which is exactly the class of bug that only ever appears in
+        production. Awaiting costs one round trip that the client is no longer waiting on and
+        makes the analytics write subject to the same backpressure as everything else.
+
+        .. rubric:: The honest cost, stated rather than claimed away
+
+        "After the body is sent" removes this from the client's *perceived* latency for the
+        response it is reading — the bytes are already on the wire. It does **not** remove it from
+        a strictly sequential client's throughput: on an HTTP/1.1 keep-alive connection uvicorn
+        does not begin reading request N+1 until the application callable returns, so a client that
+        waits for response N before sending request N+1 sees this round trip in its inter-request
+        gap. A concurrent client, a pipelined one, or one on HTTP/2 does not. The measurement is
+        real either way and is reported as a p50/p95 delta rather than asserted to be zero.
+
+        .. rubric:: ``getattr``, even though :class:`LimiterRuntime` declares the attribute
+
+        The Protocol states the intent; the ``getattr`` protects against the one runtime state the
+        type system cannot see — a half-wired ``app.state.runtime`` built before this collaborator
+        existed. Everywhere else in this file a missing collaborator raises
+        (see :func:`_runtime_of`), because raising *before* the response turns into a 500 that
+        someone fixes. Here the response has **already been sent**: the status line and the body
+        are on the wire, so an exception cannot become a 500 even in principle — it becomes a torn
+        connection or an "Unexpected ASGI message" from the server, i.e. it damages a request that
+        had already succeeded, to report a missing dashboard counter. Nothing after the seam may
+        raise, and this is the only line in it that could.
+
+        :meth:`src.analytics.AnalyticsCollector.record` swallows everything else itself.
+        """
+        collector = getattr(runtime, "analytics", None)
+        if collector is None:
+            return
+        await collector.record(
+            decision,
+            status_code=status_code,
+            user_id=user_id,
+            endpoint=endpoint,
+            tier=tier,
+            cost=cost,
         )

@@ -2,9 +2,8 @@
 
 Three things live here, and they are the three seams the rest of the project hangs off:
 
-* :class:`Runtime` — the single container for per-process collaborators (settings, the Redis
-  gateway, the tier registry, the limiter and the identity resolver now; C9's analytics collector
-  as it lands).
+* :class:`Runtime` — the single container for per-process collaborators: settings, the Redis
+  gateway, the tier registry, the limiter, the identity resolver and the analytics collector.
   Handlers read it defensively off ``request.app.state.runtime`` and degrade to a safe fallback
   rather than raising, so a half-wired runtime is never a 500.
 * :func:`lifespan` — the production startup path. It builds a Runtime, **starts** it (opening the
@@ -51,6 +50,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
 
+from src.analytics import AnalyticsCollector
 from src.api.health import router as health_router
 from src.api.protected import router as protected_router
 from src.api.protected import verify_route_pricing
@@ -135,8 +135,10 @@ class Runtime:
     clock, so reported uptime cannot go backwards when NTP steps the system clock — the same
     reasoning that puts the limiter's clock inside Redis rather than on each replica.
 
-    C9 adds ``analytics``. Read sites use ``getattr(runtime, "...", None)`` so a half-wired runtime
-    degrades to a documented fallback rather than a 500.
+    Read sites use ``getattr(runtime, "...", None)`` so a half-wired runtime degrades to a
+    documented fallback rather than a 500 — and, at C9's seam specifically, so a runtime built
+    before ``analytics`` existed cannot raise *after* a response has already been sent. See
+    :meth:`src.middleware.RateLimitMiddleware._record`.
     """
 
     settings: Settings
@@ -144,6 +146,7 @@ class Runtime:
     tiers: TierRegistry
     limiter: Limiter
     identity: IdentityResolver
+    analytics: AnalyticsCollector
     started_at: float = field(default_factory=time.monotonic)
 
     @property
@@ -182,6 +185,14 @@ class Runtime:
         ``apikey:v1:*`` lookup, and **what tier that principal is on is never read here** — it is
         read from ``user:{uid}`` inside the decision script, on every request. Wiring the resolver
         to the registry would create exactly the per-user tier cache the whole design avoids.
+
+        The analytics collector takes the gateway and nothing else — no registry, no limiter. It
+        records what the middleware hands it and never asks anything about a principal, which is
+        what keeps a dashboard write off the decision path entirely. Like the limiter it registers
+        its Lua script in its own constructor and tolerates the gateway not being connected yet
+        (always the case here, since ``build`` is I/O-free by contract); both re-register on demand,
+        so there is no separate "register the scripts" step in :meth:`start` that a future
+        reconnect could invalidate. See :meth:`src.analytics.AnalyticsCollector._ensure_registered`.
         """
         gateway = RedisGateway(settings)
         registry = TierRegistry(settings, gateway)
@@ -191,6 +202,7 @@ class Runtime:
             tiers=registry,
             limiter=Limiter(gateway, registry, settings),
             identity=IdentityResolver(gateway, settings),
+            analytics=AnalyticsCollector(gateway, settings),
         )
 
     async def start(self) -> None:

@@ -83,9 +83,14 @@ __all__ = [
     "RATELIMIT_REMAINING_HEADER",
     "RATELIMIT_RESET_HEADER",
     "RETRY_AFTER_HEADER",
+    "StatsBucket",
+    "StatsSnapshot",
+    "StatsTotals",
+    "StatsWindow",
     "Tier",
     "TierConfig",
     "TierUpdate",
+    "TopConsumer",
     "UNLIMITED",
     "UserTierUpdate",
     "UserUsage",
@@ -852,12 +857,220 @@ class LimitDecision:
 
 
 # ---------------------------------------------------------------------------------------------
-# Admin / stats wire shapes (C10, C11)
+# Admin / stats wire shapes (C9, C10, C11)
 #
-# Only what those commits need and what is cheap to declare now. `StatsSnapshot` is deliberately
-# absent: its shape is driven by what C9's analytics collector actually records, and declaring it
-# early would mean guessing a schema and then either living with the guess or breaking it.
+# `StatsSnapshot` and its parts were deliberately absent until C9, because their shape is driven
+# by what the analytics collector actually records and declaring them earlier would have meant
+# guessing a schema and then either living with the guess or breaking it. C9 records, so C9
+# declares.
+#
+# What is declared here is the *measurement*, and nothing else. C11's `GET /dashboard/api/stats`
+# wraps this in a response envelope that also carries `tiers`, `config_version`, `poll_ms`,
+# `replicas` and the degradation counters — none of which come from the analytics buckets, and all
+# of which would make this model a description of one HTTP route rather than of a measurement that
+# the admin API and the E2E verifier read too.
 # ---------------------------------------------------------------------------------------------
+
+
+class StatsTotals(BaseModel):
+    """The whole window, folded: how much traffic, how much load, and how it ended.
+
+    ``requests`` counts requests; ``cost`` counts **weighted** units. Both, because they are
+    genuinely different numbers once endpoints are priced — 100 calls to ``/whoami`` and 20 to
+    ``/logs/query`` are the same 100 units of load and a 5x different request count, and a
+    dashboard showing only one of them cannot tell a busy caller from an expensive one.
+
+    .. rubric:: ``cost`` is weight ATTEMPTED, not weight charged. Label a chart accordingly
+
+    A refused request contributes its full weight here and **nothing** to the quota counter,
+    because a denial writes nothing (C4's founding property). The series is therefore a measure of
+    *demand*: a caller hammering the 5-token endpoint is generating five times the load of one
+    hammering ``/whoami`` whether or not the limiter admits them, and recording refusals at cost 1
+    would make the most expensive endpoint look like the cheapest exactly as it started being
+    throttled.
+
+    The reconciliation caveat that follows from it, stated because someone will otherwise spend an
+    afternoon on it: this number does **not** match ``GET /admin/users/{id}/usage``'s
+    ``daily.used``, and it is not supposed to. The difference between the two *is* the throttled
+    demand, and during a throttling event it can be several times the charged figure. A C11 panel
+    titled "cost consumed" would be wrong; "cost attempted" is the honest label.
+
+    ``allowed`` / ``denied`` / ``degraded`` are lifted out of
+    :attr:`StatsSnapshot.by_outcome` rather than left only in that map. The map is the raw
+    dimension and stays authoritative (it survives an outcome name this model has never heard of);
+    these three are the ones every consumer wants by name, and making a chart guess at dictionary
+    keys is how a rename becomes a silently empty graph. The three partition the traffic, so
+    ``allowed + denied + degraded == requests`` for any window this service wrote in full.
+    """
+
+    requests: int = Field(description="Requests folded into the window.")
+    cost: int = Field(
+        description=(
+            "Weighted cost units ATTEMPTED across the window — refused requests included. Not "
+            "reconcilable against `daily.used`; see the rubric above."
+        )
+    )
+    allowed: int = Field(description="Requests admitted by an authoritative (Redis) decision.")
+    denied: int = Field(
+        description="Requests refused — 429, 401 and the fail-closed/overloaded 503s."
+    )
+    degraded: int = Field(
+        description="Requests decided by the local fallback bucket rather than by Redis."
+    )
+
+
+class StatsBucket(BaseModel):
+    """One time bucket, folded — the element type of ``per_minute`` and ``per_hour``.
+
+    Deliberately **light**: five counters and two timestamps, with no per-dimension maps. A window
+    of 120 buckets each carrying four dictionaries would be the largest thing this service
+    serialises, on the endpoint polled every 5 seconds, to draw a line chart that needs one number
+    per point. The dimensional breakdown is folded once for the whole window instead
+    (:attr:`StatsSnapshot.by_status` and friends).
+
+    ``start_ms`` and ``width_ms`` are carried rather than left for the client to recompute from
+    ``index``. The multiplier differs per series (60 000 vs 3 600 000), so a client that derived it
+    would need to know which series it was holding — and a chart that multiplies by the wrong
+    constant plots the right numbers in the wrong century.
+    """
+
+    index: int = Field(description="Bucket index: epoch_ms // width_ms.")
+    start_ms: int = Field(description="Unix milliseconds at which this bucket opens.")
+    width_ms: int = Field(description="Bucket width: 60_000 for a minute, 3_600_000 for an hour.")
+    requests: int = Field(description="Requests folded into this bucket.")
+    cost: int = Field(
+        description="Weighted cost units attempted in this bucket, refused requests included."
+    )
+    allowed: int = Field(description="Of those requests, how many were admitted.")
+    denied: int = Field(description="Of those requests, how many were refused.")
+    degraded: int = Field(description="Of those requests, how many were decided without Redis.")
+
+
+class TopConsumer(BaseModel):
+    """One entry of the top-consumers ranking, ordered by **cost** rather than request count.
+
+    Ranking by cost is the point of the ZSET: a caller making 20 requests to a 5-token endpoint is
+    a heavier consumer than one making 60 to a 1-token endpoint, and a ranking by request count
+    would put the cheap caller on top and send an operator after the wrong client.
+    """
+
+    user_id: str = Field(description="The principal, or the anonymous sentinel for a 401 flood.")
+    cost: int = Field(description="Weighted cost units attributed to this principal.")
+
+
+class StatsWindow(BaseModel):
+    """What the snapshot **actually covered** — never what was asked for.
+
+    The distinction is the entire reason this model exists. A read that was truncated by
+    ``ANALYTICS_MAX_BUCKETS`` and one that covered everything produce the same-shaped payload, and
+    without the two ``*_requested`` fields sitting next to the two ``*_covered`` ones, a partial
+    answer reads as a complete one: a dashboard would render 30 minutes of history under a heading
+    that says 120 and nobody would ever know the difference. Reporting both makes the truncation a
+    fact on the wire rather than something a reader has to infer from a log line on a replica they
+    are not looking at.
+
+    The index and millisecond bounds are ``None`` — not ``0``, and not ``-1`` — when a series
+    covers no buckets at all. ``0`` is a real minute index (the unix epoch) and a real instant, so
+    reusing it would mean "we covered nothing" and "we covered 1970" were the same payload. This is
+    the one place the project's integer-sentinel convention (:data:`UNLIMITED`) does not apply:
+    that sentinel exists because a *quantity* has to survive being rendered into a header, and
+    these fields never touch one.
+    """
+
+    minutes_requested: int = Field(description="Minute buckets the caller asked for.")
+    minutes_covered: int = Field(description="Minute buckets actually read.")
+    hours_requested: int = Field(description="Hour buckets the caller asked for.")
+    hours_covered: int = Field(description="Hour buckets actually read.")
+    newest_minute_index: int | None = Field(
+        default=None, description="Index of the most recent minute bucket read; null if none."
+    )
+    oldest_minute_index: int | None = Field(
+        default=None, description="Index of the oldest minute bucket read; null if none."
+    )
+    newest_hour_index: int | None = Field(
+        default=None, description="Index of the most recent hour bucket read; null if none."
+    )
+    oldest_hour_index: int | None = Field(
+        default=None, description="Index of the oldest hour bucket read; null if none."
+    )
+    start_ms: int | None = Field(
+        default=None,
+        description="Unix ms at which the earliest covered bucket opens, across both series.",
+    )
+    end_ms: int | None = Field(
+        default=None,
+        description="Unix ms at which the latest covered bucket closes, across both series.",
+    )
+
+
+class StatsSnapshot(BaseModel):
+    """Everything :meth:`src.analytics.AnalyticsCollector.snapshot` read, in one JSON-ready value.
+
+    C11's ``GET /dashboard/api/stats`` is a thin wrapper over this: it adds the response envelope
+    (``tiers``, ``config_version``, ``poll_ms``, ``replicas``) and serialises the rest untouched.
+    That is the shape this model is sized for — enough that the endpoint has nothing left to
+    compute, and no more, so the same value is equally usable from the admin API and the E2E
+    verifier without either of them parsing a page's worth of chart state.
+
+    .. rubric:: ``totals`` and every ``by_*`` dimension are folded from the MINUTE buckets only
+
+    Not from both series. The hour buckets describe the same requests at a coarser resolution, so
+    folding them in as well would count every request twice — and inconsistently, because the hour
+    window reaches further back than the minute window, so the double-counting would apply to some
+    of the traffic and not the rest. The per-hour series is the long-tail context line and nothing
+    else; :attr:`per_hour` is where it lives.
+
+    The consequence worth stating: a caller who asks for ``hours`` and **no** ``minutes`` gets a
+    populated ``per_hour`` and zeroed totals. That is honest rather than convenient — the totals
+    describe the per-minute window, and inventing them from a different series when the first one
+    is empty would make the field mean two things depending on the arguments.
+
+    .. rubric:: Both series run OLDEST FIRST
+
+    :func:`src.keys.recent_minute_indices` returns newest-first, because element zero of *that*
+    list is "the minute happening now". A **time series** wants the opposite: a chart draws left to
+    right, so ``per_minute[0]`` is the oldest point and ``per_minute[-1]`` is now. The reversal
+    happens once, here, rather than in every consumer.
+    """
+
+    totals: StatsTotals = Field(description="The per-minute window, folded.")
+    per_minute: list[StatsBucket] = Field(
+        default_factory=list, description="Minute series, oldest first."
+    )
+    per_hour: list[StatsBucket] = Field(
+        default_factory=list, description="Hour series, oldest first."
+    )
+    by_status: dict[str, int] = Field(
+        default_factory=dict,
+        description="HTTP status code (as a string) -> request count, over the minute window.",
+    )
+    by_endpoint: dict[str, int] = Field(
+        default_factory=dict,
+        description="Classified endpoint label -> request count, over the minute window.",
+    )
+    by_tier: dict[str, int] = Field(
+        default_factory=dict,
+        description="Tier name -> request count, over the minute window.",
+    )
+    by_outcome: dict[str, int] = Field(
+        default_factory=dict,
+        description="allowed | denied | degraded -> request count, over the minute window.",
+    )
+    top_consumers: list[TopConsumer] = Field(
+        default_factory=list, description="Heaviest principals by cost, highest first."
+    )
+    window: StatsWindow = Field(description="What range this snapshot actually covered.")
+    dropped: int = Field(
+        default=0,
+        description=(
+            "Buckets asked for and not read, because ANALYTICS_MAX_BUCKETS capped the fan-in "
+            "(or the range ran off the start of the epoch). Non-zero means this payload is "
+            "partial."
+        ),
+    )
+    buckets_read: int = Field(
+        default=0, description="Time buckets actually pipelined and folded (minutes + hours)."
+    )
 
 
 class TierUpdate(BaseModel):

@@ -81,6 +81,14 @@ WHOAMI = "/api/v1/whoami"
 #: The three headers that must vanish while degraded and come back on recovery.
 QUOTA_HEADERS = (QUOTA_LIMIT_HEADER, QUOTA_REMAINING_HEADER, QUOTA_RESET_HEADER)
 
+#: How many times one metered request reaches :meth:`~src.redis_client.RedisGateway.run`.
+#:
+#: Two, as of C9: the decision script, and the analytics record fired after the response is sent.
+#: Named rather than written as a literal ``2`` because the number is a *property of the request
+#: path* — if a later commit adds a third store touch per request, the test that breaks should be
+#: the one that has to be re-reasoned about, and it should break by naming this constant.
+GATEWAY_TOUCHES_PER_REQUEST = 2
+
 
 # =============================================================================================
 # Fixtures
@@ -548,6 +556,21 @@ async def test_a_flood_against_an_unreachable_redis_costs_less_than_one_dial(
     less than a single dial would have**. Nothing about that bound is arbitrary: it is the
     configured timeout, and un-short-circuited these 60 would need at least two of them (60
     requests through a pool of 32).
+
+    .. rubric:: Two gateway touches per request as of C9, and the second one matters here
+
+    Each request now reaches the gateway twice: once for the decision script, and once for the
+    analytics record fired after the response is sent. Both must be short-circuited, so the count
+    below is ``60 x GATEWAY_TOUCHES_PER_REQUEST`` rather than 60.
+
+    That is a *stronger* assertion than the original, not a relaxed one. The failure it newly
+    catches is specific: the analytics write goes through the same gateway and the same breaker,
+    so an implementation that dialled for it — a collector holding its own client, or one calling
+    ``self._gateway.client`` directly instead of going through
+    :meth:`~src.redis_client.RedisGateway.run` — would re-introduce exactly the parked-coroutine
+    pile-up this test exists to prevent, on a code path that runs on **every** request including
+    the ones the limiter refused. The elapsed-time bound above would catch it too; this count says
+    which call was responsible.
     """
     client, runtime = blackhole
     headers = bearer(redis_settings, user_id="flood-user")
@@ -573,8 +596,9 @@ async def test_a_flood_against_an_unreachable_redis_costs_less_than_one_dial(
     # 503 — an open breaker never reaches the pool at all.
     assert all(response.status_code in {200, 429} for response in responses)
     assert elapsed < redis_settings.redis_timeout_ms / 1000
-    # ...and the reason was the breaker, not luck. Every one of the 60 was refused without a socket.
-    assert runtime.redis.short_circuits - before == 60
+    # ...and the reason was the breaker, not luck. Every gateway touch of all 60 was refused
+    # without a socket — the decision script AND the analytics record. See the docstring.
+    assert runtime.redis.short_circuits - before == 60 * GATEWAY_TOUCHES_PER_REQUEST
 
 
 async def test_a_degraded_flood_of_distinct_principals_cannot_grow_without_bound(

@@ -77,11 +77,12 @@ report one of them. It is driven by :attr:`~src.redis_client.RedisGateway.is_ove
 gateway's own recent history — rather than by this probe's ping, so a ping that happened to win a
 connection does not erase a replica that is shedding requests.
 
-.. rubric:: What is deliberately NOT reported here: the C5 identity-cache counters
+.. rubric:: What is deliberately NOT reported here: the identity-cache and analytics counters
 
-:meth:`~src.identity.IdentityResolver.cache_stats` is a pure counter read — no I/O, no lock — so
-adding ``identity_cache`` to this body would be cheap in CPU. It is not added, for three reasons
-that are not about cost:
+:meth:`~src.identity.IdentityResolver.cache_stats` and
+:meth:`~src.analytics.AnalyticsCollector.stats` are pure counter reads — no I/O, no lock — so
+adding ``identity_cache`` or ``analytics`` to this body would be cheap in CPU. Neither is added,
+for three reasons that are not about cost:
 
 * **This body is a pinned contract, not a dashboard.** ``tests/unit/test_health.py`` asserts the
   exact key set and the C13 verifier asserts the spec's two keys character-for-character across a
@@ -94,12 +95,21 @@ that are not about cost:
   informative next to the request rate that produced it.
 * **``/health`` is unauthenticated and public.** Cache size and hit rate are a (weak, but free)
   side channel about credential traffic: a jump in the negative-hit share is exactly the signature
-  of a key-guessing flood, and that is operator information rather than caller information.
+  of a key-guessing flood, and that is operator information rather than caller information. The
+  analytics counters are the same shape of leak from the other end — ``records`` is a public
+  request-rate meter for the whole service.
 
-So the counters exist, are exposed on the resolver, and C11 publishes them. If a future operator
+So the counters exist, are exposed on their owners, and C11 publishes them. If a future operator
 genuinely needs them on the liveness probe, adding the field is a one-line change *and* a
 deliberate edit to the key-set test — which is the right amount of friction for changing a probe's
 contract.
+
+The one thing an analytics failure *would* deserve a place here for is that it is silent by
+construction — :meth:`~src.analytics.AnalyticsCollector.record` swallows every exception, so a
+collector that has recorded nothing for an hour looks identical to one that is working. That is
+answered by ``dropped`` and ``last_error`` on the C11 payload rather than here, because the
+comparison that makes those numbers mean anything is against the request rate they sit next to,
+and that number is not on this probe either.
 
 .. rubric:: A Redis outage does NOT make this endpoint red
 

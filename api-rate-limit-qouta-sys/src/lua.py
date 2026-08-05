@@ -1,4 +1,4 @@
-"""The decision script, and the KEYS/ARGV contract that lets Python build a call to it.
+"""The two Lua scripts, and the KEYS/ARGV contracts that let Python build a call to each.
 
 .. rubric:: This module is PURE
 
@@ -49,6 +49,21 @@ representing integers exactly.
   time-bucketed and therefore cannot share the ``{user}`` hash tag — folding them in here would be
   a guaranteed ``CROSSSLOT`` the day this shards, and an analytics error would abort the script
   that decides whether a request is allowed.
+
+.. rubric:: The second script: :data:`RLQ_RECORD_REQUEST` (C9)
+
+It lives in this module beside the first because they are the same *kind* of artefact — a body, a
+KEYS/ARGV contract and a set of return-index constants, all inspectable without a server — and
+because keeping both contracts in one file is what makes "which ARGV slot is the cost?" a question
+with one place to look. They share nothing else: two independent ``EVAL`` bodies, two SHAs, two
+registrations, and no execution path in which one can abort the other. That separation is the whole
+argument of the paragraph above, so expressing it as two module constants rather than one is the
+point rather than a duplication.
+
+The ``int_arg`` helper is therefore written out twice, once per script. Factoring it into a shared
+prelude that both bodies interpolate would rewrite :data:`RLQ_CHECK_AND_CONSUME`'s text — and
+therefore its SHA, and therefore every replica's script cache — to save nine lines in a file whose
+whole purpose is that the two scripts cannot affect each other.
 """
 
 from __future__ import annotations
@@ -75,8 +90,29 @@ __all__ = [
     "KEY_USER",
     "MICRO_TOKENS",
     "NO_CLOCK_OVERRIDE",
+    "RECORD_ARGV_ARITY",
+    "RECORD_ARGV_COST",
+    "RECORD_ARGV_ENDPOINT",
+    "RECORD_ARGV_HOUR_TTL_SEC",
+    "RECORD_ARGV_MINUTE_TTL_SEC",
+    "RECORD_ARGV_OUTCOME",
+    "RECORD_ARGV_STATUS",
+    "RECORD_ARGV_TIER",
+    "RECORD_ARGV_USER_ID",
+    "RECORD_FIELD_COST",
+    "RECORD_FIELD_ENDPOINT_PREFIX",
+    "RECORD_FIELD_OUTCOME_PREFIX",
+    "RECORD_FIELD_REQUESTS",
+    "RECORD_FIELD_STATUS_PREFIX",
+    "RECORD_FIELD_TIER_PREFIX",
+    "RECORD_KEYS_ARITY",
+    "RECORD_KEY_HOUR",
+    "RECORD_KEY_MINUTE",
+    "RECORD_KEY_TOP",
     "RLQ_CHECK_AND_CONSUME",
     "RLQ_CHECK_AND_CONSUME_NAME",
+    "RLQ_RECORD_REQUEST",
+    "RLQ_RECORD_REQUEST_NAME",
     "SW_DISABLED",
     "SW_ENABLED",
     "TIER_ARGV_SLOTS",
@@ -695,4 +731,218 @@ return {{
   retry_ms,                                                 -- 18 retry_ms
   now_ms,                                                   -- 19 now_ms
 }}
+"""
+
+
+# =============================================================================================
+# C9 — the analytics record script
+#
+# A SECOND script, deliberately. See the "The second script" rubric in the module docstring and
+# the three-reason argument in `src.analytics`: analytics keys are global and time-bucketed, so
+# they cannot carry the `{user}` hash tag the decision script's four keys share; folding them in
+# would triple the command count on the critical path; and an analytics `redis.call` that errored
+# would abort the script that decides whether a request is allowed.
+# =============================================================================================
+
+# ---------------------------------------------------------------------------------------------
+# KEYS contract
+#
+# All three are GLOBAL and untagged — see `src.keys`, which builds them from an integer time
+# index and nothing else. They are computed by Python (from `LimitDecision.server_now_ms`, so two
+# replicas with skewed system clocks write into the SAME bucket) and passed in as KEYS rather than
+# derived inside the script, which is the opposite of what the decision script does with its
+# `sw:{uid}:<index>` keys. The reason is the same rule read from the other side: a key whose name a
+# script derives itself is invisible to Redis Cluster's slot check, which is acceptable only when
+# the derivation provably stays inside one slot. These three do not — they cannot — so they are
+# named up front where the server can see them.
+# ---------------------------------------------------------------------------------------------
+
+#: ``stats:min:<minute_index>`` — HASH. ``EXPIRE <ANALYTICS_MINUTE_TTL_SEC> NX``.
+RECORD_KEY_MINUTE = 1
+
+#: ``stats:hour:<hour_index>`` — HASH, identical field set. ``EXPIRE <ANALYTICS_HOUR_TTL_SEC> NX``.
+RECORD_KEY_HOUR = 2
+
+#: ``stats:top:min:<minute_index>`` — ZSET, member = user id, score = accumulated cost. TTL tracks
+#: the minute bucket's, because it *is* a view of the minute bucket.
+RECORD_KEY_TOP = 3
+
+#: How many KEYS the record script expects. Asserted by :class:`src.analytics.AnalyticsCollector`.
+RECORD_KEYS_ARITY = 3
+
+# ---------------------------------------------------------------------------------------------
+# ARGV contract
+#
+# Fixed arity, no pre-rendered tail: unlike the decision script there is no tier table to splice,
+# so every slot is built per request. All eight are strings on the wire (redis-py encodes them
+# anyway) and the two numeric ones are re-read with `tonumber` on the Lua side.
+# ---------------------------------------------------------------------------------------------
+
+RECORD_ARGV_COST = 1
+RECORD_ARGV_MINUTE_TTL_SEC = 2
+RECORD_ARGV_HOUR_TTL_SEC = 3
+RECORD_ARGV_USER_ID = 4
+RECORD_ARGV_OUTCOME = 5
+RECORD_ARGV_TIER = 6
+RECORD_ARGV_ENDPOINT = 7
+RECORD_ARGV_STATUS = 8
+
+#: How many ARGV elements the record script expects.
+RECORD_ARGV_ARITY = 8
+
+# ---------------------------------------------------------------------------------------------
+# Bucket HASH field names
+#
+# Interpolated into the script below AND imported by `src.analytics`'s read side, so the producer
+# and the consumer of every field name are the same string literal. A dashboard that silently
+# reports zeros because one side spells it `endpoint:` and the other `endpoints:` is the exact
+# failure this removes, and it is a failure with no error message anywhere.
+#
+# The four prefixed families are open sets: the suffix is the dimension's value (`status:429`,
+# `tier:premium`, `endpoint:GET:/api/v1/logs/query`). Each one is bounded by construction —
+# `src.keys.classify` collapses every unrecognised path onto ONE label, tiers come from
+# `config:tiers`, outcomes are a closed three-value set and statuses are HTTP codes — so a caller
+# cannot mint hash fields by varying a URL, which would be the `rate_limit:*` key-explosion bug
+# relocated into the analytics bucket.
+# ---------------------------------------------------------------------------------------------
+
+#: Total requests folded into the bucket, incremented by 1 per request.
+RECORD_FIELD_REQUESTS = "requests"
+
+#: Total **weighted** cost **attempted** — incremented by the request's cost whether or not the
+#: limiter admitted it. Kept beside ``requests`` rather than derived from it because they are
+#: genuinely different numbers once endpoints are weighted: 100 requests to ``/whoami`` and 20 to
+#: ``/logs/query`` are the same cost and a 5x different load.
+#:
+#: **Attempted, not charged**, and the distinction is load-bearing during a throttling event. A
+#: denial writes nothing (that is C4's whole "a denial writes nothing" property), so the quota
+#: counter does not move for a refused request while this field does. That is deliberate — this
+#: series measures *demand*, and a caller hammering the 5-token endpoint is generating five times
+#: the load of one hammering ``/whoami`` whether or not the limiter lets them through, so recording
+#: refusals at cost 1 would make the most expensive endpoint look like the cheapest exactly when it
+#: started being throttled.
+#:
+#: The consequence for a reader: this field is **not** reconcilable against
+#: ``GET /admin/users/{id}/usage``'s ``daily.used``, and the gap between them is the throttled
+#: demand. See :class:`src.models.StatsTotals`, which says the same thing on the wire shape.
+RECORD_FIELD_COST = "cost"
+
+#: ``outcome:allowed`` / ``outcome:denied`` / ``outcome:degraded``. See
+#: :data:`src.analytics.OUTCOMES` — the three PARTITION the traffic, so they sum to ``requests``.
+RECORD_FIELD_OUTCOME_PREFIX = "outcome:"
+
+#: ``tier:free``, ``tier:premium``, ... — and ``tier:unknown`` for a request whose tier was never
+#: read (a 401 never reaches ``user:{uid}``).
+RECORD_FIELD_TIER_PREFIX = "tier:"
+
+#: ``endpoint:GET:/api/v1/logs/query`` — the CLASSIFIED label, never a raw path.
+RECORD_FIELD_ENDPOINT_PREFIX = "endpoint:"
+
+#: ``status:200``, ``status:429``, ``status:401``, ``status:503``.
+RECORD_FIELD_STATUS_PREFIX = "status:"
+
+#: The name the record script is registered under on :class:`~src.redis_client.RedisGateway`.
+RLQ_RECORD_REQUEST_NAME = "rlq_record_request"
+
+
+RLQ_RECORD_REQUEST = f"""
+-- rlq_record_request: fold ONE served request into the minute bucket, the hour bucket and the
+-- per-minute top-consumer ZSET. Runs AFTER the response body is on the wire, never before it.
+--
+-- KEYS[1] stats:min:<minute_index>      HASH  requests, cost, outcome:*, tier:*, endpoint:*, status:*
+-- KEYS[2] stats:hour:<hour_index>       HASH  the same field set
+-- KEYS[3] stats:top:min:<minute_index>  ZSET  member = user id, score = accumulated cost
+--
+-- ARGV[1] cost              ARGV[5] outcome (allowed | denied | degraded)
+-- ARGV[2] minute_ttl_sec    ARGV[6] tier
+-- ARGV[3] hour_ttl_sec      ARGV[7] endpoint label (classified, never a raw path)
+-- ARGV[4] user_id           ARGV[8] status code
+
+local cost           = tonumber(ARGV[1]) or 0
+local minute_ttl_sec = tonumber(ARGV[2]) or 0
+local hour_ttl_sec   = tonumber(ARGV[3]) or 0
+local user_id        = ARGV[4]
+local outcome        = ARGV[5]
+local tier           = ARGV[6]
+local endpoint       = ARGV[7]
+local status         = ARGV[8]
+
+if cost < 0 then
+  -- A negative cost would DECREMENT a counter that is only ever meant to climb, and a monotonic
+  -- series that can go backwards is worse than a missing data point: the dashboard would show a
+  -- dip nobody can explain and the arithmetic would never re-converge. `AnalyticsCollector.record`
+  -- already floors this at 1; the script refuses to corrupt the bucket even if it stops doing so.
+  cost = 0
+end
+
+-- The same invariant the decision script states at length: every number handed BACK to redis.call
+-- goes through here first, so the wire format does not depend on which Redis build is answering
+-- (<= 6.2 renders an integral Lua number through fpconv_dtoa, i.e. 1750000000000 as '1.75e+12').
+-- Written out again rather than shared with the decision script: a shared prelude would rewrite
+-- that script's body and therefore its SHA. See the module docstring.
+local function int_arg(value)
+  return string.format('%d', value)
+end
+
+-- Formatted ONCE. `fold` runs twice and issues six HINCRBYs each time, so the two constants below
+-- would otherwise be re-formatted twelve times per request on a single-threaded server.
+local ONE      = int_arg(1)
+local COST_ARG = int_arg(cost)
+
+local function fold(key, ttl_sec)
+  local requests = redis.call('HINCRBY', key, '{RECORD_FIELD_REQUESTS}', ONE)
+  redis.call('HINCRBY', key, '{RECORD_FIELD_COST}', COST_ARG)
+  redis.call('HINCRBY', key, '{RECORD_FIELD_OUTCOME_PREFIX}' .. outcome, ONE)
+  redis.call('HINCRBY', key, '{RECORD_FIELD_TIER_PREFIX}' .. tier, ONE)
+  redis.call('HINCRBY', key, '{RECORD_FIELD_ENDPOINT_PREFIX}' .. endpoint, ONE)
+  redis.call('HINCRBY', key, '{RECORD_FIELD_STATUS_PREFIX}' .. status, ONE)
+
+  -- EXPIRE ... NX -- Redis >= 7. The NX is the whole point and it is not a micro-optimisation:
+  -- it sets the TTL only when the key has none, so the clock starts at bucket CREATION. Without
+  -- it, every write re-arms the full TTL, a continuously hot minute bucket lives an hour past its
+  -- last write, and "minute buckets are retained for an hour" silently becomes "for an hour after
+  -- traffic stops" -- unbounded retention under exactly the load that produces the most buckets.
+  --
+  -- Reissued on every request rather than only on creation: there is no cheap way to know whether
+  -- this call created the key (HINCRBY does not say), and with NX the repeat is a no-op the server
+  -- answers in O(1). Correct by construction beats correct by bookkeeping.
+  if ttl_sec > 0 then
+    redis.call('EXPIRE', key, int_arg(ttl_sec), 'NX')
+  end
+
+  return requests
+end
+
+local minute_requests = fold(KEYS[1], minute_ttl_sec)
+fold(KEYS[2], hour_ttl_sec)
+
+-- A ZSET rather than another HASH field family, and rather than sorting a hash in Python:
+-- ZINCRBY keeps the ordering maintained on write (O(log N)) so the read is `ZREVRANGE 0 9`,
+-- O(log N + 10). The hash alternative transfers every member to the client and sorts there --
+-- O(N) on the wire plus O(N log N) in Python, on the endpoint the dashboard polls every 5 s.
+--
+-- Scored by COST, not by request count, because "top consumer" means load: 20 calls to
+-- /logs/query (cost 5) outweigh 60 calls to /whoami (cost 1), and ranking by request count would
+-- put the cheap caller on top.
+redis.call('ZINCRBY', KEYS[3], COST_ARG, user_id)
+if minute_ttl_sec > 0 then
+  -- The minute bucket's TTL, because this ZSET is a view OF that minute. A longer TTL would leave
+  -- a top-consumer list for a minute whose totals had already expired -- a ranking with no
+  -- denominator; a shorter one would make the list vanish while the chart still drew the minute.
+  --
+  -- NOTE the asymmetry a zeroed ANALYTICS_MINUTE_TTL_SEC creates, which is why that setting says
+  -- so at length: skipping the EXPIRE leaves the bucket HASHes immortal at ~6 fields each, and
+  -- leaves THIS key immortal at one member per distinct principal per minute. The ZSET is the only
+  -- analytics family whose size a caller controls, so "never expire" costs orders of magnitude
+  -- more here than it does two lines up. Not forced to some invented default: an operator who
+  -- turns retention off has said what they want, and quietly expiring one family and not the other
+  -- would be a third behaviour nobody asked for.
+  redis.call('EXPIRE', KEYS[3], int_arg(minute_ttl_sec), 'NX')
+end
+
+-- One integer, not a table: the minute bucket's post-increment `requests` count. It gives the
+-- collector something to log and a test something to assert without a second read, and being a
+-- scalar it has none of the nil-truncation hazard the decision script's 19-element reply has to
+-- reason about.
+return minute_requests
 """
