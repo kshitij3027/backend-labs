@@ -472,6 +472,17 @@ class _Fold:
         )
 
 
+def _only(bounds: Sequence[int]) -> int | None:
+    """The single element of a 0-or-1 length slice, or ``None``.
+
+    :meth:`AnalyticsCollector._window` derives each bound from a one-element slice (``[-1:]`` /
+    ``[:1]``) precisely so an empty series produces an empty list rather than an ``IndexError``.
+    This turns that back into the ``int | None`` the model declares, in one place, so the four
+    per-series bounds do not become four copies of the same conditional.
+    """
+    return bounds[0] if bounds else None
+
+
 def _add(target: dict[str, int], name: str, count: int) -> None:
     """Accumulate ``count`` under ``name``, skipping the empty name a bare prefix would produce.
 
@@ -785,6 +796,10 @@ class AnalyticsCollector:
         costs nothing" is true of the whole method rather than of its pipeline alone. The outcome
         map is still fully seeded, because a chart handed a missing key draws a gap and one handed
         an explicit zero draws the flat line that is the truth.
+
+        ``window.server_now_ms`` is therefore ``None`` here, and that is the honest value: no
+        ``TIME`` was issued, and substituting the local clock is the per-replica bucketing the
+        module docstring rejects — it would be exactly as wrong on the read side as on the write.
         """
         return StatsSnapshot(
             totals=_Fold().totals(),
@@ -908,6 +923,10 @@ class AnalyticsCollector:
                 hour_indices,
                 minutes_requested=minutes_requested,
                 hours_requested=hours_requested,
+                # The SAME `TIME` the bucket names were computed from, not a second call and not
+                # the local clock. A consumer clipping the newest still-filling bucket has to clip
+                # it against the instant that *named* it, or the two disagree by the round trip.
+                server_now_ms=at_ms,
             ),
             dropped=dropped,
             buckets_read=covered,
@@ -1018,6 +1037,7 @@ class AnalyticsCollector:
         *,
         minutes_requested: int,
         hours_requested: int,
+        server_now_ms: int | None = None,
     ) -> StatsWindow:
         """Describe what was actually covered. See :class:`~src.models.StatsWindow`.
 
@@ -1026,11 +1046,34 @@ class AnalyticsCollector:
         practice the hour series sets the start and the minute series sets the end, but taking the
         min and the max rather than assuming that keeps the answer correct for a caller who asked
         for one series and not the other.
+
+        .. rubric:: Each series also publishes its OWN bounds, and a consumer needs them
+
+        Added after C11's verification measured the consequence of publishing only the union.
+        ``totals`` and every ``by_*`` are folded from the minute buckets alone, so on the default
+        60-minute + 24-hour read the spanning bounds describe 24 h while every number beside them
+        describes 60 minutes — a KPI labelled from ``start_ms``/``end_ms`` is wrong by 24x, and
+        ``end_ms`` (the close of the current *hour* bucket) was measured 52 minutes in the future.
+        Neither is a defect in the spanning fields; they are correct about the question they
+        answer. The defect was that they were the only ones on offer.
+
+        ``server_now_ms`` is the read's own instant, carried through from ``snapshot``'s ``TIME``
+        call so a consumer can clip the still-filling newest bucket without consulting its own
+        clock — which, on a page polling two replicas through a load balancer, is the one clock
+        that would disagree. It stays ``None`` on the empty-range path, where no ``TIME`` was
+        issued and inventing one would be the local-clock substitution the module docstring refuses
+        everywhere else.
+
+        This is additive only: every field that existed before is computed from the same
+        expressions, so the folding semantics C9 pinned are untouched.
         """
-        starts = [index * MS_PER_MINUTE for index in minute_indices[-1:]]
-        starts += [index * MS_PER_HOUR for index in hour_indices[-1:]]
-        ends = [(index + 1) * MS_PER_MINUTE for index in minute_indices[:1]]
-        ends += [(index + 1) * MS_PER_HOUR for index in hour_indices[:1]]
+        minute_starts = [index * MS_PER_MINUTE for index in minute_indices[-1:]]
+        minute_ends = [(index + 1) * MS_PER_MINUTE for index in minute_indices[:1]]
+        hour_starts = [index * MS_PER_HOUR for index in hour_indices[-1:]]
+        hour_ends = [(index + 1) * MS_PER_HOUR for index in hour_indices[:1]]
+
+        starts = minute_starts + hour_starts
+        ends = minute_ends + hour_ends
 
         return StatsWindow(
             minutes_requested=minutes_requested,
@@ -1041,8 +1084,13 @@ class AnalyticsCollector:
             oldest_minute_index=minute_indices[-1] if minute_indices else None,
             newest_hour_index=hour_indices[0] if hour_indices else None,
             oldest_hour_index=hour_indices[-1] if hour_indices else None,
+            minutes_start_ms=_only(minute_starts),
+            minutes_end_ms=_only(minute_ends),
+            hours_start_ms=_only(hour_starts),
+            hours_end_ms=_only(hour_ends),
             start_ms=min(starts) if starts else None,
             end_ms=max(ends) if ends else None,
+            server_now_ms=server_now_ms,
         )
 
     # ------------------------------------------------------------------ #

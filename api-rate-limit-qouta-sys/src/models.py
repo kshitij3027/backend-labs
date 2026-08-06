@@ -66,12 +66,16 @@ __all__ = [
     "DEGRADED_HEADER",
     "DEGRADED_HEADER_VALUE",
     "DENY_DETAIL",
+    "DashboardStats",
+    "DegradedSignals",
     "DenyReason",
+    "DroppedSignals",
     "ERROR_QUOTA",
     "ERROR_RATE_LIMIT",
     "LUA_REPLY_ARITY",
     "LUA_REPLY_FIELDS",
     "LimitDecision",
+    "PoolSignals",
     "Principal",
     "QUOTA_LIMIT_HEADER",
     "QUOTA_REASONS",
@@ -83,6 +87,7 @@ __all__ = [
     "RATELIMIT_REMAINING_HEADER",
     "RATELIMIT_RESET_HEADER",
     "RETRY_AFTER_HEADER",
+    "ReplicaInfo",
     "StatsBucket",
     "StatsSnapshot",
     "StatsTotals",
@@ -975,11 +980,45 @@ class StatsWindow(BaseModel):
     the one place the project's integer-sentinel convention (:data:`UNLIMITED`) does not apply:
     that sentinel exists because a *quantity* has to survive being rendered into a header, and
     these fields never touch one.
+
+    .. rubric:: Which bound a chart should actually use — there are three answers and they differ
+
+    ``start_ms`` / ``end_ms`` span **both** series, and that is a genuine hazard for a consumer
+    that assumes otherwise. :attr:`StatsSnapshot.totals` and every ``by_*`` are folded from the
+    *minute* buckets alone, so on the default 60-minute + 24-hour request these two fields describe
+    a 24-hour period while every KPI beside them describes the last hour. A tile labelled
+    "requests in {start_ms}-{end_ms}" is then wrong by 24x, and it is wrong in the direction that
+    looks plausible.
+
+    So each series also publishes its own pair:
+
+    * ``minutes_start_ms`` / ``minutes_end_ms`` — the period ``totals`` and every ``by_*``
+      **actually** describe, and the correct x-axis domain for :attr:`StatsSnapshot.per_minute`.
+    * ``hours_start_ms`` / ``hours_end_ms`` — the same for :attr:`StatsSnapshot.per_hour`.
+    * ``start_ms`` / ``end_ms`` — the union, i.e. "what period does this whole payload touch".
+      Useful as a caption, wrong as a KPI label.
+
+    Every ``*_end_ms`` is the instant the newest covered bucket **closes**, not "now". The newest
+    bucket is still filling, so an end bound is always in the future relative to the read — by up
+    to 60 s for the minute series and up to an hour for the hour series (measured at 52 minutes on
+    the default request, which is what makes an hour-spanned axis render an hour of empty future).
+    That is the right domain for a bar chart, because the in-progress bar is a full-width bar with
+    a partial value; it is the wrong number to *print*.
+
+    ``server_now_ms`` is the line to clip at, and it is the read's own instant from **Redis's**
+    clock — the same ``TIME`` the write side buckets against, so two replicas answering the same
+    poll name the same instant. Null only when no clock was read at all: an empty range, or a store
+    that could not be reached.
     """
 
-    minutes_requested: int = Field(description="Minute buckets the caller asked for.")
+    minutes_requested: int = Field(
+        description="Minute buckets the caller asked for — their ask, never a server-side "
+        "ceiling. Greater than `minutes_covered` exactly when this payload is partial."
+    )
     minutes_covered: int = Field(description="Minute buckets actually read.")
-    hours_requested: int = Field(description="Hour buckets the caller asked for.")
+    hours_requested: int = Field(
+        description="Hour buckets the caller asked for, on the same terms as `minutes_requested`."
+    )
     hours_covered: int = Field(description="Hour buckets actually read.")
     newest_minute_index: int | None = Field(
         default=None, description="Index of the most recent minute bucket read; null if none."
@@ -993,13 +1032,43 @@ class StatsWindow(BaseModel):
     oldest_hour_index: int | None = Field(
         default=None, description="Index of the oldest hour bucket read; null if none."
     )
+    minutes_start_ms: int | None = Field(
+        default=None,
+        description="Unix ms at which the oldest covered MINUTE bucket opens. **This is the "
+        "period `totals` and every `by_*` describe** — label KPI tiles from this pair, not from "
+        "`start_ms`/`end_ms`, which span both series.",
+    )
+    minutes_end_ms: int | None = Field(
+        default=None,
+        description="Unix ms at which the newest covered minute bucket CLOSES — up to 60 s ahead "
+        "of `server_now_ms`, because that bucket is still filling. Correct as an x-axis domain "
+        "for `per_minute`; clip at `server_now_ms` before printing it as a time.",
+    )
+    hours_start_ms: int | None = Field(
+        default=None, description="Unix ms at which the oldest covered HOUR bucket opens."
+    )
+    hours_end_ms: int | None = Field(
+        default=None,
+        description="Unix ms at which the newest covered hour bucket closes — up to an hour ahead "
+        "of `server_now_ms`, for the same reason.",
+    )
     start_ms: int | None = Field(
         default=None,
-        description="Unix ms at which the earliest covered bucket opens, across both series.",
+        description="Unix ms at which the earliest covered bucket opens, across BOTH series. The "
+        "payload's outer extent, not the period any KPI describes.",
     )
     end_ms: int | None = Field(
         default=None,
-        description="Unix ms at which the latest covered bucket closes, across both series.",
+        description="Unix ms at which the latest covered bucket closes, across BOTH series. On "
+        "the default request this is the end of the current HOUR, so it can sit an hour in the "
+        "future — see the rubric before plotting against it.",
+    )
+    server_now_ms: int | None = Field(
+        default=None,
+        description="Redis's clock at the instant of the read — the shared clock the write side "
+        "buckets against, so every replica answering the same poll reports the same value. The "
+        "line to clip a still-filling newest bucket at. Null when no clock was read: an empty "
+        "range, or an unreachable store.",
     )
 
 
@@ -1071,6 +1140,349 @@ class StatsSnapshot(BaseModel):
     buckets_read: int = Field(
         default=0, description="Time buckets actually pipelined and folded (minutes + hours)."
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# The C11 envelope
+#
+# `StatsSnapshot` above is the MEASUREMENT — what the analytics buckets said. Everything below is
+# the ENVELOPE `GET /dashboard/api/stats` wraps it in: the configuration the measurement has to be
+# read against (`tiers`, `config_version`, `rate_limit_enabled`, `poll_ms`) and the health of the
+# machinery that produced it (`degraded`, `pool`, `dropped`, `replicas`).
+#
+# Declared here rather than beside the route — unlike `HealthResponse` and C10's `TierTable`, which
+# live next to their handlers — because C13's verifier and C15's page both parse this shape, and
+# `StatsSnapshot`'s own rubric already promises "C11 wraps this in a response envelope". The two
+# halves are one contract and are read together.
+#
+# The envelope is FLAT rather than `{"stats": {...}, "meta": {...}}`. A dashboard tile showing "0
+# requests" is only interpretable next to `rate_limit_enabled`, and a nesting that let a client
+# fetch, cache or render one half without the other would be a nesting that lets it draw the empty
+# chart without the field that explains it. See `DashboardStats.rate_limit_enabled`.
+# ---------------------------------------------------------------------------------------------
+
+
+class ReplicaInfo(BaseModel):
+    """Which replicas this payload can honestly name — and, more importantly, which it cannot.
+
+    The analytics record carries six dimensions (requests, cost, outcome, status, endpoint, tier)
+    and **no replica dimension**. So a per-replica breakdown cannot be computed from the buckets,
+    and this model reports that rather than inventing one: :attr:`observed` is empty, and
+    :attr:`attributed` says why in a field a UI can branch on.
+
+    Fabricating the number was the tempting alternative and would have been worse than useless.
+    ``configured`` (``API_REPLICAS``) is what an operator *declared*, and rendering it as "2
+    replicas serving" would state as measurement the one thing this payload has no evidence for —
+    on the surface an operator opens precisely to find out whether a replica has stopped.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    served_by: str = Field(
+        description="Hostname of the replica that built this payload. Same value as the "
+        "envelope's top-level `served_by`; repeated here so this block is self-contained."
+    )
+    configured: int = Field(
+        description="API_REPLICAS — how many replicas are *declared* to share the store. It sizes "
+        "the C8 degraded fallback bucket; it is NOT evidence that that many are serving."
+    )
+    observed: list[str] = Field(
+        default_factory=list,
+        description="Replicas the analytics data itself names. Always empty today — see "
+        "`attributed`.",
+    )
+    attributed: bool = Field(
+        default=False,
+        description="False: the recorded bucket fields carry no replica dimension, so `observed` "
+        "cannot be populated from them. With C12's load balancer in front, polling this endpoint "
+        "repeatedly and collecting `served_by` is what reveals the other replicas.",
+    )
+
+
+class DegradedSignals(BaseModel):
+    """Whether anything between the traffic and this payload is currently not working.
+
+    Four different failures, four fields, for the reason ``GET /health`` keeps ``rate_limiter``,
+    ``redis`` and ``pool`` apart: they have different remedies, they occur independently, and one
+    flag could only ever report whichever happened to be checked first.
+
+    :attr:`stats_unavailable` is the field with no analogue on ``/health``, and it is the one that
+    makes the rest of the payload readable. Every counter in a snapshot that could not be read is
+    ``0`` — and a zero that means "we could not ask" renders identically to a zero that means
+    "nothing happened", which is the single most misleading thing an observability surface can say
+    during an incident. :meth:`src.analytics.AnalyticsCollector.snapshot` refuses to return those
+    zeros at all (it raises); this flag is how the endpoint is able to serve them anyway without
+    lying about what they are.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    rate_limiter: bool = Field(
+        description="True while the C8 local fallback bucket is carrying this replica's traffic — "
+        "the same condition `/health` reports as `rate_limiter: \"degraded\"`. Enforcement is "
+        "replica-local and approximate while this is true."
+    )
+    store: str = Field(
+        description="'ok', 'unreachable', or 'saturated' when this replica had no pooled "
+        "connection to ask with — so the store's health is genuinely unknown rather than bad."
+    )
+    stats_unavailable: bool = Field(
+        description="True when the analytics read failed. Every measurement in this payload is "
+        "then a zero that was NOT measured: totals, both series and every `by_*` are unknown, not "
+        "empty. The configuration fields (`tiers`, `config_version`, `rate_limit_enabled`, "
+        "`poll_ms`) are still true — they never needed the store."
+    )
+    since_sec: float | None = Field(
+        default=None,
+        description="Seconds this replica has been failing to reach the store, or null while "
+        "healthy. A duration from a monotonic clock, never a date.",
+    )
+    breaker: str = Field(
+        description="Circuit-breaker state: 'closed', 'open' or 'half_open'. 'open' means this "
+        "replica is refusing store calls without dialling — including this endpoint's read."
+    )
+    detail: str | None = Field(
+        default=None,
+        description="Why the analytics read failed, if it did. Null otherwise.",
+    )
+
+
+class PoolSignals(BaseModel):
+    """This replica's own connection capacity — a different incident from a store outage.
+
+    Separate from :class:`DegradedSignals` for the reason ``/health`` gives ``pool`` its own field:
+    a saturated pool means the store is fine and *this process* is the bottleneck, which is fixed
+    by adding connections or shedding load rather than by waiting for Redis. Reporting it as an
+    outage sends an operator to debug the wrong machine.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    state: str = Field(description="'ok' or 'saturated'. Cleared by the next successful call.")
+    max_connections: int = Field(description="REDIS_MAX_CONNECTIONS — the bound being hit.")
+    overloads: int = Field(
+        description="Calls refused because this process could not get a connection out of its own "
+        "pool. Non-zero next to a null `degraded.since_sec` means the store is healthy and this "
+        "replica ran out of connections to it."
+    )
+    overloaded_for_sec: float | None = Field(
+        default=None, description="Seconds in the current saturation run, or null."
+    )
+
+
+class DroppedSignals(BaseModel):
+    """The two ways this payload can be incomplete, side by side.
+
+    They are unrelated failures that produce the same symptom — a chart that under-reports — so
+    they are counted separately and published together:
+
+    * :attr:`buckets` is about **this read**: buckets asked for and not pipelined, because
+      ``ANALYTICS_MAX_BUCKETS`` capped the fan-in. Recoverable by asking for a smaller window.
+    * :attr:`records` is about **the write path**, over this process's lifetime: requests that
+      were served and never made it into a bucket. Not recoverable at all — that traffic is gone
+      from every chart on this page.
+
+    The second is why this block exists. :meth:`src.analytics.AnalyticsCollector.record` swallows
+    every exception by design (it runs after the response is already on the wire, so there is
+    nothing left for a failure to usefully do), which means **a collector that has recorded nothing
+    for an hour looks exactly like one that is working**. These counters are the only place that
+    difference is visible, and they are only meaningful next to the request rate on the same
+    payload — which is the argument ``src/api/health.py`` makes for keeping them off the liveness
+    probe and publishing them here instead.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    buckets: int = Field(
+        description="Time buckets this read asked for and did not cover. Non-zero means the "
+        "window below is PARTIAL; compare `window.minutes_requested` with `minutes_covered`."
+    )
+    records: int = Field(
+        description="Requests whose analytics record was lost, since process start. "
+        "`records + records_written` is every attempt, so the ratio answers 'what fraction of my "
+        "traffic is actually on this graph?'."
+    )
+    records_written: int = Field(
+        description="Requests successfully folded into a bucket, since process start."
+    )
+    errors: int = Field(
+        description="Of the drops, how many were an exception the collector swallowed."
+    )
+    shed: int = Field(
+        description="Of the drops, how many were shed to protect the connection pool — a record "
+        "arriving while the in-flight gate was full. Rising `shed` beside a flat `errors` means "
+        "load and a limiter that is winning the contention, which is the system working as "
+        "designed rather than failing."
+    )
+    last_error: str | None = Field(
+        default=None,
+        description="repr of the most recent swallowed record exception, or null. Somewhere to "
+        "look that is not 'grep the logs of whichever replica it was'.",
+    )
+
+
+class DashboardStats(BaseModel):
+    """Body of ``GET /dashboard/api/stats`` — the measurement plus everything needed to read it.
+
+    :class:`StatsSnapshot`'s nine fields are flattened in verbatim (they are *not* nested under a
+    ``stats`` key — see the rubric above), and the envelope adds the configuration and health
+    context that turns them from numbers into a diagnosis.
+
+    .. rubric:: ``cost`` is weight ATTEMPTED. Any chart built from it is "attempted", never
+       "consumed"
+
+    Stated here as well as on :class:`StatsTotals` because this is the model a UI author reads. A
+    refused request contributes its full weight to ``totals.cost`` and **nothing** to the quota
+    counter, so this series measures demand rather than spend: during a throttling event it
+    over-reports relative to what was charged, and it will not reconcile against
+    ``GET /api/v1/admin/users/{id}/usage``'s ``daily.used``. That gap is not an error to be
+    explained away — **the difference between the two IS the throttled demand**, which is the most
+    interesting number on the page. A tile labelled "cost consumed" would be wrong.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    # -- the measurement, flattened from StatsSnapshot ------------------------------------- #
+    totals: StatsTotals = Field(
+        description="The per-minute window, folded. `cost` is weight ATTEMPTED — label any chart "
+        "built from it 'attempted', never 'consumed'; it does not reconcile against `daily.used`."
+    )
+    per_minute: list[StatsBucket] = Field(
+        default_factory=list, description="Minute series, oldest first — the live chart."
+    )
+    per_hour: list[StatsBucket] = Field(
+        default_factory=list,
+        description="Hour series, oldest first — the long-tail context line. It describes the "
+        "SAME requests at a coarser resolution and is therefore folded into nothing above.",
+    )
+    by_status: dict[str, int] = Field(
+        default_factory=dict, description="HTTP status (as a string) -> requests, minute window."
+    )
+    by_endpoint: dict[str, int] = Field(
+        default_factory=dict, description="Classified endpoint label -> requests, minute window."
+    )
+    by_tier: dict[str, int] = Field(
+        default_factory=dict, description="Tier -> requests, minute window."
+    )
+    by_outcome: dict[str, int] = Field(
+        default_factory=dict,
+        description="allowed | denied | degraded -> requests, minute window. The three partition "
+        "the traffic, so a rejection *rate* can be computed without knowing every value.",
+    )
+    top_consumers: list[TopConsumer] = Field(
+        default_factory=list,
+        description="Heaviest principals by attempted cost, highest first. **This block is the "
+        "documented hole**: it exposes user ids on an unauthenticated endpoint, and in a real "
+        "deployment it is what goes behind ADMIN_TOKEN. Approximate by construction — see "
+        "`AnalyticsCollector._rank`.",
+    )
+    window: StatsWindow = Field(
+        description="What this read actually covered, against what the caller asked for. The two "
+        "differ whenever ANALYTICS_MAX_BUCKETS truncated the fan-in, and `dropped.buckets` counts "
+        "the difference. **Plot and label the KPIs above from `minutes_start_ms`/`minutes_end_ms`, "
+        "not from `start_ms`/`end_ms`** — the latter span both series, so on the default request "
+        "they describe 24 h while every number above describes 60 minutes. See the model."
+    )
+
+    # -- configuration the measurement has to be read against ------------------------------ #
+    tiers: dict[str, TierConfig] = Field(
+        description="The tier table THIS replica is enforcing right now (its in-process snapshot, "
+        "not a fresh read of `config:tiers`) — so a chart's per-tier bars sit next to the limits "
+        "that produced them."
+    )
+    config_version: int = Field(
+        description="`config:version` behind that snapshot. 0 means no snapshot has been read "
+        "from Redis yet and the configured defaults are in force."
+    )
+    rate_limit_enabled: bool = Field(
+        description="RATE_LIMIT_ENABLED. **Mandatory, and load-bearing rather than decorative.** "
+        "With the switch off the middleware returns before it records anything, so every number "
+        "on this page is byte-identical to a service receiving no traffic — while `/health` still "
+        "reports `rate_limiter: \"active\"` and names no switch anywhere. This field is the ONLY "
+        "thing on any surface this service exposes that separates 'metering is off' from 'nobody "
+        "is calling us', and it is false during the one configuration in which the service is "
+        "also serving every request unauthenticated."
+    )
+    poll_ms: int = Field(
+        description="DASHBOARD_POLL_MS — how often the page should re-request this payload. "
+        "Served by the API so the interval has ONE source of truth rather than one in Python and "
+        "one in JavaScript."
+    )
+
+    # -- health of the machinery that produced the measurement ----------------------------- #
+    replicas: ReplicaInfo = Field(description="Which replicas this payload can name. See the model.")
+    degraded: DegradedSignals = Field(description="What is currently not working. See the model.")
+    pool: PoolSignals = Field(description="This replica's connection capacity. See the model.")
+    dropped: DroppedSignals = Field(
+        description="The two ways this payload can be incomplete. See the model."
+    )
+    buckets_read: int = Field(
+        description="Time buckets actually pipelined and folded (minutes + hours). Zero with "
+        "`degraded.stats_unavailable` true means nothing was read at all."
+    )
+
+    # -- provenance ------------------------------------------------------------------------ #
+    generated_at: int = Field(
+        description="Unix **milliseconds** at which this replica built the payload, from its own "
+        "wall clock. Deliberately a different clock from `window.start_ms`/`end_ms`, which come "
+        "from Redis's `TIME` so that every replica names the same window: the gap between the two "
+        "is this replica's skew, which is worth being able to see rather than hide."
+    )
+    served_by: str = Field(
+        description="Hostname of the replica that answered. Under C12's load balancer, polling "
+        "this endpoint and watching this value change is how you prove the fan-out is real."
+    )
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        snapshot: StatsSnapshot,
+        *,
+        tiers: Mapping[str, TierConfig],
+        config_version: int,
+        rate_limit_enabled: bool,
+        poll_ms: int,
+        replicas: ReplicaInfo,
+        degraded: DegradedSignals,
+        pool: PoolSignals,
+        dropped_records: DroppedSignals,
+        generated_at: int,
+        served_by: str,
+    ) -> DashboardStats:
+        """Flatten a measurement into the envelope. The one place the mapping is written down.
+
+        Every envelope-only field is keyword-only and required, so a future field cannot be
+        forgotten into a default that renders as a plausible zero — the failure mode this whole
+        payload is built to make impossible.
+
+        ``dropped_records`` is spelled differently from the ``dropped`` field it lands in because
+        the two ``dropped`` counts here mean different things (see :class:`DroppedSignals`), and a
+        parameter that silently accepted the snapshot's bucket count would produce a payload that
+        under-reports lost traffic as zero. The bucket half is taken from the snapshot below, which
+        is the only place it exists.
+        """
+        return cls(
+            totals=snapshot.totals,
+            per_minute=snapshot.per_minute,
+            per_hour=snapshot.per_hour,
+            by_status=snapshot.by_status,
+            by_endpoint=snapshot.by_endpoint,
+            by_tier=snapshot.by_tier,
+            by_outcome=snapshot.by_outcome,
+            top_consumers=snapshot.top_consumers,
+            window=snapshot.window,
+            tiers=dict(tiers),
+            config_version=config_version,
+            rate_limit_enabled=rate_limit_enabled,
+            poll_ms=poll_ms,
+            replicas=replicas,
+            degraded=degraded,
+            pool=pool,
+            dropped=dropped_records.model_copy(update={"buckets": snapshot.dropped}),
+            buckets_read=snapshot.buckets_read,
+            generated_at=generated_at,
+            served_by=served_by,
+        )
 
 
 class TierUpdate(BaseModel):

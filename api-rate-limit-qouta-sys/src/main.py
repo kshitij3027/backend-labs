@@ -52,6 +52,7 @@ from fastapi.responses import ORJSONResponse
 
 from src.analytics import AnalyticsCollector
 from src.api.admin import router as admin_router
+from src.api.dashboard import router as dashboard_router
 from src.api.health import router as health_router
 from src.api.protected import router as protected_router
 from src.api.protected import verify_route_pricing
@@ -426,6 +427,27 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     # route nothing charges would be asking the classifier to price the control plane.
     # =========================================================================================
     app.include_router(admin_router)
+
+    # =========================================================================================
+    # THE OBSERVABILITY SURFACE — mounted at /dashboard, OUTSIDE the versioned prefix and, like
+    # the control plane, exempt from metering.
+    #
+    #   * `/dashboard` is on `src.middleware.EXEMPT_PATH_PREFIXES`, so `/dashboard/api/stats` is
+    #     never rate limited. Same argument as the admin API's exemption, pointed the other way:
+    #     the admin surface is how you *fix* an incident, this one is how you *see* it, and a
+    #     limiter that throttles the view of itself hides the event it was built to expose.
+    #   * Unlike the control plane it is also **unauthenticated**, and that is a documented hole
+    #     rather than an omission: `top_consumers` publishes user ids to anonymous callers.
+    #     `src/api/dashboard.py`'s docstring states it in full and names `ADMIN_TOKEN` as the
+    #     remedy a real deployment would apply. It is open here because this is a demo whose
+    #     point is that `make up` plus a browser shows the limiter working.
+    #
+    # Not under `/api/v1` despite serving JSON: the versioned prefix exists so a breaking change
+    # can arrive as a new namespace, and this feed's only consumer is the page shipped in the
+    # same image. It is therefore invisible to `verify_route_pricing` below by construction —
+    # `mounted_v1_routes` is scoped to the versioned prefix — with no second exclusion list.
+    # =========================================================================================
+    app.include_router(dashboard_router)
 
     # =========================================================================================
     # THE PRICING CROSS-CHECK. Read this before deleting the line below.
