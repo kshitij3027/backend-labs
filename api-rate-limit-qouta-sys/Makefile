@@ -9,10 +9,10 @@
 
 help:
 	@echo "API Rate Limiter & Quota Manager — make targets:"
-	@echo "  build      - build all images (api + test)"
-	@echo "  up         - run Redis + the API (detached) and print the API + docs URLs"
+	@echo "  build      - build all images (api1/api2 + test)"
+	@echo "  up         - run Redis + BOTH api replicas behind the nginx load balancer (detached)"
 	@echo "  down       - stop and remove the stack"
-	@echo "  logs       - tail the API logs"
+	@echo "  logs       - tail the load balancer + both replica logs, interleaved"
 	@echo "  test       - full pytest suite in Docker, with the >=90% branch coverage gate"
 	@echo "  test-unit  - unit tests only in Docker (no coverage gate — see below)"
 	@echo "  test-int   - integration tests only in Docker (no coverage gate — see below)"
@@ -24,19 +24,37 @@ help:
 build:
 	docker compose build
 
-# Bring the stack up detached. `redis` starts implicitly via `api`'s depends_on and is waited on
-# by its own healthcheck, so the API never begins life in the degraded fail-open path. --build
-# keeps a stale image from silently serving yesterday's code.
+# Bring the stack up detached. ONE service is named — `lb` — and the whole topology follows from
+# its depends_on: nginx waits on `api1` and `api2` being *healthy*, and each of those waits on
+# Redis answering `redis-cli ping`. So the API never begins life in the degraded fail-open path,
+# and nginx never starts against an upstream name Docker's DNS cannot resolve yet (it resolves the
+# `upstream` block once, at startup, and exits rather than retrying). --build keeps a stale image
+# from silently serving yesterday's code.
+#
+# The printed URL is the LOAD BALANCER's, and it is the only way in from the host: neither replica
+# publishes a port. That is the point of C12 — the default way to use this project is the
+# distributed one, so a `curl` from the README exercises the configuration whose correctness was
+# actually in question.
+#
+# The replica count is COUNTED from the running stack rather than printed as a literal "2". It has
+# to agree with API_REPLICAS (which sizes each replica's degraded fallback bucket at
+# ceil(capacity / API_REPLICAS)), and a number that is typed in two places is a number that will
+# eventually disagree with itself — silently, and only during an outage.
 up:
-	docker compose up -d --build api
-	@echo "API:  http://localhost:$${API_PORT:-8020}  (GET /health)"
-	@echo "Docs: http://localhost:$${API_PORT:-8020}/docs"
+	docker compose up -d --build lb
+	@echo "API:      http://localhost:$${API_PORT:-8020}  (GET /health — through the load balancer)"
+	@echo "Docs:     http://localhost:$${API_PORT:-8020}/docs"
+	@echo "Replicas: $$(docker compose ps --services --status running | grep -cE '^api[0-9]+$$') behind nginx (round-robin over api1:8000, api2:8000)"
+	@echo "Proof:    for i in \$$(seq 1 20); do curl -s localhost:$${API_PORT:-8020}/health | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"served_by\"])'; done | sort | uniq -c"
 
 down:
 	docker compose down
 
+# All three, interleaved, because the interesting line is a request appearing in the LB's log with
+# an `upstream=` field and then in exactly ONE replica's log. Tailing `api1` alone shows half the
+# traffic and reads as if the service were dropping requests.
 logs:
-	docker compose logs -f api
+	docker compose logs -f lb api1 api2
 
 # Full suite + the coverage gate. Torn down with -v FIRST so a leftover container or Redis volume
 # from an interrupted run can never leak counters into the suite, then the tester image is
@@ -101,9 +119,15 @@ load:
 	@echo "make load: the perf/load harness arrives in C14 (scripts/load_test.py)."
 	@echo "           Until then, 'make test' covers the suite and 'make up' serves the API."
 
-# The dashboard is served by the SAME uvicorn process on the SAME port as the API (C15 adds
-# `GET /` and `GET /dashboard/` -> src/static/index.html). There is no second service and no
-# node image, so `ui` is exactly `up` plus the extra URL. The URL 404s until C15 lands.
+# The dashboard is served by the SAME uvicorn processes on the SAME host port as the API (C15 adds
+# `GET /` and `GET /dashboard/` -> src/static/index.html). There is no second service and no node
+# image, so `ui` is exactly `up` plus the extra URL. The URL 404s until C15 lands.
+#
+# Note for C15, since it is a consequence of this commit rather than of that one: the dashboard is
+# load balanced like everything else, so consecutive polls of `/dashboard/api/stats` land on
+# DIFFERENT replicas and the per-process counters in that payload (limiter checks, cache hit rate,
+# uptime) will alternate between two series. `served_by` in the payload is what disambiguates
+# them, and the replica fan-out strip is the feature that turns the artefact into the point.
 ui: up
 	@echo "Dashboard: http://localhost:$${API_PORT:-8020}/dashboard/  (arrives in C15)"
 

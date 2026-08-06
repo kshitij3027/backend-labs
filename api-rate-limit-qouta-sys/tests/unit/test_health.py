@@ -287,6 +287,15 @@ def test_rate_limit_headers_are_readable_cross_origin(client):
 
     CORS emits ``access-control-expose-headers`` only for a request that carries an ``Origin``, so
     one is sent here rather than assumed.
+
+    .. rubric:: C13 strengthened this test, and the reason is the whole point of the commit
+
+    ``x-served-by`` has been in the set below since C1 and **nothing emitted it** until C13 — so
+    for twelve commits this test passed while the header was advertised as readable and never
+    sent, which is the exact failure the docstring above says no Python can catch. Being on the
+    allowlist and being on the wire are two different facts, and asserting only the first is how a
+    list drifts away from a service. So the header is now also asserted **present on this very
+    response**: the set is unchanged, and one more thing is required of it.
     """
     response = client.get("/health", headers={"Origin": "http://localhost:5173"})
 
@@ -305,6 +314,10 @@ def test_rate_limit_headers_are_readable_cross_origin(client):
         "x-quota-reset",
         "retry-after",
         "x-ratelimit-degraded",
+        # Advertised from C1, EMITTED from C13 by `src.middleware.ServedByMiddleware`. C13's
+        # distributed double-spend check reads it off a burst of metered responses
+        # (`len({X-Served-By}) >= 2`), which is what stops that check passing trivially against a
+        # single replica; `/health` is the path it probes through the load balancer.
         "x-served-by",
         # Added at C6, when RateLimitMiddleware became the first thing to emit it. It is not
         # CORS-safelisted, so without it a browser client that got a 401 could read the status
@@ -312,6 +325,11 @@ def test_rate_limit_headers_are_readable_cross_origin(client):
         # scheme at all. Changing this set is meant to take a deliberate edit; this is one.
         "www-authenticate",
     }
+
+    # Exposed AND sent. `/health` is unmetered, so this response carries none of the other nine —
+    # which is exactly why it is the one that would have gone on passing forever with an
+    # allowlist naming a header no code produced.
+    assert response.headers["X-Served-By"] == SERVED_BY
 
 
 def test_runtime_uptime_is_monotonic_and_non_negative(settings):

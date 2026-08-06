@@ -42,10 +42,11 @@ from fastapi import FastAPI, Request
 from starlette.responses import PlainTextResponse
 from starlette.routing import Route
 
+from src.api.health import SERVED_BY
 from src.config import Settings
 from src.identity import DEMO_KEY_BY_TIER, WWW_AUTHENTICATE
 from src.main import EXPOSE_HEADERS, Runtime, create_app
-from src.middleware import JSON_CONTENT_TYPE, SCOPE_DECISION_KEY
+from src.middleware import JSON_CONTENT_TYPE, SCOPE_DECISION_KEY, SERVED_BY_HEADER
 from src.models import ERROR_RATE_LIMIT, Tier
 
 #: An origin that is not this app's, so CORS has something to answer about. The shipped
@@ -527,6 +528,151 @@ async def test_a_preflight_is_answered_by_cors_and_never_charged(api: httpx.Asyn
 
     follow_up = await api.get("/api/v1/whoami", headers=key_headers(Tier.FREE))
     assert int(follow_up.headers["X-RateLimit-Remaining"]) == FREE_TIER_RPM - 1
+
+
+# =============================================================================================
+# X-Served-By — replica attribution, through the real stack
+#
+# `tests/unit/test_served_by.py` proves the ASGI mechanics and walks every terminal path against
+# stubs. What it cannot prove is the thing C13 depends on: that the header survives the *real*
+# assembled stack — a real identity resolver, a real limiter running the real Lua script, a real
+# CORS wrapper — on responses this process genuinely produced. That is what these do.
+# =============================================================================================
+
+
+async def test_served_by_is_on_the_200_the_429_and_the_401_alike(api: httpx.AsyncClient):
+    """**The property C13's distributed double-spend check is built on.**
+
+    That check fires a burst at a metered route and asserts ``len({X-Served-By}) >= 2`` — which is
+    what stops it passing trivially against a single replica and letting the bug this whole project
+    exists to catch go undetected. A burst that exhausts a tier is mostly 429s, and an
+    unauthenticated probe in the middle of one is a 401, so a header present only on the 200 would
+    leave the assertion reading a fraction of the responses it thinks it is reading.
+
+    All three are asserted in one test on purpose: they are three *different writers* (the app's
+    own response, the limiter's hand-written short-circuit, and the limiter's 401) and the claim is
+    that the replica is named regardless of which one answered.
+    """
+    admitted = await api.get("/api/v1/whoami", headers=key_headers(Tier.FREE))
+    anonymous = await api.get("/api/v1/whoami")
+    refused = await _drain_free_tier(api)
+
+    assert [admitted.status_code, anonymous.status_code, refused.status_code] == [200, 401, 429]
+    for response in (admitted, anonymous, refused):
+        assert response.headers[SERVED_BY_HEADER] == SERVED_BY
+
+    # One notion of replica identity, not two: the same string `/health` has published in its body
+    # since C12, which is what makes the two observations of "who answered?" comparable at all.
+    probe = await api.get("/health")
+    assert probe.json()["served_by"] == SERVED_BY
+    assert probe.headers[SERVED_BY_HEADER] == SERVED_BY
+
+
+async def test_served_by_is_never_emitted_twice(api: httpx.AsyncClient):
+    """One header, one value, on every shape of response this stack can produce.
+
+    Two contradictory values is worse than either alone — a client takes whichever its parser
+    reaches first — and it is the specific failure `nginx/nginx.conf` avoids by refusing to
+    synthesise this header from `$upstream_addr` now that the app emits its own.
+
+    ``httpx`` joins repeated headers with ``", "``, so a duplicate would be visible in the value as
+    well as in ``get_list``; both are checked because the two catch different mistakes.
+    """
+    for response in (
+        await api.get("/api/v1/whoami", headers=key_headers(Tier.FREE)),
+        await api.get("/health"),
+        await api.get("/docs"),
+        await api.get("/dashboard/api/stats"),
+        await api.get("/nope", headers=key_headers(Tier.FREE)),
+        await api.get("/api/v1/whoami"),
+    ):
+        assert response.headers.get_list(SERVED_BY_HEADER) == [SERVED_BY]
+
+
+async def test_the_exempt_probe_names_its_replica_and_still_advertises_no_limit(
+    api: httpx.AsyncClient,
+):
+    """C13 probes `/health` through the load balancer, so the exempt path genuinely matters.
+
+    And the exemption itself is unchanged, which is the other half of this assertion: the limiter's
+    exempt branch returns before a principal is resolved, before the script runs and before any
+    `send` wrapper is installed, so the probe still carries **no** `X-RateLimit-*`, no `X-Quota-*`
+    and no `Retry-After`. The only thing that is new on this response is the replica's name.
+    """
+    probe = await api.get("/health")
+
+    assert probe.status_code == 200
+    assert probe.headers[SERVED_BY_HEADER] == SERVED_BY
+    assert not [n for n in probe.headers if n.lower().startswith("x-ratelimit-")]
+    assert not [n for n in probe.headers if n.lower().startswith("x-quota-")]
+    assert "Retry-After" not in probe.headers
+
+
+async def test_a_browser_may_read_served_by_on_a_real_429(api: httpx.AsyncClient):
+    """Sent **and** exposed, on the response a dashboard is most likely to be looking at.
+
+    `ServedByMiddleware` runs outside `CORSMiddleware`, so the stamp is applied after CORS has
+    finished with the message — safe, because CORS only adds headers on the way out. But being
+    outside CORS buys nothing for readability: a cross-origin `fetch` may read a non-safelisted
+    header only if `Access-Control-Expose-Headers` names it, and that list comes from
+    `EXPOSE_HEADERS`. Both facts, one response.
+    """
+    headers = {**key_headers(Tier.FREE), "Origin": BROWSER_ORIGIN}
+    for _ in range(FREE_TIER_RPM + 5):
+        response = await api.get("/api/v1/whoami", headers=headers)
+        if response.status_code == 429:
+            break
+    else:  # pragma: no cover - only reachable if the limiter stopped enforcing
+        raise AssertionError("the free tier was never refused")
+
+    assert SERVED_BY_HEADER.lower() in _exposed(response)
+    assert response.headers[SERVED_BY_HEADER] == SERVED_BY
+
+
+async def test_a_handler_that_raises_still_names_its_replica(limited_app: FastAPI):
+    """**The 500 that is written outside every middleware `add_middleware` can register.**
+
+    An unhandled handler exception propagates past the limiter and past CORS to
+    `ServerErrorMiddleware`, which writes its 500 through the `send` *it* was handed and then
+    re-raises. Nothing inside the user-middleware stack is on that response's path — which is why
+    `ServedByMiddleware` is wrapped around `build_middleware_stack()` instead, and why this is the
+    test that would fail if somebody "simplified" it back into `RateLimitMiddleware`.
+
+    Driven with a fresh transport rather than the `api` fixture because
+    `httpx.ASGITransport(raise_app_exceptions=False)` is what lets the 500 be *read* instead of
+    re-raised into the test — the same knob `TestClient(raise_server_exceptions=False)` turns.
+
+    .. rubric:: The absent rate-limit headers are the measurement, not an oversight
+
+    This 500 carries **no** `X-RateLimit-*` at all, and that is not a bug being tolerated — it is
+    the bypass being observed directly. The limiter's `send` wrapper is the thing that appends
+    those headers, and it was never called for this response, for exactly the reason above. So the
+    same response demonstrates both halves at once: a header written from inside the stack is
+    missing, and the one written from outside it is present. The metering itself still happened —
+    proved below by the allowance the follow-up request reports, read from Redis rather than from
+    a header this response could not carry.
+    """
+
+    async def boom(request: Request) -> PlainTextResponse:
+        raise RuntimeError("the handler blew up")
+
+    limited_app.router.routes.append(Route("/boom", boom, methods=["GET"]))
+
+    transport = httpx.ASGITransport(app=limited_app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        response = await client.get("/boom", headers=key_headers(Tier.FREE))
+        follow_up = await client.get("/api/v1/whoami", headers=key_headers(Tier.FREE))
+
+    assert response.status_code == 500
+    assert response.headers[SERVED_BY_HEADER] == SERVED_BY
+    assert not [n for n in response.headers if n.lower().startswith("x-ratelimit-")]
+
+    # `/boom` classifies as `other` and costs 1, so the account-wide window has been charged twice
+    # by the time the follow-up answers: once for the request that 500'd, once for itself. The
+    # handler raising did not un-meter it.
+    assert follow_up.status_code == 200
+    assert int(follow_up.headers["X-RateLimit-Remaining"]) == FREE_TIER_RPM - 2
+    assert follow_up.headers[SERVED_BY_HEADER] == SERVED_BY
 
 
 # =============================================================================================

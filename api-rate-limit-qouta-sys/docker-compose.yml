@@ -1,9 +1,10 @@
-# API Rate Limiter & Quota Manager — service topology (Commit C1).
+# API Rate Limiter & Quota Manager — service topology (Commit C12).
 #
-# Two services today: `redis` (the shared store) and `api` (one uvicorn/FastAPI process on
-# :8000). C12 splits `api` into `api1` + `api2` behind an nginx `lb`; nothing else about the
-# topology changes, because the reason there are two services rather than one is already true
-# here.
+# Four services now: `redis` (the shared store), `api1` + `api2` (two byte-identical uvicorn
+# processes, neither published on the host) and `lb` (nginx, round-robining between them and
+# owning the only host port). C1 shipped a single `api` and said this split was coming; nothing
+# else about the topology changed to accommodate it, because the reason there were two services
+# rather than one was already true then.
 #
 # .. rubric:: Why Redis is its own service, and not a dict in the app
 #
@@ -17,14 +18,151 @@
 # with a fast system clock cannot refill its own bucket early. Redis being a separate container
 # is what makes that property visible and testable rather than merely intended.
 #
+# As of this commit that sentence is no longer hypothetical: `api1` and `api2` are two real
+# processes with two real connection pools, and `for i in $(seq 1 20); do curl -s
+# localhost:8020/health; done | ...` returns TWO distinct `served_by` hostnames. Every claim in
+# the paragraph above is now falsifiable from a shell loop rather than only from a unit test.
+#
 # The profile-gated `test` service runs the pytest suite from Dockerfile.test; C13/C14 add `e2e`
 # and `loadtest` services from the same image. None of them starts on a bare `docker compose up`.
-# The harnesses reach the API by SERVICE NAME over the compose network (http://api:8000), never
-# via a published host port, so they are immune to an API_PORT collision on the host.
+# The harnesses reach the API by SERVICE NAME over the compose network (http://lb:80, with
+# http://api1:8000 as C13's single-replica control), never via a published host port, so they are
+# immune to an API_PORT collision on the host.
 #
-# Every one of the 29 Settings fields is passed to `api` as ${VAR:-default}, including the ones
-# no code reads until C4-C14. That is deliberate: the whole config surface is host-overridable
-# from day one and this file never has to change again as later commits start reading those keys.
+# Every one of the 29 Settings fields is passed to both replicas as ${VAR:-default}, including the
+# ones no code reads until C13-C15. That is deliberate: the whole config surface is
+# host-overridable from day one and this file never has to change again as later commits start
+# reading those keys.
+
+# ---------------------------------------------------------------------------------------------
+# The replica template.
+#
+# `api1` and `api2` are the SAME service twice, and the anchor is what makes that a structural
+# fact rather than two blocks a reviewer has to diff by eye. The environment block in particular
+# must be identical across replicas or the system stops being one system:
+#
+#   * A different API_KEY_PEPPER per replica means the same API key hashes to a different digest
+#     on each, so a caller authenticates against api1 and gets a 401 from api2 — identity would
+#     become replica-dependent, which is indistinguishable from an intermittent auth outage.
+#   * A different JWT_SECRET means a token minted for one replica is a forgery to the other.
+#   * A different ADMIN_TOKEN means the control plane answers only half the time.
+#   * A different TIER_LIMITS means the two replicas seed and enforce different ceilings, so the
+#     answer to "what is this caller's limit?" depends on which one the LB picked.
+#
+# YAML merge keys (`<<: *api`) rather than `deploy: replicas: 2`, because C13's double-spend check
+# needs to address ONE replica directly as its single-replica control, and `deploy.replicas`
+# produces compose-generated names nothing can address stably.
+# ---------------------------------------------------------------------------------------------
+x-api: &api
+  build:
+    context: .
+    dockerfile: Dockerfile
+  # An operator-supplied .env is optional: `required: false` keeps a clean clone runnable.
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    # --- Server / logging ---
+    - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+    # --- Shared state (C2) ---
+    - "REDIS_URL=${REDIS_URL:-redis://redis:6379/0}"
+    - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-32}
+    # 250 ms, on BOTH connect and socket read. The rate-limit check has a 5 ms budget, so a
+    # Redis that has stopped answering must be classified as failed in milliseconds, not
+    # seconds — a limiter that hangs is worse for the caller than one that fails open.
+    - REDIS_TIMEOUT_MS=${REDIS_TIMEOUT_MS:-250}
+
+    # --- Secrets (C5, C10) ---
+    # Dev-only values — NOT secrets, and deliberately not any of the placeholder strings
+    # Settings rejects, so `make up` works on a clean clone with no .env at all. Override via
+    # .env or the shell (`JWT_SECRET=$(openssl rand -hex 32)`) for anything not a laptop.
+    #
+    # Every one of these resolves ONCE, here in the anchor, so both replicas necessarily get the
+    # same value — see the rubric above for what each divergence would break.
+    - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-signing-key-0123456789abcdef}
+    - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+    - ACCESS_TOKEN_TTL_MIN=${ACCESS_TOKEN_TTL_MIN:-30}
+    # The pepper for the HMAC-SHA256 API-key digests. It lives HERE, in the app's environment,
+    # and never in Redis — so a stolen Redis dump on its own yields digests an attacker cannot
+    # invert into usable keys. Rotating it invalidates every stored key by construction.
+    - API_KEY_PEPPER=${API_KEY_PEPPER:-dev-only-insecure-pepper-0123456789abcdef}
+    - ADMIN_TOKEN=${ADMIN_TOKEN:-dev-only-insecure-admin-token-0123456789abcdef}
+
+    # --- Limits and quotas (C3, C4) ---
+    - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
+    # Quoted: the value is `tier:rpm:burst:daily:monthly,...` and YAML would otherwise have to
+    # be trusted with a string full of colons.
+    - "TIER_LIMITS=${TIER_LIMITS:-free:60:60:1000:25000,premium:300:300:50000:1250000,enterprise:1000:1000:500000:12500000}"
+    - DEFAULT_TIER=${DEFAULT_TIER:-free}
+    # Weighted per-request cost by endpoint category (the in-scope bonus). Quoted for the
+    # same reason as TIER_LIMITS.
+    - "ENDPOINT_COSTS=${ENDPOINT_COSTS:-logs_query:5,logs_ingest:2,default:1}"
+    - BUCKET_TTL_SEC=${BUCKET_TTL_SEC:-3600}
+    - SLIDING_WINDOW_SEC=${SLIDING_WINDOW_SEC:-60}
+    - SLIDING_WINDOW_ENABLED=${SLIDING_WINDOW_ENABLED:-true}
+    - QUOTA_DAILY_ENABLED=${QUOTA_DAILY_ENABLED:-true}
+    - QUOTA_MONTHLY_ENABLED=${QUOTA_MONTHLY_ENABLED:-true}
+    # The bound on how long a tier DEFINITION change takes to reach the replica that did not
+    # serve the write. `PUT /admin/users/{id}/tier` has no such bound — who is on which tier is
+    # read inside the Lua script on every request — and the two-replica integration test asserts
+    # exactly that asymmetry.
+    - TIER_CACHE_TTL_SEC=${TIER_CACHE_TTL_SEC:-5}
+
+    # --- Analytics (C9, C11) ---
+    - ANALYTICS_MINUTE_TTL_SEC=${ANALYTICS_MINUTE_TTL_SEC:-3600}
+    - ANALYTICS_HOUR_TTL_SEC=${ANALYTICS_HOUR_TTL_SEC:-604800}
+    - ANALYTICS_MAX_BUCKETS=${ANALYTICS_MAX_BUCKETS:-120}
+
+    # --- Degradation (C8) ---
+    - FAIL_MODE=${FAIL_MODE:-open}
+    # Sizes the degraded fallback bucket at ceil(tier_capacity / API_REPLICAS). It must track
+    # the number of `api*` services below — there are exactly TWO as of this commit, and adding a
+    # third without changing this number would give the three of them 3 x ceil(cap/2) between them
+    # during an outage: the N-times overspend this project exists to prevent, arriving through a
+    # config value nobody re-read.
+    - API_REPLICAS=${API_REPLICAS:-2}
+    - BREAKER_FAILURES=${BREAKER_FAILURES:-5}
+    - BREAKER_COOLDOWN_SEC=${BREAKER_COOLDOWN_SEC:-5}
+
+    # --- Test-only seam, inert in production (C4) ---
+    # Gates the Lua script's `now_ms_override` ARGV. Default false, and it stays false here:
+    # a caller-supplied clock is precisely the skew vulnerability the design removed, so it
+    # must be inert by construction outside the tests that need a frozen clock.
+    - ALLOW_CLOCK_OVERRIDE=${ALLOW_CLOCK_OVERRIDE:-false}
+
+    # --- Dashboard (C15) ---
+    - DASHBOARD_POLL_MS=${DASHBOARD_POLL_MS:-5000}
+
+    # --- CORS ---
+    - CORS_ORIGINS=${CORS_ORIGINS:-*}
+  depends_on:
+    # Wait for `redis-cli ping`, not merely for the container to exist. Starting the API
+    # against a Redis that is not answering yet would make the first seconds of every `make up`
+    # run in the degraded fail-open path — i.e. unmetered — which is exactly the state this
+    # project is built to make visible rather than accidental.
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    # /health is dependency-proof, unauthenticated and never metered, so the app is healthy as
+    # soon as uvicorn binds; 20s covers pool construction without flapping the container.
+    #
+    # "never metered" is load bearing for the whole topology and is the property the LB config is
+    # written around: this probe carries no credential, so if a proxy prefix ever made `/health`
+    # miss the middleware's exempt list, this line would start collecting 401s and compose would
+    # restart two replicas that are serving perfectly. See nginx/nginx.conf.
+    start_period: 20s
+  # Trade-off, accepted deliberately: a FATAL config error (e.g. a placeholder JWT_SECRET,
+  # which Settings rejects at import) restart-loops here rather than stopping once — compose
+  # cannot distinguish "crashed transiently" from "will never start". The refusal contract
+  # still holds (the container never serves a request with a bad key, and `docker compose up`
+  # surfaces `exited with code 1` on every cycle), and auto-recovery from transient crashes is
+  # worth more day to day than a clean exit on a misconfiguration you see immediately anyway.
+  restart: unless-stopped
 
 services:
   # Shared state. ONE bucket, ONE quota counter, ONE clock, for however many API replicas exist.
@@ -40,7 +178,7 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     healthcheck:
       # `redis-cli ping` rather than a TCP port probe: the port is listening well before the
-      # server is ready to answer commands, and `api`'s depends_on below waits on THIS.
+      # server is ready to answer commands, and the replicas' depends_on below waits on THIS.
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
@@ -50,113 +188,73 @@ services:
     volumes:
       - redis-data:/data
 
-  # Live production API — built from the production Dockerfile and the only service exposed on
-  # the host. No container_name (sibling convention: leaves compose free to name/scale it, which
-  # C12 relies on).
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    # An operator-supplied .env is optional: `required: false` keeps a clean clone runnable.
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      # --- Server / logging ---
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+  # Replica 1. Identical to `api2` in every respect except its name — see the `x-api` anchor.
+  #
+  # No `ports:`. NEITHER replica publishes a host port, and that is the point of this commit
+  # rather than tidiness: a published port on `api1` would let a developer (or a benchmark, or a
+  # `curl` in a README) address one replica directly and conclude the limiter works, having
+  # exercised exactly the single-process configuration whose correctness was never in doubt. The
+  # only way in from the host is through the LB, so the default way to use this project is the
+  # distributed one.
+  #
+  # `api1` is still reachable BY NAME over the compose network (`http://api1:8000`), which is what
+  # C13 uses for its single-replica control — deliberately from inside the network, where only the
+  # harness can go.
+  api1:
+    <<: *api
 
-      # --- Shared state (C2) ---
-      - "REDIS_URL=${REDIS_URL:-redis://redis:6379/0}"
-      - REDIS_MAX_CONNECTIONS=${REDIS_MAX_CONNECTIONS:-32}
-      # 250 ms, on BOTH connect and socket read. The rate-limit check has a 5 ms budget, so a
-      # Redis that has stopped answering must be classified as failed in milliseconds, not
-      # seconds — a limiter that hangs is worse for the caller than one that fails open.
-      - REDIS_TIMEOUT_MS=${REDIS_TIMEOUT_MS:-250}
+  # Replica 2. Same image, same environment, same everything. If these two blocks ever stop being
+  # a merge key each, that is the bug.
+  api2:
+    <<: *api
 
-      # --- Secrets (C5, C10) ---
-      # Dev-only values — NOT secrets, and deliberately not any of the placeholder strings
-      # Settings rejects, so `make up` works on a clean clone with no .env at all. Override via
-      # .env or the shell (`JWT_SECRET=$(openssl rand -hex 32)`) for anything not a laptop.
-      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-signing-key-0123456789abcdef}
-      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
-      - ACCESS_TOKEN_TTL_MIN=${ACCESS_TOKEN_TTL_MIN:-30}
-      # The pepper for the HMAC-SHA256 API-key digests. It lives HERE, in the app's environment,
-      # and never in Redis — so a stolen Redis dump on its own yields digests an attacker cannot
-      # invert into usable keys. Rotating it invalidates every stored key by construction.
-      - API_KEY_PEPPER=${API_KEY_PEPPER:-dev-only-insecure-pepper-0123456789abcdef}
-      - ADMIN_TOKEN=${ADMIN_TOKEN:-dev-only-insecure-admin-token-0123456789abcdef}
-
-      # --- Limits and quotas (C3, C4) ---
-      - RATE_LIMIT_ENABLED=${RATE_LIMIT_ENABLED:-true}
-      # Quoted: the value is `tier:rpm:burst:daily:monthly,...` and YAML would otherwise have to
-      # be trusted with a string full of colons.
-      - "TIER_LIMITS=${TIER_LIMITS:-free:60:60:1000:25000,premium:300:300:50000:1250000,enterprise:1000:1000:500000:12500000}"
-      - DEFAULT_TIER=${DEFAULT_TIER:-free}
-      # Weighted per-request cost by endpoint category (the in-scope bonus). Quoted for the
-      # same reason as TIER_LIMITS.
-      - "ENDPOINT_COSTS=${ENDPOINT_COSTS:-logs_query:5,logs_ingest:2,default:1}"
-      - BUCKET_TTL_SEC=${BUCKET_TTL_SEC:-3600}
-      - SLIDING_WINDOW_SEC=${SLIDING_WINDOW_SEC:-60}
-      - SLIDING_WINDOW_ENABLED=${SLIDING_WINDOW_ENABLED:-true}
-      - QUOTA_DAILY_ENABLED=${QUOTA_DAILY_ENABLED:-true}
-      - QUOTA_MONTHLY_ENABLED=${QUOTA_MONTHLY_ENABLED:-true}
-      - TIER_CACHE_TTL_SEC=${TIER_CACHE_TTL_SEC:-5}
-
-      # --- Analytics (C9, C11) ---
-      - ANALYTICS_MINUTE_TTL_SEC=${ANALYTICS_MINUTE_TTL_SEC:-3600}
-      - ANALYTICS_HOUR_TTL_SEC=${ANALYTICS_HOUR_TTL_SEC:-604800}
-      - ANALYTICS_MAX_BUCKETS=${ANALYTICS_MAX_BUCKETS:-120}
-
-      # --- Degradation (C8) ---
-      - FAIL_MODE=${FAIL_MODE:-open}
-      # Sizes the degraded fallback bucket at ceil(tier_capacity / API_REPLICAS). It must track
-      # the number of `api*` services below: N replicas each holding a FULL local bucket is the
-      # N-times overspend this project exists to prevent, so a wrong value here is not cosmetic.
-      - API_REPLICAS=${API_REPLICAS:-2}
-      - BREAKER_FAILURES=${BREAKER_FAILURES:-5}
-      - BREAKER_COOLDOWN_SEC=${BREAKER_COOLDOWN_SEC:-5}
-
-      # --- Test-only seam, inert in production (C4) ---
-      # Gates the Lua script's `now_ms_override` ARGV. Default false, and it stays false here:
-      # a caller-supplied clock is precisely the skew vulnerability the design removed, so it
-      # must be inert by construction outside the tests that need a frozen clock.
-      - ALLOW_CLOCK_OVERRIDE=${ALLOW_CLOCK_OVERRIDE:-false}
-
-      # --- Dashboard (C15) ---
-      - DASHBOARD_POLL_MS=${DASHBOARD_POLL_MS:-5000}
-
-      # --- CORS ---
-      - CORS_ORIGINS=${CORS_ORIGINS:-*}
-    depends_on:
-      # Wait for `redis-cli ping`, not merely for the container to exist. Starting the API
-      # against a Redis that is not answering yet would make the first seconds of every `make up`
-      # run in the degraded fail-open path — i.e. unmetered — which is exactly the state this
-      # project is built to make visible rather than accidental.
-      redis:
-        condition: service_healthy
-    # The container always binds :8000; only the host side is tunable. 8020 because sibling
-    # projects in this repo already hold 8000/8001/8010/8080.
+  # The load balancer, and the only service on a host port.
+  #
+  # Round-robin over api1:8000 and api2:8000. `nginx:alpine` with the config bind-mounted
+  # read-only rather than baked into an image: there is no build step for a 150-line text file,
+  # and mounting it means `make up` after an edit re-reads it without a rebuild.
+  lb:
+    image: nginx:alpine
+    volumes:
+      # Read-only, and mounted OVER the stock nginx.conf rather than dropped into conf.d/. The
+      # file is therefore the complete configuration (it carries its own `events`/`http` blocks),
+      # which also stops the image's default `conf.d/default.conf` welcome page from binding :80.
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    # 8020 because sibling projects in this repo already hold 8000/8001/8010/8080. The container
+    # side is nginx's :80; the replicas' :8000 is now an internal detail nothing on the host sees.
     ports:
-      - "${API_PORT:-8020}:8000"
+      - "${API_PORT:-8020}:80"
+    depends_on:
+      # BOTH replicas, and `service_healthy` rather than `service_started`. nginx resolves the
+      # names in its `upstream` block ONCE, at startup, and exits with "host not found in
+      # upstream" if either is missing — it does not start and retry. Waiting on the healthcheck
+      # rather than on container creation also means the first request through the LB cannot land
+      # on a process that has not finished building its Redis pool.
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      # busybox `wget`, because nginx:alpine has NO curl — the production image installs it, this
+      # one does not, and a `CMD curl` here would fail with "executable file not found" on every
+      # probe and mark a perfectly healthy LB unhealthy forever.
+      #
+      # The probe goes through the proxy to a real replica rather than to a local stub, so "lb is
+      # healthy" means "the LB can reach at least one replica", which is the only reading worth
+      # having. One dead replica does not fail it: `proxy_next_upstream error timeout` moves the
+      # probe to the sibling.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/health"]
       interval: 10s
       timeout: 5s
       retries: 5
-      # /health is dependency-free, unauthenticated and never metered, so the app is healthy as
-      # soon as uvicorn binds; 20s covers pool construction without flapping the container.
-      start_period: 20s
-    # Trade-off, accepted deliberately: a FATAL config error (e.g. a placeholder JWT_SECRET,
-    # which Settings rejects at import) restart-loops here rather than stopping once — compose
-    # cannot distinguish "crashed transiently" from "will never start". The refusal contract
-    # still holds (the container never serves a request with a bad key, and `docker compose up`
-    # surfaces `exited with code 1` on every cycle), and auto-recovery from transient crashes is
-    # worth more day to day than a clean exit on a misconfiguration you see immediately anyway.
+      # Short, because `depends_on` already waited for both replicas: by the time this container
+      # exists there is something behind it to answer.
+      start_period: 5s
     restart: unless-stopped
 
   # Unit + integration suite. Builds the tester image (Dockerfile.test ships the same code and
-  # requirements as `api`, plus tests/ and the two config files) and runs pytest. Profile-gated
-  # so it never starts on a bare `docker compose up`. Run via `make test`.
+  # requirements as the replicas, plus tests/ + scripts/ and the two config files) and runs
+  # pytest. Profile-gated so it never starts on a bare `docker compose up`. Run via `make test`.
   #
   # It waits on Redis because from C2 the integration suite asserts gateway and (from C4) Lua
   # behaviour against a REAL redis:7-alpine rather than against fakeredis. fakeredis is a
@@ -164,6 +262,12 @@ services:
   # precisely the wrong oracle for a script whose entire job is exactness. The NOSCRIPT-recovery
   # test in tests/integration/test_redis_gateway.py is the concrete example: it issues a real
   # `SCRIPT FLUSH` and re-runs, which only means anything against a real script cache.
+  #
+  # It deliberately does NOT depend on `lb`, `api1` or `api2`. The suite builds its apps in-process
+  # through `httpx.ASGITransport` — including C12's two-replica test, which constructs two apps
+  # with two gateways and two pools against this same Redis — so the only container it needs is
+  # the store. Booting the live stack to run unit tests would make `make test` slower and would
+  # couple a green suite to a healthy proxy.
   #
   # REDIS_URL is the ONE variable the suite needs from compose: tests/integration/conftest.py
   # reads it (defaulting to this same value) to point its gateway fixture at this service.

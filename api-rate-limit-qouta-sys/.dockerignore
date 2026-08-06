@@ -2,13 +2,21 @@
 # copies only src/ (+ requirements.txt) and Dockerfile.test additionally copies tests/ +
 # scripts/ + pytest.ini + .coveragerc, so most of this is belt-and-braces.
 #
-# Three things are deliberately NOT ignored, and each has bitten a build somewhere:
+# Two things are deliberately NOT ignored, and each has bitten a build somewhere:
 #   * tests/ and scripts/  — the tester image needs them in its build context.
 #   * .coveragerc          — it is COPYed into the tester image; ignoring it would silently
 #                            fall back to coverage.py's defaults and measure the wrong tree.
-#   * nginx/               — C12's load-balancer config is bind-mounted from the build context.
 # Patterns below are listed by name rather than as `*.md` so adding a doc never accidentally
 # knocks one of the above out of the context.
+#
+# nginx/ is not listed here at all, and the correction is worth making explicitly because C1's
+# version of this comment claimed it was exempted "because the load-balancer config is bind-mounted
+# from the build context". It is not: `.dockerignore` filters what is sent to the DAEMON for a
+# build, and the `lb` service runs the stock `nginx:alpine` image with no build stanza whatsoever.
+# `./nginx/nginx.conf:/etc/nginx/nginx.conf:ro` is a bind mount read from the host filesystem at
+# container start, which this file cannot affect in either direction. So there is nothing to
+# exempt and nothing to add — and it stays out of both images' contexts, which is correct: the
+# production image COPYs only src/ and would never use it.
 
 # VCS / planning docs
 .git

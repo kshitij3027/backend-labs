@@ -184,6 +184,14 @@ saturated connection pool in *either* mode, it is a refusal carrying
 limit", and a client library will treat it as a signal about *its own* behaviour. This caller is
 not over any limit; we were unable to find out. A 503 says that, and it says it in the one status
 code every HTTP client already understands as "the server, not you".
+
+.. rubric:: There is a SECOND middleware in this module, and it deliberately owns nothing else
+
+:class:`ServedByMiddleware` stamps ``X-Served-By: <hostname>`` and does not read a header, resolve
+a principal, touch Redis or look at a path. It is a separate class rather than four lines inside
+:class:`RateLimitMiddleware` because it has to run somewhere the limiter cannot: **outside
+``ServerErrorMiddleware``**, so the 500 that middleware writes for a handler that raised carries
+the header too. See that class for the full argument and for the ordering interaction with CORS.
 """
 
 from __future__ import annotations
@@ -198,6 +206,7 @@ from starlette.routing import get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from src.analytics import ANONYMOUS_USER_ID, UNKNOWN_TIER, AnalyticsCollector
+from src.api.health import SERVED_BY
 from src.config import DEFAULT_COST_CATEGORY, Settings
 from src.identity import ACCEPTED_SCHEMES, WWW_AUTHENTICATE, IdentityResolver
 from src.keys import classify
@@ -223,6 +232,7 @@ __all__ = [
     "RateLimitMiddleware",
     "SCOPE_DECISION_KEY",
     "SCOPE_ENDPOINT_KEY",
+    "SERVED_BY_HEADER",
     "SERVICE_UNAVAILABLE_ERROR",
     "STATUS_INTERNAL_SERVER_ERROR",
     "STATUS_SERVICE_UNAVAILABLE",
@@ -231,6 +241,7 @@ __all__ = [
     "UNAUTHORIZED_DETAIL",
     "UNAUTHORIZED_ERROR",
     "WWW_AUTHENTICATE_HEADER",
+    "ServedByMiddleware",
     "is_exempt",
 ]
 
@@ -1146,3 +1157,136 @@ class RateLimitMiddleware:
             tier=tier,
             cost=cost,
         )
+
+
+# ---------------------------------------------------------------------------------------------
+# C13 — X-Served-By: which replica answered
+# ---------------------------------------------------------------------------------------------
+
+#: The header name, in the display spelling :data:`src.main.EXPOSE_HEADERS` advertises. That list
+#: has named it since C1; until now **nothing emitted it**, so it was advertised as readable and
+#: never sent — the browser-only failure mode :func:`src.main.create_app`'s CORS comment describes,
+#: reached from the other end.
+SERVED_BY_HEADER: Final = "X-Served-By"
+
+#: Lower-case **bytes**, because that is what an ASGI ``http.response.start`` message carries. The
+#: same rule (and the same pre-encoding) as :data:`_RAW_CONTENT_TYPE` above: a ``str`` here does not
+#: raise, it produces a header the server may drop or mangle depending on which server it is.
+_RAW_SERVED_BY_HEADER: Final[bytes] = SERVED_BY_HEADER.lower().encode("latin-1")
+
+#: Encoded **once at import**, from :data:`src.api.health.SERVED_BY` — the single notion of "which
+#: replica am I" in this process. Deliberately not a second :func:`socket.gethostname` call: two
+#: independent answers to that question is exactly the drift this project keeps finding, and it
+#: would be invisible until the day the two disagreed.
+#:
+#: ``errors="replace"`` because this value comes from the OS rather than from this repository. Every
+#: real hostname is ASCII (and under compose it is a container id), but a host configured with a
+#: non-latin-1 name would otherwise raise ``UnicodeEncodeError`` **at import**, i.e. the replica
+#: would fail to boot because it could not spell its own name in a header.
+_RAW_SERVED_BY_VALUE: Final[bytes] = SERVED_BY.encode("latin-1", "replace")
+
+
+class ServedByMiddleware:
+    """Stamp ``X-Served-By: <hostname>`` on every HTTP response this process writes.
+
+    Six lines of behaviour, and every one of the decisions below is about *where* it runs rather
+    than about what it does.
+
+    .. rubric:: Why this is not four lines inside :class:`RateLimitMiddleware`
+
+    The limiter would cover most of it — its ``send`` wrapper already appends headers on
+    ``http.response.start``, and the exempt branch could be given one too. It cannot cover the
+    path that matters most for C13's fail-safety: **a handler (or the limiter itself) that
+    raised.** That exception propagates past every user middleware to
+    ``ServerErrorMiddleware``, which is registered *outside* all of them and writes its 500 with
+    the ``send`` **it** was handed — so a wrapper installed anywhere inside it is simply not on
+    that response's path. The one 5xx an operator most wants attributed to a replica would be the
+    one response with no replica on it.
+
+    So this runs outside the whole stack. :func:`src.main.create_app` wraps it around
+    ``build_middleware_stack()`` rather than registering it with ``add_middleware``, which can
+    only ever place a middleware *inside* ``ServerErrorMiddleware``. The consequence is that this
+    class sees every ``http.response.start`` the application can produce — the limiter's 429, its
+    401, both 503s, an exempt ``/health``, a CORS preflight, a router 404, and
+    ``ServerErrorMiddleware``'s 500 — with no per-path branch to keep in sync with
+    :data:`EXEMPT_EXACT_PATHS`.
+
+    Keeping it a separate class rather than folding it into the limiter also preserves the
+    property the exempt branch is worth having: ``/health`` still resolves no principal, runs no
+    script and emits no ``X-RateLimit-*``. The only thing that changed for an exempt request is
+    this header.
+
+    .. rubric:: Outside CORS, and that is fine — but only because of ``expose_headers``
+
+    Being outermost puts this **outside** ``CORSMiddleware`` too, so the stamp is added after CORS
+    has finished with the message. That direction is the safe one: CORS *adds* headers on the way
+    out and removes none, so nothing of ours can be stripped, whereas a header CORS added could
+    have been clobbered by a wrapper that rebuilt the list carelessly.
+
+    What being outside CORS does **not** buy is browser readability. A cross-origin ``fetch`` can
+    read a non-safelisted response header only if ``Access-Control-Expose-Headers`` names it, and
+    that list is emitted by ``CORSMiddleware`` from :data:`src.main.EXPOSE_HEADERS` — which is why
+    ``X-Served-By`` has to stay in it, and why ``tests/unit/test_health.py`` pins the whole list
+    literally. Sending the header and forgetting the list is the failure that is invisible from
+    Python and visible only as ``null`` in the dashboard's JavaScript.
+
+    .. rubric:: Appended, never duplicated
+
+    If anything downstream already set ``X-Served-By``, this leaves it alone. Two contradictory
+    values for one header is the outcome :class:`RateLimitMiddleware`'s ``send`` wrapper refuses
+    to produce for ``X-RateLimit-Remaining``, for the same reason: an HTTP client takes whichever
+    value its parser reaches first, so the answer would depend on library internals. It is also
+    precisely why ``nginx/nginx.conf`` does **not** synthesise this header from ``$upstream_addr``
+    — the proxy's copy and the app's copy would both be on the wire.
+
+    The existing name is compared **lower-cased**, so a raw-ASGI sub-app that emitted
+    ``b"X-Served-By"`` is recognised rather than duplicated. ASGI requires lower-case names and
+    neither Starlette nor FastAPI can emit anything else, so this defends against a sub-app
+    someone mounts later — the same gap :class:`RateLimitMiddleware` closes for the limit headers.
+
+    .. rubric:: The hostname is resolved once, at import
+
+    :data:`src.api.health.SERVED_BY` is read at import and encoded once into
+    :data:`_RAW_SERVED_BY_VALUE`. A hostname cannot change under a running process, and this runs
+    on **every** response including the container ``HEALTHCHECK``'s 10-second poll, so a syscall
+    per request would be paying for a constant on the hot path.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Wrap ``send`` and stamp the header on the response-start message.
+
+        The ``scope["type"]`` guard is the same one :meth:`RateLimitMiddleware.__call__` opens
+        with, and it is load-bearing for the same reason: this callable is invoked for the
+        ``lifespan`` scope at startup and for ``websocket`` scopes, neither of which has an
+        ``http.response.start`` message to decorate. Passing those straight through — rather than
+        installing a wrapper that would never fire — keeps the startup path free of a closure
+        allocation and keeps a websocket's frames untouched.
+        """
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                # `headers` is OPTIONAL in an ASGI response-start message and a handful of
+                # raw-ASGI apps omit it, so the absent case is handled rather than assumed —
+                # `RateLimitMiddleware` has the same branch, and `tests/unit/test_middleware.py`
+                # pins it there against a stub that leaves the key out.
+                raw = message.get("headers")
+                if raw is None:
+                    message["headers"] = [(_RAW_SERVED_BY_HEADER, _RAW_SERVED_BY_VALUE)]
+                elif not any(name.lower() == _RAW_SERVED_BY_HEADER for name, _ in raw):
+                    # A NEW list rather than `raw.append(...)`: the message may carry a tuple, or
+                    # a list some other layer is still holding a reference to, and mutating a
+                    # sequence handed to us in passing is a bug that only shows up in whichever
+                    # component happened to keep it.
+                    message["headers"] = [
+                        *raw,
+                        (_RAW_SERVED_BY_HEADER, _RAW_SERVED_BY_VALUE),
+                    ]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)

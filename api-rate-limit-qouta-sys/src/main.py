@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse
+from starlette.types import ASGIApp
 
 from src.analytics import AnalyticsCollector
 from src.api.admin import router as admin_router
@@ -59,7 +60,7 @@ from src.api.protected import verify_route_pricing
 from src.config import Settings, get_settings
 from src.identity import IdentityResolver
 from src.limiter import Limiter
-from src.middleware import RateLimitMiddleware
+from src.middleware import RateLimitMiddleware, ServedByMiddleware
 from src.redis_client import RedisGateway, redact_redis_url
 from src.tiers import TierRegistry
 
@@ -109,6 +110,12 @@ pace itself instead of discovering the ceiling by hitting it. Note the deliberat
 #: browser client that got a 401 could see the status and not the challenge — i.e. could not
 #: discover that this API accepts an ``ApiKey`` scheme at all. ``tests/unit/test_middleware.py``
 #: pins the correspondence in the same way ``tests/unit/test_models.py`` pins the other eight.
+#:
+#: ``X-Served-By`` is the case that proves why declaring the contract early is worth it *and* why
+#: the declaration is not the feature. It has been listed here since C1 and nothing emitted it
+#: until C13's :class:`~src.middleware.ServedByMiddleware` — so for twelve commits it was
+#: advertised as readable and never sent, which is a header that "exists" in exactly the way a
+#: browser cannot detect. The list is the contract; something still has to keep it.
 EXPOSE_HEADERS = [
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
@@ -305,6 +312,45 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("runtime shutdown complete (uptime %.1fs)", runtime.uptime_sec)
 
 
+class _ServedByApp(FastAPI):
+    """A FastAPI whose **entire** middleware stack is wrapped in
+    :class:`~src.middleware.ServedByMiddleware`.
+
+    .. rubric:: Why this subclass exists at all, instead of one more ``add_middleware`` call
+
+    ``add_middleware`` can only insert into ``user_middleware``, and Starlette builds the stack as
+    ``[ServerErrorMiddleware] + user_middleware + [ExceptionMiddleware]``. So *every* middleware
+    registered the normal way — however early or late — ends up **inside**
+    ``ServerErrorMiddleware``. That matters here because of what ``ServerErrorMiddleware`` does
+    with an unhandled exception: it writes its 500 through the ``send`` **it** was given, not
+    through the one the inner stack was using, and then re-raises. A ``send`` wrapper installed
+    anywhere below it is therefore not on that response's path at all.
+
+    The practical consequence, if this were a plain ``add_middleware``: every response would carry
+    ``X-Served-By`` except the 500 produced by a handler that raised — the single status code an
+    operator most wants pinned to a replica, and the one C13's fail-safety story is about. The
+    same hole covers a bug raised *inside* :class:`~src.middleware.RateLimitMiddleware` itself
+    (:func:`~src.middleware._runtime_of`'s wiring guard, say), which is exactly the case where
+    "which replica?" is the first question.
+
+    ``build_middleware_stack`` is the one seam Starlette offers above that boundary: it returns
+    the assembled callable, so wrapping its result puts this outside ``ServerErrorMiddleware``,
+    outside CORS and outside the limiter — one place, no per-path branches, nothing to keep in
+    sync with :data:`src.middleware.EXEMPT_EXACT_PATHS`.
+
+    Kept a subclass of ``FastAPI`` rather than "wrap the app object at module scope" so that
+    :func:`create_app` keeps returning a real ``FastAPI`` — ``app.state``, ``app.routes``,
+    ``app.version`` and the ``TestClient``/``ASGITransport`` seams all keep working, and, more
+    importantly, the **injected-runtime test path and the production path get the identical stack**.
+    Wrapping only the module-level ``app`` would have left every test proving things about an
+    application that is not the one being shipped, which is the trade
+    :meth:`Runtime.build` refuses one paragraph at a time.
+    """
+
+    def build_middleware_stack(self) -> ASGIApp:
+        return ServedByMiddleware(super().build_middleware_stack())
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     """Build and return the FastAPI application.
 
@@ -331,12 +377,16 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         "default_response_class": ORJSONResponse,
     }
 
+    # `_ServedByApp`, not `FastAPI`, on BOTH branches — see that class. It is the only way to get
+    # `X-Served-By` onto the 500 `ServerErrorMiddleware` writes for a handler that raised, and
+    # using it on one branch only would mean the tests and the shipped process had different
+    # middleware stacks.
     if runtime is not None:
-        app = FastAPI(**common)  # type: ignore[arg-type]
+        app = _ServedByApp(**common)  # type: ignore[arg-type]
         app.state.runtime = runtime
         settings = runtime.settings
     else:
-        app = FastAPI(lifespan=lifespan, **common)  # type: ignore[arg-type]
+        app = _ServedByApp(lifespan=lifespan, **common)  # type: ignore[arg-type]
         settings = get_settings()
 
     _configure_logging(settings)
@@ -364,6 +414,13 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
     #
     # `tests/integration/test_middleware_flow.py` asserts the CORS half against a real 429 rather
     # than trusting this comment, because the failure mode is invisible from Python.
+    #
+    # THERE IS A THIRD MIDDLEWARE AND IT IS NOT REGISTERED HERE. `ServedByMiddleware` wraps the
+    # stack from OUTSIDE, via `_ServedByApp.build_middleware_stack`, because `add_middleware`
+    # cannot place anything outside `ServerErrorMiddleware` — and that is the only position from
+    # which `X-Served-By` reaches the 500 written for a handler that raised. It is deliberately
+    # not in this list: nothing about the ordering below affects it, and nothing about it affects
+    # the ordering below.
     #
     # ---------------------------------------------------------------------------------------
     # Registered UNCONDITIONALLY, including when RATE_LIMIT_ENABLED is false. The middleware
