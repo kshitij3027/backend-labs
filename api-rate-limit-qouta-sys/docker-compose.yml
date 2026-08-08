@@ -23,10 +23,12 @@
 # localhost:8020/health; done | ...` returns TWO distinct `served_by` hostnames. Every claim in
 # the paragraph above is now falsifiable from a shell loop rather than only from a unit test.
 #
-# The profile-gated `test` service runs the pytest suite from Dockerfile.test; C13/C14 add `e2e`
-# and `loadtest` services from the same image. None of them starts on a bare `docker compose up`.
-# The harnesses reach the API by SERVICE NAME over the compose network (http://lb:80, with
-# http://api1:8000 as C13's single-replica control), never via a published host port, so they are
+# The profile-gated `test` service runs the pytest suite from Dockerfile.test; `e2e` (C13) and
+# `loadtest` (C14) run the two black-box harnesses from the same image, and C14 adds one more
+# process — `api-baseline`, an `api1` with RATE_LIMIT_ENABLED=false that exists only to be measured
+# against. None of them starts on a bare `docker compose up`. The harnesses reach the API by SERVICE
+# NAME over the compose network (http://lb:80, with http://api1:8000 as the single-replica control
+# and http://api-baseline:8000 as the unmetered one), never via a published host port, so they are
 # immune to an API_PORT collision on the host.
 #
 # Every one of the 29 Settings fields is passed to both replicas as ${VAR:-default}, including the
@@ -397,6 +399,177 @@ services:
       api2:
         condition: service_healthy
     command: ["python", "-m", "scripts.verify_e2e"]
+
+  # The overhead BASELINE replica (C14 phase C). Profile-gated behind `loadtest`, so it never
+  # starts on a bare `docker compose up`, never joins the nginx upstream, and never serves a
+  # customer — it exists to be measured against.
+  #
+  # .. rubric:: Why a whole extra process, rather than the trick C13 used
+  #
+  # C13's check 14 measures the limiter's cost as `p95(GET /api/v1/whoami) - p95(GET /docs)` and its
+  # own docstring says why that is a lower bound rather than a measurement: the two paths run
+  # DIFFERENT handlers, so the residual carries whatever those handlers differ by. The clean
+  # experiment is the SAME route with enforcement switched off — which cannot be done to a replica
+  # that is also serving the metered leg, because `RATE_LIMIT_ENABLED` is read from the environment
+  # at startup and there is no runtime switch for it (deliberately: a rate limiter with a live
+  # off-button is a rate limiter with a live bypass). So the baseline is a second process.
+  #
+  # `extends` rather than the `x-api` merge key, and this is the one place in this file where the
+  # difference matters. A YAML merge key REPLACES `environment` wholesale, so `<<: *api` plus a
+  # one-variable override would mean copying all 29 variables into a second block that a reviewer
+  # then has to keep in sync by eye — and a drifted copy here would not fail loudly, it would
+  # silently make the baseline incomparable (a different REDIS_URL, a different TIER_LIMITS, and
+  # phase C would be subtracting the latency of a different system). `extends` MERGES the
+  # environment key by key, so this service is `api1` in every respect with exactly one variable
+  # changed, structurally rather than by inspection. `scripts/load_test.py` re-establishes that at
+  # runtime before it measures anything: it asserts this replica reports `rate_limit_enabled=false`
+  # and emits no `X-RateLimit-*`, and that `api1` reports the opposite.
+  #
+  # `depends_on` is re-declared rather than inherited: the Compose spec excludes it from what
+  # `extends` shares (some versions copy it anyway, which is exactly the sort of thing not to depend
+  # on). Without it this container can start against a Redis that is not answering yet — and while
+  # the limiter is off here, the app still builds a pool and seeds the demo credentials at startup.
+  api-baseline:
+    extends:
+      service: api1
+    profiles: [loadtest]
+    environment:
+      # THE one variable. With it false, `RateLimitMiddleware` classifies the endpoint and returns:
+      # no cost lookup, no identity resolution, no decision script, no analytics write, no headers.
+      # So the phase-C delta is the whole enforcement layer's cost, which is what a caller pays.
+      - RATE_LIMIT_ENABLED=false
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Perf/load harness (C14). Same tester image as `test` and `e2e`, running scripts/load_test.py
+  # against the LIVE stack over HTTP only. Profile-gated; run via `make load`.
+  #
+  # FOUR target URLs, because the four phases ask four different questions and each needs to address
+  # a specific part of the topology by name:
+  #
+  #   * TARGET_URL=http://lb:80                — through the proxy, across BOTH replicas. Phase A's
+  #     parallel burst and phase B's throughput number.
+  #   * DIRECT_URL=http://api1:8000            — ONE replica. Phase D's single-replica leg, and
+  #     phase C's metered leg (no proxy hop on either side of that comparison).
+  #   * BASELINE_URL=http://api-baseline:8000  — the RATE_LIMIT_ENABLED=false process above.
+  #   * LOAD_REPLICA_URLS=api1,api2            — every real replica, individually, for phase E. RSS
+  #     is a property of a PROCESS: read through the round-robin proxy, "before" and "after" would
+  #     routinely come from different containers and the growth figure would be a fiction. `lb` and
+  #     `api-baseline` are deliberately absent from it — nginx has no /admin surface, and the
+  #     baseline replica's memory is not this service's memory.
+  #
+  # All by SERVICE NAME over the compose network, never via ${API_PORT}: a published host port would
+  # make this harness immune to nothing and vulnerable to a sibling project's port collision.
+  #
+  # The three secrets are declared from the SAME ${VAR:-default} expressions the `x-api` anchor uses:
+  # JWT_SECRET because the harness signs its own throwaway principals with src.identity.issue_token
+  # (a different key means every token it mints is a forgery and phase A measures 401s), ADMIN_TOKEN
+  # because it drives tier assignment and reads the memory probe, and API_KEY_PEPPER because
+  # `Settings` REFUSES TO CONSTRUCT without it — omitting it fails the bootstrap before phase A.
+  #
+  # TIER_LIMITS and DEFAULT_TIER are deliberately NOT declared here, unlike on the `e2e` service.
+  # That service needs them because it grades measured ceilings against the configured table; this
+  # one grades no ceiling at all — it reads the live table only to size its principal pools so the
+  # limiter never refuses a request it is trying to time. Declaring them would imply a cross-check
+  # this harness does not perform, and the E2E verifier already owns that assertion.
+  loadtest:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [loadtest]
+    environment:
+      - TARGET_URL=http://lb:80
+      - DIRECT_URL=http://api1:8000
+      - BASELINE_URL=http://api-baseline:8000
+      - "LOAD_REPLICA_URLS=${LOAD_REPLICA_URLS:-http://api1:8000,http://api2:8000}"
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-signing-key-0123456789abcdef}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - API_KEY_PEPPER=${API_KEY_PEPPER:-dev-only-insecure-pepper-0123456789abcdef}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-dev-only-insecure-admin-token-0123456789abcdef}
+      - LOAD_READY_TIMEOUT=${LOAD_READY_TIMEOUT:-90}
+      # Unmeasured traffic to every target before the clock starts. uvicorn's per-connection setup,
+      # the Redis pool's lazy connect and the script cache's first EVALSHA miss are one-off costs
+      # that would otherwise land inside phase A.
+      - LOAD_WARMUP_REQUESTS=${LOAD_WARMUP_REQUESTS:-500}
+      # The spec's own number, and its own test: "100 parallel requests via httpx, counting 200s vs
+      # 429s". It must stay ABOVE the free tier's ceiling (60) or the burst never provokes a refusal
+      # and the harness fails on purpose — `Successful: 100, Rate Limited: 0` is not a pass.
+      - LOAD_SPEC_REQUESTS=${LOAD_SPEC_REQUESTS:-100}
+      # 20000, not the 5000 the plan pencilled in: that figure assumed ~1000 req/s, and this stack
+      # measured ~6000 through the LB, which turns 5000 requests into a 0.8-second sample dominated
+      # by connection ramp-up. Three repeats at 5000 spread the scaling ratio over 1.51-1.72x; the
+      # same repeats at 20000 spread it over 1.59-1.62x.
+      - LOAD_REQUESTS=${LOAD_REQUESTS:-20000}
+      # 32 keep-alive connections, not the plan's 100, and the number is REDIS_MAX_CONNECTIONS
+      # rather than a taste: phase D's single-replica leg points all of them at ONE replica, which
+      # answers each request out of a pool of 32 with a 50 ms wait budget. Offer more and some
+      # request is always queueing for a store connection, and the queue lands in the measurement.
+      # Measured on that leg: c=100 -> p95 45 ms and 15 x 503 per 8000; c=64 -> 1 x 503 per 20000
+      # (a coin flip per run); c=32 -> clean across 3 x 20000, with the replica already saturated
+      # (it serves ~4k req/s at 24, 32, 40 and 64 alike). Those 503s are the limiter refusing
+      # rather than admitting unmetered — correct behaviour, and exactly why they must not appear
+      # inside a throughput number.
+      - LOAD_CONCURRENCY=${LOAD_CONCURRENCY:-32}
+      # Cores the load generator may consume before its throughput number is declared void. This is
+      # the gate that stops this harness from publishing ITS OWN ceiling as the service's: the first
+      # three calibration runs did exactly that (569 req/s at 1.00 core, then 1144 at 2.87 — both
+      # measurements of httpx, and a scaling factor of 0.94x because a saturated client cannot push
+      # harder at two replicas than at one). The generator now costs ~0.05 ms of CPU per request and
+      # sits near 0.2 of a core at ~6000 req/s, so 0.8 is a wide berth around a real failure mode.
+      - LOAD_MAX_CLIENT_CPU=${LOAD_MAX_CLIENT_CPU:-0.8}
+      # Throughput gate: roughly half the measured floor (~5800 req/s through the LB on the
+      # calibration host), so a change that costs this service half its throughput fails the run and
+      # a busy laptop does not. The spec's figure is 1,000 rps — met about six times over — and is
+      # printed separately (`RESULT spec_target_rps`, `RESULT throughput_meets_spec_target`) rather
+      # than being restated as a gate. `LOAD_MIN_RPS=1000000 make load` MUST fail.
+      - LOAD_MIN_RPS=${LOAD_MIN_RPS:-3000}
+      - LOAD_OVERHEAD_SAMPLES=${LOAD_OVERHEAD_SAMPLES:-200}
+      # The limiter's ADDED p95, measured against `api-baseline` — the same route on the same image
+      # with RATE_LIMIT_ENABLED=false. This is the honest version of C13's MAX_OVERHEAD_MS, which
+      # differenced two different handlers; the spec asks for <5ms and this is that number.
+      # `LOAD_MAX_OVERHEAD_MS=0 make load` MUST exit non-zero.
+      - LOAD_MAX_OVERHEAD_MS=${LOAD_MAX_OVERHEAD_MS:-5}
+      # Empty by default, and the harness reads an empty value as "use LOAD_REQUESTS". Spelled this
+      # way rather than repeating 5000, so lowering LOAD_REQUESTS for a quick run cannot leave
+      # phase D still firing the original volume.
+      - LOAD_SCALING_REQUESTS=${LOAD_SCALING_REQUESTS:-}
+      # Two replicas over ONE Redis cannot reach 2.0x: every metered request runs a Lua script on a
+      # single-threaded server, so that section is serialised across the whole cluster. ~1.5x is
+      # what "it scales, and the shared store is the ceiling" looks like, and a run reporting 2.0x
+      # would mean the decision had stopped serialising — i.e. the per-process bucket this project
+      # exists to prevent. Measured: 1.56x and 1.61x in the shipped arrangement, inside a 1.40-1.72x
+      # band across twenty-two legs at four concurrency settings. The gate is 1.30 rather than the
+      # plan's 1.5 because 1.5 sits INSIDE that spread (a sequential run measured 1.404) and would
+      # flake — and a gate nobody trusts gets raised until it passes, at which point it is
+      # decoration. The harness interleaves the two legs in alternating chunks so a slow patch of
+      # machine time lands on both; run sequentially the single-replica leg always went first, in
+      # the quietest window, and the ratio came out 1.40-1.54x for that reason alone.
+      - LOAD_MIN_SCALING=${LOAD_MIN_SCALING:-1.30}
+      # Measured: each replica sits at ~66 MiB RSS both at rest and after the run. 150 is a ceiling
+      # for the process (2.2x the measurement), not a prediction of it — tight enough that an
+      # in-process cache someone adds later has to justify itself.
+      # `MAX_BACKEND_MEM_MB=1 make load` MUST fail.
+      - MAX_BACKEND_MEM_MB=${MAX_BACKEND_MEM_MB:-150}
+      # "Stable memory usage under sustained load", as a number. Every bucket, counter and window
+      # this service keeps lives in Redis, so a replica that grows across ~62k requests and ~125
+      # fresh principals is keeping per-caller state it should not have. Measured growth:
+      # 0.7 MiB. At 25 the gate still catches a per-request leak of ~400 bytes.
+      - MAX_MEM_GROWTH_MB=${MAX_MEM_GROWTH_MB:-25}
+    depends_on:
+      # All four, `service_healthy` on every one. `lb` alone is not enough (nginx is healthy as soon
+      # as it can reach ONE upstream, so phase D's two-replica leg could start against a stack that
+      # is still half up), and `api-baseline` has to be waited on explicitly or phase C's first
+      # sample races its startup.
+      lb:
+        condition: service_healthy
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+      api-baseline:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.load_test"]
 
 volumes:
   # Named rather than a bind mount: the AOF is Redis's own on-disk format and has no business in

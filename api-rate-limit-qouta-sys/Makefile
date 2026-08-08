@@ -3,8 +3,8 @@
 # alternative — leaving them out until then — makes `make e2e` fail with "No rule to make target",
 # which reads as a broken Makefile rather than as "not yet". So both targets existed from the
 # start, printed exactly which commit brings them, and exited 0: a scheduled feature must not turn
-# a green build red. `e2e` is the real invocation as of THIS commit and `load` becomes one in C14 —
-# the placeholder replaces itself exactly as its comment said it would, and `make help` never had
+# a green build red. `e2e` became the real invocation in C13 and `load` is one as of THIS commit —
+# each placeholder replaced itself exactly as its comment said it would, and `make help` never had
 # to lie about what this project is going to have.
 .PHONY: help build up down logs test test-unit test-int e2e load ui clean
 
@@ -18,7 +18,7 @@ help:
 	@echo "  test-unit  - unit tests only in Docker (no coverage gate — see below)"
 	@echo "  test-int   - integration tests only in Docker (no coverage gate — see below)"
 	@echo "  e2e        - black-box E2E verifier vs the live stack (incl. the double-spend check)"
-	@echo "  load       - perf/load gates vs the live stack (arrives in C14)"
+	@echo "  load       - perf/load gates vs the live stack (throughput, overhead, scaling, memory)"
 	@echo "  ui         - run the stack (detached) and print the dashboard URL"
 	@echo "  clean      - down + remove volumes and orphans"
 
@@ -126,19 +126,67 @@ test-int:
 # Every gate is host-overridable, which is how we prove they bite instead of decorate:
 #   MAX_OVERHEAD_MS=0 make e2e        MUST exit non-zero
 #   E2E_BURST_REQUESTS=1 make e2e     MUST exit non-zero (a burst of 1 proves nothing)
+# `--profile loadtest` on the PRE-run teardown only, and it is about `make load`'s `api-baseline`
+# rather than about this target: an interrupted load run can leave that unmetered replica running,
+# and a container that survives into this `up` holds an IP while api1/api2 are recreated on new ones
+# — which is exactly how nginx ends up proxying to it (see the `load` target). Removing it first
+# costs nothing here and removes the whole class of confusion.
 e2e:
-	docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+	docker compose --profile loadtest down -v --remove-orphans >/dev/null 2>&1 || true
 	docker compose up -d --build --wait lb
 	@status=0; \
 	docker compose --profile e2e run --rm --build e2e || status=$$?; \
 	docker compose down -v; \
 	exit $$status
 
-# Perf/load harness (scripts/load_test.py). Arrives in C14 with the throughput, limiter-overhead,
-# scaling and memory gates, each host-overridable so an impossible bar proves the gate bites.
+# Perf/load harness (scripts/load_test.py) against the LIVE stack: the spec's 100-parallel-request
+# test, throughput, the limiter's added latency, scaling across replicas, and memory. The
+# placeholder this replaces said it would become the real invocation in C14, and here it is.
+#
+# Same shape as `e2e` — down -v first, bring the stack up, run the harness in a throwaway
+# container, capture the status, tear down, re-raise — and for the same reasons. The starting store
+# must be empty (`down -v`, dropping the redis-data volume): the harness fires ~62k requests across
+# ~125 freshly-minted principals, and leftover quota counters from an interrupted run are exactly
+# the state that turns a throughput phase into a 429 phase.
+#
+# .. rubric:: Why `--profile loadtest` is on EVERY compose command here, and why `api-baseline`
+#             comes up in the same `up` as `lb`
+#
+# This target starts one extra process — `api-baseline`, an `api1` with RATE_LIMIT_ENABLED=false
+# that the overhead phase measures against — and nginx resolves the names in its `upstream` block
+# EXACTLY ONCE, at startup. Those two facts collide, and the collision was observed rather than
+# imagined:
+#
+#   * `down -v` WITHOUT the profile leaves `api-baseline` running (compose only tears down services
+#     in the active profiles), so an unmetered replica survives `make load` — hence the profile on
+#     both `down`s;
+#   * a surviving container then holds its IP while the next `up` recreates api1/api2 on NEW ones,
+#     and nginx — pointed at the old addresses — proxied the entire load run to the UNMETERED
+#     baseline. Every request came back 200, phase A printed `Successful: 100, Rate Limited: 0`,
+#     and the whole run measured a service with no rate limiter in it.
+#
+# So: `build` first (no image is built after nginx exists), then ONE `up` that creates
+# `api-baseline` in the same wave as api1/api2 — both only wait on redis, while `lb` waits for the
+# replicas to be *healthy*, so the proxy is necessarily the last container created and resolves
+# addresses that nothing will move afterwards. `run` gets no `--build` for the same reason: a
+# rebuild there can recreate the very containers nginx has already resolved.
+#
+# The harness re-establishes all of this at runtime rather than trusting this comment: it probes
+# `/health` through the LB and refuses to start unless the hosts answering are exactly the replicas
+# and never the baseline.
+#
+# Every gate is host-overridable, which is how we prove they bite instead of decorate:
+#   LOAD_MIN_RPS=1000000 make load     MUST exit non-zero
+#   LOAD_MAX_OVERHEAD_MS=0 make load   MUST exit non-zero
+#   MAX_BACKEND_MEM_MB=1 make load     MUST exit non-zero
 load:
-	@echo "make load: the perf/load harness arrives in C14 (scripts/load_test.py)."
-	@echo "           Until then, 'make test' covers the suite and 'make up' serves the API."
+	docker compose --profile loadtest down -v --remove-orphans >/dev/null 2>&1 || true
+	docker compose --profile loadtest build
+	docker compose --profile loadtest up -d --wait lb api-baseline
+	@status=0; \
+	docker compose --profile loadtest run --rm loadtest || status=$$?; \
+	docker compose --profile loadtest down -v; \
+	exit $$status
 
 # The dashboard is served by the SAME uvicorn processes on the SAME host port as the API (C15 adds
 # `GET /` and `GET /dashboard/` -> src/static/index.html). There is no second service and no node
@@ -155,5 +203,10 @@ ui: up
 # -v drops the redis-data volume too, so the next run starts from an empty store: leftover quota
 # counters from yesterday are exactly the kind of state that makes a limiter test pass for the
 # wrong reason.
+#
+# `--profile loadtest` because a plain `down` only tears down services in the ACTIVE profiles, and
+# `make load`'s `api-baseline` (an api replica with RATE_LIMIT_ENABLED=false) would otherwise
+# survive an interrupted run and sit there unmetered — see the `load` target for what happened when
+# it did. `clean` is the target whose whole job is "leave nothing behind", so it names the profile.
 clean:
-	docker compose down -v --remove-orphans
+	docker compose --profile loadtest down -v --remove-orphans
