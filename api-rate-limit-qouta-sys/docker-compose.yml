@@ -243,7 +243,17 @@ services:
       # healthy" means "the LB can reach at least one replica", which is the only reading worth
       # having. One dead replica does not fail it: `proxy_next_upstream error timeout` moves the
       # probe to the sibling.
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/health"]
+      #
+      # `127.0.0.1`, NOT `localhost`, and the difference is the whole probe. The container's
+      # /etc/hosts maps `localhost` to both 127.0.0.1 and ::1, busybox wget tries ::1 first, and
+      # nginx/nginx.conf says `listen 80` — which binds IPv4 only. So the probe answered
+      # "Connection refused" on every interval while the proxy was serving the host perfectly, and
+      # the container sat at `health: starting` until it went `unhealthy` five probes later. It was
+      # invisible from the host (the published port maps to the IPv4 socket) and it is exactly what
+      # C13's `depends_on: lb: service_healthy` waits on, so it fails `make e2e` before check 1.
+      # Fixed here rather than by adding `listen [::]:80` to nginx.conf: the probe is the thing that
+      # was wrong about which address it meant, and the proxy has no reason to bind a second stack.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:80/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -289,6 +299,104 @@ services:
     # No -q: verbosity is centralized in pytest.ini (`addopts = -q --tb=short`). A second -q here
     # would stack to -qq and suppress the "N passed in Xs" summary line.
     command: ["pytest"]
+
+  # Black-box E2E verifier (C13). Same tester image, running scripts/verify_e2e.py against the LIVE
+  # stack over HTTP only. Profile-gated so it never starts on a bare `docker compose up`; run via
+  # `make e2e`.
+  #
+  # TWO base URLs, and the pair is the point of this service:
+  #
+  #   * TARGET_URL=http://lb:80    — through the load balancer, so a burst is round-robined across
+  #     BOTH replicas. This is where the distributed double-spend check fires.
+  #   * DIRECT_URL=http://api1:8000 — ONE replica, addressed directly, for the single-replica
+  #     control run. Without it, "the LB admitted 60" is an observation; with it, it is an
+  #     experiment — if one replica admits 60 and two admit 120, the shared-state claim is false.
+  #
+  # Both by SERVICE NAME over the compose network, never via a published host port. Neither replica
+  # publishes one (that is C12's whole point), and reaching `lb` by name rather than through
+  # ${API_PORT} makes this immune to a host port collision with a sibling project.
+  #
+  # The three secrets below are declared with the SAME ${VAR:-default} expressions as the `x-api`
+  # anchor, and they have to be:
+  #
+  #   * JWT_SECRET — the verifier signs its own throwaway principals with src.identity.issue_token,
+  #     so a different key here means every token it mints is a forgery to the replicas and check 3
+  #     fails with a 401 that looks like an identity bug.
+  #   * ADMIN_TOKEN — it drives the control plane (tier assignment, the quota and hot-reload
+  #     checks, the usage read-back that proves a rejected request burned nothing).
+  #   * API_KEY_PEPPER — never used by the verifier, but `Settings` REFUSES TO CONSTRUCT without
+  #     it, so omitting it would fail the bootstrap before check 1.
+  #
+  # TIER_LIMITS and DEFAULT_TIER are declared from the SAME expressions the anchor uses, and for
+  # one reason only: the verifier's bootstrap asserts the LIVE table (read from
+  # `GET /api/v1/admin/tiers`) against the CONFIGURED one before any check runs. Every ceiling the
+  # harness grades against comes from that live table — which is right, because it is the only
+  # source that reflects a tier changed at runtime — but on its own it is a closed loop: a
+  # regression in the seed/store/decode path that fell back to built-in defaults would be reported
+  # by the admin API and enforced by the limiter identically, and all 14 checks would pass against
+  # limits nobody configured. These two variables are the second, independent view that closes it.
+  # If they are ever removed, that assertion silently starts comparing the shipped defaults with
+  # themselves.
+  #
+  # TIER_CACHE_TTL_SEC stays undeclared: the verifier reads the TTL from the live admin API because
+  # what matters there is what the replicas are actually caching for, and it bounds the wait with
+  # its OWN absolute ceiling (E2E_TIER_MAX_WAIT_SEC) rather than with the server's number — see
+  # that gate below.
+  e2e:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    profiles: [e2e]
+    environment:
+      - TARGET_URL=http://lb:80
+      - DIRECT_URL=http://api1:8000
+      - JWT_SECRET=${JWT_SECRET:-dev-only-insecure-signing-key-0123456789abcdef}
+      - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+      - API_KEY_PEPPER=${API_KEY_PEPPER:-dev-only-insecure-pepper-0123456789abcdef}
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-dev-only-insecure-admin-token-0123456789abcdef}
+      - "TIER_LIMITS=${TIER_LIMITS:-free:60:60:1000:25000,premium:300:300:50000:1250000,enterprise:1000:1000:500000:12500000}"
+      - DEFAULT_TIER=${DEFAULT_TIER:-free}
+      - E2E_READY_TIMEOUT=${E2E_READY_TIMEOUT:-90}
+      - E2E_REPLICA_PROBES=${E2E_REPLICA_PROBES:-20}
+      # ~3.3x the free tier's capacity of 60, at a concurrency high enough that nginx has to fan
+      # the burst out. A burst that is not comfortably larger than capacity cannot tell a shared
+      # bucket from two per-process ones — which is why `E2E_BURST_REQUESTS=1 make e2e` MUST fail.
+      - E2E_BURST_REQUESTS=${E2E_BURST_REQUESTS:-200}
+      - E2E_BURST_CONCURRENCY=${E2E_BURST_CONCURRENCY:-50}
+      - E2E_RATE_LIMIT_MARGIN=${E2E_RATE_LIMIT_MARGIN:-30}
+      - E2E_QUOTA_LIMIT=${E2E_QUOTA_LIMIT:-3}
+      - E2E_TIER_RPM=${E2E_TIER_RPM:-137}
+      - E2E_TIER_SLACK_SEC=${E2E_TIER_SLACK_SEC:-5}
+      # An ABSOLUTE ceiling on tier convergence, and it is the gate that keeps check 11 honest.
+      # The relative budget (TIER_CACHE_TTL_SEC + slack) is read from the live admin API, so on its
+      # own it scales with the very mechanism under test — propagation IS TTL expiry, there is no
+      # pub/sub in src/tiers.py. Measured: at TIER_CACHE_TTL_SEC=45 the slow replica took 32.7s and
+      # the check PASSED, because the budget had widened to 50s with it. The tighter of the two
+      # bounds wins, so `TIER_CACHE_TTL_SEC=45 make e2e` MUST now exit non-zero: a stack configured
+      # to converge more slowly than the harness tolerates is the finding, not the excuse.
+      - E2E_TIER_MAX_WAIT_SEC=${E2E_TIER_MAX_WAIT_SEC:-15}
+      - E2E_ANALYTICS_REQUESTS=${E2E_ANALYTICS_REQUESTS:-12}
+      - E2E_ANALYTICS_UNAUTH=${E2E_ANALYTICS_UNAUTH:-5}
+      - E2E_ANALYTICS_TIMEOUT=${E2E_ANALYTICS_TIMEOUT:-20}
+      - E2E_STATS_MINUTES=${E2E_STATS_MINUTES:-60}
+      - E2E_LATENCY_SAMPLES=${E2E_LATENCY_SAMPLES:-40}
+      # The limiter's ADDED latency, measured black-box as metered p95 minus exempt p95 on the same
+      # stack. `MAX_OVERHEAD_MS=0 make e2e` MUST exit non-zero — that is how we prove the gate
+      # bites rather than decorates. C14 measures the same quantity against a
+      # RATE_LIMIT_ENABLED=false baseline and reads its own LOAD_MAX_OVERHEAD_MS.
+      - MAX_OVERHEAD_MS=${MAX_OVERHEAD_MS:-5}
+    depends_on:
+      # All three, and `service_healthy` on every one. The LB alone would not be enough: nginx is
+      # healthy as soon as it can reach ONE upstream, and a verifier that started then would fire
+      # check 2 (both replicas answer) at a stack where the second replica is still building its
+      # Redis pool — a flake that reads as "the load balancer is not fanning out".
+      lb:
+        condition: service_healthy
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    command: ["python", "-m", "scripts.verify_e2e"]
 
 volumes:
   # Named rather than a bind mount: the AOF is Redis's own on-disk format and has no business in

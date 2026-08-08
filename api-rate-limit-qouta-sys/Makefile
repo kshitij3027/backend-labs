@@ -1,10 +1,11 @@
 .DEFAULT_GOAL := help
-# `e2e` and `load` are declared here from C1 even though their scripts land in C13/C14. The
+# `e2e` and `load` were declared here from C1 even though their scripts land in C13/C14. The
 # alternative — leaving them out until then — makes `make e2e` fail with "No rule to make target",
-# which reads as a broken Makefile rather than as "not yet". So both targets exist now, print
-# exactly which commit brings them, and exit 0: a scheduled feature must not turn a green build
-# red. They are replaced by the real invocations in C13/C14, and `make help` never has to lie
-# about what this project is going to have.
+# which reads as a broken Makefile rather than as "not yet". So both targets existed from the
+# start, printed exactly which commit brings them, and exited 0: a scheduled feature must not turn
+# a green build red. `e2e` is the real invocation as of THIS commit and `load` becomes one in C14 —
+# the placeholder replaces itself exactly as its comment said it would, and `make help` never had
+# to lie about what this project is going to have.
 .PHONY: help build up down logs test test-unit test-int e2e load ui clean
 
 help:
@@ -16,7 +17,7 @@ help:
 	@echo "  test       - full pytest suite in Docker, with the >=90% branch coverage gate"
 	@echo "  test-unit  - unit tests only in Docker (no coverage gate — see below)"
 	@echo "  test-int   - integration tests only in Docker (no coverage gate — see below)"
-	@echo "  e2e        - black-box E2E verifier vs the live stack (arrives in C13)"
+	@echo "  e2e        - black-box E2E verifier vs the live stack (incl. the double-spend check)"
 	@echo "  load       - perf/load gates vs the live stack (arrives in C14)"
 	@echo "  ui         - run the stack (detached) and print the dashboard URL"
 	@echo "  clean      - down + remove volumes and orphans"
@@ -106,12 +107,32 @@ test-int:
 	docker compose down; \
 	exit $$status
 
-# Black-box E2E verifier (scripts/verify_e2e.py). Arrives in C13, where this becomes the usual
-# boot-wait-run-teardown against the live load balancer, including the distributed double-spend
-# check that is the whole reason this project exists. Exits 0 today — see the .PHONY note above.
+# Black-box E2E verifier (scripts/verify_e2e.py) against the LIVE stack, including the distributed
+# double-spend check that is the whole reason this project exists.
+#
+# Torn down with -v FIRST, for the reason `make test` gives and one more that is specific to this
+# target: the redis-data volume survives a plain `down`, so yesterday's daily QUOTA counters and any
+# tier left resized by an interrupted run would still be there. Every count this verifier asserts is
+# exact, so it starts from an empty store or it is grading against state nobody recorded.
+#
+# `up --wait lb` names ONE service and the whole topology follows from its depends_on (nginx waits
+# on both replicas being healthy, each of those waits on `redis-cli ping`). --wait is what makes the
+# verifier's own /health poll a formality rather than the thing standing between it and a race.
+#
+# The verifier runs in a throwaway container (--build, so a stale image can never mask a change) and
+# its exit status is captured and re-raised AFTER the teardown — one failed check fails `make e2e`
+# and still leaves a clean machine behind.
+#
+# Every gate is host-overridable, which is how we prove they bite instead of decorate:
+#   MAX_OVERHEAD_MS=0 make e2e        MUST exit non-zero
+#   E2E_BURST_REQUESTS=1 make e2e     MUST exit non-zero (a burst of 1 proves nothing)
 e2e:
-	@echo "make e2e: the black-box E2E verifier arrives in C13 (scripts/verify_e2e.py)."
-	@echo "          Until then, 'make test' covers the suite and 'make up' serves the API."
+	docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+	docker compose up -d --build --wait lb
+	@status=0; \
+	docker compose --profile e2e run --rm --build e2e || status=$$?; \
+	docker compose down -v; \
+	exit $$status
 
 # Perf/load harness (scripts/load_test.py). Arrives in C14 with the throughput, limiter-overhead,
 # scaling and memory gates, each host-overridable so an impossible bar proves the gate bites.
